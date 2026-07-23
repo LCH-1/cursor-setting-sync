@@ -1,0 +1,205 @@
+import { open, readFile, rename, rm, stat, utimes } from "node:fs/promises";
+import { readFileSync, utimesSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { ensureDirectory, isMissingPathError } from "./files";
+import { dirname } from "node:path";
+
+// The holder refreshes the lock file's mtime so other processes can tell a
+// live lock from one whose PID was recycled after a reboot. Staleness needs
+// either a dead PID or an mtime older than the TTL, so a recycled PID that
+// never heartbeats the file heals instead of blocking sync forever. The TTL
+// is fifteen heartbeats so a holder stalled in long synchronous work does
+// not lose a live lock over a few missed refreshes.
+const HEARTBEAT_INTERVAL_MS = 60_000;
+const STALE_LOCK_TTL_MS = 15 * 60_000;
+
+interface LockContent {
+  pid: number;
+  token: string;
+  createdAt: string;
+}
+
+export interface FileLock {
+  path: string;
+  refresh(): void;
+  release(): Promise<void>;
+}
+
+export async function acquireFileLock(path: string): Promise<FileLock | null> {
+  await ensureDirectory(dirname(path));
+  const content: LockContent = {
+    pid: process.pid,
+    token: randomUUID(),
+    createdAt: new Date().toISOString(),
+  };
+
+  const fresh = await tryCreateLock(path, content);
+  if (fresh !== null) {
+    return fresh;
+  }
+
+  const existing = await readLock(path);
+  if (existing !== null && !(await isLockStale(path, existing))) {
+    return null;
+  }
+
+  // Renaming the stale file away is atomic, so exactly one contender takes it
+  // over. A plain remove-then-create would let a slow racer delete the lock a
+  // faster racer just created.
+  const takeoverPath = `${path}.${process.pid}.${randomUUID()}.stale`;
+  try {
+    await rename(path, takeoverPath);
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      // Another contender already renamed the stale lock; retry the normal
+      // create and lose gracefully if that contender recreated it first.
+      return tryCreateLock(path, content);
+    }
+    throw error;
+  }
+  // The staleness decision was made before the rename, so the rename can land
+  // after another contender already took the stale lock over and created a
+  // fresh live lock at the path. Only proceed when the renamed-away file is
+  // still the stale lock observed above; otherwise put it back and lose.
+  const moved = await readLock(takeoverPath);
+  if (!isSameLock(existing, moved)) {
+    await undoTakeover(path, takeoverPath);
+    return null;
+  }
+  await rm(takeoverPath, { force: true });
+  return tryCreateLock(path, content);
+}
+
+function isSameLock(
+  left: LockContent | null,
+  right: LockContent | null,
+): boolean {
+  if (left === null || right === null) {
+    return left === null && right === null;
+  }
+  return left.token === right.token && left.pid === right.pid;
+}
+
+async function undoTakeover(path: string, takeoverPath: string): Promise<void> {
+  try {
+    // Recreating with "wx" restores the displaced lock byte-for-byte without
+    // ever clobbering the path: if yet another contender recreated it first,
+    // the create fails and that contender keeps the lock.
+    const displaced = await readFile(takeoverPath);
+    const handle = await open(path, "wx");
+    try {
+      await handle.writeFile(displaced);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    // Best effort: the displaced holder cannot be restored once the path is
+    // occupied again, and a failed undo must not mask the null result.
+  }
+  await rm(takeoverPath, { force: true });
+}
+
+async function tryCreateLock(
+  path: string,
+  content: LockContent,
+): Promise<FileLock | null> {
+  try {
+    const handle = await open(path, "wx");
+    try {
+      await handle.writeFile(JSON.stringify(content), "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    return createLock(path, content);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function readLock(path: string): Promise<LockContent | null> {
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as LockContent;
+  } catch (error) {
+    if (isMissingPathError(error) || error instanceof SyntaxError) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function isLockStale(path: string, existing: LockContent): Promise<boolean> {
+  if (!isProcessAlive(existing.pid)) {
+    return true;
+  }
+  try {
+    const lockStat = await stat(path);
+    return Date.now() - lockStat.mtimeMs > STALE_LOCK_TTL_MS;
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return true;
+    }
+    throw error;
+  }
+}
+
+function createLock(path: string, content: LockContent): FileLock {
+  const heartbeat = setInterval(() => {
+    void touchLock(path, content);
+  }, HEARTBEAT_INTERVAL_MS);
+  heartbeat.unref();
+  return {
+    path,
+    refresh(): void {
+      // Long synchronous phases stall the event loop and with it the
+      // heartbeat, so holders call this right before entering one. It must
+      // stay synchronous to run while the loop still can.
+      try {
+        const existing = JSON.parse(readFileSync(path, "utf8")) as LockContent;
+        if (existing.token !== content.token) {
+          return;
+        }
+        const now = new Date();
+        utimesSync(path, now, now);
+      } catch {
+        // Same contract as the heartbeat: a failed refresh never interrupts
+        // the holder.
+      }
+    },
+    async release(): Promise<void> {
+      clearInterval(heartbeat);
+      const existing = await readLock(path);
+      if (existing?.token === content.token) {
+        await rm(path, { force: true });
+      }
+    },
+  };
+}
+
+async function touchLock(path: string, content: LockContent): Promise<void> {
+  try {
+    const existing = await readLock(path);
+    if (existing?.token !== content.token) {
+      return;
+    }
+    const now = new Date();
+    await utimes(path, now, now);
+  } catch {
+    // A failed heartbeat must never interrupt the holder; the lock only goes
+    // stale for others once the TTL lapses or the holder's PID dies.
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means the process exists but cannot be signalled from here.
+    return error instanceof Error && "code" in error && error.code === "EPERM";
+  }
+}

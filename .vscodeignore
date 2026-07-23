@@ -1,0 +1,20 @@
+.gitignore
+.vscode/**
+src/**
+tests/**
+coverage/**
+node_modules/**
+package-lock.json
+tsconfig.json
+esbuild.mjs
+eslint.config.mjs
+cursor-setting-sync-기획서.md
+**/*.map
+.vitest-cursor.*
+*.log
+image.png
+tmp/**
+icons/
+scripts/**
+image*.png
+image copy.png

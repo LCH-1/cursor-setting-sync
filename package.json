@@ -1,0 +1,210 @@
+{
+  "name": "cursor-setting-sync",
+  "displayName": "Cursor Setting Sync",
+  "description": "Securely synchronize Cursor settings, workspace state, profiles, extensions, user files, and chat data across devices.",
+  "version": "0.0.1",
+  "publisher": "lch",
+  "icon": "icon.png",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.99.0",
+    "node": ">=20.0.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "cursor",
+    "sync",
+    "settings",
+    "chat",
+    "onedrive",
+    "syncthing",
+    "profiles",
+    "encrypted"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "main": "./dist/extension.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LCH-1/cursor-setting-sync"
+  },
+  "homepage": "https://github.com/LCH-1/cursor-setting-sync#readme",
+  "bugs": {
+    "url": "https://github.com/LCH-1/cursor-setting-sync/issues"
+  },
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:cursorSync.setup",
+    "onCommand:cursorSync.syncNow",
+    "onCommand:cursorSync.restartToApply",
+    "onCommand:cursorSync.resolveConflicts",
+    "onCommand:cursorSync.showDiagnostics",
+    "onCommand:cursorSync.restoreBackup",
+    "onCommand:cursorSync.forgetDevice",
+    "onCommand:cursorSync.repositoryUsage",
+    "onCommand:cursorSync.compactRepository",
+    "onCommand:cursorSync.archiveRepository",
+    "onCommand:cursorSync.restoreVersion",
+    "onCommand:cursorSync.checkpointRepository"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "cursorSync.setup",
+        "title": "Cursor Setting Sync: Setup"
+      },
+      {
+        "command": "cursorSync.syncNow",
+        "title": "Cursor Setting Sync: Sync Now"
+      },
+      {
+        "command": "cursorSync.restartToApply",
+        "title": "Cursor Setting Sync: Restart to Apply"
+      },
+      {
+        "command": "cursorSync.resolveConflicts",
+        "title": "Cursor Setting Sync: Resolve Conflicts"
+      },
+      {
+        "command": "cursorSync.showDiagnostics",
+        "title": "Cursor Setting Sync: Show Diagnostics"
+      },
+      {
+        "command": "cursorSync.restoreBackup",
+        "title": "Cursor Setting Sync: Restore Backup"
+      },
+      {
+        "command": "cursorSync.forgetDevice",
+        "title": "Cursor Setting Sync: Forget Device"
+      },
+      {
+        "command": "cursorSync.repositoryUsage",
+        "title": "Cursor Setting Sync: Show Repository Usage"
+      },
+      {
+        "command": "cursorSync.compactRepository",
+        "title": "Cursor Setting Sync: Compact Safe Orphans"
+      },
+      {
+        "command": "cursorSync.restoreVersion",
+        "title": "Cursor Setting Sync: Restore Version History"
+      },
+      {
+        "command": "cursorSync.checkpointRepository",
+        "title": "Cursor Setting Sync: Checkpoint & Prune History"
+      },
+      {
+        "command": "cursorSync.archiveRepository",
+        "title": "Cursor Setting Sync: Archive Repository"
+      }
+    ],
+    "configuration": {
+      "title": "Cursor Setting Sync",
+      "properties": {
+        "cursorSettingSync.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable automatic synchronization after setup."
+        },
+        "cursorSettingSync.pollIntervalSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 10,
+          "maximum": 3600,
+          "description": "Fallback interval for scanning the shared repository."
+        },
+        "cursorSettingSync.chatPollIntervalSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 10,
+          "maximum": 3600,
+          "description": "Interval for checking Cursor chat metadata changes."
+        },
+        "cursorSettingSync.autoApplyFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Apply non-conflicting file resources while Cursor is running."
+        },
+        "cursorSettingSync.syncChat": {
+          "type": "boolean",
+          "default": true,
+          "description": "Synchronize supported Cursor chat stores."
+        },
+        "cursorSettingSync.syncWorkspaceStorage": {
+          "type": "boolean",
+          "default": true,
+          "description": "Back up allowlisted Cursor workspaceStorage data after Cursor exits and restore it offline."
+        },
+        "cursorSettingSync.ignoredSettings": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Settings keys excluded from synchronization."
+        },
+        "cursorSettingSync.ignoredExtensions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Extension identifiers excluded from synchronization."
+        },
+        "cursorSettingSync.ignoredUserFiles": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Cursor home user files excluded from synchronization, as relative paths such as mcp.json or rules/private.md. Useful for files containing API keys."
+        },
+        "cursorSettingSync.gitSync": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the repository folder is a git worktree, pull before reading and commit/push after writing. Requires the git CLI."
+        },
+        "cursorSettingSync.maxPayloadMiB": {
+          "type": "number",
+          "default": 128,
+          "minimum": 1,
+          "maximum": 512,
+          "description": "Maximum uncompressed size of one synchronized payload."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run check && npm run build",
+    "build": "node esbuild.mjs && npm run smoke",
+    "smoke": "node scripts/smoke-bundle.cjs",
+    "watch": "node esbuild.mjs --watch",
+    "check": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "package": "npm run build && vsce package --out cursor-setting-sync.vsix",
+    "publish": "npm run build && vsce publish",
+    "publish:patch": "npm run build && vsce publish patch",
+    "publish:minor": "npm run build && vsce publish minor",
+    "publish:major": "npm run build && vsce publish major",
+    "ovsx:publish": "npx ovsx publish --pat $OVSX_TOKEN"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1",
+    "node-diff3": "^3.2.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.99.0",
+    "@vscode/vsce": "^3.9.2",
+    "esbuild": "^0.28.1",
+    "eslint": "^10.7.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.64.0",
+    "vitest": "^4.1.10"
+  }
+}

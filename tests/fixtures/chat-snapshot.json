@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "composerId": "00000000-0000-4000-8000-000000000001",
+  "header": {
+    "composerId": "00000000-0000-4000-8000-000000000001",
+    "workspaceId": "anonymous-workspace",
+    "createdAt": 1700000000000,
+    "lastUpdatedAt": 1700000001000,
+    "isArchived": 0,
+    "isSubagent": 0,
+    "recency": 0,
+    "checkpointAt": 0,
+    "value": "{}"
+  },
+  "composerData": {
+    "key": "composerData:00000000-0000-4000-8000-000000000001",
+    "valueBase64": "e30="
+  },
+  "bubbles": [
+    {
+      "key": "bubbleId:00000000-0000-4000-8000-000000000001:00000000-0000-4000-8000-000000000002",
+      "valueBase64": "eyJ0ZXh0IjoiYW5vbnltb3VzIn0="
+    }
+  ]
+}
