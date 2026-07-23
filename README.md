@@ -49,7 +49,8 @@ Install **Cursor Setting Sync** from the Extensions view, then run `Cursor Setti
 ### Common (every transport)
 
 - Every transport starts by running `Cursor Setting Sync: Setup`.
-- The passphrase must be at least 12 characters and identical on every PC. It is never stored in the shared repository and cannot be recovered.
+- The passphrase is optional. If you set one, it must be at least 12 characters and identical on every PC. It is never stored in the shared repository and cannot be recovered.
+- Leaving the passphrase empty shows a security warning and then proceeds. The encryption key is then stored inside the repository next to the data, so anyone who can read the shared folder or git remote can decrypt everything. Use it only for a trusted local folder or a fully controlled private remote.
 - On additional PCs, file resources apply automatically when safe. When database or workspace-storage changes are pending, follow the status bar and run `Cursor Setting Sync: Restart to Apply`.
 - Running `Sync Now` (or any other command) before `Setup` does nothing: the status bar shows `unconfigured` and a message points you to `Setup`. Nothing is synchronized until a repository is configured.
 
@@ -62,7 +63,7 @@ Pick a transport below, and check the [Storage options](#storage-options) table 
 1. Run `Cursor Setting Sync: Setup`.
 2. Select an empty folder inside the shared (or local) location.
 3. Choose **Plain shared folder**.
-4. Enter a passphrase with at least 12 characters.
+4. Enter a passphrase (at least 12 characters, or leave it empty to skip it).
 5. Wait for the status bar to report that synchronization is up to date, then confirm your provider finished uploading.
 
 **Additional PCs**
@@ -71,7 +72,7 @@ Pick a transport below, and check the [Storage options](#storage-options) table 
 2. Select the same shared folder (each PC's own local copy).
 3. Choose **Plain shared folder** and enter the same passphrase.
 
-> Google Drive needs mirror mode with offline availability, and OneDrive needs "always keep on this device". See [Storage options](#storage-options) for details.
+> Google Drive needs "Mirror files" mode with "Available offline", and OneDrive needs "Always keep on this device". See [Storage options](#storage-options) for details.
 
 ### Transport B — git remote (GitHub · GitLab · self-hosted)
 
@@ -82,7 +83,7 @@ Pick a transport below, and check the [Storage options](#storage-options) table 
 1. Run `Cursor Setting Sync: Setup`.
 2. Select an empty folder (any location).
 3. Choose **New git repository with remote** and enter the remote URL (leave it empty for a local-only git history).
-4. Enter a passphrase with at least 12 characters. The first sync pushes to the remote.
+4. Enter a passphrase (at least 12 characters, or leave it empty to skip it). The first sync pushes to the remote.
 
 **Additional PCs (join the repository)**
 
@@ -97,8 +98,8 @@ The repository is a folder of encrypted, append-only files. What "sync" means de
 
 | Transport | How to set it up | What you get |
 | --- | --- | --- |
-| **OneDrive / Dropbox / iCloud Drive** | Choose **Plain shared folder** and select an empty folder inside the provider's synced location. Keep it **always available offline** (OneDrive: turn off "Free up space" / Files On-Demand for this folder) so real files exist on disk. | Full multi-PC sync. The provider uploads the folder; each PC points `Setup` at its own local copy of the same synced folder. |
-| **Google Drive** | Use the desktop app in **mirror** mode (not stream-only) and mark the folder **Available offline**, then choose **Plain shared folder**. | Full multi-PC sync. In stream-only mode files are virtual placeholders, so file watching and reads are unreliable — mirror mode is required. |
+| **OneDrive / Dropbox / iCloud Drive** | Choose **Plain shared folder** and select an empty folder inside the provider's synced location. Keep it on disk: OneDrive right-click → **"Always keep on this device"** (not "Free up space"; this is the Files On-Demand feature), Dropbox → turn off "online-only", iCloud Drive keeps files local by default. | Full multi-PC sync. The provider uploads the folder; each PC points `Setup` at its own local copy of the same synced folder. |
+| **Google Drive** | In Google Drive for desktop use **"Mirror files"** mode (not stream-only) and right-click the folder → **"Available offline"**, then choose **Plain shared folder**. | Full multi-PC sync. In stream-only mode files are virtual placeholders, so file watching and reads are unreliable — Mirror files mode is required. |
 | **Syncthing / Resilio** | Point every PC's share at the same folder and choose **Plain shared folder**. | Full multi-PC sync with no cloud account. The extension already ignores `sync-conflict` copies. |
 | **Local folder (no cloud, no git)** | Choose **Plain shared folder** and select any local directory. | Single-PC versioned backup: full version history, `Restore Version History`, and `Restore Backup` all work. It just never reaches other PCs, because nothing carries the folder off the machine. |
 | **Git — clone existing** | Choose **Clone an existing git repository** and paste the repository URL (GitHub, GitLab, or a self-hosted remote). | Joins a repository other PCs already push to. Each cycle pulls before reading and commits/pushes after writing. |

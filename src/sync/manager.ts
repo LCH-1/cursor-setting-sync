@@ -272,14 +272,27 @@ export class SyncManager implements vscode.Disposable {
     const passphrase = await vscode.window.showInputBox({
       title: exists ? "Unlock synchronization repository" : "Create repository passphrase",
       prompt:
-        "Use the same passphrase on every PC. It is not stored in the shared folder.",
+        "Use the same passphrase on every PC. Leave it empty to skip the passphrase. It is not stored in the shared folder.",
       password: true,
       ignoreFocusOut: true,
       validateInput: (value) =>
-        value.length < 12 ? "Use at least 12 characters." : undefined,
+        value.length === 0 || value.length >= 12
+          ? undefined
+          : "Use at least 12 characters, or leave it empty for no passphrase.",
     });
     if (passphrase === undefined) {
       return;
+    }
+    if (!exists && passphrase.length === 0) {
+      const proceed = "Create without a passphrase";
+      const confirmed = await vscode.window.showWarningMessage(
+        "Without a passphrase, the encryption key is stored inside the repository, next to the data. Anyone who can read the shared folder or git remote can then decrypt everything. Only skip the passphrase for a private local folder or a fully trusted private remote.",
+        { modal: true },
+        proceed,
+      );
+      if (confirmed !== proceed) {
+        return;
+      }
     }
 
     this.disposeRuntime();
@@ -343,14 +356,14 @@ export class SyncManager implements vscode.Disposable {
           value: "plain" as const,
         },
         {
-          label: "$(repo-clone) Clone an existing git repository",
-          description: "Join a sync repository other devices already push to",
-          value: "clone" as const,
-        },
-        {
           label: "$(repo-create) New git repository with remote",
           description: "Initialize git here; the remote URL may stay empty",
           value: "init" as const,
+        },
+        {
+          label: "$(repo-clone) Clone an existing git repository",
+          description: "Join a sync repository other devices already push to",
+          value: "clone" as const,
         },
       ],
       { title: "Choose how the empty folder stores the repository" },

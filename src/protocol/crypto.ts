@@ -133,7 +133,11 @@ async function derivePassphraseKey(
   passphrase: string,
   kdf: RepositoryKdf,
 ): Promise<Buffer> {
-  if (passphrase.length < 12) {
+  // An empty passphrase is allowed and means "no passphrase": the wrapping key
+  // is derived from the salt alone, so the master key stored in the repository
+  // is recoverable by anyone who can read it. A non-empty passphrase must still
+  // meet the minimum so a short one cannot give a false sense of protection.
+  if (passphrase.length > 0 && passphrase.length < 12) {
     throw new Error("The repository passphrase must contain at least 12 characters.");
   }
   return new Promise<Buffer>((resolve, reject) => {

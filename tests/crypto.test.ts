@@ -27,6 +27,26 @@ describe("repository encryption", () => {
     ).toThrow(/unknown or missing fields/i);
   });
 
+  it("supports an empty passphrase as no passphrase", async () => {
+    const created = await createEncryptedRepository(
+      "",
+      "00000000-0000-4000-8000-000000000009",
+    );
+
+    const unlocked = await unlockRepository("", created.repository);
+
+    expect(unlocked.equals(created.masterKey)).toBe(true);
+    await expect(
+      unlockRepository("not the empty passphrase", created.repository),
+    ).rejects.toThrow();
+  });
+
+  it("rejects a short but non-empty passphrase", async () => {
+    await expect(
+      createEncryptedRepository("short", "00000000-0000-4000-8000-00000000000a"),
+    ).rejects.toThrow(/at least 12 characters/i);
+  });
+
   it("rejects a wrong passphrase", async () => {
     const created = await createEncryptedRepository(
       "correct horse battery staple",

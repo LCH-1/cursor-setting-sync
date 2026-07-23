@@ -49,7 +49,8 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 ### 공통 (모든 방식 공통)
 
 - 어느 방식이든 `Cursor Setting Sync: Setup`을 실행하는 것으로 시작합니다.
-- 패스프레이즈는 12자 이상이며 모든 PC에서 동일해야 합니다. 공유 저장소에 저장되지 않고, 복구할 수 없습니다.
+- 패스프레이즈는 선택 사항입니다. 입력한다면 12자 이상이어야 하고 모든 PC에서 동일해야 합니다. 공유 저장소에 저장되지 않으며, 복구할 수 없습니다.
+- 패스프레이즈를 비워 두면 보안 경고가 뜬 뒤 진행됩니다. 이 경우 암호화 키가 저장소 안(데이터 옆)에 놓여, 공유 폴더나 git 원격을 읽을 수 있는 사람은 누구나 복호화할 수 있습니다. 신뢰할 수 있는 로컬 폴더나 완전히 통제되는 비공개 원격에서만 사용하세요.
 - 추가 PC에서는 파일 리소스가 안전할 때 자동으로 적용됩니다. DB·워크스페이스 스토리지 변경이 대기하면 상태바 안내에 따라 `Cursor Setting Sync: Restart to Apply`를 실행합니다.
 - Setup 전에 `Sync Now`(또는 다른 명령)를 실행하면 아무 일도 일어나지 않습니다. 상태바에 `unconfigured`가 표시되고 Setup을 안내하는 메시지가 뜹니다. 저장소가 설정되기 전까지는 아무것도 동기화되지 않습니다.
 
@@ -62,7 +63,7 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 1. `Cursor Setting Sync: Setup`을 실행합니다.
 2. 공유 폴더(또는 로컬 폴더) 안의 빈 폴더를 선택합니다.
 3. **Plain shared folder**를 선택합니다.
-4. 12자 이상의 패스프레이즈를 입력합니다.
+4. 패스프레이즈를 입력합니다(12자 이상, 또는 비워서 생략).
 5. 상태바가 동기화 완료를 보고할 때까지 기다린 뒤, 공유 폴더 제공자의 업로드 완료를 확인합니다.
 
 **추가 PC**
@@ -71,7 +72,7 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 2. 같은 공유 폴더(각 PC의 로컬 사본)를 선택합니다.
 3. **Plain shared folder**를 선택하고 같은 패스프레이즈를 입력합니다.
 
-> Google Drive는 mirror 모드 + 오프라인 사용, OneDrive는 "항상 오프라인 사용"이 필요합니다. 자세한 내용은 [저장소 옵션](#저장소-옵션)을 참고하세요.
+> Google Drive는 "파일 미러링" 모드 + "오프라인 액세스", OneDrive는 "항상 이 장치에 유지"가 필요합니다. 자세한 내용은 [저장소 옵션](#저장소-옵션)을 참고하세요.
 
 ### 방식 B — Git 원격 (GitHub · GitLab · 셀프호스팅)
 
@@ -82,7 +83,7 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 1. `Cursor Setting Sync: Setup`을 실행합니다.
 2. 빈 폴더를 선택합니다(위치는 자유).
 3. **New git repository with remote**를 선택하고 원격 URL을 입력합니다(비워두면 원격 없는 로컬 git 히스토리).
-4. 12자 이상의 패스프레이즈를 입력합니다. 첫 동기화에서 원격으로 push됩니다.
+4. 패스프레이즈를 입력합니다(12자 이상, 또는 비워서 생략). 첫 동기화에서 원격으로 push됩니다.
 
 **추가 PC (기존 저장소 합류)**
 
@@ -97,8 +98,8 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 
 | 케이스 | 설정 | 결과 |
 | --- | --- | --- |
-| **OneDrive / Dropbox / iCloud** | **Plain shared folder** 선택, 동기 폴더 지정, "항상 오프라인 사용" 유지 | 완전한 다중 PC 동기화 |
-| **Google Drive** | **mirror 모드 + 오프라인 사용** 필수(stream 모드는 파일이 가상이라 안 됨), **Plain shared folder** 선택 | 완전한 다중 PC 동기화 |
+| **OneDrive / Dropbox / iCloud** | **Plain shared folder** 선택, 동기 폴더 지정, 폴더를 로컬에 항상 유지(OneDrive는 "항상 이 장치에 유지") | 완전한 다중 PC 동기화 |
+| **Google Drive** | **"파일 미러링" 모드 + "오프라인 액세스"** 필수(스트리밍 모드는 파일이 가상이라 안 됨), **Plain shared folder** 선택 | 완전한 다중 PC 동기화 |
 | **Syncthing / Resilio** | 모든 PC의 공유를 같은 폴더로, **Plain shared folder** 선택 | 클라우드 계정 없이 동기화 |
 | **로컬 폴더** | **Plain shared folder** 선택, 아무 로컬 경로 지정 | 단일 PC 버전관리 + 복구(다른 PC로 전파 없음) |
 | **Git — clone existing** | **Clone an existing git repository** 선택, 저장소 URL 붙여넣기 | 다른 PC들이 이미 push하는 저장소에 합류 |
@@ -107,8 +108,8 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 
 **보충 설명**
 
-- **OneDrive / Dropbox / iCloud**: 제공자가 동기화하는 폴더 안의 빈 폴더를 고르고, 그 폴더를 **항상 기기에 유지**로 두세요(OneDrive는 이 폴더의 "여유 공간 확보"/Files On-Demand를 끄기). 실제 파일이 디스크에 존재해야 합니다. 각 PC는 자기 로컬에 있는 같은 동기 폴더를 `Setup`에서 가리킵니다.
-- **Google Drive**: 데스크톱 앱을 **mirror 모드**(stream 전용 아님)로 쓰고 폴더를 **오프라인 사용 가능**으로 표시하세요. stream 모드에서는 파일이 가상 placeholder라 파일 감시와 읽기가 불안정합니다.
+- **OneDrive / Dropbox / iCloud**: 제공자가 동기화하는 폴더 안의 빈 폴더를 고르고, 그 폴더를 로컬에 항상 유지하세요. OneDrive는 폴더를 우클릭해 **"항상 이 장치에 유지"**를 켜고, 반대 옵션인 **"공간 확보"**는 쓰지 마세요("파일 온디맨드" 기능). Dropbox는 "온라인 전용"을 끄고, iCloud Drive는 기본적으로 로컬에 유지됩니다. 실제 파일이 디스크에 존재해야 합니다. 각 PC는 자기 로컬에 있는 같은 동기 폴더를 `Setup`에서 가리킵니다.
+- **Google Drive**: 데스크톱용 Google Drive에서 **"파일 미러링"** 모드(스트리밍 전용 아님)를 쓰고, 폴더를 우클릭해 **"오프라인 액세스 가능"**으로 설정하세요. 스트리밍 모드에서는 파일이 가상 placeholder라 파일 감시와 읽기가 불안정합니다.
 - **Syncthing / Resilio**: 클라우드 계정 없이 동기화됩니다. 확장은 `sync-conflict` 사본을 이미 무시합니다.
 - **로컬 폴더**: 단일 PC 버전 백업입니다. 전체 버전 히스토리, `Restore Version History`, `Restore Backup`이 모두 동작합니다. 폴더를 기기 밖으로 옮기는 주체가 없으므로 다른 PC로만 전파되지 않을 뿐입니다.
 - **Git**: `git` CLI가 `PATH`에 있어야 합니다. 인증은 시스템 git 자격증명을 비대화식(`GIT_TERMINAL_PROMPT=0`)으로 사용하므로, 자격증명 헬퍼나 SSH 키를 미리 설정하세요. 인증 실패 시 경고로 강등되고 폴더는 로컬에서 계속 동작합니다. 원격 변경은 폴링으로 감지됩니다(git 모드는 파일 변경 이벤트를 받지 않음). 암호화 페이로드는 델타 압축이 안 되어 git 저장소는 담긴 데이터만큼 커집니다 — GitHub는 100MB 초과 파일을 거부하고 수 GB 이하 저장소를 선호하므로, `Show Repository Usage`를 확인하고 저장소가 커지면 `Checkpoint & Prune History`로 git 히스토리를 스쿼시하세요.
