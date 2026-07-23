@@ -64,7 +64,7 @@ export class StoreDbChatAdapter implements ResourceAdapter {
         if (known[resourceId]?.sourceTimestamp === lastUpdatedAt) {
           continue;
         }
-        const snapshot = readStoreSnapshot(path, relativePath);
+        const snapshot = readStoreSnapshot(path, relativePath, warnings);
         const content = canonicalBytes(snapshot);
         snapshots.push({
           resourceId,
@@ -168,7 +168,11 @@ function isPortableStoreValue(value: unknown): value is PortableStoreValue {
   );
 }
 
-export function readStoreSnapshot(path: string, relativePath: string): PortableStoreSnapshot {
+export function readStoreSnapshot(
+  path: string,
+  relativePath: string,
+  warnings?: string[],
+): PortableStoreSnapshot {
   const database = openDatabase(path, { readOnly: true });
   try {
     database.exec("PRAGMA busy_timeout=2000");
@@ -179,30 +183,42 @@ export function readStoreSnapshot(path: string, relativePath: string): PortableS
       const metaRows = database
         .prepare("SELECT key, value, typeof(value) AS valueType FROM meta ORDER BY key")
         .all() as Array<{
-          key: string;
+          key: Uint8Array | string | number | bigint | null;
           value: Uint8Array | string | number | bigint | null;
           valueType: string;
         }>;
       const blobRows = database
         .prepare("SELECT id, data, typeof(data) AS dataType FROM blobs ORDER BY id")
         .all() as Array<{
-          id: string;
+          id: Uint8Array | string | number | bigint | null;
           data: Uint8Array | string | number | bigint | null;
           dataType: string;
         }>;
       database.exec("COMMIT");
-      return {
-        schemaVersion: 1,
-        relativePath,
-        meta: metaRows.map((row) => ({
-          key: row.key,
+      // SQLite permits NULL in a non-INTEGER PRIMARY KEY column. Such a row
+      // has no usable identity, so it is dropped here rather than published
+      // as a snapshot every peer rejects; coercing it would create a literal
+      // "null" key on the target.
+      const meta = metaRows
+        .filter((row) => typeof row.key === "string")
+        .map((row) => ({
+          key: row.key as string,
           value: portableValue(row.value, row.valueType),
-        })),
-        blobs: blobRows.map((row) => ({
-          id: row.id,
+        }));
+      const blobs = blobRows
+        .filter((row) => typeof row.id === "string")
+        .map((row) => ({
+          id: row.id as string,
           data: portableValue(row.data, row.dataType),
-        })),
-      };
+        }));
+      const skippedRows =
+        metaRows.length - meta.length + (blobRows.length - blobs.length);
+      if (skippedRows > 0) {
+        warnings?.push(
+          `Skipped ${skippedRows} store.db row(s) without a text key in ${relativePath}.`,
+        );
+      }
+      return { schemaVersion: 1, relativePath, meta, blobs };
     } catch (error) {
       database.exec("ROLLBACK");
       throw error;

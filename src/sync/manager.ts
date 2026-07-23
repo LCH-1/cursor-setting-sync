@@ -1721,6 +1721,12 @@ export class SyncManager implements vscode.Disposable {
       }
       const sourceWorkspaceId = tip.metadata?.workspaceId;
       const sourceWorkspaceUri = tip.metadata?.workspaceUri;
+      if (pending.kind === "chat" && sourceWorkspaceId === null) {
+        // A workspace-less composer has nothing to map; the helper writes its
+        // NULL workspaceId straight back.
+        delete pending.blockedReason;
+        continue;
+      }
       if (typeof sourceWorkspaceId !== "string") {
         pending.blockedReason = "Incoming workspace metadata is missing a workspace ID.";
         continue;

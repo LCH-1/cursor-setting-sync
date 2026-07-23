@@ -1,4 +1,6 @@
 import { EXTENSION_ID } from "../constants";
+import type { SqliteStorageValue } from "../platform/sqlite";
+import { sqliteStorageText } from "../platform/sqlite";
 
 const DENIED_KEY_PATTERNS = [
   /^secret:\/\//i,
@@ -14,15 +16,23 @@ export function isDeniedUiStateKey(key: string): boolean {
   return DENIED_KEY_PATTERNS.some((pattern) => pattern.test(key));
 }
 
+/**
+ * A NULL, absent, or empty marker means the same thing to VS Code: no key is
+ * registered as USER-target. A marker that is present but unparseable still
+ * throws, because degrading a real marker to {} would let the apply side
+ * rewrite it and strip every registered key.
+ */
 export function parseTargetStorageMarker(
-  value: Uint8Array | string | undefined,
+  value: SqliteStorageValue | undefined,
 ): Record<string, number> {
   const result = Object.create(null) as Record<string, number>;
-  if (value === undefined) {
+  if (value === undefined || value === null) {
     return result;
   }
-  const source =
-    typeof value === "string" ? value : Buffer.from(value).toString("utf8");
+  const source = sqliteStorageText(value, "Target storage marker");
+  if (source.trim().length === 0) {
+    return result;
+  }
   const parsed = JSON.parse(source) as unknown;
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Target storage marker must be an object.");

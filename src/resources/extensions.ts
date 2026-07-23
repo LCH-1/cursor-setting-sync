@@ -2,7 +2,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join, relative } from "node:path";
 import { stat } from "node:fs/promises";
-import { openDatabase } from "../platform/sqlite";
+import type { SqliteStorageValue } from "../platform/sqlite";
+import { openDatabase, sqliteStorageText } from "../platform/sqlite";
 import { existsSync } from "node:fs";
 import type {
   JsonValue,
@@ -72,13 +73,23 @@ export class ExtensionsAdapter implements ResourceAdapter {
     const scannedProfiles = new Set<string>();
     const metadata = await this.readExtensionMetadata();
     const manifestMtimeMs = await mtimeOrNull(this.paths.cursorExtensionsManifest);
-    const profiles = [
-      { id: "default", name: "Default" },
-      ...readPortableProfiles(this.paths.globalDatabase).map((profile) => ({
-        id: profile.id,
-        name: profile.name,
-      })),
-    ];
+    // An unreadable profile manifest must degrade to "default profile only"
+    // instead of taking down extension sync entirely. Profiles missing from
+    // the list are also absent from scannedProfiles, so findDeletions
+    // suppresses their deletions rather than uninstalling them elsewhere.
+    let declaredProfiles: Array<{ id: string; name: string }> = [];
+    try {
+      declaredProfiles = readPortableProfiles(this.paths.globalDatabase).map(
+        (profile) => ({ id: profile.id, name: profile.name }),
+      );
+    } catch (error) {
+      warnings.push(
+        `Unable to enumerate profiles: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    const profiles = [{ id: "default", name: "Default" }, ...declaredProfiles];
 
     for (const profile of profiles) {
       try {
@@ -298,16 +309,19 @@ function readDisabledExtensions(paths: CursorPaths, profileId: string): Set<stri
     const row = database
       .prepare("SELECT value FROM ItemTable WHERE key = ?")
       .get("extensionsIdentifiers/disabled") as
-      | { value?: Uint8Array | string }
+      | { value?: SqliteStorageValue }
       | undefined;
-    if (row?.value === undefined) {
+    const raw = row?.value;
+    // A NULL disabled list means "nothing is disabled", exactly like an
+    // absent row; this path is read-only so the NULL stays on disk.
+    if (raw === undefined || raw === null) {
       return new Set();
     }
-    const parsed = JSON.parse(
-      typeof row.value === "string"
-        ? row.value
-        : Buffer.from(row.value).toString("utf8"),
-    ) as unknown;
+    const text = sqliteStorageText(raw, "extensionsIdentifiers/disabled");
+    if (text.trim().length === 0) {
+      return new Set();
+    }
+    const parsed = JSON.parse(text) as unknown;
     if (!Array.isArray(parsed)) {
       return new Set();
     }

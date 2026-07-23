@@ -226,6 +226,46 @@ describe("non-global resource apply", () => {
   });
 });
 
+describeWithBackup("extension enablement over a NULL disabled list", () => {
+  it("applies enablement and leaves an untouched NULL row alone", async () => {
+    const fixture = await createFixture();
+    await createProfileDatabase(fixture.paths.globalDatabase, null);
+    await stubCursorCli(fixture);
+    const resourceId = "extension/default/some.extension";
+
+    const result = await applyNonGlobalChanges(fixture.request, [
+      extensionPut(resourceId, "some.extension"),
+    ]);
+
+    expect(result.applied).toEqual([resourceId]);
+    expect(
+      readItemTableType(
+        fixture.paths.globalDatabase,
+        "extensionsIdentifiers/disabled",
+      ),
+    ).toBe("null");
+  });
+
+  it("writes a real JSON array when disabling over a NULL row", async () => {
+    const fixture = await createFixture();
+    await createProfileDatabase(fixture.paths.globalDatabase, null);
+    await stubCursorCli(fixture);
+    const resourceId = "extension/default/some.extension";
+
+    const result = await applyNonGlobalChanges(fixture.request, [
+      extensionPut(resourceId, "some.extension", false),
+    ]);
+
+    expect(result.applied).toEqual([resourceId]);
+    expect(
+      readItemTableValue(
+        fixture.paths.globalDatabase,
+        "extensionsIdentifiers/disabled",
+      ),
+    ).toBe(JSON.stringify([{ id: "some.extension" }]));
+  });
+});
+
 describeWithBackup("non-global resource apply with backups", () => {
   it("records the union hash when a store apply retains local-only rows", async () => {
     const fixture = await createFixture();
@@ -394,6 +434,7 @@ function extensionDelete(
 function extensionPut(
   resourceId: string,
   extensionId: string,
+  enabled = true,
 ): PreparedHelperChange {
   return {
     change: {
@@ -414,7 +455,7 @@ function extensionPut(
         id: extensionId,
         version: "latest",
         installed: true,
-        enabled: true,
+        enabled,
         preRelease: false,
         pinned: false,
       }),
@@ -495,6 +536,47 @@ function readMetaValue(path: string, key: string): string | null {
       : typeof row.value === "string"
         ? row.value
         : Buffer.from(row.value).toString("utf8");
+  } finally {
+    database.close();
+  }
+}
+
+async function createProfileDatabase(
+  path: string,
+  disabled: string | null,
+): Promise<void> {
+  await mkdir(join(path, ".."), { recursive: true });
+  const database = new DatabaseSync(path);
+  try {
+    database.exec("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)");
+    database
+      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
+      .run("extensionsIdentifiers/disabled", disabled);
+  } finally {
+    database.close();
+  }
+}
+
+async function stubCursorCli(fixture: {
+  request: HelperRequest;
+  paths: CursorPaths;
+}): Promise<void> {
+  fixture.request.cursorExecutable = process.execPath;
+  await mkdir(join(fixture.paths.appRoot, "out"), { recursive: true });
+  await writeFile(
+    join(fixture.paths.appRoot, "out", "cli.js"),
+    "process.exit(0);",
+    "utf8",
+  );
+}
+
+function readItemTableType(path: string, key: string): string | undefined {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const row = database
+      .prepare("SELECT typeof(value) AS type FROM ItemTable WHERE key = ?")
+      .get(key) as { type?: string } | undefined;
+    return row?.type;
   } finally {
     database.close();
   }

@@ -1,3 +1,4 @@
+import type { SqliteStorageValue } from "../platform/sqlite";
 import { openDatabase } from "../platform/sqlite";
 import {
   CURSOR_USER_RULES_KEY,
@@ -33,10 +34,24 @@ export class UiStateAdapter implements ResourceAdapter {
       // bursts instead of failing the whole sync cycle with SQLITE_BUSY.
       database.exec("PRAGMA busy_timeout=2000");
       database.exec("PRAGMA query_only=ON");
+      const scanWarnings: string[] = [];
       const markerRow = database
         .prepare("SELECT value FROM ItemTable WHERE key = ?")
-        .get(TARGET_STORAGE_MARKER) as { value?: Uint8Array | string } | undefined;
-      const targets = parseTargetStorageMarker(markerRow?.value);
+        .get(TARGET_STORAGE_MARKER) as
+        | { value?: SqliteStorageValue }
+        | undefined;
+      // An unreadable marker must not take down the whole adapter: without it
+      // no key is known to be USER-target, but cursor-user-rules still syncs.
+      let targets: Record<string, number> = {};
+      try {
+        targets = parseTargetStorageMarker(markerRow?.value);
+      } catch (error) {
+        scanWarnings.push(
+          `Unable to read the UI state target marker: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
       const keys = Object.entries(targets)
         .filter(([, target]) => target === USER_STORAGE_TARGET)
         .map(([key]) => key)
@@ -46,17 +61,31 @@ export class UiStateAdapter implements ResourceAdapter {
       }
 
       const snapshots: ResourceSnapshot[] = [];
+      const warnings: string[] = [...scanWarnings];
       const current = new Set<string>();
       const select = database.prepare("SELECT value FROM ItemTable WHERE key = ?");
       for (const key of keys.sort((left, right) => left.localeCompare(right))) {
-        const row = select.get(key) as { value?: Uint8Array | string } | undefined;
-        if (row?.value === undefined) {
+        const row = select.get(key) as { value?: SqliteStorageValue } | undefined;
+        const raw = row?.value;
+        if (raw === undefined) {
           continue;
         }
-        const content = toBuffer(row.value);
         const kind: ResourceKind =
           key === CURSOR_USER_RULES_KEY ? "cursor-user-rules" : "ui-state";
         const resourceId = uiStateResourceId(kind, key);
+        if (typeof raw !== "string" && !(raw instanceof Uint8Array)) {
+          // The wire format has no NULL storage class, and publishing empty
+          // content would overwrite a peer's real value. The row is still in
+          // `current` so a present-but-unusable value is not a deletion.
+          current.add(resourceId);
+          warnings.push(
+            `ui-state ${key}: skipped an unusable SQLite value (${
+              raw === null ? "NULL" : typeof raw
+            }).`,
+          );
+          continue;
+        }
+        const content = toBuffer(raw);
         current.add(resourceId);
         snapshots.push({
           resourceId,
@@ -68,14 +97,14 @@ export class UiStateAdapter implements ResourceAdapter {
             registeredUserTarget: targets[key] === USER_STORAGE_TARGET,
             // SQLite storage class; the apply side must bind TEXT as a string
             // or VS Code's strict string comparisons silently reset UI state.
-            valueType: typeof row.value === "string" ? "text" : "blob",
+            valueType: typeof raw === "string" ? "text" : "blob",
           },
         });
       }
       return {
         snapshots,
         deletions: findDeletions(known, current),
-        warnings: [],
+        warnings,
       };
     } finally {
       database.close();

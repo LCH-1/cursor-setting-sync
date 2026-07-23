@@ -1,5 +1,9 @@
-import type { DatabaseSync } from "../platform/sqlite";
-import { backupDatabase, openDatabase } from "../platform/sqlite";
+import type { DatabaseSync, SqliteStorageValue } from "../platform/sqlite";
+import {
+  backupDatabase,
+  openDatabase,
+  sqliteStorageText,
+} from "../platform/sqlite";
 import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, posix, win32 } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -601,6 +605,17 @@ async function preflightGlobalChanges(
   return localWorkspaces;
 }
 
+/**
+ * A violation that must abort the whole apply instead of degrading into a
+ * per-change skip, because continuing would act on untrusted input.
+ */
+class FatalApplyError extends Error {}
+
+type ChangeOutcome =
+  | { status: "applied" }
+  | { status: "ignored" }
+  | { status: "skipped"; reason: string };
+
 function applyPreparedChanges(
   database: DatabaseSync,
   request: HelperRequest,
@@ -609,121 +624,190 @@ function applyPreparedChanges(
 ): { applied: string[]; skipped: string[] } {
   const applied: string[] = [];
   const skipped: string[] = [];
-  const targetMarker = readTargetMarker(database);
+  const marker: MarkerState = {
+    entries: readTargetMarker(database),
+    dirty: false,
+  };
 
   for (const item of prepared) {
-    const { change, content } = item;
-    if (change.kind === "chat") {
-      if (change.operation === "delete") {
-        skipped.push(`${change.resourceId}: tombstone retained without hard delete`);
-        continue;
-      }
-      if (content === undefined) {
-        throw new Error(`Chat payload is missing: ${change.resourceId}`);
-      }
-      const snapshot = parsePortableChatSnapshot(content);
-      if (change.resourceId !== `chat/${snapshot.composerId}`) {
-        throw new Error(`Chat payload does not match ${change.resourceId}.`);
-      }
-      const sourceWorkspaceUri = metadataStringOrNull(
-        change.metadata,
-        "workspaceUri",
-      );
-      const targetWorkspaceId = resolveTargetWorkspace(
-        snapshot.header.workspaceId,
-        sourceWorkspaceUri,
-        localWorkspaces,
-        request.workspaceMappings,
-      );
-      if (targetWorkspaceId === null) {
-        skipped.push(`${change.resourceId}: workspace mapping required`);
-        continue;
-      }
-      upsertChat(database, snapshot, targetWorkspaceId);
-      applied.push(change.resourceId);
-      continue;
-    }
-
-    if (change.kind === "ui-state" || change.kind === "cursor-user-rules") {
-      const key = metadataString(change.metadata, "key");
-      if (change.resourceId !== `${change.kind}/${encodeURIComponent(key)}`) {
-        throw new Error(`UI state metadata does not match ${change.resourceId}.`);
-      }
-      if (!isSafeUiStateKey(key, change.kind)) {
-        throw new Error(`Refused unsafe UI state key: ${key}`);
-      }
-      if (change.operation === "delete") {
-        database.prepare("DELETE FROM ItemTable WHERE key = ?").run(key);
-        delete targetMarker[key];
-      } else {
-        if (content === undefined) {
-          throw new Error(`UI state payload is missing: ${change.resourceId}`);
-        }
-        // ItemTable values are TEXT in practice; binding a Buffer would store
-        // a BLOB and break VS Code's strict string comparisons. Events
-        // published before valueType was captured decode to TEXT only when
-        // the decode is lossless, so non-UTF-8 legacy BLOBs keep their bytes.
-        const valueType = metadataStringOrNull(change.metadata, "valueType");
-        const value =
-          valueType === "blob"
-            ? content
-            : valueType === "text"
-              ? content.toString("utf8")
-              : legacyStorageValue(content);
-        database
-          .prepare(
-            `INSERT INTO ItemTable(key, value) VALUES (?, ?)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-          )
-          .run(key, value);
-        if (metadataBoolean(change.metadata, "registeredUserTarget")) {
-          targetMarker[key] = USER_STORAGE_TARGET;
-        }
-      }
-      applied.push(change.resourceId);
-      continue;
-    }
-
-    if (change.kind === "profile") {
-      if (change.resourceId !== "profile/manifest") {
-        throw new Error(`Unexpected profile resource: ${change.resourceId}`);
-      }
-      if (change.operation === "delete") {
-        skipped.push(`${change.resourceId}: profile manifest deletion ignored`);
-        continue;
-      }
-      if (content === undefined) {
-        throw new Error("Profile manifest payload is missing.");
-      }
-      const profiles = parsePortableProfiles(content);
-      const stored = mergeStoredProfiles(
+    // A savepoint keeps a rejected change from leaving partial writes behind,
+    // so one unparseable snapshot never discards the rest of the batch.
+    database.exec("SAVEPOINT cursor_sync_change");
+    let outcome: ChangeOutcome;
+    try {
+      outcome = applyPreparedChange(
         database,
-        profiles,
-        request.paths.profilesRoot,
+        request,
+        item,
+        localWorkspaces,
+        marker,
       );
+      database.exec("RELEASE cursor_sync_change");
+    } catch (error) {
+      database.exec("ROLLBACK TO cursor_sync_change");
+      database.exec("RELEASE cursor_sync_change");
+      if (error instanceof FatalApplyError) {
+        throw error;
+      }
+      outcome = {
+        status: "skipped",
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (outcome.status === "applied") {
+      applied.push(item.change.resourceId);
+    } else if (outcome.status === "skipped") {
+      skipped.push(`${item.change.resourceId}: ${outcome.reason}`);
+    }
+  }
+
+  // Rewriting an untouched marker would replace a NULL or absent row with the
+  // literal "{}" on every apply, including batches that never read UI state.
+  if (marker.dirty) {
+    database
+      .prepare(
+        `INSERT INTO ItemTable(key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(TARGET_STORAGE_MARKER, JSON.stringify(marker.entries));
+  }
+  return { applied, skipped };
+}
+
+function applyPreparedChange(
+  database: DatabaseSync,
+  request: HelperRequest,
+  item: PreparedHelperChange,
+  localWorkspaces: Awaited<ReturnType<typeof discoverWorkspaces>>,
+  marker: MarkerState,
+): ChangeOutcome {
+  const { change, content } = item;
+  if (change.kind === "chat") {
+    if (change.operation === "delete") {
+      return { status: "skipped", reason: "tombstone retained without hard delete" };
+    }
+    if (content === undefined) {
+      throw new Error(`Chat payload is missing: ${change.resourceId}`);
+    }
+    const snapshot = parsePortableChatSnapshot(content);
+    if (change.resourceId !== `chat/${snapshot.composerId}`) {
+      throw new Error(`Chat payload does not match ${change.resourceId}.`);
+    }
+    const sourceWorkspaceId = snapshot.header.workspaceId;
+    if (sourceWorkspaceId === null) {
+      // A workspace-less composer round-trips as workspace-less; there is
+      // nothing to map and no local workspace it belongs to.
+      upsertChat(database, snapshot, null);
+      return { status: "applied" };
+    }
+    const sourceWorkspaceUri = metadataStringOrNull(
+      change.metadata,
+      "workspaceUri",
+    );
+    const targetWorkspaceId = resolveTargetWorkspace(
+      sourceWorkspaceId,
+      sourceWorkspaceUri,
+      localWorkspaces,
+      request.workspaceMappings,
+    );
+    if (targetWorkspaceId === null) {
+      return { status: "skipped", reason: "workspace mapping required" };
+    }
+    upsertChat(database, snapshot, targetWorkspaceId);
+    return { status: "applied" };
+  }
+
+  if (change.kind === "ui-state" || change.kind === "cursor-user-rules") {
+    const key = metadataString(change.metadata, "key");
+    if (change.resourceId !== `${change.kind}/${encodeURIComponent(key)}`) {
+      throw new Error(`UI state metadata does not match ${change.resourceId}.`);
+    }
+    if (!isSafeUiStateKey(key, change.kind)) {
+      throw new FatalApplyError(`Refused unsafe UI state key: ${key}`);
+    }
+    if (change.operation === "delete") {
+      database.prepare("DELETE FROM ItemTable WHERE key = ?").run(key);
+      if (Object.hasOwn(marker.entries, key)) {
+        delete marker.entries[key];
+        marker.dirty = true;
+      }
+    } else {
+      if (content === undefined) {
+        throw new Error(`UI state payload is missing: ${change.resourceId}`);
+      }
       database
         .prepare(
           `INSERT INTO ItemTable(key, value) VALUES (?, ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
         )
-        .run("userDataProfiles", JSON.stringify(stored));
-      applied.push(change.resourceId);
+        .run(key, uiStateValue(change.metadata, content));
+      if (
+        metadataBoolean(change.metadata, "registeredUserTarget") &&
+        marker.entries[key] !== USER_STORAGE_TARGET
+      ) {
+        marker.entries[key] = USER_STORAGE_TARGET;
+        marker.dirty = true;
+      }
     }
+    return { status: "applied" };
   }
 
-  database
-    .prepare(
-      `INSERT INTO ItemTable(key, value) VALUES (?, ?)
-       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-    )
-    .run(TARGET_STORAGE_MARKER, JSON.stringify(targetMarker));
-  return { applied, skipped };
+  if (change.kind === "profile") {
+    if (change.resourceId !== "profile/manifest") {
+      throw new Error(`Unexpected profile resource: ${change.resourceId}`);
+    }
+    if (change.operation === "delete") {
+      return { status: "skipped", reason: "profile manifest deletion ignored" };
+    }
+    if (content === undefined) {
+      throw new Error("Profile manifest payload is missing.");
+    }
+    const profiles = parsePortableProfiles(content);
+    const stored = mergeStoredProfiles(
+      database,
+      profiles,
+      request.paths.profilesRoot,
+    );
+    database
+      .prepare(
+        `INSERT INTO ItemTable(key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run("userDataProfiles", JSON.stringify(stored));
+    return { status: "applied" };
+  }
+
+  return { status: "ignored" };
+}
+
+/**
+ * ItemTable values are TEXT in practice; binding a Buffer would store a BLOB
+ * and break VS Code's strict string comparisons. Events published before
+ * valueType was captured decode to TEXT only when the decode is lossless, so
+ * non-UTF-8 legacy BLOBs keep their bytes. An unrecognised class must fail
+ * closed rather than silently degrade to an empty or re-encoded value.
+ */
+function uiStateValue(
+  metadata: Record<string, JsonValue> | undefined,
+  content: Buffer,
+): string | Buffer {
+  const valueType = metadataStringOrNull(metadata, "valueType");
+  if (valueType === "blob") {
+    return content;
+  }
+  if (valueType === "text") {
+    return content.toString("utf8");
+  }
+  if (valueType !== null) {
+    throw new Error(`Unsupported UI state storage class: ${valueType}`);
+  }
+  return legacyStorageValue(content);
 }
 
 function upsertChat(
   database: DatabaseSync,
   snapshot: ReturnType<typeof parsePortableChatSnapshot>,
-  workspaceId: string,
+  workspaceId: string | null,
 ): void {
   const insertKv = database.prepare(
     `INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)
@@ -777,7 +861,12 @@ function upsertChat(
     );
 }
 
-function portableKvValue(row: PortableKvRow): string | Buffer {
+function portableKvValue(row: PortableKvRow): string | Buffer | null {
+  // node:sqlite binds a JS null to SQL NULL, so a captured NULL is restored
+  // exactly instead of becoming an empty string or a zero-length blob.
+  if (row.valueType === "null") {
+    return null;
+  }
   const value = Buffer.from(row.valueBase64, "base64");
   if (row.valueType === "blob") {
     return value;
@@ -836,7 +925,7 @@ function mergeStoredProfiles(
 ): Array<Record<string, unknown>> {
   const row = database
     .prepare("SELECT value FROM ItemTable WHERE key = ?")
-    .get("userDataProfiles") as { value?: Uint8Array | string } | undefined;
+    .get("userDataProfiles") as { value?: SqliteStorageValue } | undefined;
   const current = parseStoredProfileArray(row?.value);
   const positions = new Map<string, number>();
   current.forEach((profile, index) => {
@@ -868,14 +957,18 @@ function mergeStoredProfiles(
 }
 
 function parseStoredProfileArray(
-  value: Uint8Array | string | undefined,
+  value: SqliteStorageValue | undefined,
 ): Array<Record<string, unknown>> {
-  if (value === undefined) {
+  // A NULL manifest reads the same as an absent one; the caller then writes a
+  // real JSON array back, and the merge is additive so nothing can be lost.
+  if (value === undefined || value === null) {
     return [];
   }
-  const parsed = JSON.parse(
-    typeof value === "string" ? value : Buffer.from(value).toString("utf8"),
-  ) as unknown;
+  const text = sqliteStorageText(value, "Stored profile manifest");
+  if (text.trim().length === 0) {
+    return [];
+  }
+  const parsed = JSON.parse(text) as unknown;
   if (!Array.isArray(parsed) || parsed.length > 1_000) {
     throw new Error("Stored profile manifest is invalid.");
   }
@@ -901,10 +994,17 @@ function storedProfileId(profile: Record<string, unknown>): string | null {
   return /^[a-zA-Z0-9._-]+$/.test(id) ? id : null;
 }
 
+interface MarkerState {
+  entries: Record<string, number>;
+  dirty: boolean;
+}
+
 function readTargetMarker(database: DatabaseSync): Record<string, number> {
   const row = database
     .prepare("SELECT value FROM ItemTable WHERE key = ?")
-    .get(TARGET_STORAGE_MARKER) as { value?: Uint8Array | string } | undefined;
+    .get(TARGET_STORAGE_MARKER) as
+    | { value?: SqliteStorageValue }
+    | undefined;
   return parseTargetStorageMarker(row?.value);
 }
 

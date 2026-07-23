@@ -43,6 +43,8 @@ composerHeaders(
 
 Workspace `state.vscdb` additionally requires `ItemTable(key, value)` and `cursorDiskKV(key, value)` with a unique key. These rows are transported in a typed portable format; the database file, schema objects, WAL, SHM, and rollback journal are never transported. Newer target tables and columns therefore survive an older-to-newer import.
 
+Every nullable `composerHeaders` column and every `cursorDiskKV` chat value is transported with its SQLite storage class, so SQL `NULL` round-trips as `NULL` instead of becoming `0` or the text `null`. A client older than the `null` storage class rejects such a chat snapshot rather than applying a coerced value.
+
 If these checks fail, file synchronization remains active while profile, UI-state, extension-state, workspace storage, and database-backed chat resources are deferred. Diagnostics explain the failed capability or schema check.
 
 ## Portable resources

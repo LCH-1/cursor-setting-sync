@@ -1,5 +1,6 @@
 import { basename } from "node:path";
-import { openDatabase } from "../platform/sqlite";
+import type { SqliteStorageValue } from "../platform/sqlite";
+import { openDatabase, sqliteStorageText } from "../platform/sqlite";
 import type {
   JsonValue,
   LocalProjection,
@@ -25,7 +26,22 @@ export class ProfilesAdapter implements ResourceAdapter {
   constructor(private readonly paths: CursorPaths) {}
 
   async scan(_known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
-    const profiles = this.readPortableProfiles();
+    let profiles: PortableProfile[];
+    try {
+      profiles = this.readPortableProfiles();
+    } catch (error) {
+      // Publishing an empty manifest here would delete every profile on the
+      // other PCs, so an unreadable manifest publishes nothing at all.
+      return {
+        snapshots: [],
+        deletions: [],
+        warnings: [
+          `Unable to read the profile manifest: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ],
+      };
+    }
     const value = profiles as unknown as JsonValue;
     return {
       snapshots: [
@@ -57,15 +73,18 @@ export function readPortableProfiles(databasePath: string): PortableProfile[] {
     database.exec("PRAGMA query_only=ON");
     const row = database
       .prepare("SELECT value FROM ItemTable WHERE key = ?")
-      .get("userDataProfiles") as { value?: Uint8Array | string } | undefined;
-    if (row?.value === undefined) {
+      .get("userDataProfiles") as { value?: SqliteStorageValue } | undefined;
+    const raw = row?.value;
+    // A NULL manifest means "no profiles", exactly like an absent row. This
+    // path never writes, so the NULL is left untouched on disk.
+    if (raw === undefined || raw === null) {
       return [];
     }
-    const raw =
-      typeof row.value === "string"
-        ? row.value
-        : Buffer.from(row.value).toString("utf8");
-    const parsed = JSON.parse(raw) as unknown;
+    const text = sqliteStorageText(raw, "userDataProfiles");
+    if (text.trim().length === 0) {
+      return [];
+    }
+    const parsed = JSON.parse(text) as unknown;
     if (!Array.isArray(parsed)) {
       throw new Error("userDataProfiles is not an array.");
     }

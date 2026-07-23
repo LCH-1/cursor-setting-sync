@@ -1,7 +1,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { DatabaseSync } from "../platform/sqlite";
-import { backupDatabase, openDatabase } from "../platform/sqlite";
+import type { DatabaseSync, SqliteStorageValue } from "../platform/sqlite";
+import {
+  backupDatabase,
+  openDatabase,
+  sqliteStorageText,
+} from "../platform/sqlite";
 import { dirname, join, relative } from "node:path";
 import { utimes } from "node:fs/promises";
 import type { JsonValue } from "../types";
@@ -637,9 +641,10 @@ async function updateExtensionEnablement(
     const row = database
       .prepare("SELECT value FROM ItemTable WHERE key = ?")
       .get("extensionsIdentifiers/disabled") as
-      | { value?: Uint8Array | string }
+      | { value?: SqliteStorageValue }
       | undefined;
-    const disabled = parseDisabledExtensions(row?.value);
+    const raw = row?.value;
+    const disabled = parseDisabledExtensions(raw);
     const existingEntry = disabled.find(
       (item) => disabledExtensionId(item)?.toLowerCase() === extensionId,
     );
@@ -649,12 +654,16 @@ async function updateExtensionEnablement(
     if (!enabled) {
       filtered.push(existingEntry ?? { id: extensionId });
     }
-    database
-      .prepare(
-        `INSERT INTO ItemTable(key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-      )
-      .run("extensionsIdentifiers/disabled", JSON.stringify(filtered));
+    // A no-op enable must not gratuitously replace an absent or NULL row with
+    // the string "[]" in the user's live database.
+    if (filtered.length > 0 || (raw !== undefined && raw !== null)) {
+      database
+        .prepare(
+          `INSERT INTO ItemTable(key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        )
+        .run("extensionsIdentifiers/disabled", JSON.stringify(filtered));
+    }
     assertIntegrity(database);
     database.exec("COMMIT");
     transactionStarted = false;
@@ -673,14 +682,18 @@ async function updateExtensionEnablement(
 }
 
 function parseDisabledExtensions(
-  value: Uint8Array | string | undefined,
+  value: SqliteStorageValue | undefined,
 ): unknown[] {
-  if (value === undefined) {
+  // A NULL disabled list means "nothing is disabled", exactly like an absent
+  // row; the caller writes a real JSON array back when it needs to change it.
+  if (value === undefined || value === null) {
     return [];
   }
-  const parsed = JSON.parse(
-    typeof value === "string" ? value : Buffer.from(value).toString("utf8"),
-  ) as unknown;
+  const text = sqliteStorageText(value, "Disabled extension state");
+  if (text.trim().length === 0) {
+    return [];
+  }
+  const parsed = JSON.parse(text) as unknown;
   if (!Array.isArray(parsed)) {
     throw new Error("Disabled extension state must be an array.");
   }

@@ -509,6 +509,195 @@ describeWithBackup("offline database helper", () => {
     }
   });
 
+  it("restores NULL chat values and NULL header columns as SQL NULL", async () => {
+    const fixture = await createFixture();
+    const composerId = "00000000-0000-4000-8000-000000000002";
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, "replaced-by-null");
+    seed
+      .prepare(
+        `INSERT INTO composerHeaders(composerId, workspaceId, createdAt, value)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(composerId, "anonymous-workspace", 1, "{}");
+    seed.close();
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      {
+        change: {
+          eventHash: "7".repeat(64),
+          changeIndex: 0,
+          resourceId: `chat/${composerId}`,
+          kind: "chat",
+          operation: "put",
+          semanticHash: "hash",
+        },
+        content: Buffer.from(
+          JSON.stringify({
+            schemaVersion: 1,
+            composerId,
+            header: {
+              composerId,
+              workspaceId: null,
+              createdAt: null,
+              lastUpdatedAt: null,
+              isArchived: null,
+              isSubagent: null,
+              recency: null,
+              checkpointAt: null,
+              value: null,
+            },
+            composerData: {
+              key: `composerData:${composerId}`,
+              valueBase64: "",
+              valueType: "null",
+            },
+            bubbles: [
+              {
+                key: `bubbleId:${composerId}:null-bubble`,
+                valueBase64: "",
+                valueType: "null",
+              },
+            ],
+          }),
+          "utf8",
+        ),
+      },
+    ]);
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKvType(database, `composerData:${composerId}`)).toBe("null");
+      expect(readKvType(database, `bubbleId:${composerId}:null-bubble`)).toBe(
+        "null",
+      );
+      const header = database
+        .prepare(
+          `SELECT typeof(workspaceId) AS workspaceId, typeof(createdAt) AS createdAt,
+            typeof(isArchived) AS isArchived, typeof(checkpointAt) AS checkpointAt,
+            typeof(value) AS value
+           FROM composerHeaders WHERE composerId = ?`,
+        )
+        .get(composerId) as Record<string, string> | undefined;
+      expect(header).toEqual({
+        workspaceId: "null",
+        createdAt: "null",
+        isArchived: "null",
+        checkpointAt: "null",
+        value: "null",
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("commits a profile apply when userDataProfiles is SQL NULL", async () => {
+    const fixture = await createFixture();
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
+      .run("userDataProfiles", null);
+    seed.close();
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      {
+        change: {
+          eventHash: "8".repeat(64),
+          changeIndex: 0,
+          resourceId: "profile/manifest",
+          kind: "profile",
+          operation: "put",
+          semanticHash: "hash",
+        },
+        content: Buffer.from(
+          JSON.stringify([{ id: "work", name: "Work" }]),
+          "utf8",
+        ),
+      },
+    ]);
+
+    expect(result.applied).toEqual(["profile/manifest"]);
+    const stored = JSON.parse(
+      readItem(fixture.databasePath, "userDataProfiles") ?? "[]",
+    ) as Array<Record<string, unknown>>;
+    expect(stored).toHaveLength(1);
+  });
+
+  it("leaves a NULL target storage marker untouched when no change registers a key", async () => {
+    const fixture = await createFixture();
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare("UPDATE ItemTable SET value = ? WHERE key = ?")
+      .run(null, "__$__targetStorageMarker");
+    seed.close();
+
+    await applyGlobalDatabaseChanges(fixture.request, [
+      {
+        change: {
+          eventHash: "9".repeat(64),
+          changeIndex: 0,
+          resourceId: "cursor-user-rules/aicontext.personalContext",
+          kind: "cursor-user-rules",
+          operation: "put",
+          semanticHash: "hash",
+          metadata: {
+            key: "aicontext.personalContext",
+            registeredUserTarget: false,
+          },
+        },
+        content: Buffer.from("rules", "utf8"),
+      },
+    ]);
+
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readItemType(database, "__$__targetStorageMarker")).toBe("null");
+    } finally {
+      database.close();
+    }
+  });
+
+  it("skips one rejected change instead of discarding the whole batch", async () => {
+    const fixture = await createFixture();
+    const composerId = "00000000-0000-4000-8000-000000000003";
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      {
+        change: {
+          eventHash: "a".repeat(64),
+          changeIndex: 0,
+          resourceId: `chat/${composerId}`,
+          kind: "chat",
+          operation: "put",
+          semanticHash: "hash",
+        },
+        content: Buffer.from("{ not a snapshot", "utf8"),
+      },
+      uiStateChange("workbench.survivor", "text", Buffer.from("kept", "utf8")),
+    ]);
+
+    expect(result.applied).toEqual(["ui-state/workbench.survivor"]);
+    expect(result.skipped.join("\n")).toContain(`chat/${composerId}:`);
+    expect(readItem(fixture.databasePath, "workbench.survivor")).toBe("kept");
+  });
+
+  it("rejects an unrecognised UI state storage class instead of writing a decoded value", async () => {
+    const fixture = await createFixture();
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      uiStateChange("workbench.futureKey", "null", Buffer.alloc(0)),
+    ]);
+
+    expect(result.applied).toEqual([]);
+    expect(result.skipped.join("\n")).toContain(
+      "Unsupported UI state storage class: null",
+    );
+    expect(readItem(fixture.databasePath, "workbench.futureKey")).toBeNull();
+  });
+
   it("does not restore a stale backup when recovering an applying journal", async () => {
     const fixture = await createFixture();
     const storageRoot = fixture.request.storageRoot;
@@ -790,7 +979,7 @@ function readKvType(
 
 function uiStateChange(
   key: string,
-  valueType: "text" | "blob" | undefined,
+  valueType: "text" | "blob" | "null" | undefined,
   content: Buffer,
 ): PreparedHelperChange {
   return {

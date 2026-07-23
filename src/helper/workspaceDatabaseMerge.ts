@@ -596,6 +596,7 @@ function captureFromOpenDatabase(
       descriptor,
       snapshotWorkspaceId,
       databaseWorkspaceId,
+      warnings,
     );
     rowCount += rows.length;
     if (rowCount > limits.maxRows) {
@@ -711,10 +712,12 @@ function hasUniqueKey(
     if (Number(index.unique) !== 1 || typeof index.name !== "string") {
       return false;
     }
+    // An expression index reports a NULL column name; narrowing keeps it from
+    // being compared as the literal string "null".
     const indexedColumns = database
       .prepare(`PRAGMA index_info(${quoteIdentifier(index.name)})`)
       .all()
-      .map((row) => String(row.name));
+      .map((row) => (typeof row.name === "string" ? row.name : null));
     return (
       indexedColumns.length === 1 &&
       indexedColumns[0] === descriptor.keyColumn
@@ -727,6 +730,7 @@ function readTableRows(
   descriptor: TableDescriptor,
   snapshotWorkspaceId: string,
   databaseWorkspaceId: string,
+  warnings: string[],
 ): WorkspaceDatabaseRow[] {
   const columns = [descriptor.keyColumn, ...descriptor.valueColumns];
   const projection = columns.flatMap((column, index) => [
@@ -739,16 +743,20 @@ function readTableRows(
   statement.setReadBigInts(true);
   const rows: WorkspaceDatabaseRow[] = [];
   const seen = new Set<string>();
+  let skippedRows = 0;
   for (const raw of statement.iterate()) {
     const keyValue = toPortableValue(
       raw.value_0 as SqliteValue,
       raw.type_0,
       `${descriptor.name}.${descriptor.keyColumn}`,
     );
+    // A row with no usable text key cannot be addressed by the upsert-only
+    // merge, so it is skipped deterministically instead of dropping the whole
+    // workspace database out of the backup. Every capture of the same file
+    // skips the same rows, so the snapshot-hash equality checks still hold.
     if (keyValue.type !== "text") {
-      throw new Error(
-        `Workspace database key ${descriptor.name}.${descriptor.keyColumn} is not text.`,
-      );
+      skippedRows += 1;
+      continue;
     }
     if (seen.has(keyValue.value)) {
       throw new Error(`Workspace database contains a duplicate key in ${descriptor.name}.`);
@@ -772,6 +780,11 @@ function readTableRows(
       return portable;
     });
     rows.push({ key: keyValue.value, values });
+  }
+  if (skippedRows > 0) {
+    warnings.push(
+      `Skipped ${skippedRows} row(s) with a non-text key in ${descriptor.name}.`,
+    );
   }
   return rows.sort((left, right) => compareText(left.key, right.key));
 }

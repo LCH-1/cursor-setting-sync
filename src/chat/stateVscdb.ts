@@ -1,3 +1,4 @@
+import type { DatabaseSync } from "../platform/sqlite";
 import { openDatabase } from "../platform/sqlite";
 import type {
   LocalProjection,
@@ -12,22 +13,55 @@ import { discoverWorkspaces } from "./workspace";
 
 export interface PortableComposerHeader {
   composerId: string;
-  workspaceId: string;
-  createdAt: number;
-  lastUpdatedAt: number;
-  isArchived: number;
-  isSubagent: number;
-  recency: number;
-  checkpointAt: number;
-  value: string;
+  workspaceId: string | null;
+  createdAt: number | null;
+  lastUpdatedAt: number | null;
+  isArchived: number | null;
+  isSubagent: number | null;
+  recency: number | null;
+  checkpointAt: number | null;
+  value: string | null;
 }
 
 export interface PortableKvRow {
   key: string;
   valueBase64: string;
   /** SQLite storage class; absent in older snapshots, which are TEXT. */
-  valueType?: "text" | "blob";
+  valueType?: "text" | "blob" | "null";
 }
+
+type SqliteRowValue = Uint8Array | string | number | bigint | null;
+
+type RawComposerHeader = {
+  composerId: SqliteRowValue;
+  workspaceId: SqliteRowValue;
+  createdAt: SqliteRowValue;
+  lastUpdatedAt: SqliteRowValue;
+  isArchived: SqliteRowValue;
+  isSubagent: SqliteRowValue;
+  recency: SqliteRowValue;
+  checkpointAt: SqliteRowValue;
+  value: SqliteRowValue;
+};
+
+type RawKvRow = {
+  key: SqliteRowValue;
+  value: SqliteRowValue;
+  valueType: SqliteRowValue;
+};
+
+type ChatStatement = ReturnType<DatabaseSync["prepare"]>;
+
+interface ChatStatements {
+  header: ChatStatement;
+  data: ChatStatement;
+  bubbles: ChatStatement;
+}
+
+type ChatCapture =
+  | { kind: "missing" }
+  | { kind: "unchanged" }
+  | { kind: "captured"; snapshot: PortableChatSnapshot };
 
 export interface PortableChatSnapshot {
   schemaVersion: 1;
@@ -60,71 +94,55 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
       // bursts instead of failing the whole sync cycle with SQLITE_BUSY.
       database.exec("PRAGMA busy_timeout=2000");
       database.exec("PRAGMA query_only=ON");
+      // NULL = 0 is NULL, not true, so a composer whose late-added isSubagent
+      // column was never backfilled must be matched explicitly or it silently
+      // drops out of the scan and is published as a deletion.
       const headers = database
         .prepare(
-          "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, recency, checkpointAt, value FROM composerHeaders WHERE isSubagent = 0",
+          "SELECT composerId FROM composerHeaders WHERE COALESCE(isSubagent, 0) = 0",
         )
-        .all() as unknown as PortableComposerHeader[];
-      const selectData = database.prepare(
-        "SELECT key, value FROM cursorDiskKV WHERE key = ?",
-      );
-      const selectHeader = database.prepare(
-        "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, recency, checkpointAt, value FROM composerHeaders WHERE composerId = ? AND isSubagent = 0",
-      );
-      const selectBubbles = database.prepare(
-        "SELECT key, value FROM cursorDiskKV WHERE key LIKE ? ORDER BY key",
-      );
+        .all() as Array<{ composerId: SqliteRowValue }>;
+      const statements: ChatStatements = {
+        header: database.prepare(
+          "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, recency, checkpointAt, value FROM composerHeaders WHERE composerId = ? AND COALESCE(isSubagent, 0) = 0",
+        ),
+        data: database.prepare(
+          "SELECT key, value, typeof(value) AS valueType FROM cursorDiskKV WHERE key = ?",
+        ),
+        bubbles: database.prepare(
+          "SELECT key, value, typeof(value) AS valueType FROM cursorDiskKV WHERE key LIKE ? ORDER BY key",
+        ),
+      };
       for (const rawHeader of headers) {
-        let snapshot: PortableChatSnapshot | null = null;
-        database.exec("BEGIN");
-        try {
-          const currentHeader = selectHeader.get(rawHeader.composerId) as
-            | PortableComposerHeader
-            | undefined;
-          if (currentHeader === undefined) {
-            database.exec("COMMIT");
-            continue;
-          }
-          const header = normalizeHeader(currentHeader);
-          const resourceId = `chat/${header.composerId}`;
-          current.add(resourceId);
-          if (
-            known[resourceId]?.kind === "chat" &&
-            known[resourceId]?.sourceTimestamp === header.lastUpdatedAt
-          ) {
-            database.exec("COMMIT");
-            continue;
-          }
-          const composerDataRow = selectData.get(
-            `composerData:${header.composerId}`,
-          ) as { key: string; value: Uint8Array | string } | undefined;
-          if (composerDataRow === undefined) {
-            warnings.push(`Missing composerData for ${header.composerId}.`);
-            database.exec("COMMIT");
-            continue;
-          }
-          const bubbleRows = selectBubbles.all(
-            `bubbleId:${header.composerId}:%`,
-          ) as Array<{
-            key: string;
-            value: Uint8Array | string;
-          }>;
-          snapshot = {
-            schemaVersion: 1,
-            composerId: header.composerId,
-            header,
-            composerData: portableRow(composerDataRow),
-            bubbles: bubbleRows.map(portableRow),
-          };
-          database.exec("COMMIT");
-        } catch (error) {
-          database.exec("ROLLBACK");
-          throw error;
-        }
-        if (snapshot === null) {
+        const composerId = rawHeader.composerId;
+        if (typeof composerId !== "string") {
+          warnings.push("Skipped a composer header whose composerId is not text.");
           continue;
         }
-        const resourceId = `chat/${snapshot.composerId}`;
+        const resourceId = `chat/${composerId}`;
+        let captured: ChatCapture;
+        try {
+          captured = captureChat(database, statements, composerId, known);
+        } catch (error) {
+          // One unusable row must never take the whole adapter down. The
+          // resource stays in `current` so it is not published as a deletion.
+          current.add(resourceId);
+          warnings.push(
+            `Skipped chat ${composerId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          continue;
+        }
+        if (captured.kind === "missing") {
+          continue;
+        }
+        current.add(resourceId);
+        if (captured.kind === "unchanged") {
+          continue;
+        }
+        const snapshot = captured.snapshot;
+        const workspaceId = snapshot.header.workspaceId;
         const content = canonicalBytes(snapshot);
         snapshots.push({
           resourceId,
@@ -133,9 +151,11 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           semanticHash: sha256(content),
           metadata: {
             composerId: snapshot.header.composerId,
-            workspaceId: snapshot.header.workspaceId,
+            workspaceId,
             workspaceUri:
-              workspaceUris.get(snapshot.header.workspaceId) ?? null,
+              workspaceId === null
+                ? null
+                : workspaceUris.get(workspaceId) ?? null,
             lastUpdatedAt: snapshot.header.lastUpdatedAt,
             bubbleCount: snapshot.bubbles.length,
           },
@@ -181,8 +201,8 @@ export function parsePortableChatSnapshot(content: Buffer): PortableChatSnapshot
   }
   if (
     !isValidBase64(value.composerData.valueBase64) ||
-    typeof value.header.workspaceId !== "string" ||
-    typeof value.header.value !== "string" ||
+    !isNullableText(value.header.workspaceId) ||
+    !isNullableText(value.header.value) ||
     ![
       value.header.createdAt,
       value.header.lastUpdatedAt,
@@ -190,7 +210,10 @@ export function parsePortableChatSnapshot(content: Buffer): PortableChatSnapshot
       value.header.isSubagent,
       value.header.recency,
       value.header.checkpointAt,
-    ].every((item) => typeof item === "number" && Number.isFinite(item)) ||
+    ].every(
+      (item) =>
+        item === null || (typeof item === "number" && Number.isFinite(item)),
+    ) ||
     value.bubbles.length > 250_000
   ) {
     throw new Error("Chat snapshot fields are invalid.");
@@ -221,7 +244,16 @@ export function parsePortableChatSnapshot(content: Buffer): PortableChatSnapshot
 }
 
 function isValidKvValueType(value: unknown): value is PortableKvRow["valueType"] {
-  return value === undefined || value === "text" || value === "blob";
+  return (
+    value === undefined ||
+    value === "text" ||
+    value === "blob" ||
+    value === "null"
+  );
+}
+
+function isNullableText(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
 }
 
 function isValidBase64(value: unknown): value is string {
@@ -234,30 +266,131 @@ function isValidBase64(value: unknown): value is string {
   );
 }
 
-function normalizeHeader(header: PortableComposerHeader): PortableComposerHeader {
+function captureChat(
+  database: DatabaseSync,
+  statements: ChatStatements,
+  composerId: string,
+  known: Record<string, LocalProjection>,
+): ChatCapture {
+  database.exec("BEGIN");
+  try {
+    const currentHeader = statements.header.get(composerId) as
+      | RawComposerHeader
+      | undefined;
+    if (currentHeader === undefined) {
+      database.exec("COMMIT");
+      return { kind: "missing" };
+    }
+    const header = normalizeHeader(currentHeader);
+    const resourceId = `chat/${header.composerId}`;
+    // A null timestamp carries no change information, so it must never
+    // short-circuit against a projection that simply recorded none either.
+    if (
+      header.lastUpdatedAt !== null &&
+      known[resourceId]?.kind === "chat" &&
+      known[resourceId]?.sourceTimestamp === header.lastUpdatedAt
+    ) {
+      database.exec("COMMIT");
+      return { kind: "unchanged" };
+    }
+    const composerDataRow = statements.data.get(
+      `composerData:${header.composerId}`,
+    ) as RawKvRow | undefined;
+    if (composerDataRow === undefined) {
+      throw new Error("composerData row is missing.");
+    }
+    const bubbleRows = statements.bubbles.all(
+      `bubbleId:${header.composerId}:%`,
+    ) as RawKvRow[];
+    const snapshot: PortableChatSnapshot = {
+      schemaVersion: 1,
+      composerId: header.composerId,
+      header,
+      composerData: portableRow(composerDataRow),
+      bubbles: bubbleRows.map(portableRow),
+    };
+    database.exec("COMMIT");
+    return { kind: "captured", snapshot };
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function normalizeHeader(header: RawComposerHeader): PortableComposerHeader {
+  if (typeof header.composerId !== "string") {
+    throw new Error("composerId is not text.");
+  }
   return {
-    composerId: String(header.composerId),
-    workspaceId: String(header.workspaceId),
-    createdAt: Number(header.createdAt),
-    lastUpdatedAt: Number(header.lastUpdatedAt),
-    isArchived: Number(header.isArchived),
-    isSubagent: Number(header.isSubagent),
-    recency: Number(header.recency),
-    checkpointAt: Number(header.checkpointAt),
-    value: String(header.value),
+    composerId: header.composerId,
+    workspaceId: nullableText(header.workspaceId, "workspaceId"),
+    createdAt: nullableNumber(header.createdAt, "createdAt"),
+    lastUpdatedAt: nullableNumber(header.lastUpdatedAt, "lastUpdatedAt"),
+    isArchived: nullableNumber(header.isArchived, "isArchived"),
+    isSubagent: nullableNumber(header.isSubagent, "isSubagent"),
+    recency: nullableNumber(header.recency, "recency"),
+    checkpointAt: nullableNumber(header.checkpointAt, "checkpointAt"),
+    value: nullableText(header.value, "value"),
   };
 }
 
-function portableRow(row: {
-  key: string;
-  value: Uint8Array | string;
-}): PortableKvRow {
-  const value = typeof row.value === "string" ? Buffer.from(row.value, "utf8") : Buffer.from(row.value);
-  return {
-    key: row.key,
-    valueBase64: value.toString("base64"),
-    valueType: typeof row.value === "string" ? "text" : "blob",
-  };
+// Coercing an unexpected storage class here would publish fabricated data: a
+// BLOB would become its comma-joined bytes, and a non-numeric value would
+// become NaN, which canonicalization turns into a NULL that overwrites the
+// target's real value. Rejecting instead lets the caller skip the composer.
+function nullableText(value: SqliteRowValue, column: string): string | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    throw new Error(
+      `composerHeaders.${column} has an unsupported SQLite storage class.`,
+    );
+  }
+  return value;
+}
+
+function nullableNumber(value: SqliteRowValue, column: string): number | null {
+  if (value === null) {
+    return null;
+  }
+  if (typeof value === "bigint") {
+    return Number(value);
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(
+      `composerHeaders.${column} has an unsupported SQLite storage class.`,
+    );
+  }
+  return value;
+}
+
+function portableRow(row: RawKvRow): PortableKvRow {
+  if (typeof row.key !== "string") {
+    throw new Error("A cursorDiskKV key is not text.");
+  }
+  if (row.valueType === "null" && row.value === null) {
+    return { key: row.key, valueBase64: "", valueType: "null" };
+  }
+  if (row.valueType === "text" && typeof row.value === "string") {
+    return {
+      key: row.key,
+      valueBase64: Buffer.from(row.value, "utf8").toString("base64"),
+      valueType: "text",
+    };
+  }
+  if (row.valueType === "blob" && row.value instanceof Uint8Array) {
+    return {
+      key: row.key,
+      valueBase64: Buffer.from(row.value).toString("base64"),
+      valueType: "blob",
+    };
+  }
+  throw new Error(
+    `cursorDiskKV key ${row.key} has an unsupported SQLite storage class: ${String(
+      row.valueType,
+    )}.`,
+  );
 }
 
 function findChatDeletions(

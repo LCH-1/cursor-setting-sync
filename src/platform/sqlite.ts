@@ -13,6 +13,29 @@ let cached: SqliteModule | null | undefined;
 
 export type DatabaseSync = NodeDatabaseSync;
 
+/** Every storage class node:sqlite can hand back for a column value. */
+export type SqliteStorageValue = Uint8Array | string | number | bigint | null;
+
+/**
+ * Decodes a TEXT or BLOB column that is expected to hold text. INTEGER and
+ * REAL have no faithful text form for these payloads, so they are rejected
+ * instead of coerced; SQL NULL is the caller's decision and never reaches here.
+ */
+export function sqliteStorageText(
+  value: Exclude<SqliteStorageValue, null>,
+  label: string,
+): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value).toString("utf8");
+  }
+  throw new Error(
+    `${label} has an unsupported SQLite storage class: ${typeof value}.`,
+  );
+}
+
 export function openDatabase(
   ...arguments_: ConstructorParameters<typeof NodeDatabaseSync>
 ): NodeDatabaseSync {
