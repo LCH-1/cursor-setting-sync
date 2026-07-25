@@ -28,6 +28,63 @@ import {
 import { discoverProfileResourcePaths, profilePathById } from "./profilePaths";
 import { sha256 } from "../protocol/canonical";
 import { relative } from "node:path";
+import type { IgnoreMatcher } from "./ignorePatterns";
+import {
+  combineIgnoreMatchers,
+  createIgnoreMatcher,
+  EMPTY_IGNORE_MATCHER,
+} from "./ignorePatterns";
+
+/**
+ * Keys that describe *this computer* rather than a preference, and that VS
+ * Code registers in workbench code instead of an extension `package.json` — so
+ * `collectMachineScopedSettings` cannot see them and they would otherwise sync
+ * verbatim between machines. A proxy URL carries credentials; a shell path
+ * points at an executable that may not exist on the other side; a zoom level
+ * belongs to a monitor. Users who genuinely want one of these to travel can
+ * set `cursorSettingSync.useDefaultIgnoredSettings` to false and curate
+ * `cursorSettingSync.ignoredSettings` themselves.
+ *
+ * The bar for being on this list is that the *value* names something that has
+ * to exist on this computer — an absolute path, a shell or host resource, a
+ * network endpoint or credential — or a property of the physical display.
+ * Anything VS Code's own Settings Sync propagates between
+ * machines is deliberately absent, because excluding it here would stop a key
+ * travelling that the user already expects to travel:
+ * `terminal.integrated.profiles.*` and `terminal.integrated.env.*` are
+ * application-scoped preferences (and the `.windows` / `.osx` / `.linux`
+ * suffix already keeps a platform's entry off the other platforms),
+ * `files.simpleDialog.enable` is a plain UI preference, and `python.venvPath`
+ * is declared `machine`-scoped by the Python extension itself, so
+ * `collectMachineScopedSettings` already excludes it wherever it matters.
+ */
+export const DEFAULT_IGNORED_SETTINGS: readonly string[] = [
+  "application.shellEnvironmentResolutionTimeout",
+  "git.path",
+  "http.proxy*",
+  "http.systemCertificates",
+  "http.experimental.systemCertificatesV2",
+  "java.jdt.ls.java.home",
+  "python.condaPath",
+  "python.defaultInterpreterPath",
+  "remote.SSH.*",
+  "remote.WSL.*",
+  "terminal.external.*",
+  "terminal.integrated.automationProfile.*",
+  "terminal.integrated.cwd",
+  "terminal.integrated.defaultProfile.*",
+  "terminal.integrated.shell.*",
+  "terminal.integrated.shellArgs.*",
+  "window.zoomLevel",
+  "window.zoomPerWindow",
+];
+
+/** Ignore-list flavour shared by settings keys and extension identifiers. */
+export function createSettingsIgnoreMatcher(
+  entries: readonly string[],
+): IgnoreMatcher {
+  return createIgnoreMatcher(entries);
+}
 
 export class SettingsAdapter implements ResourceAdapter {
   readonly id = "settings";
@@ -36,16 +93,24 @@ export class SettingsAdapter implements ResourceAdapter {
 
   constructor(
     private readonly paths: CursorPaths,
-    private readonly ignoredSettings: Set<string>,
-    private readonly machineScopedSettings: Set<string>,
+    private readonly ignoredSettings: IgnoreMatcher,
+    private readonly machineScopedSettings: IgnoreMatcher,
+    /**
+     * The built-in {@link DEFAULT_IGNORED_SETTINGS} in force, used only to
+     * report which keys the defaults took over. Exclusion itself is decided by
+     * `machineScopedSettings`, which already contains them.
+     */
+    private readonly defaultIgnoredSettings: IgnoreMatcher = EMPTY_IGNORE_MATCHER,
   ) {}
 
   async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
     const snapshots: ResourceSnapshot[] = [];
     const warnings: string[] = [];
     const current = new Set<string>();
-    const excluded = new Set<string>();
     const scannedProfiles = new Set<string>();
+    const nativeIgnoredByProfile = new Map<string, IgnoreMatcher>();
+    const observedKeys = new Set<string>();
+    const silencedByDefaults = new Set<string>();
 
     for (const profile of await discoverProfileResourcePaths(this.paths)) {
       if (!(await pathExists(profile.settings))) {
@@ -64,16 +129,28 @@ export class SettingsAdapter implements ResourceAdapter {
         ).toString("utf8");
         const object = parseJsoncObject(source, profile.settings);
         scannedProfiles.add(profile.profileId);
-        const nativeIgnored = readStringArray(object["settingsSync.ignoredSettings"]);
-        const ignored = new Set([...this.ignoredSettings, ...nativeIgnored]);
-        for (const key of [...ignored, ...this.machineScopedSettings]) {
-          excluded.add(settingsResourceId(profile.profileId, key));
-        }
+        const nativeIgnored = createIgnoreMatcher(
+          readStringArray(object["settingsSync.ignoredSettings"]),
+        );
+        nativeIgnoredByProfile.set(profile.profileId, nativeIgnored);
         for (const [key, value] of Object.entries(object)) {
-          if (ignored.has(key) || this.machineScopedSettings.has(key)) {
+          observedKeys.add(key);
+          const resourceId = settingsResourceId(profile.profileId, key);
+          if (
+            nativeIgnored.matches(key) ||
+            this.ignoredSettings.matches(key) ||
+            this.machineScopedSettings.matches(key)
+          ) {
+            if (
+              this.defaultIgnoredSettings.matches(key) &&
+              !this.ignoredSettings.matches(key) &&
+              !nativeIgnored.matches(key) &&
+              known[resourceId] !== undefined
+            ) {
+              silencedByDefaults.add(key);
+            }
             continue;
           }
-          const resourceId = settingsResourceId(profile.profileId, key);
           current.add(resourceId);
           snapshots.push({
             resourceId,
@@ -91,16 +168,41 @@ export class SettingsAdapter implements ResourceAdapter {
       }
     }
 
+    // A configured entry that matched nothing is almost always a typo or an
+    // unsupported pattern, and silence there means the user believes a key is
+    // excluded when it is not.
+    for (const pattern of this.ignoredSettings.unmatched(observedKeys)) {
+      warnings.push(
+        `cursorSettingSync.ignoredSettings entry "${pattern}" matched no settings key. Correct the typo or remove the entry; nothing is being excluded by it.`,
+      );
+    }
+
+    // A key the built-in defaults took over is otherwise completely silent:
+    // findDeletions suppresses the tombstone, apply answers "retained-local"
+    // and the status bar keeps its green check, so the user has no way to
+    // learn why a setting stopped travelling after an upgrade. The text is
+    // stable, so StandingWarningRegistry logs it once and then only on its
+    // reminder interval, and Show Diagnostics lists it under this adapter.
+    if (silencedByDefaults.size > 0) {
+      warnings.push(
+        `Built-in machine-specific defaults now exclude settings keys this device had already synchronized: ${[
+          ...silencedByDefaults,
+        ]
+          .sort()
+          .join(
+            ", ",
+          )}. Their existing values stay on each computer; set cursorSettingSync.useDefaultIgnoredSettings to false to synchronize them again.`,
+      );
+    }
+
+    const isIgnoredKey = (profileId: string, key: string): boolean =>
+      this.ignoredSettings.matches(key) ||
+      this.machineScopedSettings.matches(key) ||
+      nativeIgnoredByProfile.get(profileId)?.matches(key) === true;
+
     return {
       snapshots,
-      deletions: findDeletions(
-        known,
-        current,
-        excluded,
-        scannedProfiles,
-        this.ignoredSettings,
-        this.machineScopedSettings,
-      ),
+      deletions: findDeletions(known, current, scannedProfiles, isIgnoredKey),
       warnings,
     };
   }
@@ -123,13 +225,15 @@ export class SettingsAdapter implements ResourceAdapter {
     }
 
     const object = parseJsoncObject(source, target);
-    const nativeIgnored = new Set(
+    const nativeIgnored = createIgnoreMatcher(
       readStringArray(object["settingsSync.ignoredSettings"]),
     );
     if (
-      this.ignoredSettings.has(key) ||
-      this.machineScopedSettings.has(key) ||
-      nativeIgnored.has(key)
+      combineIgnoreMatchers(
+        this.ignoredSettings,
+        this.machineScopedSettings,
+        nativeIgnored,
+      ).matches(key)
     ) {
       const localValue = object[key];
       return {
@@ -197,25 +301,21 @@ function settingsResourceId(profileId: string, key: string): string {
 function findDeletions(
   known: Record<string, LocalProjection>,
   current: Set<string>,
-  excluded: Set<string>,
   scannedProfiles: Set<string>,
-  ignoredSettings: Set<string>,
-  machineScopedSettings: Set<string>,
+  isIgnoredKey: (profileId: string, key: string) => boolean,
 ): ResourceDeletion[] {
   return Object.values(known)
     .filter((projection) => {
       if (
         projection.kind !== "settings" ||
-        current.has(projection.resourceId) ||
-        excluded.has(projection.resourceId)
+        current.has(projection.resourceId)
       ) {
         return false;
       }
       const metadata = projectionMetadata(projection.resourceId);
       return (
         scannedProfiles.has(metadata.profileId) &&
-        !ignoredSettings.has(metadata.key) &&
-        !machineScopedSettings.has(metadata.key)
+        !isIgnoredKey(metadata.profileId, metadata.key)
       );
     })
     .map((projection) => ({

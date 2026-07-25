@@ -2,7 +2,7 @@
   "name": "cursor-setting-sync",
   "displayName": "Cursor Setting Sync",
   "description": "Securely synchronize Cursor settings, workspace state, profiles, extensions, user files, and chat data across devices.",
-  "version": "0.0.3",
+  "version": "0.0.5",
   "publisher": "lch",
   "icon": "icon.png",
   "license": "MIT",
@@ -48,7 +48,8 @@
     "onCommand:cursorSync.compactRepository",
     "onCommand:cursorSync.archiveRepository",
     "onCommand:cursorSync.restoreVersion",
-    "onCommand:cursorSync.checkpointRepository"
+    "onCommand:cursorSync.checkpointRepository",
+    "onCommand:cursorSync.disconnect"
   ],
   "contributes": {
     "commands": [
@@ -99,6 +100,10 @@
       {
         "command": "cursorSync.archiveRepository",
         "title": "Cursor Setting Sync: Archive Repository"
+      },
+      {
+        "command": "cursorSync.disconnect",
+        "title": "Cursor Setting Sync: Disconnect"
       }
     ],
     "configuration": {
@@ -144,7 +149,12 @@
           "items": {
             "type": "string"
           },
-          "description": "Settings keys excluded from synchronization."
+          "description": "Settings keys excluded from synchronization. Each entry is an exact key such as editor.fontSize or a wildcard such as remote.SSH.* ; * matches any characters."
+        },
+        "cursorSettingSync.useDefaultIgnoredSettings": {
+          "type": "boolean",
+          "default": true,
+          "description": "Exclude a built-in list of machine-specific settings (window.zoomLevel, terminal.integrated.defaultProfile.*, terminal.integrated.shell*, git.path, http.proxy*, remote.SSH.*, and similar) that describe this computer rather than a preference. Keys VS Code Settings Sync itself propagates, such as terminal.integrated.profiles.*, are not on the list. Turn this off to synchronize them anyway."
         },
         "cursorSettingSync.ignoredExtensions": {
           "type": "array",
@@ -152,7 +162,15 @@
           "items": {
             "type": "string"
           },
-          "description": "Extension identifiers excluded from synchronization."
+          "description": "Extension identifiers excluded from synchronization. Each entry is an exact ID such as ms-python.python or a wildcard such as ms-python.* ; matching ignores case."
+        },
+        "cursorSettingSync.ignoredUiStateKeys": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "UI state keys excluded from synchronization. Each entry is an exact key such as workbench.activity.pinnedViewlets2 or a wildcard such as workbench.panel.* . Use this for per-machine layout you want to keep local; an ignored key is never deleted on other devices."
         },
         "cursorSettingSync.ignoredUserFiles": {
           "type": "array",
@@ -160,7 +178,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Cursor home user files excluded from synchronization, as relative paths such as mcp.json or rules/private.md. Useful for files containing API keys."
+          "description": "Cursor home user files excluded from synchronization, as relative paths such as mcp.json or rules/private.md. A directory entry such as rules/ excludes everything under it, and wildcards such as rules/*.md or skills/**/secret.md are supported. Use this for files containing API keys."
         },
         "cursorSettingSync.gitSync": {
           "type": "boolean",

@@ -28,6 +28,7 @@ import {
   type PortableStoreValue,
 } from "../chat/storeDb";
 import { EXTENSION_ID } from "../constants";
+import { createExtensionIgnoreMatcher } from "../resources/extensions";
 import { assertValidProfileId } from "../resources/profilePaths";
 import {
   discoverWorkspaces,
@@ -107,8 +108,14 @@ export async function applyNonGlobalChanges(
         }
         const workspaceUri = metadataStringOrNull(change.metadata, "workspaceUri");
         if (change.operation === "delete") {
+          // Retained, not deleted - so the projection has to record a
+          // retained-local hash, exactly like the ignored-extension branch
+          // below. Without it the next scan finds the file still present with
+          // a hash matching neither the projection nor any tip and republishes
+          // it, resurrecting what the other device deleted.
           skipped.push(`${change.resourceId}: workspaceStorage tombstone retained`);
           applied.push(change.resourceId);
+          retainedLocal.push(change.resourceId);
           continue;
         }
         const mappedWorkspaceId = resolveTargetWorkspace(
@@ -176,6 +183,7 @@ export async function applyNonGlobalChanges(
         if (change.operation === "delete") {
           skipped.push(`${change.resourceId}: transcript tombstone retained`);
           applied.push(change.resourceId);
+          retainedLocal.push(change.resourceId);
           continue;
         }
         if (content === undefined) {
@@ -210,6 +218,7 @@ export async function applyNonGlobalChanges(
         if (change.operation === "delete") {
           skipped.push(`${change.resourceId}: store tombstone retained`);
           applied.push(change.resourceId);
+          retainedLocal.push(change.resourceId);
           continue;
         }
         if (content === undefined) {
@@ -375,11 +384,17 @@ async function applyStoreSnapshot(
     database.exec("PRAGMA busy_timeout=5000");
     database.exec("BEGIN IMMEDIATE");
     transactionStarted = true;
+    // No declared type on the value columns, which gives them BLOB affinity:
+    // SQLite then stores whatever storage class is bound. A `value TEXT`
+    // column would silently coerce a restored INTEGER or REAL to text, so the
+    // immediate read-back would disagree with the source and the resource
+    // would be stuck as retained-local forever. Cursor's own schema leaves
+    // these untyped for the same reason.
     database.exec(
-      "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)",
+      "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value)",
     );
     database.exec(
-      "CREATE TABLE IF NOT EXISTS blobs (id TEXT PRIMARY KEY, data BLOB)",
+      "CREATE TABLE IF NOT EXISTS blobs (id TEXT PRIMARY KEY, data)",
     );
     assertStoreSchema(database);
     const upsertMeta = database.prepare(
@@ -422,8 +437,8 @@ async function applyExtensionChanges(
   const applied: string[] = [];
   const skipped: string[] = [];
   const retainedLocal: string[] = [];
-  const ignoredExtensions = new Set(
-    request.syncOptions.ignoredExtensions.map((id) => id.toLowerCase()),
+  const ignoredExtensions = createExtensionIgnoreMatcher(
+    request.syncOptions.ignoredExtensions,
   );
   // A Linux AppImage unmounts its application root once Cursor exits, so the
   // CLI can be gone by the time the helper runs. Deferring keeps the changes
@@ -466,7 +481,7 @@ async function applyExtensionChanges(
         applied.push(change.resourceId);
         continue;
       }
-      if (ignoredExtensions.has(extensionId)) {
+      if (ignoredExtensions.matches(extensionId)) {
         skipped.push(`${change.resourceId}: extension is ignored on this device`);
         retainedLocal.push(change.resourceId);
         applied.push(change.resourceId);

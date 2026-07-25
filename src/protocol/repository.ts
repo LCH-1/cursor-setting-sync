@@ -10,6 +10,7 @@ import {
   DEVICE_FILE,
   EVENT_ENVELOPE_VERSION,
   EVENT_EXTENSION,
+  MAX_APPLY_BATCH_BYTES,
   MAX_CHECKPOINT_FILE_BYTES,
   MAX_EVENT_CHANGES,
   MAX_EVENT_FILE_BYTES,
@@ -82,6 +83,18 @@ const EVENT_FILE_PATTERN = /^(\d{16})-([a-f0-9]{64})\.cse$/;
 const CHECKPOINT_FILE_PATTERN = /^(\d{16})-([a-f0-9]{64})\.csc$/;
 const LOCAL_CHECKPOINT_FILE_PATTERN = /^([a-f0-9]{64})\.csc$/;
 const MAX_REPOSITORY_FILE_BYTES = 64 * 1024;
+/**
+ * How long an unchanged acks.json may go without a refreshed timestamp. Short
+ * enough that a device that has been quiet still looks alive to a peer reading
+ * the file, long enough that an idle repository is not a continuous upload.
+ */
+const ACK_HEARTBEAT_MS = 15 * 60 * 1000;
+/**
+ * How long a file this device wrote keeps suppressing the watcher. Comfortably
+ * longer than the watcher's own one-second debounce, short enough that a peer
+ * republishing byte-identical content is not ignored for long.
+ */
+const SELF_WRITE_MEMORY_MS = 10_000;
 const PRUNE_AGE_GATE_MS = 24 * 60 * 60 * 1000;
 
 export interface DecryptedEvent {
@@ -90,6 +103,13 @@ export interface DecryptedEvent {
   eventHash: string;
   stored: StoredEvent;
   manifest: EventManifest;
+}
+
+/** A decoded event plus the file identity that proved it is still current. */
+interface CachedEvent {
+  event: DecryptedEvent;
+  size: number;
+  mtimeMs: number;
 }
 
 export interface PublishResult {
@@ -149,8 +169,27 @@ export class SyncRepository {
   private readonly objectKey: Buffer;
   private readonly objectIdKey: Buffer;
   private readonly checkpointKey: Buffer;
+  /** Per-cycle memo of the sorted listing; cleared whenever state reloads. */
   private eventsCache: DecryptedEvent[] | null = null;
+  /**
+   * Every event file this process has already read, verified and decrypted,
+   * keyed by `<deviceId>/<fileName>`. Event files are immutable and content
+   * addressed — the filename carries both the sequence and the sha256 — so a
+   * file that was verified once never needs to be stat'd, read, hashed and
+   * AES-decrypted again. Only an actual deletion (prune) invalidates an entry,
+   * which is why `refreshState` does not clear this.
+   */
+  private readonly decodedEvents = new Map<string, CachedEvent>();
   private checkpointManifestCache: { hash: string; manifest: CheckpointManifest } | null = null;
+  private lastWrittenAck: { payload: string; writtenAt: number } | null = null;
+  /**
+   * File names this device just wrote into the shared folder. The recursive
+   * watcher cannot tell its own process's writes from a peer's, so every
+   * publish used to schedule a second, entirely redundant sync cycle one
+   * second later. Event and object file names are content addressed and
+   * therefore unique, so the base name alone identifies the write.
+   */
+  private readonly selfWritten = new Map<string, number>();
   private pendingRecovery: Error | null = null;
 
   private constructor(
@@ -159,7 +198,7 @@ export class SyncRepository {
     readonly masterKey: Buffer,
     readonly stateStore: LocalStateStore,
     readonly state: LocalSyncState,
-    private readonly maxPayloadBytes: number,
+    private effectiveMaxPayloadBytes: number,
     private readonly producer: EventProducer,
   ) {
     this.eventKey = deriveSubkey(masterKey, "event-encryption");
@@ -168,8 +207,49 @@ export class SyncRepository {
     this.checkpointKey = deriveSubkey(masterKey, "checkpoint-encryption");
   }
 
+  /**
+   * The limit {@link publish} enforces. Readable from outside so a caller can
+   * decline to build a payload it already knows `publish` would reject, instead
+   * of letting the throw abort the cycle.
+   */
+  get maxPayloadBytes(): number {
+    return this.effectiveMaxPayloadBytes;
+  }
+
+  /**
+   * Tracks `cursorSettingSync.maxPayloadMiB`, which is a live setting.
+   *
+   * The limit used to be frozen at open, while the publish guard read the
+   * setting on every cycle. Raising the setting is exactly the remedy the
+   * oversized-payload warning tells the user to apply, so the guard would start
+   * admitting a snapshot that `publish` still rejected against the stale
+   * captured value — and the resulting error re-threw on every poll until
+   * Cursor was restarted. The two must be the same number.
+   */
+  setMaxPayloadBytes(maxPayloadBytes: number): void {
+    this.effectiveMaxPayloadBytes = maxPayloadBytes;
+  }
+
   get pendingRecoveryError(): Error | null {
     return this.pendingRecovery;
+  }
+
+  /** True when this device wrote `fileName` moments ago. */
+  wroteRecently(fileName: string): boolean {
+    const writtenAt = this.selfWritten.get(fileName);
+    return (
+      writtenAt !== undefined && Date.now() - writtenAt <= SELF_WRITE_MEMORY_MS
+    );
+  }
+
+  private noteSelfWrite(fileName: string): void {
+    const now = Date.now();
+    for (const [name, writtenAt] of this.selfWritten) {
+      if (now - writtenAt > SELF_WRITE_MEMORY_MS) {
+        this.selfWritten.delete(name);
+      }
+    }
+    this.selfWritten.set(fileName, now);
   }
 
   get localCheckpointsRoot(): string {
@@ -388,7 +468,27 @@ export class SyncRepository {
       throw new Error(`Event already exists: ${eventFileName}`);
     }
     await writeFileAtomic(eventPath, storedBytes, false);
-    this.eventsCache = null;
+    this.noteSelfWrite(eventFileName);
+    // The event just written is already fully decoded in memory, so it is
+    // added to both caches rather than discarding them and forcing the rest of
+    // the cycle to re-read and re-decrypt the entire log.
+    const published: DecryptedEvent = {
+      path: eventPath,
+      fileName: eventFileName,
+      eventHash,
+      stored,
+      manifest,
+    };
+    this.decodedEvents.set(`${header.deviceId}/${eventFileName}`, {
+      event: published,
+      size: storedBytes.byteLength,
+      mtimeMs: (await statResilient(eventPath)).mtimeMs,
+    });
+    if (this.eventsCache !== null) {
+      this.eventsCache = [...this.eventsCache, published].sort(
+        compareDecryptedEvents,
+      );
+    }
 
     this.state.nextSequence += 1;
     this.state.lamport = manifest.lamport;
@@ -418,6 +518,7 @@ export class SyncRepository {
     }
     const deviceEntries = await readdir(devicesRoot, { withFileTypes: true });
     const events: DecryptedEvent[] = [];
+    const seen = new Set<string>();
     for (const deviceEntry of deviceEntries) {
       if (
         !deviceEntry.isDirectory() ||
@@ -459,15 +560,34 @@ export class SyncRepository {
         ) {
           continue;
         }
+        const eventPath = join(eventRoot, file.name);
+        const cacheKey = `${deviceEntry.name}/${file.name}`;
         try {
-          events.push(
-            await this.readEvent(
-              join(eventRoot, file.name),
-              file.name,
-              deviceEntry.name,
-            ),
-          );
+          // One stat decides whether the already-verified decode can be reused.
+          // Event files are immutable, so an unchanged size and mtime means the
+          // bytes are the ones that were hashed, decrypted and validated
+          // earlier; only a file that actually changed pays that cost again.
+          const info = await statResilient(eventPath);
+          const cached = this.decodedEvents.get(cacheKey);
+          if (
+            cached !== undefined &&
+            cached.size === info.size &&
+            cached.mtimeMs === info.mtimeMs
+          ) {
+            seen.add(cacheKey);
+            events.push(cached.event);
+            continue;
+          }
+          const read = await this.readEvent(eventPath, file.name, deviceEntry.name);
+          this.decodedEvents.set(cacheKey, {
+            event: read,
+            size: info.size,
+            mtimeMs: info.mtimeMs,
+          });
+          seen.add(cacheKey);
+          events.push(read);
         } catch (error) {
+          this.decodedEvents.delete(cacheKey);
           // Files at or below the absorbed checkpoint cursor may be deleted or
           // partially propagated by another device's prune while this listing
           // runs; the checkpoint already covers their content.
@@ -482,26 +602,37 @@ export class SyncRepository {
         }
       }
     }
-    const sorted = events.sort((left, right) => {
-      const deviceOrder = left.stored.header.deviceId.localeCompare(
-        right.stored.header.deviceId,
-      );
-      if (deviceOrder !== 0) {
-        return deviceOrder;
+    // Entries whose file is gone were pruned by this or another device.
+    for (const key of [...this.decodedEvents.keys()]) {
+      if (!seen.has(key)) {
+        this.decodedEvents.delete(key);
       }
-      return left.stored.header.sequence - right.stored.header.sequence;
-    });
+    }
+    const sorted = events.sort(compareDecryptedEvents);
     this.eventsCache = sorted;
     return [...sorted];
   }
 
+  /** How many event files are currently visible, for the maintenance trigger. */
+  async countEvents(): Promise<number> {
+    return (await this.listEvents()).length;
+  }
+
   async readObject(reference: ObjectReference): Promise<Buffer> {
-    validateObjectReference(reference, this.maxPayloadBytes);
+    // `maxPayloadBytes` bounds what this device *publishes*. Reads are bounded
+    // by the reference itself (capped by the absolute apply ceiling), because
+    // lowering `cursorSettingSync.maxPayloadMiB` below something already in the
+    // repository must not make that resource permanently unreadable.
+    const readLimit = Math.min(
+      MAX_APPLY_BATCH_BYTES,
+      Math.max(this.maxPayloadBytes, reference.plainBytes),
+    );
+    validateObjectReference(reference, readLimit);
     const path = this.objectPath(reference.deviceId, reference.objectId);
     const fileInfo = await statResilient(path);
     const envelopeLimit = Math.min(
       MAX_OBJECT_ENVELOPE_BYTES,
-      Math.ceil(this.maxPayloadBytes * 1.5) + 1024 * 1024,
+      Math.ceil(readLimit * 1.5) + 1024 * 1024,
     );
     if (fileInfo.size > envelopeLimit) {
       throw new Error(`Object envelope exceeds its size limit: ${reference.objectId}`);
@@ -518,12 +649,12 @@ export class SyncRepository {
       throw new Error(`Object compressed size mismatch: ${reference.objectId}`);
     }
     const plain = await gunzipAsync(compressed, {
-      maxOutputLength: this.maxPayloadBytes,
+      maxOutputLength: readLimit,
     });
     if (plain.byteLength !== reference.plainBytes) {
       throw new Error(`Object plain size mismatch: ${reference.objectId}`);
     }
-    if (plain.byteLength > this.maxPayloadBytes) {
+    if (plain.byteLength > readLimit) {
       throw new Error(`Object exceeds configured payload limit: ${reference.objectId}`);
     }
     return plain;
@@ -669,6 +800,31 @@ export class SyncRepository {
     await this.stateStore.save(this.state);
   }
 
+  /**
+   * Persists only `lastError`.
+   *
+   * A cycle that threw may have left `this.state` half-mutated - a checkpoint
+   * absorb that adopted two device cursors and then hit a rollback on the
+   * third, for example. Flushing that to disk turns a transient fault into a
+   * permanent fail-stop, so the on-disk state is reloaded first and the error
+   * recorded on top of it. The in-memory copy is reset to match, so nothing
+   * downstream keeps using the abandoned mutations.
+   */
+  async recordError(message: string): Promise<void> {
+    try {
+      const persisted = await this.stateStore.load(this.repository.repositoryId);
+      persisted.lastError = message;
+      Object.assign(this.state, persisted);
+      await this.stateStore.save(persisted);
+      return;
+    } catch {
+      // The state file itself is unreadable; fall back to what is in memory so
+      // the error is at least recorded somewhere.
+    }
+    this.state.lastError = message;
+    await this.stateStore.save(this.state);
+  }
+
   async refreshState(): Promise<void> {
     this.eventsCache = null;
     const latest = await this.stateStore.load(this.repository.repositoryId);
@@ -685,22 +841,42 @@ export class SyncRepository {
     }
   }
 
+  /**
+   * Records this device's cursors for the prune gate.
+   *
+   * The payload used to carry a fresh `updatedAt` on every call, so the file
+   * changed on every cycle even when nothing had moved and the cloud client
+   * uploaded it (plus a `.partial` create and delete) around 2,900 times a day
+   * for data that changes a few times an hour. The timestamp now moves only
+   * when the cursors move, or on a slow heartbeat so a long-idle device still
+   * looks alive.
+   */
   async writeAck(): Promise<void> {
+    const body = {
+      deviceId: this.state.device.deviceId,
+      streams: this.state.streams,
+      absorbedCheckpoint:
+        this.state.checkpoint === undefined
+          ? null
+          : {
+              hash: this.state.checkpoint.hash,
+              lamport: this.state.checkpoint.lamport,
+            },
+    };
+    const payload = canonicalBytes(body).toString("utf8");
+    const now = Date.now();
+    if (
+      this.lastWrittenAck !== null &&
+      this.lastWrittenAck.payload === payload &&
+      now - this.lastWrittenAck.writtenAt < ACK_HEARTBEAT_MS
+    ) {
+      return;
+    }
     await writeJsonAtomic(
       join(this.deviceRoot(this.state.device.deviceId), "acks.json"),
-      {
-        deviceId: this.state.device.deviceId,
-        updatedAt: new Date().toISOString(),
-        streams: this.state.streams,
-        absorbedCheckpoint:
-          this.state.checkpoint === undefined
-            ? null
-            : {
-                hash: this.state.checkpoint.hash,
-                lamport: this.state.checkpoint.lamport,
-              },
-      },
+      { ...body, updatedAt: new Date(now).toISOString() },
     );
+    this.lastWrittenAck = { payload, writtenAt: now };
   }
 
   async readDeviceAcks(deviceId: string): Promise<DeviceAcks | null> {
@@ -949,6 +1125,7 @@ export class SyncRepository {
       }
     }
     this.eventsCache = null;
+    this.decodedEvents.clear();
     this.checkpointManifestCache = null;
     let checkpointFilesDeleted = 0;
     if (await pathExists(this.sharedCheckpointsRoot)) {
@@ -1112,20 +1289,34 @@ export class SyncRepository {
       );
     }
     const coveredSequence = checkpointCursor?.lastSequence ?? 0;
-    const files = allFiles.filter(
-      (entry) => Number(entry.match[1]) > coveredSequence,
-    );
-    if (files.length === 0) {
-      if (pinned.lastSequence > coveredSequence) {
+    // Only events above the pinned cursor are decrypted. Everything at or below
+    // it was walked and verified on an earlier run and event files are
+    // immutable, so re-reading the whole stream every 30 seconds proves nothing
+    // new. What still has to be checked is that the pinned event is *there*,
+    // and the filename carries both the sequence and the sha256 the walk would
+    // have compared, so `readdir` alone answers that.
+    if (pinned.lastSequence > coveredSequence) {
+      const pinnedFile = allFiles.find(
+        (entry) =>
+          Number(entry.match[1]) === pinned.lastSequence &&
+          (entry.match[2] ?? "") === pinned.lastEventHash,
+      );
+      if (pinnedFile === undefined) {
         throw new OwnStreamPendingRecoveryError(
           deviceId,
           `previously published event ${pinned.lastSequence} is no longer visible`,
         );
       }
-      return;
     }
-    let previousHash: string | null = checkpointCursor?.lastEventHash ?? null;
-    let expectedSequence = coveredSequence + 1;
+    const verifiedSequence = Math.max(coveredSequence, pinned.lastSequence);
+    const files = allFiles.filter(
+      (entry) => Number(entry.match[1]) > verifiedSequence,
+    );
+    let previousHash: string | null =
+      pinned.lastSequence >= coveredSequence
+        ? pinned.lastEventHash
+        : checkpointCursor?.lastEventHash ?? null;
+    let expectedSequence = verifiedSequence + 1;
     let observedLamport = this.state.lamport;
     for (const entry of files) {
       const event = await this.readEvent(
@@ -1173,13 +1364,39 @@ export class SyncRepository {
         `stream ended before previously published event ${pinned.lastSequence}`,
       );
     }
+    const cursor = this.state.streams[deviceId];
+    // A device that has published nothing has no pinned cursor at all. The
+    // (nextSequence, ownStreamHead, streams[own]) triple encodes "empty
+    // stream" as an *absent* entry — that is exactly what `pinnedOwnStream`
+    // requires — and `{lastSequence: 0, lastEventHash: null}` is a cursor no
+    // validator accepts: `validatePinnedStreamCursor` rejects it outright, so
+    // writing one made a device that had merely joined an existing repository
+    // throw on its first reconcile, before it had ever published.
+    const expectedCursor: StreamCursor | undefined =
+      previousHash === null || expectedSequence - 1 < 1
+        ? undefined
+        : { lastSequence: expectedSequence - 1, lastEventHash: previousHash };
+    if (
+      this.state.lamport === observedLamport &&
+      this.state.nextSequence === expectedSequence &&
+      this.state.ownStreamHead === previousHash &&
+      cursor?.lastSequence === expectedCursor?.lastSequence &&
+      cursor?.lastEventHash === expectedCursor?.lastEventHash
+    ) {
+      // Nothing moved, and only this process appends to its own stream, so
+      // rewriting the whole state file would be a pure cost.
+      return;
+    }
     this.state.lamport = observedLamport;
     this.state.nextSequence = expectedSequence;
     this.state.ownStreamHead = previousHash;
-    this.state.streams[deviceId] = {
-      lastSequence: expectedSequence - 1,
-      lastEventHash: previousHash,
-    };
+    if (expectedCursor === undefined) {
+      // Also repairs a `{0, null}` entry an earlier build of this release
+      // persisted, so an already-wedged device recovers on its next refresh.
+      delete this.state.streams[deviceId];
+    } else {
+      this.state.streams[deviceId] = expectedCursor;
+    }
     await this.stateStore.save(this.state);
   }
 
@@ -1268,8 +1485,25 @@ export class SyncRepository {
   }
 
   private async absorbNewestCheckpoint(): Promise<void> {
-    const winner = await this.loadNewestCheckpoint();
     const current = this.state.checkpoint;
+    // The filename carries the (lamport, hash) pair that decides the winner, so
+    // the winner is known from `readdir` alone. When it is the checkpoint this
+    // device already absorbed there is nothing to do, and opening, hashing,
+    // decrypting and revalidating a multi-megabyte manifest twice a minute to
+    // conclude that would be pure waste. A local copy can never be newer than
+    // the absorbed checkpoint, so it needs no look either.
+    const sharedCandidates = await this.sharedCheckpointCandidates();
+    const sharedWinner = sharedCandidates[0];
+    if (
+      current !== undefined &&
+      sharedWinner !== undefined &&
+      sharedWinner.hash === current.hash &&
+      sharedWinner.lamport === current.lamport
+    ) {
+      await this.ensureLocalCheckpointCopy(sharedWinner);
+      return;
+    }
+    const winner = await this.loadNewestCheckpoint(sharedCandidates);
     if (winner === null) {
       if (current !== undefined) {
         throw checkpointRollbackError(current.hash);
@@ -1291,6 +1525,14 @@ export class SyncRepository {
     }
     await this.persistLocalCheckpointCopy(winner);
     const ownDeviceId = this.state.device.deviceId;
+    // Built to the side and installed only once every device agreed. Mutating
+    // `this.state.streams` in place let a rollback thrown halfway through leave
+    // some cursors adopted from the checkpoint while `state.checkpoint` stayed
+    // behind, and the error path then persisted exactly that, wedging the
+    // device in a fail-stop no later cycle could clear.
+    const nextStreams: Record<string, StreamCursor> = cloneStreams(
+      this.state.streams,
+    );
     for (const [deviceId, cursor] of Object.entries(winner.manifest.streams)) {
       // The own cursor is never adopted here; recoverOwnStream owns the
       // (nextSequence, ownStreamHead, streams[own]) triple and adopting one
@@ -1298,9 +1540,9 @@ export class SyncRepository {
       if (deviceId === ownDeviceId) {
         continue;
       }
-      const local = this.state.streams[deviceId];
+      const local = nextStreams[deviceId];
       if (local === undefined || local.lastSequence < cursor.lastSequence) {
-        this.state.streams[deviceId] = {
+        nextStreams[deviceId] = {
           lastSequence: cursor.lastSequence,
           lastEventHash: cursor.lastEventHash,
         };
@@ -1311,6 +1553,7 @@ export class SyncRepository {
         throw checkpointStreamRollbackError(deviceId, cursor.lastSequence);
       }
     }
+    this.state.streams = nextStreams;
     this.state.checkpoint = {
       hash: winner.hash,
       lamport: winner.manifest.lamport,
@@ -1329,7 +1572,79 @@ export class SyncRepository {
     );
   }
 
-  private async loadNewestCheckpoint(): Promise<LoadedCheckpoint | null> {
+  /**
+   * Shared checkpoint files that could win, newest first. The ordering key
+   * `(lamport, hash)` comes straight out of the filename, and
+   * `readCheckpointFile` rejects any file whose contents disagree with its
+   * name, so this ordering is the ordering of the decoded manifests.
+   */
+  private async sharedCheckpointCandidates(): Promise<
+    Array<CheckpointIdentity & { path: string }>
+  > {
+    if (!(await pathExists(this.sharedCheckpointsRoot))) {
+      return [];
+    }
+    const candidates: Array<CheckpointIdentity & { path: string }> = [];
+    const entries = await readdir(this.sharedCheckpointsRoot, {
+      withFileTypes: true,
+    });
+    for (const entry of entries) {
+      if (
+        !entry.isFile() ||
+        entry.name.endsWith(PARTIAL_EXTENSION) ||
+        entry.name.includes("sync-conflict")
+      ) {
+        continue;
+      }
+      const match = CHECKPOINT_FILE_PATTERN.exec(entry.name);
+      if (match === null) {
+        continue;
+      }
+      candidates.push({
+        lamport: Number(match[1]),
+        hash: match[2] ?? "",
+        path: join(this.sharedCheckpointsRoot, entry.name),
+      });
+    }
+    return candidates.sort((left, right) =>
+      compareCheckpointIdentity(right, left),
+    );
+  }
+
+  /**
+   * Writes the local copy of an already-absorbed checkpoint if it is missing,
+   * decoding nothing when the copy is already there.
+   */
+  private async ensureLocalCheckpointCopy(
+    identity: CheckpointIdentity & { path: string },
+  ): Promise<void> {
+    const localPath = join(
+      this.localCheckpointsRoot,
+      `${identity.hash}${CHECKPOINT_EXTENSION}`,
+    );
+    if (await pathExists(localPath)) {
+      return;
+    }
+    try {
+      await this.persistLocalCheckpointCopy(
+        await this.readCheckpointFile(
+          identity.path,
+          identity.hash,
+          identity.lamport,
+        ),
+      );
+    } catch (error) {
+      // The shared copy vanishing mid-cycle is another device's prune; the
+      // absorbed manifest stays reachable through the manifest loader.
+      if (!isMissingPathError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  private async loadNewestCheckpoint(
+    sharedCandidates: ReadonlyArray<CheckpointIdentity & { path: string }>,
+  ): Promise<LoadedCheckpoint | null> {
     let winner: LoadedCheckpoint | null = null;
     const consider = (candidate: LoadedCheckpoint): void => {
       if (
@@ -1342,39 +1657,26 @@ export class SyncRepository {
         winner = candidate;
       }
     };
-    if (await pathExists(this.sharedCheckpointsRoot)) {
-      const entries = await readdir(this.sharedCheckpointsRoot, {
-        withFileTypes: true,
-      });
-      for (const entry of entries) {
-        if (
-          !entry.isFile() ||
-          entry.name.endsWith(PARTIAL_EXTENSION) ||
-          entry.name.includes("sync-conflict")
-        ) {
+    for (const candidate of sharedCandidates) {
+      try {
+        consider(
+          await this.readCheckpointFile(
+            candidate.path,
+            candidate.hash,
+            candidate.lamport,
+          ),
+        );
+        // The list is ordered by the key the winner is chosen with, so the
+        // first file that reads cleanly is the shared winner.
+        break;
+      } catch (error) {
+        // A listed shared file that vanished mid-scan was deleted by another
+        // device's prune; every other failure on a well-named shared
+        // checkpoint is a fail-stop.
+        if (isMissingPathError(error)) {
           continue;
         }
-        const match = CHECKPOINT_FILE_PATTERN.exec(entry.name);
-        if (match === null) {
-          continue;
-        }
-        try {
-          consider(
-            await this.readCheckpointFile(
-              join(this.sharedCheckpointsRoot, entry.name),
-              match[2] ?? "",
-              Number(match[1]),
-            ),
-          );
-        } catch (error) {
-          // A listed shared file that vanished mid-scan was deleted by another
-          // device's prune; every other failure on a well-named shared
-          // checkpoint is a fail-stop.
-          if (isMissingPathError(error)) {
-            continue;
-          }
-          throw error;
-        }
+        throw error;
       }
     }
     if (await pathExists(this.localCheckpointsRoot)) {
@@ -1664,6 +1966,7 @@ export class SyncRepository {
     const stored: StoredObject = { ...header, ...encrypted };
     await ensureDirectory(join(this.blobsRoot(reference.deviceId), objectId.slice(0, 2)));
     await writeFileAtomic(destination, canonicalBytes(stored), false);
+    this.noteSelfWrite(`${objectId}${OBJECT_EXTENSION}`);
     return reference;
   }
 
@@ -1692,6 +1995,20 @@ export class SyncRepository {
       `${objectId}${OBJECT_EXTENSION}`,
     );
   }
+}
+
+/** Stable listing order: by device, then by sequence within that device. */
+function compareDecryptedEvents(
+  left: DecryptedEvent,
+  right: DecryptedEvent,
+): number {
+  const deviceOrder = left.stored.header.deviceId.localeCompare(
+    right.stored.header.deviceId,
+  );
+  if (deviceOrder !== 0) {
+    return deviceOrder;
+  }
+  return left.stored.header.sequence - right.stored.header.sequence;
 }
 
 function pinnedOwnStream(state: LocalSyncState): StreamCursor {

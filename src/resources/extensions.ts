@@ -24,6 +24,19 @@ import { semanticHash, serializeCanonical } from "./jsonc";
 import type { ResourceAdapter, ResourceApplyInput } from "./resource";
 import { readPortableProfiles } from "./profiles";
 import { EXTENSION_ID } from "../constants";
+import type { IgnoreMatcher } from "./ignorePatterns";
+import { createIgnoreMatcher } from "./ignorePatterns";
+
+/**
+ * Extension identifiers compare case-insensitively, so both the configured
+ * entries and the observed IDs are folded before matching. `ms-python.*` and
+ * an exact `publisher.name` both work.
+ */
+export function createExtensionIgnoreMatcher(
+  entries: readonly string[],
+): IgnoreMatcher {
+  return createIgnoreMatcher(entries, { caseFold: true });
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -63,7 +76,7 @@ export class ExtensionsAdapter implements ResourceAdapter {
 
   constructor(
     private readonly paths: CursorPaths,
-    private readonly ignoredExtensions: Set<string>,
+    private readonly ignoredExtensions: IgnoreMatcher,
   ) {}
 
   async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
@@ -131,7 +144,7 @@ export class ExtensionsAdapter implements ResourceAdapter {
           const id = entry.id.toLowerCase();
           if (
             id === EXTENSION_ID.toLowerCase() ||
-            this.ignoredExtensions.has(id)
+            this.ignoredExtensions.matches(id)
           ) {
             continue;
           }
@@ -349,7 +362,7 @@ function findDeletions(
   current: Set<string>,
   profileNames: Map<string, string>,
   scannedProfiles: Set<string>,
-  ignoredExtensions: Set<string>,
+  ignoredExtensions: IgnoreMatcher,
 ): ResourceDeletion[] {
   return Object.values(known)
     .filter((projection) => {
@@ -362,7 +375,7 @@ function findDeletions(
       const parsed = parseExtensionResourceId(projection.resourceId);
       return (
         scannedProfiles.has(parsed.profileId) &&
-        !ignoredExtensions.has(parsed.extensionId.toLowerCase()) &&
+        !ignoredExtensions.matches(parsed.extensionId.toLowerCase()) &&
         parsed.extensionId.toLowerCase() !== EXTENSION_ID.toLowerCase()
       );
     })

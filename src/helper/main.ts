@@ -26,7 +26,9 @@ import { SyncRepository } from "../protocol/repository";
 import { EventReconciler, parentsForLocalChange } from "../protocol/reconciler";
 import {
   absorbedCheckpointManifest,
+  filterPublishableChanges,
   isSyntheticTip,
+  publishInBatches,
 } from "../sync/versionPolicy";
 import { sha256 } from "../protocol/canonical";
 import { StateVscdbChatAdapter } from "../chat/stateVscdb";
@@ -36,7 +38,10 @@ import {
   discoverWorkspaces,
   resolveTargetWorkspace,
 } from "../chat/workspace";
-import { SettingsAdapter } from "../resources/settings";
+import {
+  SettingsAdapter,
+  createSettingsIgnoreMatcher,
+} from "../resources/settings";
 import { ProfileFilesAdapter } from "../resources/profileFiles";
 import {
   CursorUserFilesAdapter,
@@ -44,7 +49,11 @@ import {
 } from "../resources/cursorUserFiles";
 import { ProfilesAdapter } from "../resources/profiles";
 import { UiStateAdapter } from "../resources/uiState";
-import { ExtensionsAdapter } from "../resources/extensions";
+import { normalizeIgnoredUiStateKeys } from "../resources/uiStatePolicy";
+import {
+  ExtensionsAdapter,
+  createExtensionIgnoreMatcher,
+} from "../resources/extensions";
 import { WorkspaceStorageAdapter } from "../resources/workspaceStorage";
 import type { ResourceAdapter } from "../resources/resource";
 import {
@@ -221,18 +230,26 @@ async function executeRequest(
       gitWarnings,
       request.backupToRestore,
       collected.backups,
+      gitWarnings,
     );
   }
 
   const exportWarnings = await exportFinalChanges(request, repository);
+  // Everything that means a resource did NOT reach the repository: a git
+  // transport failure, an adapter that threw during the shutdown scan, or a
+  // snapshot dropped for exceeding the payload limit. These are reported apart
+  // from the routine `skipped` entries so the extension host can raise a
+  // standing warning for them without also flagging every deliberately
+  // retained tombstone and every superseded change.
+  const warnings = [...gitWarnings, ...exportWarnings];
   if (request.mode === "final-export") {
     await finishGitTransport(
       gitActive,
       request.repositoryRoot,
       `shutdown export (${repository.state.device.deviceId.slice(0, 8)})`,
-      gitWarnings,
+      warnings,
     );
-    return successResult(request, [], [...gitWarnings, ...exportWarnings], null);
+    return successResult(request, [], [...warnings], null, [], warnings);
   }
   const ensureExclusiveAccess = async (): Promise<void> => {
     if (!(await noOtherCursorProcesses())) {
@@ -253,8 +270,6 @@ async function executeRequest(
     isEligible(change, reconcileResult.projections, repository.state.conflicts),
   );
   const skipped = [
-    ...gitWarnings,
-    ...exportWarnings,
     ...request.changes
     .filter((change) => !eligible.includes(change))
     .map((change) => `${change.resourceId}: superseded or conflicted`),
@@ -309,9 +324,16 @@ async function executeRequest(
     gitActive,
     request.repositoryRoot,
     `apply (${request.requestId.slice(0, 8)})`,
-    skipped,
+    warnings,
   );
-  return successResult(request, applied, skipped, backupPath, collected.backups);
+  return successResult(
+    request,
+    applied,
+    [...warnings, ...skipped],
+    backupPath,
+    collected.backups,
+    warnings,
+  );
 }
 
 async function beginGitTransport(
@@ -385,8 +407,8 @@ async function exportFinalChanges(
   const adapters: ResourceAdapter[] = [
     new SettingsAdapter(
       request.paths,
-      new Set(request.syncOptions.ignoredSettings),
-      new Set(request.syncOptions.machineScopedSettings),
+      createSettingsIgnoreMatcher(request.syncOptions.ignoredSettings),
+      createSettingsIgnoreMatcher(request.syncOptions.machineScopedSettings),
     ),
     new ProfileFilesAdapter(request.paths),
     new CursorUserFilesAdapter(
@@ -394,17 +416,22 @@ async function exportFinalChanges(
       normalizeIgnoredUserFiles(request.syncOptions.ignoredUserFiles ?? []),
     ),
     new ProfilesAdapter(request.paths),
-    new UiStateAdapter(request.paths),
+    new UiStateAdapter(
+      request.paths,
+      normalizeIgnoredUiStateKeys(request.syncOptions.ignoredUiStateKeys ?? []),
+    ),
     new ExtensionsAdapter(
       request.paths,
-      new Set(
-        request.syncOptions.ignoredExtensions.map((id) => id.toLowerCase()),
-      ),
+      createExtensionIgnoreMatcher(request.syncOptions.ignoredExtensions),
     ),
   ];
   if (request.syncOptions.syncWorkspaceStorage) {
     adapters.push(
-      new WorkspaceStorageAdapter(request.paths, workspaceMappings),
+      new WorkspaceStorageAdapter(
+        request.paths,
+        workspaceMappings,
+        request.syncOptions.maxPayloadBytes,
+      ),
     );
   }
   if (request.syncOptions.syncChat) {
@@ -491,7 +518,21 @@ async function exportFinalChanges(
       })),
     );
   }
-  const published = await repository.publish(snapshots, deletions);
+  // This is the ONLY path that backs up workspaceStorage, so it must survive an
+  // oversized or oversized-in-count batch instead of losing the whole export.
+  // A resource above the payload limit is dropped with a warning that names it;
+  // more than MAX_EVENT_CHANGES changes are split across several events.
+  const publishable = filterPublishableChanges(
+    snapshots,
+    deletions,
+    request.syncOptions.maxPayloadBytes,
+  );
+  warnings.push(...publishable.warnings);
+  const publishedEventHashes = await publishInBatches(
+    repository,
+    publishable.snapshots,
+    publishable.deletions,
+  );
   const result = reconciler.reconcile(
     await repository.listEvents(),
     repository.state,
@@ -499,8 +540,7 @@ async function exportFinalChanges(
   );
   for (const projection of result.projections) {
     if (
-      published.eventHash !== null &&
-      projection.tip.eventHash === published.eventHash &&
+      publishedEventHashes.has(projection.tip.eventHash) &&
       projection.tip.deviceId === repository.state.device.deviceId &&
       !result.conflicts.some(
         (conflict) => conflict.resourceId === projection.resourceId,
@@ -807,6 +847,7 @@ function successResult(
   skipped: string[],
   backupPath: string | null,
   backups: HelperBackup[] = [],
+  warnings: string[] = [],
 ): HelperResult {
   return {
     requestId: request.requestId,
@@ -814,6 +855,9 @@ function successResult(
     completedAt: new Date().toISOString(),
     applied,
     skipped,
+    // Always present on a 0.0.5 result, empty included: an empty array is what
+    // tells the extension host a previous run's standing warning has cleared.
+    warnings: [...warnings],
     backupPath,
     ...(backups.length === 0 ? {} : { backups }),
     error: null,

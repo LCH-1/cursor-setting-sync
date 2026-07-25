@@ -4,3 +4,13 @@ coverage/
 *.vsix
 *.log
 .DS_Store
+tmp/
+
+# Screenshots and editor scratch files land in the repository root. They are
+# never part of the extension, and an untracked pile of them hides real
+# changes in `git status`.
+image*.png
+!icon.png
+!image.png
+Untitled
+Untitled *

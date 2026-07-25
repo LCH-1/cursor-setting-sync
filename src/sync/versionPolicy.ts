@@ -3,10 +3,13 @@ import type {
   EventProducer,
   JsonValue,
   LocalProjection,
+  ResourceDeletion,
   ResourceSnapshot,
   ResourceTip,
 } from "../types";
 import type { SyncRepository } from "../protocol/repository";
+import { MAX_EVENT_CHANGES } from "../constants";
+import { PUBLISH_WARNING_SOURCE } from "./warningLog";
 
 export function shouldPublishSnapshot(
   projection: LocalProjection | undefined,
@@ -97,4 +100,134 @@ export async function absorbedCheckpointManifest(
   repository: SyncRepository,
 ): Promise<CheckpointManifest | null> {
   return repository.loadAbsorbedCheckpointManifest();
+}
+
+/**
+ * Splits the scan result into what can actually go into an event.
+ *
+ * `SyncRepository.publish` throws on the first snapshot over the configured
+ * limit, and that throw used to abort the whole cycle: one 150 MiB workspace
+ * database stopped settings, keybindings, extensions and every other resource
+ * from publishing, on this cycle and on every cycle after it. An oversized
+ * resource is now dropped from the batch with a warning that names it, its
+ * size and the two things the user can do about it, and everything else
+ * publishes. The hard throw stays in `publish` as a defensive invariant.
+ *
+ * `sourceOf` names the warning bucket each snapshot belongs to, so a warning
+ * can be scoped to the adapter that owns the resource: only a cycle that
+ * scanned that adapter is entitled to clear it.
+ */
+export function filterPublishableChanges(
+  snapshots: readonly ResourceSnapshot[],
+  deletions: readonly ResourceDeletion[],
+  maxPayloadBytes: number,
+  sourceOf: (snapshot: ResourceSnapshot) => string = () =>
+    PUBLISH_WARNING_SOURCE,
+): {
+  snapshots: ResourceSnapshot[];
+  deletions: ResourceDeletion[];
+  warnings: string[];
+  warningsBySource: Map<string, string[]>;
+} {
+  const warnings: string[] = [];
+  const warningsBySource = new Map<string, string[]>();
+  const publishable = snapshots.filter((snapshot) => {
+    if (snapshot.content.byteLength <= maxPayloadBytes) {
+      return true;
+    }
+    const warning = oversizedPayloadWarning(
+      snapshot.resourceId,
+      snapshot.content.byteLength,
+      maxPayloadBytes,
+    );
+    warnings.push(warning);
+    const source = sourceOf(snapshot);
+    const bucket = warningsBySource.get(source);
+    if (bucket === undefined) {
+      warningsBySource.set(source, [warning]);
+    } else {
+      bucket.push(warning);
+    }
+    return false;
+  });
+  return {
+    snapshots: publishable,
+    deletions: [...deletions],
+    warnings,
+    warningsBySource,
+  };
+}
+
+/**
+ * Publishes in events of at most MAX_EVENT_CHANGES changes. A single batch
+ * larger than that used to throw and take the cycle with it.
+ *
+ * Lives next to {@link filterPublishableChanges} because the two guards belong
+ * together: every publisher — the sync cycle and the shutdown export alike —
+ * has to drop what cannot fit in a payload and split what cannot fit in an
+ * event. It also keeps both reachable from the helper bundle, which cannot
+ * import the extension-host manager.
+ *
+ * Returns the hash of every event actually written; a caller that marks its own
+ * projections has to recognise all of them, not just the last one.
+ */
+export async function publishInBatches(
+  repository: SyncRepository,
+  snapshots: readonly ResourceSnapshot[],
+  deletions: readonly ResourceDeletion[],
+): Promise<Set<string>> {
+  const published = new Set<string>();
+  const record = (eventHash: string | null): void => {
+    if (eventHash !== null) {
+      published.add(eventHash);
+    }
+  };
+  if (snapshots.length + deletions.length <= MAX_EVENT_CHANGES) {
+    record((await repository.publish([...snapshots], [...deletions])).eventHash);
+    return published;
+  }
+  let snapshotIndex = 0;
+  let deletionIndex = 0;
+  while (snapshotIndex < snapshots.length || deletionIndex < deletions.length) {
+    const batchSnapshots = snapshots.slice(
+      snapshotIndex,
+      snapshotIndex + MAX_EVENT_CHANGES,
+    );
+    snapshotIndex += batchSnapshots.length;
+    const room = MAX_EVENT_CHANGES - batchSnapshots.length;
+    const batchDeletions =
+      room > 0 ? deletions.slice(deletionIndex, deletionIndex + room) : [];
+    deletionIndex += batchDeletions.length;
+    record((await repository.publish(batchSnapshots, batchDeletions)).eventHash);
+  }
+  return published;
+}
+
+/** The one wording used wherever a payload is refused for being too large. */
+export function oversizedPayloadWarning(
+  resourceId: string,
+  byteLength: number,
+  maxPayloadBytes: number,
+): string {
+  return (
+    `${resourceId} is ${formatBytes(byteLength)}, ` +
+    `above the ${formatBytes(maxPayloadBytes)} limit, so it was not published. ` +
+    'Raise "cursorSettingSync.maxPayloadMiB" to cover it, or exclude the resource ' +
+    '("cursorSettingSync.ignoredUserFiles", "cursorSettingSync.syncChat" or ' +
+    '"cursorSettingSync.syncWorkspaceStorage" depending on its kind). ' +
+    "Everything else in this cycle still synchronized."
+  );
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KiB`;
+  }
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+  }
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
 }

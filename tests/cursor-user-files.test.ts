@@ -21,13 +21,13 @@ afterEach(async () => {
 
 describe("Cursor user file ignore matching per platform", () => {
   it("folds ignore entries on Windows and macOS but keeps Linux exact", () => {
-    expect([...normalizeIgnoredUserFiles(["Rules/Secret.md"], "win32")]).toEqual([
+    expect([...normalizeIgnoredUserFiles(["Rules/Secret.md"], "win32").patterns]).toEqual([
       "rules/secret.md",
     ]);
-    expect([...normalizeIgnoredUserFiles(["Rules/Secret.md"], "darwin")]).toEqual([
+    expect([...normalizeIgnoredUserFiles(["Rules/Secret.md"], "darwin").patterns]).toEqual([
       "rules/secret.md",
     ]);
-    expect([...normalizeIgnoredUserFiles(["Rules/Secret.md"], "linux")]).toEqual([
+    expect([...normalizeIgnoredUserFiles(["Rules/Secret.md"], "linux").patterns]).toEqual([
       "Rules/Secret.md",
     ]);
   });

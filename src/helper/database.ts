@@ -36,9 +36,13 @@ import {
   type PortableProfile,
 } from "../resources/profiles";
 import {
-  isDeniedUiStateKey,
+  isIgnoredUiStateKey,
+  isPolicyExcludedUiStateKey,
+  isSecurityDeniedUiStateKey,
+  normalizeIgnoredUiStateKeys,
   parseTargetStorageMarker,
 } from "../resources/uiStatePolicy";
+import type { IgnoreMatcher } from "../resources/ignorePatterns";
 
 export interface PreparedHelperChange {
   change: HelperChange;
@@ -614,6 +618,12 @@ class FatalApplyError extends Error {}
 type ChangeOutcome =
   | { status: "applied" }
   | { status: "ignored" }
+  /**
+   * The local value wins and nothing was written, but the change is still
+   * accounted for so it stops being pending — the same shape the ignored
+   * extension and the retained tombstone branches use in `resourceApply`.
+   */
+  | { status: "retained-local"; reason: string }
   | { status: "skipped"; reason: string };
 
 function applyPreparedChanges(
@@ -628,6 +638,9 @@ function applyPreparedChanges(
     entries: readTargetMarker(database),
     dirty: false,
   };
+  const ignoredUiStateKeys = normalizeIgnoredUiStateKeys(
+    request.syncOptions.ignoredUiStateKeys ?? [],
+  );
 
   for (const item of prepared) {
     // A savepoint keeps a rejected change from leaving partial writes behind,
@@ -641,6 +654,7 @@ function applyPreparedChanges(
         item,
         localWorkspaces,
         marker,
+        ignoredUiStateKeys,
       );
       database.exec("RELEASE cursor_sync_change");
     } catch (error) {
@@ -655,6 +669,9 @@ function applyPreparedChanges(
       };
     }
     if (outcome.status === "applied") {
+      applied.push(item.change.resourceId);
+    } else if (outcome.status === "retained-local") {
+      skipped.push(`${item.change.resourceId}: ${outcome.reason}`);
       applied.push(item.change.resourceId);
     } else if (outcome.status === "skipped") {
       skipped.push(`${item.change.resourceId}: ${outcome.reason}`);
@@ -680,6 +697,7 @@ function applyPreparedChange(
   item: PreparedHelperChange,
   localWorkspaces: Awaited<ReturnType<typeof discoverWorkspaces>>,
   marker: MarkerState,
+  ignoredUiStateKeys: IgnoreMatcher,
 ): ChangeOutcome {
   const { change, content } = item;
   if (change.kind === "chat") {
@@ -724,6 +742,36 @@ function applyPreparedChange(
     }
     if (!isSafeUiStateKey(key, change.kind)) {
       throw new FatalApplyError(`Refused unsafe UI state key: ${key}`);
+    }
+    // A key this build declines to synchronize as a matter of policy, not
+    // safety. Every release up to 0.0.3 published these, so repositories in the
+    // field carry immutable events for them; failing the request would abort
+    // the whole apply — including chat, profiles, extensions, user files and
+    // the workspaceStorage restore — on every shutdown forever, because the
+    // event can never be superseded. Skipped and accounted for instead, exactly
+    // like an ignored key.
+    if (change.kind === "ui-state" && isPolicyExcludedUiStateKey(key)) {
+      return {
+        status: "retained-local",
+        reason:
+          "UI state key is excluded from synchronization by this version; the local value is kept and nothing is deleted on other devices",
+      };
+    }
+    // "cursorSettingSync.ignoredUiStateKeys" is honored on both sides, exactly
+    // like the settings, user-file and extension ignore lists. Publishing-side
+    // only was worse than not honoring it at all: a peer's put overwrote the
+    // layout the user declared machine-local, and a peer's tombstone deleted
+    // it outright. cursor-user-rules is excluded here for the same reason the
+    // scan excludes it — its key is fixed and never matched against the list.
+    if (
+      change.kind === "ui-state" &&
+      isIgnoredUiStateKey(key, ignoredUiStateKeys)
+    ) {
+      return {
+        status: "retained-local",
+        reason:
+          "UI state key is ignored on this device; remove it from cursorSettingSync.ignoredUiStateKeys to accept changes for it",
+      };
     }
     if (change.operation === "delete") {
       database.prepare("DELETE FROM ItemTable WHERE key = ?").run(key);
@@ -1117,6 +1165,11 @@ function formatUnknownError(error: unknown): string {
   }
 }
 
+/**
+ * Only the security half of the policy. A key excluded for churn reasons is
+ * *safe*; it is simply not wanted, and is skipped by the caller instead of
+ * aborting the transaction.
+ */
 function isSafeUiStateKey(
   key: string,
   kind: "ui-state" | "cursor-user-rules",
@@ -1124,5 +1177,5 @@ function isSafeUiStateKey(
   if (kind === "cursor-user-rules") {
     return key === CURSOR_USER_RULES_KEY;
   }
-  return !isDeniedUiStateKey(key);
+  return !isSecurityDeniedUiStateKey(key);
 }

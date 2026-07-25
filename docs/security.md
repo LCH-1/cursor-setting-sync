@@ -20,7 +20,7 @@ The extension excludes from database-backed UI-state synchronization:
 
 Account and OAuth authorization must be completed separately on each PC.
 
-File resources are handled differently: explicitly synchronized settings and MCP JSON may contain inline API keys, headers, or environment values. Those files are encrypted in the shared repository, but their inline contents are intentionally synchronized. Prefer environment-variable references and list sensitive settings in `cursorSettingSync.ignoredSettings`.
+File resources are handled differently: explicitly synchronized settings and MCP JSON may contain inline API keys, headers, or environment values. Those files are encrypted in the shared repository, but their inline contents are intentionally synchronized. Prefer environment-variable references. `cursorSettingSync.ignoredSettings` applies only to keys inside `settings.json`; a whole file under `~/.cursor` — `mcp.json`, `cli-config.json`, a private rules file — is excluded with `cursorSettingSync.ignoredUserFiles`, which also accepts a directory entry such as `rules/` and wildcards such as `rules/*.md`.
 
 ## Input and path boundaries
 

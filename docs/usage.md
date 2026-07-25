@@ -93,7 +93,11 @@ Transient SQLite files (`*-wal`, `*-shm`, and `*-journal`), prior database backu
 3. Select the version to keep.
 4. The extension publishes a resolution event referencing every conflicting tip.
 
-JSON and text resources attempt a semantic merge or diff3 merge when a common parent exists. Ambiguous changes remain conflicts.
+JSON and text resources attempt a semantic merge or diff3 merge when a common parent exists. Ambiguous changes remain conflicts. A JSON merge writes its result into the *common ancestor's* text, so both devices resolving the same fork emit identical bytes and the two independent merges collapse into one version; comments and formatting present in the ancestor survive.
+
+A resource larger than `cursorSettingSync.maxPayloadMiB` is not published. It is skipped with a warning naming the resource, its size, and the remedies, and the rest of the cycle publishes and applies normally.
+
+UI state resolves on its own instead of prompting. A value whose elements carry a stable `id` — pinned view containers (`workbench.activity.pinnedViewlets2`), every hidden-view list — is merged element by element, and anything else falls back to the newest writer, decided from replicated event ordering alone. Both devices compute the same bytes without talking to each other, so the two independent resolutions collapse into one version. This applies only to UI chrome: `.cursor` rules, settings, extensions, and chat still ask, because losing one side there loses content you wrote. Keys you would rather keep per-machine belong in `cursorSettingSync.ignoredUiStateKeys`.
 
 ## Apply database changes
 
@@ -130,11 +134,12 @@ A restored version keeps the original version's producer metadata, so the newer-
 
 ## Diagnostics and maintenance
 
-- `Cursor Setting Sync: Show Diagnostics` shows versions, database capabilities, schema results, conflicts, pending changes, and the last error.
+- `Cursor Setting Sync: Show Diagnostics` shows versions, database capabilities, schema results, the last error, and — for anything that is stuck — the reason rather than only a count: each pending change with what is blocking it, the conflicting resource IDs, every `cursorSettingSync.*` value actually in force (legacy-namespace fallbacks resolved), the machine-specific exclusion set, the git mode, the workspace mappings, and the adapters currently running. It also lists every standing warning with the adapter that produced it, how long it has been standing, and whether it blocks compaction and checkpointing. Standing warnings are logged once when they appear and then restated only once an hour, so this list — not the output channel — is the place to see what is currently true.
 - `Cursor Setting Sync: Show Repository Usage` calculates shared repository size.
 - `Cursor Setting Sync: Restore Version History` re-publishes an older version of a resource as the new current content.
 - `Cursor Setting Sync: Compact Safe Orphans` removes safe local-device partials and objects that neither an event nor the absorbed checkpoint references; it requires a warning-free reconcile.
-- `Cursor Setting Sync: Checkpoint & Prune History` folds history into a checkpoint and prunes covered event files once every device has absorbed it.
+- `Cursor Setting Sync: Checkpoint & Prune History` folds history into a checkpoint and prunes covered event files once every device has absorbed it. The same fold also runs on its own once the event log passes 500 files, at most once every six hours, behind exactly the gates listed above — so the repository does not grow without bound just because nobody ran the command.
+- `Cursor Setting Sync: Disconnect` clears this device's stored repository path, encryption key, and workspace mappings. The shared folder is untouched, so another device keeps synchronizing and this one can rejoin through `Setup`.
 - `Cursor Setting Sync: Archive Repository` copies the complete repository to a separate directory.
 - `Cursor Setting Sync: Forget Device` retires a device stream locally.
 

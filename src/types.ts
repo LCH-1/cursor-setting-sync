@@ -307,6 +307,45 @@ export interface DatabaseCapabilityStatus {
   reasons: string[];
 }
 
+export interface DiagnosticStandingWarning {
+  /** Adapter id, or "reconciler". */
+  source: string;
+  warning: string;
+  firstSeenAt: string;
+  /** Human-readable age, e.g. "2h 11m". */
+  standingFor: string;
+  lastLoggedAt: string;
+  observations: number;
+  /** Reconciler stream warnings block compaction and checkpointing. */
+  blocksMaintenance: boolean;
+  /** Publish warnings mean a resource is not reaching the other devices. */
+  blocksPublish: boolean;
+}
+
+export interface DiagnosticPendingChange {
+  resourceId: string;
+  kind: ResourceKind;
+  /** Why the change cannot be applied yet, or null when it is simply queued. */
+  blockedReason: string | null;
+}
+
+/** Every `cursorSettingSync.*` value actually in use, legacy fallbacks resolved. */
+export interface DiagnosticConfiguration {
+  enabled: boolean;
+  pollIntervalSeconds: number;
+  chatPollIntervalSeconds: number;
+  autoApplyFiles: boolean;
+  syncChat: boolean;
+  syncWorkspaceStorage: boolean;
+  gitSync: boolean;
+  maxPayloadMiB: number;
+  useDefaultIgnoredSettings: boolean;
+  ignoredSettings: string[];
+  ignoredExtensions: string[];
+  ignoredUserFiles: string[];
+  ignoredUiStateKeys: string[];
+}
+
 export interface DiagnosticSnapshot {
   generatedAt: string;
   compatibility: CompatibilityReport;
@@ -314,7 +353,19 @@ export interface DiagnosticSnapshot {
   repositoryPath: string | null;
   deviceId: string | null;
   pendingDatabaseChanges: number;
+  pending: DiagnosticPendingChange[];
   conflicts: number;
+  conflictResourceIds: string[];
+  effectiveConfiguration: DiagnosticConfiguration;
+  /** The built-in machine-specific keys in force, empty when opted out. */
+  defaultIgnoredSettings: string[];
+  /** Everything excluded as machine-specific, defaults and extensions merged. */
+  machineScopedSettings: string[];
+  gitMode: "off" | "enabled" | "degraded";
+  workspaceMappings: Record<string, string>;
+  /** The adapters currently constructed; absent kinds are not synchronizing. */
+  adapters: string[];
+  standingWarnings: DiagnosticStandingWarning[];
   lastSyncAt: string | null;
   lastError: string | null;
   repositoryBytes?: number;

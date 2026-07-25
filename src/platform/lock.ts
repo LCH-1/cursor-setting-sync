@@ -70,6 +70,41 @@ export async function acquireFileLock(path: string): Promise<FileLock | null> {
   return tryCreateLock(path, content);
 }
 
+/**
+ * Explains who is holding `path`, for the message shown when a command cannot
+ * take the lock. The lock file already records the PID and the creation time
+ * and self-heals on a dead PID or after the TTL, but none of that used to reach
+ * the user: every command failed with the same six words and no way to learn
+ * that closing the other window - or simply waiting - fixes it.
+ */
+export async function describeLockHolder(path: string): Promise<string> {
+  const existing = await readLock(path);
+  if (existing === null) {
+    return (
+      "Another Cursor window or the offline helper is synchronizing. " +
+      "Close other Cursor windows, or try again in a moment. " +
+      `Lock file: ${path}.`
+    );
+  }
+  let heldFor = "";
+  try {
+    const minutes = Math.max(
+      0,
+      Math.floor((Date.now() - (await stat(path)).mtimeMs) / 60_000),
+    );
+    heldFor = `, last active ${minutes} minute(s) ago`;
+  } catch {
+    // The age is a nicety; the PID alone is already actionable.
+  }
+  const staleMinutes = Math.round(STALE_LOCK_TTL_MS / 60_000);
+  return (
+    `Another Cursor window or the offline helper (pid ${existing.pid}${heldFor}) is synchronizing. ` +
+    "Close other Cursor windows, or wait - a lock whose holder has exited is " +
+    `released automatically, and any lock goes stale after ${staleMinutes} minutes. ` +
+    `Lock file: ${path}.`
+  );
+}
+
 function isSameLock(
   left: LockContent | null,
   right: LockContent | null,

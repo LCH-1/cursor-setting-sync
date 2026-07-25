@@ -92,18 +92,27 @@ export class ExtensionConfiguration {
   }
 
   get ignoredSettings(): string[] {
-    return setting<string[]>("ignoredSettings", []);
+    return stringArray(setting<string[]>("ignoredSettings", []));
+  }
+
+  /**
+   * Whether the built-in machine-specific key list is honored. Off means the
+   * user takes responsibility for `ignoredSettings` themselves.
+   */
+  get useDefaultIgnoredSettings(): boolean {
+    return setting<boolean>("useDefaultIgnoredSettings", true);
   }
 
   get ignoredExtensions(): string[] {
-    return setting<string[]>("ignoredExtensions", []);
+    return stringArray(setting<string[]>("ignoredExtensions", []));
+  }
+
+  get ignoredUiStateKeys(): string[] {
+    return stringArray(setting<string[]>("ignoredUiStateKeys", []));
   }
 
   get ignoredUserFiles(): string[] {
-    const value = setting<string[]>("ignoredUserFiles", []);
-    return Array.isArray(value)
-      ? value.filter((entry): entry is string => typeof entry === "string")
-      : [];
+    return stringArray(setting<string[]>("ignoredUserFiles", []));
   }
 
   get maxPayloadBytes(): number {
@@ -165,6 +174,12 @@ export class ExtensionConfiguration {
     await this.context.globalState.update(REPOSITORY_ID_KEY, undefined);
     await this.context.globalState.update(WORKSPACE_MAPPINGS_KEY, undefined);
   }
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string")
+    : [];
 }
 
 function masterKeySecret(repositoryId: string): string {

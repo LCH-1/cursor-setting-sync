@@ -1,3 +1,4 @@
+import type { Dirent } from "node:fs";
 import { readFile, readdir, stat } from "node:fs/promises";
 import { basename, join, relative } from "node:path";
 import type {
@@ -37,23 +38,40 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
   constructor(
     private readonly paths: CursorPaths,
     private readonly workspaceMappings: Record<string, string> = {},
+    /**
+     * The publish limit. Capturing a database larger than what can ever be
+     * published only burns minutes of IO before the publish side skips it, so
+     * the capture stops at the same number.
+     */
+    private readonly maxPayloadBytes: number | undefined = undefined,
   ) {}
 
   async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
     const snapshots: ResourceSnapshot[] = [];
     const warnings: string[] = [];
-    const workspaceUris = new Map(
-      (await discoverWorkspaces(this.paths)).map((workspace) => [
-        workspace.id,
-        workspace.uri,
-      ]),
-    );
+    // The URI map is snapshot metadata, not a precondition. Letting an
+    // unreadable workspaceStorage root reject here dropped the backup of every
+    // workspace, which is exactly the failure this adapter must not have.
+    let workspaceUris = new Map<string, string>();
+    try {
+      workspaceUris = new Map(
+        (await discoverWorkspaces(this.paths)).map((workspace) => [
+          workspace.id,
+          workspace.uri,
+        ]),
+      );
+    } catch (error) {
+      warnings.push(formatScanWarning(this.paths.workspaceStorageRoot, error));
+    }
     const mappingTargets = new Set(Object.values(this.workspaceMappings));
     const candidates = new Map<string, WorkspaceStorageCandidate>();
 
-    for (const path of await listBackedUpWorkspaceStoragePaths(
+    const listed = await listBackedUpWorkspaceStoragePaths(
       this.paths.workspaceStorageRoot,
-    )) {
+    );
+    warnings.push(...listed.warnings);
+
+    for (const path of listed.paths) {
       try {
         const actualRelativePath = normalizeResourcePath(
           relative(this.paths.workspaceStorageRoot, path),
@@ -126,6 +144,7 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
               candidate.path,
               candidate.canonicalRelativePath.split("/")[0] ?? "",
               candidate.actualWorkspaceId,
+              this.maxPayloadBytes,
             )
           : await readStableFile(candidate.path);
         warnings.push(
@@ -161,36 +180,63 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
   }
 }
 
-async function listBackedUpWorkspaceStoragePaths(root: string): Promise<string[]> {
+/**
+ * Enumerates the backed-up files under every workspaceStorage directory.
+ *
+ * A single locked, hydrating or permission-denied directory used to reject the
+ * whole listing, which made the adapter throw and dropped the backup of *every*
+ * workspace for that run — and since this adapter only scans at shutdown, the
+ * next chance was the next clean exit. Each workspace is therefore enumerated
+ * on its own and a failure is reported as a warning naming that workspace. This
+ * adapter emits no deletions, so a partial listing is safe.
+ */
+async function listBackedUpWorkspaceStoragePaths(
+  root: string,
+): Promise<{ paths: string[]; warnings: string[] }> {
   if (!(await pathExists(root))) {
-    return [];
+    return { paths: [], warnings: [] };
   }
   const paths: string[] = [];
-  const workspaces = await readdir(root, { withFileTypes: true });
+  const warnings: string[] = [];
+  let workspaces: Dirent[];
+  try {
+    workspaces = await readdir(root, { withFileTypes: true });
+  } catch (error) {
+    return { paths: [], warnings: [formatScanWarning(root, error)] };
+  }
   for (const workspace of workspaces) {
     if (!workspace.isDirectory() || workspace.isSymbolicLink()) {
       continue;
     }
     const workspaceRoot = join(root, workspace.name);
-    const entries = await readdir(workspaceRoot, { withFileTypes: true });
-    for (const entry of entries) {
-      const lowerName = entry.name.toLowerCase();
-      if (
-        entry.isFile() &&
-        !entry.isSymbolicLink() &&
-        ["state.vscdb", "notepads.json"].includes(lowerName)
-      ) {
-        paths.push(join(workspaceRoot, entry.name));
-      } else if (
-        entry.isDirectory() &&
-        !entry.isSymbolicLink() &&
-        lowerName === "images"
-      ) {
-        paths.push(...(await listFilesRecursively(join(workspaceRoot, entry.name))));
+    try {
+      const entries = await readdir(workspaceRoot, { withFileTypes: true });
+      for (const entry of entries) {
+        const lowerName = entry.name.toLowerCase();
+        if (
+          entry.isFile() &&
+          !entry.isSymbolicLink() &&
+          ["state.vscdb", "notepads.json"].includes(lowerName)
+        ) {
+          paths.push(join(workspaceRoot, entry.name));
+        } else if (
+          entry.isDirectory() &&
+          !entry.isSymbolicLink() &&
+          lowerName === "images"
+        ) {
+          paths.push(
+            ...(await listFilesRecursively(join(workspaceRoot, entry.name))),
+          );
+        }
       }
+    } catch (error) {
+      warnings.push(formatScanWarning(workspaceRoot, error));
     }
   }
-  return paths.sort((left, right) => left.localeCompare(right));
+  return {
+    paths: paths.sort((left, right) => left.localeCompare(right)),
+    warnings,
+  };
 }
 
 export function validateWorkspaceStorageRelativePath(
@@ -280,6 +326,7 @@ async function snapshotWorkspaceDatabase(
   path: string,
   canonicalWorkspaceId: string,
   databaseWorkspaceId: string,
+  maxPayloadBytes: number | undefined,
 ): Promise<{ content: Buffer; mtimeMs: number; warnings: string[] }> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const before = await workspaceStorageTimestamp(path, true);
@@ -287,8 +334,23 @@ async function snapshotWorkspaceDatabase(
       workspaceId: canonicalWorkspaceId,
       databaseWorkspaceId,
       includeComposerHeaders: true,
+      ...(maxPayloadBytes === undefined
+        ? {}
+        : { limits: { maxPlainBytes: maxPayloadBytes } }),
     });
     const content = serializeWorkspaceDatabaseSnapshot(captured.snapshot);
+    // The capture limit counts DECODED bytes, but the payload is base64 inside
+    // JSON — roughly 4/3 of the blobs plus structure. A database that passed
+    // capture can therefore still be far above the publish limit, and letting
+    // it reach `publish` used to throw away the entire shutdown export. Only
+    // the serialized buffer can be compared against the limit that matters.
+    if (maxPayloadBytes !== undefined && content.byteLength > maxPayloadBytes) {
+      throw new Error(
+        `the snapshot serializes to ${content.byteLength} bytes, above the ${maxPayloadBytes} byte payload limit. ` +
+          'Raise "cursorSettingSync.maxPayloadMiB" to cover it, or set ' +
+          '"cursorSettingSync.syncWorkspaceStorage" to false. Everything else in this export still synchronized.',
+      );
+    }
     const after = await workspaceStorageTimestamp(path, true);
     if (before === after) {
       return {

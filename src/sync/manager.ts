@@ -2,9 +2,13 @@ import { basename, isAbsolute, join, relative } from "node:path";
 import { readdir, rm } from "node:fs/promises";
 import * as vscode from "vscode";
 import {
+  AUTOMATIC_CHECKPOINT_COOLDOWN_MS,
+  AUTOMATIC_CHECKPOINT_EVENT_THRESHOLD,
   BACKUP_DIRECTORY,
+  CONFLICTED_REPUBLISH_INTERVAL_MS,
   MAX_APPLY_BATCH_BYTES,
   REPOSITORY_FILE,
+  SYNC_INDICATOR_DELAY_MS,
 } from "../constants";
 import type {
   AbsorbedCheckpoint,
@@ -34,7 +38,7 @@ import {
   pathExists,
   readJsonFile,
 } from "../platform/files";
-import { acquireFileLock } from "../platform/lock";
+import { acquireFileLock, describeLockHolder } from "../platform/lock";
 import {
   GitError,
   cloneRepository,
@@ -60,6 +64,7 @@ import type {
 } from "../protocol/repository";
 import {
   EventReconciler,
+  compareTips,
   parentsForLocalChange,
   type ResourceProjection,
 } from "../protocol/reconciler";
@@ -68,7 +73,12 @@ import type {
   ResourceApplyInput,
   ResourceApplyResult,
 } from "../resources/resource";
-import { SettingsAdapter, collectMachineScopedSettings } from "../resources/settings";
+import {
+  DEFAULT_IGNORED_SETTINGS,
+  SettingsAdapter,
+  collectMachineScopedSettings,
+  createSettingsIgnoreMatcher,
+} from "../resources/settings";
 import { ProfileFilesAdapter } from "../resources/profileFiles";
 import {
   CursorUserFilesAdapter,
@@ -76,7 +86,15 @@ import {
 } from "../resources/cursorUserFiles";
 import { ProfilesAdapter } from "../resources/profiles";
 import { UiStateAdapter } from "../resources/uiState";
-import { ExtensionsAdapter } from "../resources/extensions";
+import { mergeUiStateBuffers } from "../resources/uiStateMerge";
+import {
+  isPolicyExcludedUiStateKey,
+  normalizeIgnoredUiStateKeys,
+} from "../resources/uiStatePolicy";
+import {
+  ExtensionsAdapter,
+  createExtensionIgnoreMatcher,
+} from "../resources/extensions";
 import {
   WorkspaceStorageAdapter,
   isWorkspaceStateDatabasePath,
@@ -97,7 +115,7 @@ import {
   parseWorkspaceDatabaseSnapshot,
   serializeWorkspaceDatabaseSnapshot,
 } from "../helper/workspaceDatabaseMerge";
-import type { StatusController } from "../ui/status";
+import type { StatusController, SyncStatus } from "../ui/status";
 import type {
   ConflictController,
   ConflictResolutionResult,
@@ -105,7 +123,10 @@ import type {
 import { mergeJsoncBuffers, parseJsonc } from "../resources/jsonc";
 import { mergeTextBuffers } from "../resources/text";
 import { sha256 } from "../protocol/canonical";
-import { isRepositoryPayloadFile } from "./watch";
+import {
+  isRepositoryPayloadFile,
+  repositoryPayloadFileName,
+} from "./watch";
 import {
   createRepositoryWatcher,
   type RepositoryWatcher,
@@ -114,11 +135,26 @@ import {
   absorbedCheckpointManifest,
   effectiveTipProducer,
   effectiveVersionProducer,
+  filterPublishableChanges,
+  formatBytes,
   isSyntheticTip,
+  oversizedPayloadWarning,
   producerAsMetadata,
+  publishInBatches,
   shouldPublishSnapshot,
 } from "./versionPolicy";
 import { assertSafeRepositoryLocation } from "./repositoryPath";
+import {
+  AUTO_MERGE_WARNING_SOURCE,
+  HELPER_WARNING_SOURCE,
+  PUBLISH_WARNING_SOURCE,
+  RECONCILER_WARNING_SOURCE,
+  StandingWarningRegistry,
+  formatWarningLine,
+  isPublishWarningSource,
+  publishWarningSource,
+  standingWarningDiagnostics,
+} from "./warningLog";
 import {
   isChatResourceKind,
   resourceConfigurationBlockReason,
@@ -159,6 +195,19 @@ export class SyncManager implements vscode.Disposable {
   private readonly historyDocuments = new Map<string, string>();
   private readonly historyPreviewRegistration: vscode.Disposable;
   private readonly gitWarningsShown = new Set<GitErrorKind>();
+  private readonly warnings = new StandingWarningRegistry();
+  /**
+   * Resource id -> epoch ms of the last time this device republished its own
+   * tip while that resource was in an unresolved conflict. See
+   * {@link throttleConflictedRepublish}. Deliberately in memory only: the loop
+   * it bounds is a steady state inside one long-lived extension host, and a
+   * window reload costs at most one extra event per conflicted resource, which
+   * is not worth a local-state schema change and its migration.
+   */
+  private readonly conflictedRepublishAt = new Map<string, number>();
+  private syncIndicatorTimer: NodeJS.Timeout | null = null;
+  private automaticMaintenanceAt = 0;
+  private maintenanceRequested = false;
   private largeFileCheckAt = 0;
   private disposed = false;
 
@@ -200,19 +249,27 @@ export class SyncManager implements vscode.Disposable {
       return;
     }
     await this.openConfiguredRepository(masterKey);
-    if (this.configuration.enabled) {
-      await this.syncNow(false);
-      await this.startFinalizer();
-      this.startWatching();
+    if (!this.configuration.enabled) {
+      // Configured, unlocked, and deliberately paused. Leaving the constructor
+      // default in place made the status bar read "Setup" on every restart and
+      // sent a click into the first-run wizard.
+      this.status.setStatus("disabled");
+      return;
     }
+    await this.syncNow(false);
+    await this.startFinalizer();
+    this.startWatching();
   }
 
   async configurationChanged(): Promise<void> {
-    this.adapters = this.createAdapters();
+    this.refreshAdapters();
+    if (this.repository !== null) {
+      this.syncRepositoryLimit(this.repository);
+    }
     if (!this.configuration.enabled) {
       this.disposeRuntime();
       await this.helper.cancelFinalizers();
-      this.status.setStatus("up-to-date", "Automatic synchronization is disabled.");
+      this.status.setStatus("disabled");
       return;
     }
     await this.startFinalizer();
@@ -298,21 +355,31 @@ export class SyncManager implements vscode.Disposable {
     this.disposeRuntime();
     this.masterKey?.fill(0);
     try {
-      this.repository = exists
-        ? await SyncRepository.open(
-            root,
-            this.paths.extensionStorage,
-            passphrase,
-            this.configuration.maxPayloadBytes,
-            this.producer,
-          )
-        : await SyncRepository.create(
-            root,
-            this.paths.extensionStorage,
-            passphrase,
-            this.configuration.maxPayloadBytes,
-            this.producer,
+      this.repository = await this.withProgress(
+        "Cursor Setting Sync: Setup",
+        async (report) => {
+          report(
+            exists
+              ? "Unlocking the repository (deriving the encryption key)..."
+              : "Creating the repository (deriving the encryption key)...",
           );
+          return exists
+            ? SyncRepository.open(
+                root,
+                this.paths.extensionStorage,
+                passphrase,
+                this.configuration.maxPayloadBytes,
+                this.producer,
+              )
+            : SyncRepository.create(
+                root,
+                this.paths.extensionStorage,
+                passphrase,
+                this.configuration.maxPayloadBytes,
+                this.producer,
+              );
+        },
+      );
     } catch (error) {
       // Leaving the git shell behind would make the folder non-empty, so a
       // retry could never reach the storage-mode picker again.
@@ -330,15 +397,20 @@ export class SyncManager implements vscode.Disposable {
       this.repository.repository.repositoryId,
       this.masterKey,
     );
-    this.adapters = this.createAdapters();
-    if (await this.gitModeFor(root)) {
-      await this.commitGitWindow(true, root, "initial sync repository");
-    }
-    await this.syncNow(true);
-    await this.startFinalizer();
+    this.refreshAdapters();
+    await this.withProgress("Cursor Setting Sync: Setup", async (report) => {
+      if (await this.gitModeFor(root)) {
+        report("Committing the initial repository...");
+        await this.commitGitWindow(true, root, "initial sync repository");
+      }
+      report("Scanning local resources and synchronizing...");
+      await this.syncNow(true);
+      report("Preparing the offline helper...");
+      await this.startFinalizer();
+    });
     this.startWatching();
     void vscode.window.showInformationMessage(
-      "Cursor Setting Sync is configured. The check mark confirms a local shared-folder write, not OneDrive cloud upload completion. The encrypted sync set includes ~/.cursor/mcp.json and cli-config.json, which may contain API keys.",
+      'Cursor Setting Sync is configured. The check mark confirms a local shared-folder write, not OneDrive cloud upload completion. The encrypted sync set includes ~/.cursor/mcp.json and cli-config.json, which may contain API keys - add them to "cursorSettingSync.ignoredUserFiles" to keep them on this device only.',
     );
   }
 
@@ -398,12 +470,100 @@ export class SyncManager implements vscode.Disposable {
       return true;
     }
     const remoteUrl = url.trim();
-    if (choice.value === "clone") {
-      await cloneRepository(remoteUrl, root);
-    } else {
+    await this.withProgress("Cursor Setting Sync: Setup", async (report) => {
+      if (choice.value === "clone") {
+        report(`Cloning ${remoteUrl}...`);
+        await cloneRepository(remoteUrl, root);
+        return;
+      }
+      report("Initializing the git repository...");
       await initRepository(root, remoteUrl.length === 0 ? null : remoteUrl);
-    }
+    });
     return true;
+  }
+
+  /**
+   * Runs `task` behind a notification progress indicator.
+   *
+   * Setup can clone a multi-gigabyte git repository, derive a scrypt key at
+   * N=131072 and then run a full first sync; archiving copies the repository
+   * file by file. All of that used to happen between a closing input box and a
+   * completion toast, with nothing on screen in between, which is exactly how
+   * a user concludes the command failed and restarts Cursor mid-clone.
+   */
+  private async withProgress<T>(
+    title: string,
+    task: (report: (message: string) => void) => Promise<T>,
+  ): Promise<T> {
+    return vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title,
+        cancellable: false,
+      },
+      async (progress) =>
+        task((message: string) => {
+          progress.report({ message });
+        }),
+    );
+  }
+
+  /** The `cursorSync.syncNow` command: a manual sync with visible progress. */
+  async syncNowCommand(): Promise<void> {
+    await this.withProgress("Cursor Setting Sync", async (report) => {
+      report("Synchronizing...");
+      await this.syncNow(true);
+    });
+  }
+
+  /**
+   * Clears the local configuration: the stored master key, the repository path
+   * and ID, and the workspace mappings. Nothing in the shared folder is
+   * touched.
+   *
+   * Without this there was no way to stop syncing, switch repositories, or
+   * recover from a stored key that no longer matches the folder - that last
+   * one failed at every startup with "The configured folder now contains a
+   * different repository." and no stated remedy.
+   */
+  async disconnect(): Promise<void> {
+    if (this.configuration.repositoryPath === null) {
+      void vscode.window.showInformationMessage(
+        'Cursor Setting Sync is not connected to a repository, so there is nothing to disconnect. Run "Cursor Setting Sync: Setup" to connect one.',
+      );
+      return;
+    }
+    const proceed = "Disconnect";
+    const confirmed = await vscode.window.showWarningMessage(
+      `Stop synchronizing with ${this.configuration.repositoryPath}? The shared folder and its history are left untouched; this device forgets the repository, its encryption key and its workspace mappings. Run Setup again to reconnect.`,
+      { modal: true },
+      proceed,
+    );
+    if (confirmed !== proceed) {
+      return;
+    }
+    // Stop the timers first, then let an in-flight cycle finish before the
+    // repository is dropped. Tearing down underneath it would publish into the
+    // shared folder after the user was told this device had disconnected.
+    this.disposeRuntime();
+    try {
+      await this.syncPromise;
+    } catch {
+      // A failing final cycle has already recorded its own error; it must not
+      // block the disconnect the user asked for.
+    }
+    await this.helper.cancelFinalizers();
+    this.repository = null;
+    this.masterKey?.fill(0);
+    this.masterKey = null;
+    this.adapters = [];
+    this.warnings.clear();
+    await this.configuration.clearRepository();
+    this.status.setStatus("unconfigured");
+    this.status.log("Disconnected from the synchronization repository.");
+    void vscode.window.showInformationMessage(
+      "Cursor Setting Sync is disconnected. Run \"Cursor Setting Sync: Setup\" to connect again.",
+    );
   }
 
   async syncNow(
@@ -428,6 +588,70 @@ export class SyncManager implements vscode.Disposable {
       this.pendingManualSync = false;
       await this.performSync(manual, scope);
     }
+    // Outside the cycle, because the maintenance phases take the same lock the
+    // cycle holds.
+    await this.runRequestedMaintenance();
+  }
+
+  /**
+   * Decides whether the repository has accumulated enough history to fold.
+   *
+   * Checkpointing used to be reachable only from a command nothing scheduled,
+   * so an active user's event log and blob store grew without bound and every
+   * cycle got slower as they did - and the only hint was a line in "Show
+   * Repository Usage". The gates the manual path uses (a warning-free
+   * reconcile, no unresolved conflicts, every device acked, a 24-hour-old
+   * checkpoint) all still apply; this only decides when to try.
+   */
+  private async noteMaintenanceNeed(
+    repository: SyncRepository,
+    reconcileWarnings: readonly string[],
+  ): Promise<void> {
+    if (
+      this.maintenanceRequested ||
+      reconcileWarnings.length > 0 ||
+      unresolvedConflicts(repository).length > 0 ||
+      repository.state.pendingDatabaseChanges.length > 0 ||
+      Date.now() - this.automaticMaintenanceAt < AUTOMATIC_CHECKPOINT_COOLDOWN_MS
+    ) {
+      return;
+    }
+    if (
+      (await repository.countEvents()) < AUTOMATIC_CHECKPOINT_EVENT_THRESHOLD
+    ) {
+      return;
+    }
+    this.maintenanceRequested = true;
+  }
+
+  private async runRequestedMaintenance(): Promise<void> {
+    if (!this.maintenanceRequested || this.disposed) {
+      return;
+    }
+    this.maintenanceRequested = false;
+    const repository = this.repository;
+    if (repository === null) {
+      return;
+    }
+    // The clock starts whether or not the attempt succeeds: every phase is
+    // gated on conditions this device cannot force, and retrying them on the
+    // next poll would be the same work for the same answer.
+    this.automaticMaintenanceAt = Date.now();
+    this.status.log(
+      "Automatic repository maintenance: folding history into a checkpoint.",
+    );
+    try {
+      const outcome = await this.runCheckpointPhases(repository, false);
+      this.status.log(
+        `Automatic repository maintenance: ${describeCheckpointOutcome(outcome)}`,
+      );
+    } catch (error) {
+      this.status.log(
+        `Automatic repository maintenance was skipped: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   async restartToApply(): Promise<void> {
@@ -435,9 +659,9 @@ export class SyncManager implements vscode.Disposable {
     const masterKey = this.requireMasterKey();
     assertCompatibleForDatabaseWrite(this.compatibility);
     await this.syncNow(true);
-    const lock = await acquireFileLock(join(this.paths.extensionStorage, "sync.lock"));
+    const lock = await acquireFileLock(this.syncLockPath());
     if (lock === null) {
-      throw new Error("Synchronization is currently busy.");
+      throw await this.synchronizationBusyError();
     }
     let changes: HelperChange[];
     try {
@@ -478,10 +702,10 @@ export class SyncManager implements vscode.Disposable {
   async resolveConflicts(): Promise<void> {
     const repository = this.requireRepository();
     const refreshLock = await acquireFileLock(
-      join(this.paths.extensionStorage, "sync.lock"),
+      this.syncLockPath(),
     );
     if (refreshLock === null) {
-      throw new Error("Synchronization is currently busy.");
+      throw await this.synchronizationBusyError();
     }
     try {
       await this.openGitWindow(repository);
@@ -510,10 +734,10 @@ export class SyncManager implements vscode.Disposable {
     };
     if (collected.selections.length > 0) {
       const lock = await acquireFileLock(
-        join(this.paths.extensionStorage, "sync.lock"),
+        this.syncLockPath(),
       );
       if (lock === null) {
-        throw new Error("Synchronization is currently busy.");
+        throw await this.synchronizationBusyError();
       }
       try {
         const gitActive = await this.openGitWindow(repository);
@@ -561,10 +785,10 @@ export class SyncManager implements vscode.Disposable {
   async restoreVersion(): Promise<void> {
     const repository = this.requireRepository();
     const refreshLock = await acquireFileLock(
-      join(this.paths.extensionStorage, "sync.lock"),
+      this.syncLockPath(),
     );
     if (refreshLock === null) {
-      throw new Error("Synchronization is currently busy.");
+      throw await this.synchronizationBusyError();
     }
     try {
       await this.openGitWindow(repository);
@@ -697,10 +921,10 @@ export class SyncManager implements vscode.Disposable {
       return;
     }
     const lock = await acquireFileLock(
-      join(this.paths.extensionStorage, "sync.lock"),
+      this.syncLockPath(),
     );
     if (lock === null) {
-      throw new Error("Synchronization is currently busy.");
+      throw await this.synchronizationBusyError();
     }
     try {
       const gitActive = await this.openGitWindow(repository);
@@ -845,10 +1069,60 @@ export class SyncManager implements vscode.Disposable {
       deviceId: repository?.state.device.deviceId ?? null,
       pendingDatabaseChanges:
         repository?.state.pendingDatabaseChanges.length ?? 0,
+      // The counts alone were undebuggable: "3 deferred" with no way to learn
+      // which resources, why, or which PC to update.
+      pending: (repository?.state.pendingDatabaseChanges ?? []).map(
+        (pending) => ({
+          resourceId: pending.resourceId,
+          kind: pending.kind,
+          blockedReason: pending.blockedReason ?? null,
+        }),
+      ),
       conflicts:
         repository?.state.conflicts.filter(
           (conflict) => conflict.resolvedAt === undefined,
         ).length ?? 0,
+      conflictResourceIds:
+        repository === null
+          ? []
+          : unresolvedConflicts(repository).map(
+              (conflict) => conflict.resourceId,
+            ),
+      effectiveConfiguration: {
+        enabled: this.configuration.enabled,
+        pollIntervalSeconds: this.configuration.pollIntervalSeconds,
+        chatPollIntervalSeconds: this.configuration.chatPollIntervalSeconds,
+        autoApplyFiles: this.configuration.autoApplyFiles,
+        syncChat: this.configuration.syncChat,
+        syncWorkspaceStorage: this.configuration.syncWorkspaceStorage,
+        gitSync: this.configuration.gitSync,
+        maxPayloadMiB: Math.round(
+          this.configuration.maxPayloadBytes / (1024 * 1024),
+        ),
+        useDefaultIgnoredSettings: this.configuration.useDefaultIgnoredSettings,
+        ignoredSettings: this.configuration.ignoredSettings,
+        ignoredExtensions: this.configuration.ignoredExtensions,
+        ignoredUserFiles: this.configuration.ignoredUserFiles,
+        ignoredUiStateKeys: this.configuration.ignoredUiStateKeys,
+      },
+      defaultIgnoredSettings: this.configuration.useDefaultIgnoredSettings
+        ? [...DEFAULT_IGNORED_SETTINGS]
+        : [],
+      machineScopedSettings: this.machineSpecificSettingPatterns().sort(
+        (left, right) => left.localeCompare(right),
+      ),
+      gitMode:
+        this.gitWarningsShown.size > 0
+          ? "degraded"
+          : this.configuration.gitSync
+            ? "enabled"
+            : "off",
+      workspaceMappings: this.configuration.workspaceMappings,
+      adapters: this.adapters.map((adapter) => adapter.id).sort(),
+      standingWarnings: standingWarningDiagnostics(
+        this.warnings.standing(),
+        Date.now(),
+      ),
       lastSyncAt: repository?.state.lastSyncAt ?? null,
       lastError: repository?.state.lastError ?? null,
       ...(repository === null
@@ -930,10 +1204,10 @@ export class SyncManager implements vscode.Disposable {
   async forgetDevice(): Promise<void> {
     const repository = this.requireRepository();
     const firstLock = await acquireFileLock(
-      join(this.paths.extensionStorage, "sync.lock"),
+      this.syncLockPath(),
     );
     if (firstLock === null) {
-      throw new Error("Synchronization is currently busy.");
+      throw await this.synchronizationBusyError();
     }
     let candidates: Array<{
       label: string;
@@ -973,10 +1247,10 @@ export class SyncManager implements vscode.Disposable {
       return;
     }
     const secondLock = await acquireFileLock(
-      join(this.paths.extensionStorage, "sync.lock"),
+      this.syncLockPath(),
     );
     if (secondLock === null) {
-      throw new Error("Synchronization is currently busy.");
+      throw await this.synchronizationBusyError();
     }
     try {
       const gitActive = await this.openGitWindow(repository);
@@ -1010,10 +1284,20 @@ export class SyncManager implements vscode.Disposable {
   }
 
   async compactRepository(): Promise<void> {
+    await this.withProgress(
+      "Cursor Setting Sync: Compact Safe Orphans",
+      async (report) => {
+        report("Reading the repository...");
+        await this.compactSafeOrphans();
+      },
+    );
+  }
+
+  private async compactSafeOrphans(): Promise<void> {
     const repository = this.requireRepository();
-    const lock = await acquireFileLock(join(this.paths.extensionStorage, "sync.lock"));
+    const lock = await acquireFileLock(this.syncLockPath());
     if (lock === null) {
-      throw new Error("Synchronization is currently busy.");
+      throw await this.synchronizationBusyError();
     }
     try {
       const gitActive = await this.openGitWindow(repository);
@@ -1067,13 +1351,25 @@ export class SyncManager implements vscode.Disposable {
     repository: SyncRepository,
     overrideAgeGate: boolean,
   ): Promise<CheckpointCommandOutcome> {
+    return this.withProgress(
+      "Cursor Setting Sync: Checkpoint & Prune History",
+      async (report) => this.checkpointPhases(repository, overrideAgeGate, report),
+    );
+  }
+
+  private async checkpointPhases(
+    repository: SyncRepository,
+    overrideAgeGate: boolean,
+    report: (message: string) => void,
+  ): Promise<CheckpointCommandOutcome> {
     const lock = await acquireFileLock(
-      join(this.paths.extensionStorage, "sync.lock"),
+      this.syncLockPath(),
     );
     if (lock === null) {
-      throw new Error("Synchronization is currently busy.");
+      throw await this.synchronizationBusyError();
     }
     try {
+      report("Reading the repository...");
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
       const reconciler = new EventReconciler();
@@ -1087,6 +1383,7 @@ export class SyncManager implements vscode.Disposable {
           `Checkpointing requires a fully propagated repository; resolve this stream warning first: ${result.warnings[0]}`,
         );
       }
+      report("Folding the current tips into a checkpoint...");
       if (
         repository.state.conflicts.some(
           (conflict) => conflict.resolvedAt === undefined,
@@ -1108,6 +1405,7 @@ export class SyncManager implements vscode.Disposable {
       if (created === null && repository.state.checkpoint === undefined) {
         return { created: null, prune: null, gitSquash: null };
       }
+      report("Pruning superseded history...");
       const prune = await repository.pruneWithGates({
         reconciledWithoutWarnings: true,
         ...(overrideAgeGate ? { overrideAgeGate: true } : {}),
@@ -1240,16 +1538,27 @@ export class SyncManager implements vscode.Disposable {
     ) {
       throw new Error("The archive destination must be outside the live repository.");
     }
-    for (const source of await listFilesRecursively(repository.root)) {
-      const relativePath = relative(repository.root, source);
-      await copyFileAtomic(source, join(destination, relativePath));
-    }
+    await this.withProgress(
+      "Cursor Setting Sync: Archive Repository",
+      async (report) => {
+        report("Enumerating repository files...");
+        const sources = await listFilesRecursively(repository.root);
+        let copied = 0;
+        for (const source of sources) {
+          const relativePath = relative(repository.root, source);
+          await copyFileAtomic(source, join(destination, relativePath));
+          copied += 1;
+          report(`Copying ${copied}/${sources.length} files...`);
+        }
+      },
+    );
     void vscode.window.showInformationMessage(`Repository archived to ${destination}`);
   }
 
   dispose(): void {
     this.disposed = true;
     this.disposeRuntime();
+    this.warnings.clear();
     this.historyPreviewRegistration.dispose();
     this.helper.dispose();
     this.masterKey?.fill(0);
@@ -1270,17 +1579,31 @@ export class SyncManager implements vscode.Disposable {
       }
       return;
     }
-    const lock = await acquireFileLock(join(this.paths.extensionStorage, "sync.lock"));
+    this.syncRepositoryLimit(repository);
+    const lock = await acquireFileLock(this.syncLockPath());
     if (lock === null) {
-      this.status.log("Skipped sync because another extension host or helper owns the lock.");
+      this.status.log(
+        `Skipped sync: ${await describeLockHolder(this.syncLockPath())}`,
+      );
+      // The other holder may own the lock continuously, so this window would
+      // otherwise keep displaying whatever it last computed — including a
+      // stale "up-to-date" while conflicts are outstanding.
+      this.updateStatus(repository);
       return;
     }
-    this.status.setStatus("syncing");
+    let failed = false;
+    this.beginSyncIndicator(repository);
     try {
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
       const checkpoint = await absorbedCheckpointManifest(repository);
       const reconciler = new EventReconciler();
+      // Auto-merge runs on every cycle regardless of scope, so its bucket is
+      // always observed, exactly like the reconciler's.
+      const mergeWarnings: string[] = [];
+      const noteMergeWarning = (warning: string): void => {
+        mergeWarnings.push(warning);
+      };
       let preResult = reconciler.reconcile(
         await repository.listEvents(),
         repository.state,
@@ -1294,6 +1617,7 @@ export class SyncManager implements vscode.Disposable {
             tips.every(
               (tip) => this.resourceApplyBlockReason(tip) === null,
             ),
+          noteMergeWarning,
         )
       ) {
         preResult = reconciler.reconcile(
@@ -1339,7 +1663,7 @@ export class SyncManager implements vscode.Disposable {
           )
           .map((projection) => projection.resourceId),
       );
-      const snapshots = scan.snapshots.filter(
+      const changedSnapshots = scan.snapshots.filter(
         (snapshot) =>
           !protectedSyntheticResources.has(snapshot.resourceId) &&
           shouldPublishSnapshot(
@@ -1361,6 +1685,22 @@ export class SyncManager implements vscode.Disposable {
               repository.state.tips[snapshot.resourceId] ?? [],
             ),
       }));
+      // A conflicted resource is excluded from the deletions filter below but
+      // not from this one, deliberately: the conflicted side keeps publishing
+      // its own tip. Volatile content turned that into one new event per poll
+      // forever, so the republish is rate-limited per resource.
+      const throttled = throttleConflictedRepublish(
+        changedSnapshots,
+        conflictedResources,
+        this.conflictedRepublishAt,
+        Date.now(),
+        CONFLICTED_REPUBLISH_INTERVAL_MS,
+      );
+      // Nothing is logged for a deferred resource: it would print on every
+      // poll for as long as the conflict stands, which is the log flood the
+      // standing-warning registry exists to prevent. The conflict itself is
+      // already on the status bar and in diagnostics.
+      const snapshots = throttled.publish;
       const deletions = scan.deletions.filter(
         (deletion) =>
           !conflictedResources.has(deletion.resourceId) &&
@@ -1379,8 +1719,34 @@ export class SyncManager implements vscode.Disposable {
           repository.state.tips[deletion.resourceId] ?? [],
         ),
       }));
-      const publishedCount = snapshots.length + deletions.length;
-      await repository.publish(snapshots, deletions);
+      // The guard has to be keyed to the number `publish` will actually
+      // enforce, not to a second live read of the setting. `syncRepositoryLimit`
+      // above has already pushed the current setting into the repository, so
+      // these are the same value by construction.
+      const publishable = filterPublishableChanges(
+        snapshots,
+        deletions,
+        repository.maxPayloadBytes,
+        (snapshot) => this.publishWarningSourceFor(snapshot.kind),
+      );
+      const publishedCount =
+        publishable.snapshots.length + publishable.deletions.length;
+      // A publish failure must not stop this device from *receiving*. The
+      // publish call used to sit in front of applyProjections, so one
+      // unpublishable resource stopped every other device's changes from being
+      // applied here as well, on every cycle, forever. The error is carried to
+      // the end of the cycle instead and rethrown once the inbound half is
+      // done.
+      let publishError: Error | null = null;
+      try {
+        await publishInBatches(
+          repository,
+          publishable.snapshots,
+          publishable.deletions,
+        );
+      } catch (error) {
+        publishError = error instanceof Error ? error : new Error(String(error));
+      }
 
       let result = reconciler.reconcile(
         await repository.listEvents(),
@@ -1395,6 +1761,7 @@ export class SyncManager implements vscode.Disposable {
             tips.every(
               (tip) => this.resourceApplyBlockReason(tip) === null,
             ),
+          noteMergeWarning,
         )
       ) {
         result = reconciler.reconcile(
@@ -1403,12 +1770,31 @@ export class SyncManager implements vscode.Disposable {
           checkpoint,
         );
       }
-      for (const warning of [
-        ...preResult.warnings,
-        ...scan.warnings,
-        ...result.warnings,
-      ]) {
-        this.status.log(`Warning: ${warning}`);
+      // Warnings are deduped per source. A cycle that did not run an adapter
+      // leaves that adapter's bucket untouched, so an alternating files/chat
+      // poll no longer makes every warning look fresh. The reconciler and
+      // auto-merge buckets are always observed because both are computed on
+      // every cycle regardless of scope; the publish buckets are not, because
+      // an oversized resource can only be re-observed by the adapter that owns
+      // it, so they are keyed and scoped per adapter.
+      const observed = new Map<string, readonly string[]>([
+        [
+          RECONCILER_WARNING_SOURCE,
+          [...new Set([...preResult.warnings, ...result.warnings])],
+        ],
+        [AUTO_MERGE_WARNING_SOURCE, mergeWarnings],
+        ...publishWarningObservation(
+          scan.warningsBySource.keys(),
+          publishable.warningsBySource,
+        ),
+        ...scan.warningsBySource,
+      ]);
+      for (const entry of this.warnings.observe({
+        sources: observed,
+        now: Date.now(),
+        force: manual,
+      })) {
+        this.status.log(formatWarningLine(entry));
       }
       prunePending(repository, result.projections);
       await this.applyProjections(
@@ -1429,52 +1815,81 @@ export class SyncManager implements vscode.Disposable {
       if (gitActive && publishedCount > 0) {
         await this.warnAboutLargeFiles(repository.root, true);
       }
-      this.updateStatus(repository);
+      await this.noteMaintenanceNeed(repository, result.warnings);
+      if (publishError !== null) {
+        throw publishError;
+      }
     } catch (error) {
-      repository.state.lastError =
+      failed = true;
+      const message =
         error instanceof Error ? error.stack ?? error.message : String(error);
-      await repository.saveState();
-      this.status.log(`Error: ${repository.state.lastError}`);
-      this.status.setStatus("error", repository.state.lastError);
+      // Only the error field is persisted: the failed operation may have left
+      // `repository.state` half-mutated, and writing that out is how a
+      // transient fault became a permanent fail-stop.
+      await repository.recordError(message);
+      this.status.log(`Error: ${message}`);
+      this.status.setStatus("error", message);
       if (manual) {
         throw error;
       }
     } finally {
+      // The terminal status is restored here rather than at the end of the try
+      // block so that no future early return can leave the spinner standing.
+      this.clearSyncIndicator();
+      if (!failed) {
+        this.updateStatus(repository);
+      }
       await lock.release();
     }
+  }
+
+  /**
+   * Arms the spinner instead of showing it. A cycle that finishes promptly
+   * never displaces the status the user can act on, and a conflict or a pending
+   * restart is never displaced at all — those outrank "work is happening".
+   */
+  private beginSyncIndicator(repository: SyncRepository): void {
+    this.clearSyncIndicator();
+    if (
+      unresolvedConflicts(repository).length > 0 ||
+      repository.state.pendingDatabaseChanges.length > 0
+    ) {
+      return;
+    }
+    this.syncIndicatorTimer = setTimeout(() => {
+      this.syncIndicatorTimer = null;
+      if (!this.disposed) {
+        this.status.setStatus("syncing");
+      }
+    }, SYNC_INDICATOR_DELAY_MS);
+  }
+
+  private clearSyncIndicator(): void {
+    if (this.syncIndicatorTimer !== null) {
+      clearTimeout(this.syncIndicatorTimer);
+      this.syncIndicatorTimer = null;
+    }
+  }
+
+  private syncLockPath(): string {
+    return join(this.paths.extensionStorage, "sync.lock");
+  }
+
+  /**
+   * The message every command shows when it cannot take the sync lock. It names
+   * the holder, its age and the file, so "busy" is something the user can act
+   * on rather than a dead end.
+   */
+  private async synchronizationBusyError(): Promise<Error> {
+    return new Error(await describeLockHolder(this.syncLockPath()));
   }
 
   private async scanLocalResources(
     known: Record<string, LocalProjection>,
     scope: SyncScope = "all",
     requiredKinds: ReadonlySet<ResourceKind> = new Set(),
-  ): Promise<{
-    snapshots: ResourceSnapshot[];
-    deletions: ResourceDeletion[];
-    warnings: string[];
-  }> {
-    const snapshots: ResourceSnapshot[] = [];
-    const deletions: ResourceDeletion[] = [];
-    const warnings: string[] = [];
-    for (const adapter of this.adapters.filter((candidate) =>
-      shouldScanAdapter(candidate, scope, requiredKinds),
-    )) {
-      // A failing adapter must not abort the whole cycle; deletions come only
-      // from completed scans, so skipping the adapter is safe.
-      try {
-        const result = await adapter.scan(known);
-        snapshots.push(...result.snapshots);
-        deletions.push(...result.deletions);
-        warnings.push(...result.warnings);
-      } catch (error) {
-        warnings.push(
-          `Adapter ${adapter.id} scan failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-    }
-    return { snapshots, deletions, warnings };
+  ): Promise<LocalScanResult> {
+    return scanAdapters(this.adapters, known, scope, requiredKinds);
   }
 
   private async applyProjections(
@@ -1501,6 +1916,18 @@ export class SyncManager implements vscode.Disposable {
         ) &&
         tip.operation === "delete"
       ) {
+        markProjection(repository, projection, local);
+        continue;
+      }
+      if (isPolicyExcludedUiStateResource(projection.resourceId, tip.kind)) {
+        // A peer running 0.0.1-0.0.3 published this key before it was excluded.
+        // Accept the version without writing it: the helper would skip it
+        // anyway, and queueing it only makes the user restart for a change that
+        // will never be applied.
+        this.status.log(
+          `Skipped ${projection.resourceId}: this key is excluded from ` +
+            "synchronization because it accumulates one dead entry per AI chat panel.",
+        );
         markProjection(repository, projection, local);
         continue;
       }
@@ -1845,6 +2272,18 @@ export class SyncManager implements vscode.Disposable {
     );
   }
 
+  /**
+   * The warning bucket an oversized resource of this kind belongs to: the
+   * adapter that produces it, because only a cycle that scans that adapter can
+   * ever report the resource as no longer oversized.
+   */
+  private publishWarningSourceFor(kind: ResourceKind): string {
+    const adapter = this.adapters.find((candidate) =>
+      candidate.kinds.includes(kind),
+    );
+    return publishWarningSource(adapter?.id ?? kind);
+  }
+
   private adapterFor(kind: ResourceKind): ResourceAdapter {
     const adapter = this.adapters.find((candidate) =>
       candidate.kinds.includes(kind),
@@ -1876,15 +2315,61 @@ export class SyncManager implements vscode.Disposable {
     }
   }
 
-  private createAdapters(): ResourceAdapter[] {
+  /**
+   * Rebuilds the adapter set and drops warning buckets whose adapter no longer
+   * exists. Turning off chat sync or losing database compatibility removes
+   * adapters, and nothing would ever clear their standing warnings again.
+   */
+  private refreshAdapters(): void {
+    this.adapters = this.createAdapters();
+    this.warnings.retainSources(
+      new Set([
+        RECONCILER_WARNING_SOURCE,
+        AUTO_MERGE_WARNING_SOURCE,
+        PUBLISH_WARNING_SOURCE,
+        // Not tied to any adapter: the helper reports for a process that has
+        // already exited, and turning an adapter off cannot make what it found
+        // untrue.
+        HELPER_WARNING_SOURCE,
+        ...this.adapters.flatMap((adapter) => [
+          adapter.id,
+          publishWarningSource(adapter.id),
+        ]),
+      ]),
+    );
+  }
+
+  /**
+   * Every setting key this device refuses to publish because it describes the
+   * machine rather than a preference: the built-in default list plus whatever
+   * the installed extensions declare as `machine`-scoped. The defaults matter
+   * because VS Code registers `window.zoomLevel`, the terminal profiles, the
+   * proxy keys and `remote.SSH.*` in workbench code, where no package.json
+   * scan can ever see them.
+   */
+  machineSpecificSettingPatterns(): string[] {
     const packageJson: unknown[] = vscode.extensions.all.map(
       (extension): unknown => extension.packageJSON as unknown,
     );
+    return [
+      ...(this.configuration.useDefaultIgnoredSettings
+        ? DEFAULT_IGNORED_SETTINGS
+        : []),
+      ...collectMachineScopedSettings(packageJson),
+    ];
+  }
+
+  private createAdapters(): ResourceAdapter[] {
     const adapters: ResourceAdapter[] = [
       new SettingsAdapter(
         this.paths,
-        new Set(this.configuration.ignoredSettings),
-        collectMachineScopedSettings(packageJson),
+        createSettingsIgnoreMatcher(this.configuration.ignoredSettings),
+        createSettingsIgnoreMatcher(this.machineSpecificSettingPatterns()),
+        createSettingsIgnoreMatcher(
+          this.configuration.useDefaultIgnoredSettings
+            ? [...DEFAULT_IGNORED_SETTINGS]
+            : [],
+        ),
       ),
       new ProfileFilesAdapter(this.paths),
       new CursorUserFilesAdapter(
@@ -1894,17 +2379,19 @@ export class SyncManager implements vscode.Disposable {
       new WorkspaceStorageAdapter(
         this.paths,
         this.configuration.workspaceMappings,
+        this.configuration.maxPayloadBytes,
       ),
     ];
     if (this.compatibility.compatible) {
       adapters.push(
         new ProfilesAdapter(this.paths),
-        new UiStateAdapter(this.paths),
+        new UiStateAdapter(
+          this.paths,
+          normalizeIgnoredUiStateKeys(this.configuration.ignoredUiStateKeys),
+        ),
         new ExtensionsAdapter(
           this.paths,
-          new Set(
-            this.configuration.ignoredExtensions.map((id) => id.toLowerCase()),
-          ),
+          createExtensionIgnoreMatcher(this.configuration.ignoredExtensions),
         ),
       );
     }
@@ -1933,7 +2420,9 @@ export class SyncManager implements vscode.Disposable {
       this.configuration.repositoryId !== null &&
       repositoryFile.repositoryId !== this.configuration.repositoryId
     ) {
-      throw new Error("The configured folder now contains a different repository.");
+      throw new Error(
+        "The configured folder now contains a different repository. Point Setup at the original folder, or run \"Cursor Setting Sync: Disconnect\" to clear the stored repository and connect to this one.",
+      );
     }
     this.masterKey?.fill(0);
     this.masterKey = Buffer.from(masterKey);
@@ -1945,7 +2434,7 @@ export class SyncManager implements vscode.Disposable {
       this.configuration.maxPayloadBytes,
       this.producer,
     );
-    this.adapters = this.createAdapters();
+    this.refreshAdapters();
   }
 
   private synchronizedSourceRoots(): Array<{ label: string; path: string }> {
@@ -1988,6 +2477,17 @@ export class SyncManager implements vscode.Disposable {
         if (!isRepositoryPayloadFile(fileName)) {
           return;
         }
+        // A publish writes an event and one blob per changed resource into the
+        // watched tree, and the watcher reports them back. Reacting would run a
+        // second full cycle - state reload, full reconcile, state writes, an
+        // acks upload - for a change this device already applied.
+        if (
+          this.repository?.wroteRecently(
+            repositoryPayloadFileName(fileName),
+          ) === true
+        ) {
+          return;
+        }
         if (this.watcherDebounce !== null) {
           clearTimeout(this.watcherDebounce);
         }
@@ -2012,16 +2512,14 @@ export class SyncManager implements vscode.Disposable {
   }
 
   private helperSyncOptions(): HelperSyncOptions {
-    const packageJson: unknown[] = vscode.extensions.all.map(
-      (extension): unknown => extension.packageJSON as unknown,
-    );
     return {
       ignoredSettings: this.configuration.ignoredSettings,
       ignoredExtensions: this.configuration.ignoredExtensions,
       ignoredUserFiles: this.configuration.ignoredUserFiles,
-      machineScopedSettings: [
-        ...collectMachineScopedSettings(packageJson),
-      ],
+      ignoredUiStateKeys: this.configuration.ignoredUiStateKeys,
+      // Already includes the built-in defaults, so the helper applies exactly
+      // the same exclusions the extension host does.
+      machineScopedSettings: this.machineSpecificSettingPatterns(),
       syncChat: this.configuration.syncChat,
       syncWorkspaceStorage: this.configuration.syncWorkspaceStorage,
       maxPayloadBytes: this.configuration.maxPayloadBytes,
@@ -2054,12 +2552,18 @@ export class SyncManager implements vscode.Disposable {
       clearTimeout(this.watcherDebounce);
       this.watcherDebounce = null;
     }
+    this.clearSyncIndicator();
   }
 
   private updateStatus(repository: SyncRepository): void {
-    const activeConflicts = repository.state.conflicts.filter(
-      (conflict) => conflict.resolvedAt === undefined,
-    );
+    if (this.disposed || this.repository !== repository) {
+      // A cycle can still be draining when the extension host tears down, or
+      // after Disconnect swapped the repository out from under it. Reporting
+      // that stale repository's state would flip the status item back off
+      // "unconfigured" and offer commands the device can no longer run.
+      return;
+    }
+    const activeConflicts = unresolvedConflicts(repository);
     if (activeConflicts.length > 0) {
       this.status.setStatus(
         "conflict",
@@ -2079,17 +2583,47 @@ export class SyncManager implements vscode.Disposable {
             : "",
         ].filter((message) => message.length > 0).join(" "),
       );
+    } else if (!this.configuration.enabled) {
+      this.status.setStatus("disabled");
     } else {
-      this.status.setStatus("up-to-date");
+      // Nothing here is a hard failure, but "everything is fine" still has to
+      // account for every standing warning; see {@link settledStatus}.
+      const settled = settledStatus({
+        streamWarnings: this.warnings.standingFor(RECONCILER_WARNING_SOURCE)
+          .length,
+        publishWarnings: this.warnings.standingMatching(isPublishWarningSource)
+          .length,
+        helperWarnings: this.warnings.standingFor(HELPER_WARNING_SOURCE).length,
+        disabledKinds: this.disabledResourceKindSummary(),
+      });
+      this.status.setStatus(settled.status, settled.detail);
     }
   }
 
+  /**
+   * What is not synchronizing on this device at all, as one sentence. Empty
+   * when everything the configuration asks for is covered.
+   */
+  private disabledResourceKindSummary(): string {
+    if (this.compatibility.compatible) {
+      return "";
+    }
+    return (
+      "Profiles, UI state, extensions and chat are not synchronizing because " +
+      `this Cursor build does not support the required database access: ${
+        this.compatibility.reasons[0] ?? "unknown reason"
+      }`
+    );
+  }
+
   private async consumeHelperResults(): Promise<void> {
+    const consumed: HelperResult[] = [];
     for (const path of await listFilesRecursively(this.paths.extensionStorage)) {
       if (!basename(path).startsWith("helper-result-")) {
         continue;
       }
       const result = await readJsonFile<HelperResult>(path);
+      consumed.push(result);
       await this.recordHelperBackups(result);
       if (result.success) {
         this.status.log(
@@ -2109,6 +2643,33 @@ export class SyncManager implements vscode.Disposable {
         this.status.setStatus("error", result.error ?? "Offline helper failed.");
       }
       await rm(path, { force: true });
+    }
+    // The result file is deleted above, so this is the only chance to record
+    // what the helper reported. A warning raised here stands until a later
+    // helper run reports it gone: nothing else re-derives it, because nothing
+    // else can look at what a process that is no longer running found.
+    for (const entry of this.warnings.observe({
+      sources: helperWarningObservation(consumed),
+      now: Date.now(),
+    })) {
+      this.status.log(formatWarningLine(entry));
+    }
+    const helperWarnings = this.warnings.standingFor(
+      HELPER_WARNING_SOURCE,
+    ).length;
+    if (helperWarnings > 0 && consumed.every((result) => result.success)) {
+      // `initialize` consumes results before the repository is open, so the
+      // "partial" that `updateStatus` would set has to wait for the first
+      // successful cycle — and never arrives at all on a device that is locked
+      // or unconfigured. A failed result has already set "error", which is the
+      // more severe of the two and must not be downgraded here.
+      const settled = settledStatus({
+        streamWarnings: 0,
+        publishWarnings: 0,
+        helperWarnings,
+        disabledKinds: "",
+      });
+      this.status.setStatus(settled.status, settled.detail);
     }
   }
 
@@ -2236,7 +2797,24 @@ export class SyncManager implements vscode.Disposable {
     if (this.repository === null) {
       throw new Error("Cursor Setting Sync is not configured or unlocked.");
     }
-    return this.repository;
+    return this.syncRepositoryLimit(this.repository);
+  }
+
+  /**
+   * Pushes the current `cursorSettingSync.maxPayloadMiB` into the open
+   * repository.
+   *
+   * `configurationChanged` refreshes the adapters but never reopens the
+   * repository, and `openConfiguredRepository` is only reached from
+   * `initialize` and `setup`. Without this the repository kept enforcing
+   * whatever the setting was when Cursor started, while every guard read the
+   * setting live — so raising the limit (the remedy the oversized-payload
+   * warning names) made the guard admit a payload `publish` then rejected, on
+   * every poll, until Cursor was restarted.
+   */
+  private syncRepositoryLimit(repository: SyncRepository): SyncRepository {
+    repository.setMaxPayloadBytes(this.configuration.maxPayloadBytes);
+    return repository;
   }
 
   private requireMasterKey(): Buffer {
@@ -2247,9 +2825,182 @@ export class SyncManager implements vscode.Disposable {
   }
 }
 
-type SyncScope = "all" | "files" | "chat" | "remote";
+/** One-line summary of a checkpoint run, for the output channel. */
+function describeCheckpointOutcome(outcome: CheckpointCommandOutcome): string {
+  const parts: string[] = [];
+  if (outcome.created !== null) {
+    parts.push(
+      `created checkpoint ${outcome.created.checkpointHash.slice(0, 12)} folding ${outcome.created.resourceCount} resource(s)`,
+    );
+  }
+  if (outcome.prune === null) {
+    parts.push("nothing to prune");
+  } else if (outcome.prune.status === "pruned") {
+    parts.push(
+      `pruned ${outcome.prune.eventsDeleted} event file(s) and reclaimed ${formatBytes(outcome.prune.reclaimedBytes)}`,
+    );
+  } else {
+    parts.push(`pruning skipped (${outcome.prune.reason ?? "unknown reason"})`);
+  }
+  return `${parts.join("; ")}.`;
+}
 
-function shouldScanAdapter(
+function unresolvedConflicts(repository: SyncRepository): SyncConflict[] {
+  return repository.state.conflicts.filter(
+    (conflict) => conflict.resolvedAt === undefined,
+  );
+}
+
+export type SyncScope = "all" | "files" | "chat" | "remote";
+
+export interface LocalScanResult {
+  snapshots: ResourceSnapshot[];
+  deletions: ResourceDeletion[];
+  /**
+   * Keyed by adapter id. Present and empty means the adapter ran and produced
+   * nothing; absent means it did not run this cycle. The warning registry
+   * relies on that distinction to leave an unrun adapter's bucket alone.
+   */
+  warningsBySource: Map<string, string[]>;
+}
+
+export async function scanAdapters(
+  adapters: readonly ResourceAdapter[],
+  known: Record<string, LocalProjection>,
+  scope: SyncScope,
+  requiredKinds: ReadonlySet<ResourceKind>,
+): Promise<LocalScanResult> {
+  const snapshots: ResourceSnapshot[] = [];
+  const deletions: ResourceDeletion[] = [];
+  const warningsBySource = new Map<string, string[]>();
+  for (const adapter of adapters.filter((candidate) =>
+    shouldScanAdapter(candidate, scope, requiredKinds),
+  )) {
+    // A failing adapter must not abort the whole cycle; deletions come only
+    // from completed scans, so skipping the adapter is safe.
+    try {
+      const result = await adapter.scan(known);
+      snapshots.push(...result.snapshots);
+      deletions.push(...result.deletions);
+      warningsBySource.set(adapter.id, [...result.warnings]);
+    } catch (error) {
+      warningsBySource.set(adapter.id, [
+        `Adapter ${adapter.id} scan failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      ]);
+    }
+  }
+  return { snapshots, deletions, warningsBySource };
+}
+
+/**
+ * The status bar for a cycle with no conflict, no pending restart and sync
+ * switched on.
+ *
+ * A standing warning is not visible anywhere else once its log line scrolls
+ * away, so "everything is fine" has to account for every kind of them: a stream
+ * warning blocks compaction and checkpointing; an oversized resource never
+ * reaches the other devices; a whole resource kind can be switched off because
+ * the database capability is missing; and a helper warning means the shutdown
+ * half of the cycle dropped something — for workspaceStorage, the only backup
+ * path there is. A green check mark over any of those is the failure the user
+ * only notices weeks later.
+ */
+export function settledStatus(input: {
+  streamWarnings: number;
+  publishWarnings: number;
+  helperWarnings: number;
+  disabledKinds: string;
+}): { status: SyncStatus; detail?: string } {
+  const details = [
+    input.streamWarnings === 0
+      ? ""
+      : `${input.streamWarnings} stream warning(s) standing; compaction and checkpointing stay blocked.`,
+    input.publishWarnings === 0
+      ? ""
+      : `${input.publishWarnings} resource(s) are too large to publish.`,
+    input.helperWarnings === 0
+      ? ""
+      : `${input.helperWarnings} warning(s) from the last offline helper run; some resources were not saved to the repository.`,
+    input.disabledKinds,
+  ].filter((message) => message.length > 0);
+  if (details.length === 0) {
+    return { status: "up-to-date" };
+  }
+  return {
+    // A stream warning alone stays green-with-a-tooltip: it clears itself once
+    // the missing events propagate. The other three mean data is not moving.
+    status:
+      input.disabledKinds.length > 0 ||
+      input.publishWarnings > 0 ||
+      input.helperWarnings > 0
+        ? "partial"
+        : "up-to-date",
+    detail: `${details.join(" ")} Run "Cursor Setting Sync: Show Diagnostics".`,
+  };
+}
+
+/**
+ * The warning bucket a batch of consumed helper results is entitled to write.
+ *
+ * The offline helper is the only path that ever backs up workspaceStorage, and
+ * it runs after the extension host is gone, so a resource it drops for
+ * exceeding the payload limit is invisible unless the result carries the news
+ * back. A successful result used to produce a single output-channel line and a
+ * green check mark, which is quieter than the hard failure that guard replaced:
+ * the same workspace database was dropped on every shutdown, indefinitely.
+ *
+ * Returns an empty map — meaning "this source did not run, leave its bucket
+ * alone" — when no result in the batch reports warnings in the structured
+ * field. Results written by helpers older than 0.0.5 have no such field, and
+ * their `skipped` list mixes real problems with routine entries, so guessing
+ * would either invent warnings or clear standing ones that are still true.
+ */
+export function helperWarningObservation(
+  results: readonly HelperResult[],
+): Map<string, readonly string[]> {
+  const reported = results.filter((result) => result.warnings !== undefined);
+  if (reported.length === 0) {
+    return new Map();
+  }
+  // One bucket for the whole batch: a later helper run reporting no warnings
+  // is exactly what clears an earlier run's standing warning.
+  return new Map([
+    [
+      HELPER_WARNING_SOURCE,
+      [...new Set(reported.flatMap((result) => result.warnings ?? []))],
+    ],
+  ]);
+}
+
+/**
+ * The publish warning buckets this cycle is entitled to overwrite.
+ *
+ * `filterPublishableChanges` can only raise a warning for a resource the scan
+ * just produced, so a cycle that did not run an adapter cannot say anything
+ * about that adapter's oversized resources. Reporting one global publish bucket
+ * made every "chat" cycle clear the warning a "files" cycle had just raised,
+ * which flipped the status back to green and re-logged the identical line as
+ * new every 60 seconds. Each adapter that ran gets its own bucket — empty when
+ * it produced no oversized resource, which is the signal that the warning
+ * genuinely cleared — and an adapter that did not run is simply absent.
+ */
+export function publishWarningObservation(
+  ranAdapterIds: Iterable<string>,
+  warningsBySource: ReadonlyMap<string, readonly string[]>,
+): Map<string, readonly string[]> {
+  const observation = new Map<string, readonly string[]>();
+  for (const adapterId of ranAdapterIds) {
+    observation.set(publishWarningSource(adapterId), []);
+  }
+  for (const [source, warnings] of warningsBySource) {
+    observation.set(source, warnings);
+  }
+  return observation;
+}
+
+export function shouldScanAdapter(
   adapter: ResourceAdapter,
   scope: SyncScope,
   requiredKinds: ReadonlySet<ResourceKind>,
@@ -2398,6 +3149,64 @@ export function parentsWithOwnConflictTips(
   return [...parents].sort();
 }
 
+/**
+ * Bounds how often a resource in an unresolved conflict may republish this
+ * device's tip. Returns the snapshots that may publish now, and the resource
+ * ids held back for this cycle.
+ *
+ * The conflicted side must keep publishing — {@link parentsWithOwnConflictTips}
+ * exists precisely so that successive local edits chain onto this device's own
+ * tip instead of fanning out into siblings, and so the fork stays representable
+ * with what is really on this machine. What must not happen is that publishing
+ * becomes *unconditional*. A conflicted resource gets no projection from the
+ * reconciler, so the projection short-circuit in `shouldPublishSnapshot` can
+ * never fire for it again; only the "matches an existing tip" clause can, and
+ * that one is useless for a value Cursor rewrites every few seconds. The result
+ * is one brand-new event per poll per conflicted volatile resource, forever.
+ *
+ * A rate limit is the fix rather than "suppress when the content already
+ * matches this device's own conflict tip", because that second option is
+ * already implemented — `shouldPublishSnapshot` returns false when any tip is a
+ * put with the same `semanticHash` — and it demonstrably does not bound a
+ * volatile resource, whose hash is different every time. Only a time bound
+ * does.
+ *
+ * `lastRepublishAt` is mutated: entries for resources that are no longer
+ * conflicted are dropped, so it cannot outgrow the conflict set, and a resource
+ * whose conflict is resolved and later reappears publishes immediately.
+ */
+export function throttleConflictedRepublish<T extends { resourceId: string }>(
+  snapshots: readonly T[],
+  conflictedResources: ReadonlySet<string>,
+  lastRepublishAt: Map<string, number>,
+  now: number,
+  intervalMs: number,
+): { publish: T[]; deferred: string[] } {
+  for (const resourceId of [...lastRepublishAt.keys()]) {
+    if (!conflictedResources.has(resourceId)) {
+      lastRepublishAt.delete(resourceId);
+    }
+  }
+  const publish: T[] = [];
+  const deferred: string[] = [];
+  for (const snapshot of snapshots) {
+    if (!conflictedResources.has(snapshot.resourceId)) {
+      publish.push(snapshot);
+      continue;
+    }
+    const previous = lastRepublishAt.get(snapshot.resourceId);
+    // The first observation of a fork always publishes, so a conflict that has
+    // just appeared is represented by this device's real content at once.
+    if (previous !== undefined && now - previous < intervalMs) {
+      deferred.push(snapshot.resourceId);
+      continue;
+    }
+    lastRepublishAt.set(snapshot.resourceId, now);
+    publish.push(snapshot);
+  }
+  return { publish, deferred };
+}
+
 async function projectionInput(
   repository: SyncRepository,
   projection: ResourceProjection,
@@ -2430,10 +3239,29 @@ function markProjection(
   applyResult?: ResourceApplyResult,
 ): void {
   const tip = projection.tip;
+  const previous = repository.state.projections[projection.resourceId];
   const retainedLocalHash =
     applyResult === undefined
       ? undefined
       : applyResult.semanticHash;
+  // A tombstone for these kinds is honored by *keeping* the local copy, so the
+  // projection has to carry a hash that stands for "what is still on disk".
+  // `retainedLocal` only exists when the adapter emitted a snapshot this
+  // cycle, which it does not for an unchanged chat and never for
+  // workspaceStorage (that adapter is not scanned while Cursor runs). With the
+  // field left unset the next scan saw a hash matching neither the projection
+  // nor any tip and republished the resource, silently reverting the other
+  // device's delete. The helper's markAppliedProjections has always carried
+  // this fallback chain; the extension host now does too.
+  const retainedTombstoneHash =
+    ["chat", "chat-transcript", "chat-store", "workspace-storage"].includes(
+      tip.kind,
+    ) && tip.operation === "delete"
+      ? retainedLocal?.semanticHash ??
+        previous?.retainedLocalHash ??
+        previous?.semanticHash ??
+        sha256(`retained-local:${projection.resourceId}`)
+      : undefined;
   repository.state.projections[projection.resourceId] = {
     resourceId: projection.resourceId,
     kind: tip.kind,
@@ -2444,13 +3272,9 @@ function markProjection(
       : { payloadObjectId: tip.payload.objectId }),
     ...(retainedLocalHash !== undefined
       ? { retainedLocalHash }
-      : ["chat", "chat-transcript", "chat-store", "workspace-storage"].includes(
-            tip.kind,
-          ) &&
-          tip.operation === "delete" &&
-          retainedLocal !== undefined
-        ? { retainedLocalHash: retainedLocal.semanticHash }
-        : {}),
+      : retainedTombstoneHash === undefined
+        ? {}
+        : { retainedLocalHash: retainedTombstoneHash }),
     ...(typeof tip.metadata?.lastUpdatedAt === "number"
       ? { sourceTimestamp: tip.metadata.lastUpdatedAt }
       : {}),
@@ -2463,12 +3287,48 @@ function markProjection(
     );
 }
 
+/**
+ * True for an inbound ui-state resource this build declines to synchronize.
+ *
+ * Read from the resource ID rather than the tip metadata: the ID is what the
+ * helper validates the metadata against, and events written by 0.0.1-0.0.3
+ * are the ones this has to recognize.
+ */
+function isPolicyExcludedUiStateResource(
+  resourceId: string,
+  kind: ResourceKind,
+): boolean {
+  const prefix = "ui-state/";
+  if (kind !== "ui-state" || !resourceId.startsWith(prefix)) {
+    return false;
+  }
+  let key: string;
+  try {
+    key = decodeURIComponent(resourceId.slice(prefix.length));
+  } catch {
+    return false;
+  }
+  return isPolicyExcludedUiStateKey(key);
+}
+
 function queuePending(
   repository: SyncRepository,
   projection: ResourceProjection,
   blockedReason?: string,
 ): void {
   const tip = projection.tip;
+  if (isPolicyExcludedUiStateResource(projection.resourceId, tip.kind)) {
+    // Never hand the helper a change it is only going to skip. Any entry an
+    // earlier run of this build already queued is dropped here too, so an
+    // existing repository stops asking for a restart that would do nothing.
+    repository.state.pendingDatabaseChanges =
+      repository.state.pendingDatabaseChanges.filter(
+        (pending) =>
+          pending.eventHash !== tip.eventHash ||
+          pending.changeIndex !== tip.changeIndex,
+      );
+    return;
+  }
   const existing = repository.state.pendingDatabaseChanges.find(
     (pending) =>
       pending.eventHash === tip.eventHash &&
@@ -2511,6 +3371,13 @@ function pendingHelperChanges(repository: SyncRepository): HelperChange[] {
   let totalBytes = 0;
   for (const pending of repository.state.pendingDatabaseChanges) {
       if (pending.blockedReason !== undefined) {
+        continue;
+      }
+      // Last gate before the helper. `queuePending` already refuses these, but
+      // a repository written by an earlier run of this build can still hold the
+      // entry, and the helper is the place where getting it wrong cost the user
+      // every other resource in the request.
+      if (isPolicyExcludedUiStateResource(pending.resourceId, pending.kind)) {
         continue;
       }
       const tip = findTip(repository, pending.eventHash, pending.changeIndex);
@@ -2570,22 +3437,50 @@ function findTip(
   return undefined;
 }
 
+/**
+ * Resolves what can be resolved without asking, and never throws for one
+ * conflict it could not publish.
+ *
+ * This runs before the scan, the publish batch and applyProjections, so an
+ * escaping error aborts the entire cycle: nothing published, nothing inbound
+ * applied, no ack written. The events are immutable, so the next poll would
+ * re-derive the identical conflict and throw again — the device would stop
+ * synchronizing permanently. A three-way merge is the union of both sides'
+ * additions and is routinely LARGER than either tip, so two individually
+ * publishable tips really can merge into a payload `publish` rejects. Anything
+ * that cannot be published degrades to manual resolution: the conflict is left
+ * unresolved and `onWarning` names the resource.
+ *
+ * A conflict with no common ancestor cannot be three-way merged, but it is not
+ * therefore unresolvable — see {@link resolveBaseFreeConflict}.
+ */
 export async function autoMergeConflicts(
   repository: SyncRepository,
   conflicts: SyncConflict[],
   canMerge: (tips: ResourceTip[]) => boolean = () => true,
+  onWarning: (warning: string) => void = () => {},
 ): Promise<boolean> {
   let mergedAny = false;
   for (const conflict of conflicts) {
     if (
       conflict.resolvedAt !== undefined ||
-      conflict.tipVersionIds.length !== 2 ||
-      conflict.baseVersionId === null
+      conflict.tipVersionIds.length !== 2
     ) {
       continue;
     }
     const tips = repository.state.tips[conflict.resourceId] ?? [];
     if (tips.length !== 2 || !canMerge(tips)) {
+      continue;
+    }
+    if (conflict.baseVersionId === null) {
+      // No common ancestor, so no three-way merge is possible — but a
+      // last-writer-wins pick never needed one. Skipping these outright left
+      // every base-free fork unresolved forever: the user's live repository
+      // carried 23 of them, all ui-state, all re-prompting on every cycle.
+      if (await resolveBaseFreeConflict(repository, conflict, tips, onWarning)) {
+        conflict.resolvedAt = new Date().toISOString();
+        mergedAny = true;
+      }
       continue;
     }
     // A base folded away by a checkpoint reads as null; the conflict then
@@ -2597,7 +3492,15 @@ export async function autoMergeConflicts(
     // A tip that merely re-asserts the base (e.g. a checkpoint marker
     // concurrent with an unpublished edit) carries no change of its own, so
     // the other tip wins for every kind before kind-specific merge policy.
-    if (await resolveTrivialConflict(repository, conflict, tips, base.change)) {
+    if (
+      await resolveTrivialConflict(
+        repository,
+        conflict,
+        tips,
+        base.change,
+        onWarning,
+      )
+    ) {
       mergedAny = true;
       continue;
     }
@@ -2630,33 +3533,204 @@ export async function autoMergeConflicts(
     }
     const outcome = workspaceDatabase
       ? mergeWorkspaceDatabaseBuffers(base.content, local.content, remote.content)
-      : isJsonMergeKind(conflict.kind, localTip.metadata)
-        ? mergeJsoncBuffers(base.content, local.content, remote.content)
-        : validatedTextMergeOutcome(
-            conflict.kind,
-            mergeTextBuffers(base.content, local.content, remote.content),
-          );
+      : conflict.kind === "ui-state"
+        ? mergeUiStateBuffers(base.content, local.content, remote.content)
+        : isJsonMergeKind(conflict.kind, localTip.metadata)
+          ? mergeJsoncBuffers(base.content, local.content, remote.content)
+          : validatedTextMergeOutcome(
+              conflict.kind,
+              mergeTextBuffers(base.content, local.content, remote.content),
+            );
+    // A ui-state value with no structural merge still resolves without asking:
+    // both devices sort the same two tips with the same replicated comparator,
+    // so both republish the same side's bytes and the reconciler collapses the
+    // two merge events. This last-writer-wins step is deliberately restricted
+    // to ui-state, where the value is machine-local chrome that Cursor rewrites
+    // continuously and where the manual resolver could only ever have offered
+    // the same whole-tip either/or. It must never reach a kind whose loser
+    // holds authored content — cursor-user-rules, settings, chat.
+    // Newest tip under the replicated comparator: same answer on every device.
+    const newestTip = [...tips].sort(compareTips)[0];
+    const lastWriter =
+      conflict.kind === "ui-state" && outcome.status === "conflict"
+        ? newestTip
+        : undefined;
+    const resolved: MergeOutcome =
+      lastWriter === undefined
+        ? outcome
+        : {
+            status: "merged",
+            content:
+              lastWriter.versionId === localTip.versionId
+                ? local.content
+                : remote.content,
+          };
     if (
-      outcome.status === "conflict" ||
-      outcome.content === undefined
+      resolved.status === "conflict" ||
+      resolved.content === undefined
     ) {
       continue;
     }
     const snapshot: ResourceSnapshot = {
       resourceId: conflict.resourceId,
       kind: conflict.kind,
-      content: outcome.content,
-      semanticHash: outcome.semanticHash ?? sha256(outcome.content),
+      content: resolved.content,
+      semanticHash: resolved.semanticHash ?? sha256(resolved.content),
       metadata: {
-        ...(localTip.metadata ?? {}),
+        // The merged content is a deterministic function of the tips, and the
+        // metadata has to be one too. `localTip` is whichever tip this device
+        // happens to own, so using it made two devices attach DIFFERENT
+        // metadata to byte-identical content; the reconciler collapses those
+        // two events on operation plus semanticHash alone, and an arbitrary
+        // tip pick then decided ui-state's `valueType` — the storage class the
+        // helper binds, TEXT or BLOB — for both devices. The newest tip under
+        // `compareTips` is the same tip everywhere, and it is also the
+        // last-writer-wins winner whose own storage class must ride along.
+        ...((lastWriter ?? newestTip ?? localTip).metadata ?? {}),
         syncOrigin: "auto-merge",
       },
     };
-    await repository.publish([snapshot], []);
+    if (
+      !(await publishAutoMerge(repository, conflict, [snapshot], [], onWarning))
+    ) {
+      continue;
+    }
     conflict.resolvedAt = new Date().toISOString();
     mergedAny = true;
   }
   return mergedAny;
+}
+
+/**
+ * Kinds whose base-free forks are resolved by last-writer-wins instead of being
+ * left for the user.
+ *
+ * A conflict with no common ancestor cannot be three-way merged, but picking a
+ * winner never required a base. The list is deliberately just ui-state: a
+ * ui-state value is machine-local chrome — a timestamp, a health-check result,
+ * a panel position — that Cursor rewrites on its own on both machines, so the
+ * losing side costs a piece of layout state that the next interaction
+ * regenerates. Every kind that carries something the user authored
+ * (`cursor-user-rules`, `settings`, `cursor-user-file`, `chat`, ...) is absent
+ * on purpose: there, silently discarding the losing tip destroys content, and
+ * an unresolved conflict is the correct outcome.
+ */
+const BASE_FREE_LAST_WRITER_KINDS: readonly ResourceKind[] = ["ui-state"];
+
+/**
+ * Resolves a fork with no common ancestor by republishing the winning tip
+ * verbatim.
+ *
+ * Both devices see the same two tips and sort them with the same replicated
+ * comparator ({@link compareTips}: Lamport, then deviceId, then eventHash), so
+ * both elect the same winner, republish that tip's own bytes under that tip's
+ * own `semanticHash`, and carry that tip's own metadata. Byte-identical content
+ * AND identical metadata is the requirement, not a nicety: the reconciler
+ * collapses two tips on operation plus semanticHash alone, so a device-dependent
+ * metadata pick would leave ui-state's `valueType` — the storage class
+ * `uiStateValue` binds, TEXT or BLOB — decided by whichever device published
+ * last.
+ *
+ * Put-vs-delete rule: **a put always beats a delete, whatever the comparator
+ * says**; the comparator only breaks ties within the surviving operation. This
+ * mirrors `chooseActiveTip`, which already prefers puts when it elects the
+ * active tip, and it is the recoverable direction — a losing delete just means
+ * the key is written back and the deleting side can remove it again, while a
+ * losing put destroys the only copy of the value. Two deletes are ordered by
+ * the comparator like any other pair.
+ */
+async function resolveBaseFreeConflict(
+  repository: SyncRepository,
+  conflict: SyncConflict,
+  tips: ResourceTip[],
+  onWarning: (warning: string) => void,
+): Promise<boolean> {
+  if (!BASE_FREE_LAST_WRITER_KINDS.includes(conflict.kind)) {
+    return false;
+  }
+  const puts = tips.filter((tip) => tip.operation === "put");
+  const winner = [...(puts.length > 0 ? puts : tips)].sort(compareTips)[0];
+  if (winner === undefined) {
+    return false;
+  }
+  const metadata = { ...(winner.metadata ?? {}), syncOrigin: "auto-merge" };
+  if (winner.operation === "delete") {
+    return publishAutoMerge(
+      repository,
+      conflict,
+      [],
+      [
+        {
+          resourceId: conflict.resourceId,
+          kind: conflict.kind,
+          semanticHash: winner.semanticHash,
+          metadata,
+        },
+      ],
+      onWarning,
+    );
+  }
+  // A payload compacted out from under the winner degrades to manual
+  // resolution rather than resolving to the loser, which would not be the
+  // same answer on a device that can still read it.
+  const data = await repository.tryReadVersion(winner.versionId);
+  if (data === null || data.content === null) {
+    return false;
+  }
+  return publishAutoMerge(
+    repository,
+    conflict,
+    [
+      {
+        resourceId: conflict.resourceId,
+        kind: conflict.kind,
+        content: data.content,
+        semanticHash: winner.semanticHash,
+        metadata,
+      },
+    ],
+    [],
+    onWarning,
+  );
+}
+
+/**
+ * Publishes one auto-merge result, or explains why it could not and leaves the
+ * conflict for the manual resolver. Returns false without throwing in both
+ * failure cases.
+ */
+async function publishAutoMerge(
+  repository: SyncRepository,
+  conflict: SyncConflict,
+  snapshots: ResourceSnapshot[],
+  deletions: ResourceDeletion[],
+  onWarning: (warning: string) => void,
+): Promise<boolean> {
+  for (const snapshot of snapshots) {
+    if (snapshot.content.byteLength > repository.maxPayloadBytes) {
+      onWarning(
+        `${oversizedPayloadWarning(
+          conflict.resourceId,
+          snapshot.content.byteLength,
+          repository.maxPayloadBytes,
+        )} The automatic merge of ${conflict.resourceId} produced more than ` +
+          'either side did, so the conflict is waiting for "Cursor Setting ' +
+          'Sync: Resolve Conflicts".',
+      );
+      return false;
+    }
+  }
+  try {
+    await repository.publish(snapshots, deletions);
+    return true;
+  } catch (error) {
+    onWarning(
+      `The automatic merge of ${conflict.resourceId} could not be published (${
+        error instanceof Error ? error.message : String(error)
+      }), so the conflict is waiting for "Cursor Setting Sync: Resolve Conflicts".`,
+    );
+    return false;
+  }
 }
 
 async function resolveTrivialConflict(
@@ -2664,6 +3738,7 @@ async function resolveTrivialConflict(
   conflict: SyncConflict,
   tips: ResourceTip[],
   base: ResourceChange,
+  onWarning: (warning: string) => void,
 ): Promise<boolean> {
   const matching = tips.filter(
     (tip) =>
@@ -2682,12 +3757,37 @@ async function resolveTrivialConflict(
     if (data === null || data.content === null) {
       return false;
     }
-    await repository.publish(
+    if (
+      !(await publishAutoMerge(
+        repository,
+        conflict,
+        [
+          {
+            resourceId: conflict.resourceId,
+            kind: conflict.kind,
+            content: data.content,
+            semanticHash: survivor.semanticHash,
+            metadata: {
+              ...(survivor.metadata ?? {}),
+              syncOrigin: "auto-merge",
+            },
+          },
+        ],
+        [],
+        onWarning,
+      ))
+    ) {
+      return false;
+    }
+  } else if (
+    !(await publishAutoMerge(
+      repository,
+      conflict,
+      [],
       [
         {
           resourceId: conflict.resourceId,
           kind: conflict.kind,
-          content: data.content,
           semanticHash: survivor.semanticHash,
           metadata: {
             ...(survivor.metadata ?? {}),
@@ -2695,23 +3795,10 @@ async function resolveTrivialConflict(
           },
         },
       ],
-      [],
-    );
-  } else {
-    await repository.publish(
-      [],
-      [
-        {
-          resourceId: conflict.resourceId,
-          kind: conflict.kind,
-          semanticHash: survivor.semanticHash,
-          metadata: {
-            ...(survivor.metadata ?? {}),
-            syncOrigin: "auto-merge",
-          },
-        },
-      ],
-    );
+      onWarning,
+    ))
+  ) {
+    return false;
   }
   conflict.resolvedAt = new Date().toISOString();
   return true;
@@ -2757,10 +3844,24 @@ function isAutoMergeKind(
 ): boolean {
   // keybindings.json is a top-level JSON array, which merges better line-based
   // than atomically, so it takes the diff3 text path and not the JSON path.
+  //
+  // ui-state is here but cursor-user-rules is not, even though one adapter
+  // produces both. A ui-state value is UI chrome — pinned view containers,
+  // hidden views, MRU caches — that Cursor rewrites on its own on both
+  // machines, so a wrong merge costs a panel in the wrong place and is undone
+  // the next time the user drags something. cursor-user-rules is prose the
+  // user typed; a wrong merge there destroys authored content, so it keeps
+  // asking.
   if (
-    ["snippet", "task", "mcp", "prompt", "chat-transcript", "keybindings"].includes(
-      kind,
-    )
+    [
+      "snippet",
+      "task",
+      "mcp",
+      "prompt",
+      "chat-transcript",
+      "keybindings",
+      "ui-state",
+    ].includes(kind)
   ) {
     return true;
   }
@@ -2807,15 +3908,3 @@ function isJsonMergeKind(
   return false;
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) {
-    return `${bytes} B`;
-  }
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)} KiB`;
-  }
-  if (bytes < 1024 * 1024 * 1024) {
-    return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
-  }
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
-}

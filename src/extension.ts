@@ -41,7 +41,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     conflicts,
     manager,
     registerCommand("cursorSync.setup", () => manager?.setup()),
-    registerCommand("cursorSync.syncNow", () => manager?.syncNow(true)),
+    registerCommand("cursorSync.syncNow", () => manager?.syncNowCommand()),
     registerCommand("cursorSync.restartToApply", () =>
       manager?.restartToApply(),
     ),
@@ -70,6 +70,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerCommand("cursorSync.archiveRepository", () =>
       manager?.archiveRepository(),
     ),
+    registerCommand("cursorSync.disconnect", () => manager?.disconnect()),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (
         event.affectsConfiguration("cursorSettingSync") ||
@@ -95,6 +96,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   for (const reason of compatibility.reasons) {
     status.log(`Database writes disabled: ${reason}`);
   }
+  // Losing the database capability silently drops profiles, UI state,
+  // extensions and all chat from the sync set, and the status bar still shows
+  // a green check mark because the remaining file resources really are up to
+  // date. An output-channel line nobody opens is not a signal.
+  announceReducedCapability(compatibility, status);
 
   try {
     await manager.initialize();
@@ -104,6 +110,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     status.setStatus("error", message);
     void vscode.window.showErrorMessage(`Cursor Setting Sync activation failed: ${message}`);
   }
+}
+
+function announceReducedCapability(
+  compatibility: Awaited<ReturnType<typeof inspectCompatibility>>,
+  status: StatusController,
+): void {
+  const problems = [...compatibility.reasons, ...compatibility.warnings];
+  if (problems.length === 0) {
+    return;
+  }
+  const headline = compatibility.compatible
+    ? "Cursor Setting Sync: some resources may not synchronize on this Cursor build."
+    : "Cursor Setting Sync: profiles, UI state, extensions and chat will not synchronize on this Cursor build.";
+  const action = "Show Diagnostics";
+  void vscode.window
+    .showWarningMessage(`${headline} ${problems[0] ?? ""}`.trim(), action)
+    .then((choice) => {
+      if (choice === action) {
+        void vscode.commands.executeCommand("cursorSync.showDiagnostics");
+      }
+    }, () => {
+      status.log("Unable to show the compatibility notification.");
+    });
 }
 
 export function deactivate(): void {
@@ -131,6 +160,7 @@ function registerUnsupportedPlatformCommands(
     "cursorSync.compactRepository",
     "cursorSync.checkpointRepository",
     "cursorSync.archiveRepository",
+    "cursorSync.disconnect",
   ]) {
     context.subscriptions.push(
       vscode.commands.registerCommand(command, () => {

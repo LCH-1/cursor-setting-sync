@@ -22,6 +22,55 @@ export const OBJECT_EXTENSION = ".cso";
 export const CHECKPOINT_EXTENSION = ".csc";
 export const PARTIAL_EXTENSION = ".partial";
 
+/**
+ * How long a warning that keeps reappearing stays quiet between log lines. Long
+ * enough that a 30-second poll does not repeat it, short enough that a
+ * permanent problem — a stream gap blocking compaction, a broken adapter — is
+ * never silent for the lifetime of the extension host.
+ */
+export const STANDING_WARNING_REMINDER_MS = 60 * 60 * 1000;
+/**
+ * How long a cycle must run before the status bar switches to the spinner. A
+ * steady-state cycle finishes inside this window and never touches the status
+ * item, so the bar keeps showing whatever the user can act on instead of
+ * flickering between a spinner and a result several times a minute.
+ */
+export const SYNC_INDICATOR_DELAY_MS = 2000;
+
+/**
+ * How many event files may accumulate before the poll path runs the same
+ * checkpoint-and-prune the manual command runs. Nothing used to schedule that
+ * command, so the event log, the blob store and the shared folder grew without
+ * bound and every sync cycle got slower as the repository aged. The threshold
+ * is high enough that a normal week never reaches it and low enough that the
+ * per-cycle cost stays flat.
+ */
+export const AUTOMATIC_CHECKPOINT_EVENT_THRESHOLD = 500;
+/**
+ * Minimum spacing between automatic maintenance attempts. Every phase is gated
+ * (a warning-free reconcile, every device acked, a 24-hour-old checkpoint), so
+ * an attempt that cannot proceed must not be retried on the next poll.
+ */
+export const AUTOMATIC_CHECKPOINT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Minimum spacing between two publications of the same resource while it sits
+ * in an unresolved conflict.
+ *
+ * A conflicted side deliberately keeps publishing its own tip so the conflict
+ * stays representable (see `parentsWithOwnConflictTips`). For a resource whose
+ * content is stable that costs nothing — `shouldPublishSnapshot` already
+ * suppresses a snapshot whose hash matches an existing tip. For a VOLATILE one
+ * it costs a genuinely-new event on every poll, forever, because a conflicted
+ * resource never gets a projection and so never short-circuits: 23 conflicts on
+ * a 30-second poll is what grew the user's repository by thousands of events a
+ * day. An hour is far longer than the poll and far shorter than the time a user
+ * takes to answer the conflict prompt, and the manual resolver reads the LIVE
+ * local snapshot rather than the published tip, so a stale tip costs nothing
+ * the user can see.
+ */
+export const CONFLICTED_REPUBLISH_INTERVAL_MS = 60 * 60 * 1000;
+
 export const DEFAULT_POLL_INTERVAL_SECONDS = 30;
 export const DEFAULT_CHAT_POLL_INTERVAL_SECONDS = 30;
 export const DEFAULT_MAX_PAYLOAD_MIB = 128;

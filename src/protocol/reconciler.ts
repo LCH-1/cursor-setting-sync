@@ -354,7 +354,12 @@ function chooseActiveTip(tips: ResourceTip[]): ResourceTip | undefined {
   return [...candidates].sort(compareTips)[0];
 }
 
-function compareTips(left: ResourceTip, right: ResourceTip): number {
+/**
+ * Deterministic total order over the tips of one resource, newest first. Every
+ * device derives it from replicated event data alone, so a caller that needs a
+ * tie-break both devices will agree on can sort with this and take the head.
+ */
+export function compareTips(left: ResourceTip, right: ResourceTip): number {
   if (left.lamport !== right.lamport) {
     return right.lamport - left.lamport;
   }

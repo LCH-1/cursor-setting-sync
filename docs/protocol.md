@@ -27,6 +27,10 @@ Every resource change lists its parent version IDs. Unrelated resources merge in
 
 Lamport values provide deterministic ordering but never replace ancestry for conflict detection. Wall-clock timestamps and file modification times are not used to select a winner.
 
+Automatic conflict resolution relies on that convergence rule rather than on coordination: both devices resolve the same fork locally and publish a merge whose parents are both tips, so identical results coalesce into one version with no extra round trip. This only works when the two devices emit byte-identical payloads, because a resource that hashes its raw content — UI state among them — compares those bytes. Every automatic merge is therefore symmetric in the two sides: UI state serializes its result canonically, and a JSONC merge writes its result into the common ancestor's text rather than the local device's, so the two sides produce the same bytes and publish the same hash of those bytes. The tie-break for a UI state value with no structural merge is the tip ordering above (Lamport, then device ID, then event hash), which is derived from replicated data alone and so is the same on both devices.
+
+A three-way merge needs a common ancestor, but a tie-break does not. A fork with **no** common ancestor — two devices that each minted the same resource locally, or a base folded away by a checkpoint — is therefore still resolved automatically for UI state: the winning tip is elected with the same tip ordering and republished verbatim, carrying its own semantic hash and its own metadata, so both devices emit identical content and identical metadata. Metadata equality is load-bearing rather than cosmetic, because the reconciler coalesces two tips on operation and semantic hash alone and UI state's `valueType` decides whether the value is bound as `TEXT` or `BLOB`. A put always outranks a delete in this election, whatever the ordering says, and the ordering only breaks ties within the surviving operation: a losing delete can simply be repeated, while a losing put discards the only copy of the value. Kinds that carry authored content are excluded from the base-free rule entirely and stay with manual resolution.
+
 Each event also contains producer metadata:
 
 ```json
@@ -127,5 +131,5 @@ Only events at or below the checkpoint's per-device cursors are deleted, then su
 
 - Checkpoints are AEAD-authenticated; only master-key holders can create them.
 - `acks.json` is unauthenticated and gates only when pruning happens, never correctness: a forged ack can at worst prune early, degrading a lagging device to checkpoint absorption. State still converges; only granular history is lost.
-- Conflicts whose merge base predates the checkpoint degrade from automatic merge to manual resolution, and the conflict preview degrades to a two-way diff.
+- Conflicts whose merge base predates the checkpoint degrade from three-way merge to the base-free rule below, and the conflict preview degrades to a two-way diff. For UI state that is still automatic; for every content-bearing kind it means manual resolution.
 - Granular history before a checkpoint is unrecoverable by design, and folded delete tombstones are retained forever (a documented growth trade-off).

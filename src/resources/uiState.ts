@@ -17,15 +17,21 @@ import { sha256 } from "../protocol/canonical";
 import type { ResourceAdapter, ResourceApplyInput } from "./resource";
 import {
   isDeniedUiStateKey,
+  isIgnoredUiStateKey,
   parseTargetStorageMarker,
 } from "./uiStatePolicy";
+import type { IgnoreMatcher } from "./ignorePatterns";
+import { createIgnoreMatcher } from "./ignorePatterns";
 
 export class UiStateAdapter implements ResourceAdapter {
   readonly id = "ui-state";
   readonly kinds = ["ui-state", "cursor-user-rules"] as const;
   readonly appliesWhileRunning = false;
 
-  constructor(private readonly paths: CursorPaths) {}
+  constructor(
+    private readonly paths: CursorPaths,
+    private readonly ignoredKeys: IgnoreMatcher = createIgnoreMatcher([]),
+  ) {}
 
   async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
     const database = openDatabase(this.paths.globalDatabase, { readOnly: true });
@@ -42,12 +48,21 @@ export class UiStateAdapter implements ResourceAdapter {
         | undefined;
       // An unreadable marker must not take down the whole adapter: without it
       // no key is known to be USER-target, but cursor-user-rules still syncs.
+      //
+      // It must not produce deletions either. Without the marker `keys`
+      // collapses to cursor-user-rules alone, so every ui-state resource this
+      // device ever projected would look absent and be published as a
+      // tombstone — the peers would then delete their live UI state. The scan
+      // is incomplete, and an incomplete scan never deletes; this mirrors
+      // `scannedProfiles` in the settings and extension adapters.
       let targets: Record<string, number> = {};
+      let markerReadable = true;
       try {
         targets = parseTargetStorageMarker(markerRow?.value);
       } catch (error) {
+        markerReadable = false;
         scanWarnings.push(
-          `Unable to read the UI state target marker: ${
+          `Unable to read the UI state target marker, so no UI state deletions are published from this scan: ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
@@ -55,7 +70,10 @@ export class UiStateAdapter implements ResourceAdapter {
       const keys = Object.entries(targets)
         .filter(([, target]) => target === USER_STORAGE_TARGET)
         .map(([key]) => key)
-        .filter((key) => !isDeniedUiStateKey(key));
+        .filter(
+          (key) =>
+            !isDeniedUiStateKey(key) && !isIgnoredUiStateKey(key, this.ignoredKeys),
+        );
       if (!keys.includes(CURSOR_USER_RULES_KEY)) {
         keys.push(CURSOR_USER_RULES_KEY);
       }
@@ -103,7 +121,12 @@ export class UiStateAdapter implements ResourceAdapter {
       }
       return {
         snapshots,
-        deletions: findDeletions(known, current),
+        deletions: findDeletions(
+          known,
+          current,
+          this.ignoredKeys,
+          markerReadable,
+        ),
         warnings,
       };
     } finally {
@@ -119,6 +142,8 @@ export class UiStateAdapter implements ResourceAdapter {
 function findDeletions(
   known: Record<string, LocalProjection>,
   current: Set<string>,
+  ignoredKeys: IgnoreMatcher,
+  markerReadable: boolean,
 ): ResourceDeletion[] {
   return Object.values(known)
     .filter((projection) => {
@@ -129,12 +154,20 @@ function findDeletions(
       ) {
         return false;
       }
+      // cursor-user-rules is read by its own fixed key and does not depend on
+      // the marker, so its absence is still trustworthy.
+      if (!markerReadable && projection.kind === "ui-state") {
+        return false;
+      }
       const encodedKey = projection.resourceId.split("/")[1];
-      return (
-        encodedKey !== undefined &&
-        (projection.kind === "cursor-user-rules" ||
-          !isDeniedUiStateKey(decodeURIComponent(encodedKey)))
-      );
+      if (encodedKey === undefined) {
+        return false;
+      }
+      if (projection.kind === "cursor-user-rules") {
+        return true;
+      }
+      const key = decodeURIComponent(encodedKey);
+      return !isDeniedUiStateKey(key) && !isIgnoredUiStateKey(key, ignoredKeys);
     })
     .map((projection) => {
       const encodedKey = projection.resourceId.split("/")[1];

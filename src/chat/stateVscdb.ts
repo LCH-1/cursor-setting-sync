@@ -58,9 +58,17 @@ interface ChatStatements {
   bubbles: ChatStatement;
 }
 
+interface ChatIdentity {
+  /** Resolved UUID text, used for resource IDs and cursorDiskKV key prefixes. */
+  composerId: string;
+  /** The raw column value, used to bind the composerHeaders lookup. */
+  headerKey: SqliteRowValue;
+}
+
 type ChatCapture =
   | { kind: "missing" }
   | { kind: "unchanged" }
+  | { kind: "incomplete" }
   | { kind: "captured"; snapshot: PortableChatSnapshot };
 
 export interface PortableChatSnapshot {
@@ -89,6 +97,8 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
     const snapshots: ResourceSnapshot[] = [];
     const warnings: string[] = [];
     const current = new Set<string>();
+    const bodyless: string[] = [];
+    let identityUnknown = false;
     try {
       // Cursor writes to this database while it runs; wait out short lock
       // bursts instead of failing the whole sync cycle with SQLITE_BUSY.
@@ -97,11 +107,20 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
       // NULL = 0 is NULL, not true, so a composer whose late-added isSubagent
       // column was never backfilled must be matched explicitly or it silently
       // drops out of the scan and is published as a deletion.
+      // `lastUpdatedAt` is selected here as well so the steady state - every
+      // chat unchanged - is answered from this one query. Re-opening a
+      // transaction and re-reading the header row per composer, only to compare
+      // the same timestamp and roll straight back out, cost three statement
+      // executions per chat on every 30-second poll against a database Cursor
+      // is concurrently writing to.
       const headers = database
         .prepare(
-          "SELECT composerId FROM composerHeaders WHERE COALESCE(isSubagent, 0) = 0",
+          "SELECT composerId, lastUpdatedAt FROM composerHeaders WHERE COALESCE(isSubagent, 0) = 0",
         )
-        .all() as Array<{ composerId: SqliteRowValue }>;
+        .all() as Array<{
+        composerId: SqliteRowValue;
+        lastUpdatedAt: SqliteRowValue;
+      }>;
       const statements: ChatStatements = {
         header: database.prepare(
           "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, recency, checkpointAt, value FROM composerHeaders WHERE composerId = ? AND COALESCE(isSubagent, 0) = 0",
@@ -114,15 +133,41 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         ),
       };
       for (const rawHeader of headers) {
-        const composerId = rawHeader.composerId;
-        if (typeof composerId !== "string") {
-          warnings.push("Skipped a composer header whose composerId is not text.");
+        const composerId = composerIdText(rawHeader.composerId);
+        if (composerId === null) {
+          // Without an identity this header cannot be matched against `known`,
+          // so whichever chat it is looks absent and would be published as a
+          // deletion. That tombstone becomes the repository tip and the chat
+          // stops propagating for good, so the whole scan gives up on
+          // deletions rather than guess.
+          identityUnknown = true;
+          warnings.push(
+            "Skipped a composer header whose composerId is neither text nor a UTF-8 encoded chat ID; no chat deletions are published from this scan.",
+          );
           continue;
         }
         const resourceId = `chat/${composerId}`;
+        // Only a timestamp that is a real number carries change information, and
+        // the projection has to already be a chat for the comparison to mean
+        // anything. Anything else falls through to the transactional capture,
+        // which is where the authoritative comparison still lives.
+        const listedTimestamp = plainNumber(rawHeader.lastUpdatedAt);
+        if (
+          listedTimestamp !== null &&
+          known[resourceId]?.kind === "chat" &&
+          known[resourceId]?.sourceTimestamp === listedTimestamp
+        ) {
+          current.add(resourceId);
+          continue;
+        }
         let captured: ChatCapture;
         try {
-          captured = captureChat(database, statements, composerId, known);
+          captured = captureChat(
+            database,
+            statements,
+            { composerId, headerKey: rawHeader.composerId },
+            known,
+          );
         } catch (error) {
           // One unusable row must never take the whole adapter down. The
           // resource stays in `current` so it is not published as a deletion.
@@ -139,6 +184,14 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         }
         current.add(resourceId);
         if (captured.kind === "unchanged") {
+          continue;
+        }
+        // Aggregated rather than warned per chat: a body that never arrives is
+        // never publishable, so a per-chat line would repeat on every poll
+        // forever. The IDs still travel with the count, because a body-less
+        // header is also what a mass loss looks like.
+        if (captured.kind === "incomplete") {
+          bodyless.push(composerId);
           continue;
         }
         const snapshot = captured.snapshot;
@@ -161,13 +214,16 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           },
         });
       }
+      if (bodyless.length > 0) {
+        warnings.push(bodylessChatsWarning(bodyless));
+      }
     } finally {
       database.close();
     }
 
     return {
       snapshots,
-      deletions: findChatDeletions(known, current),
+      deletions: identityUnknown ? [] : findChatDeletions(known, current),
       warnings,
     };
   }
@@ -269,19 +325,22 @@ function isValidBase64(value: unknown): value is string {
 function captureChat(
   database: DatabaseSync,
   statements: ChatStatements,
-  composerId: string,
+  identity: ChatIdentity,
   known: Record<string, LocalProjection>,
 ): ChatCapture {
   database.exec("BEGIN");
   try {
-    const currentHeader = statements.header.get(composerId) as
+    // Bound with the raw value, not the decoded text: SQLite never considers a
+    // BLOB equal to a TEXT, so a BLOB-affinity composerId would miss its own
+    // row and read as a chat that had disappeared.
+    const currentHeader = statements.header.get(identity.headerKey) as
       | RawComposerHeader
       | undefined;
     if (currentHeader === undefined) {
       database.exec("COMMIT");
       return { kind: "missing" };
     }
-    const header = normalizeHeader(currentHeader);
+    const header = normalizeHeader(currentHeader, identity.composerId);
     const resourceId = `chat/${header.composerId}`;
     // A null timestamp carries no change information, so it must never
     // short-circuit against a projection that simply recorded none either.
@@ -296,8 +355,11 @@ function captureChat(
     const composerDataRow = statements.data.get(
       `composerData:${header.composerId}`,
     ) as RawKvRow | undefined;
+    // Cursor prunes the conversation body but leaves the list entry behind, so
+    // a header without composerData is an expected state, not a broken row.
     if (composerDataRow === undefined) {
-      throw new Error("composerData row is missing.");
+      database.exec("COMMIT");
+      return { kind: "incomplete" };
     }
     const bubbleRows = statements.bubbles.all(
       `bubbleId:${header.composerId}:%`,
@@ -317,12 +379,14 @@ function captureChat(
   }
 }
 
-function normalizeHeader(header: RawComposerHeader): PortableComposerHeader {
-  if (typeof header.composerId !== "string") {
-    throw new Error("composerId is not text.");
-  }
+function normalizeHeader(
+  header: RawComposerHeader,
+  composerId: string,
+): PortableComposerHeader {
   return {
-    composerId: header.composerId,
+    // The caller resolved this from the raw column value; a BLOB-affinity
+    // composerId carries the same UUID text as every other reference to it.
+    composerId,
     workspaceId: nullableText(header.workspaceId, "workspaceId"),
     createdAt: nullableNumber(header.createdAt, "createdAt"),
     lastUpdatedAt: nullableNumber(header.lastUpdatedAt, "lastUpdatedAt"),
@@ -391,6 +455,52 @@ function portableRow(row: RawKvRow): PortableKvRow {
       row.valueType,
     )}.`,
   );
+}
+
+/** A SQLite value usable as a change timestamp, or null if it is not one. */
+function plainNumber(value: SqliteRowValue): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+const COMPOSER_ID_PATTERN =
+  /^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/;
+const BODYLESS_SAMPLE_SIZE = 5;
+
+/**
+ * Resolves the identity of a composer header row. SQLite column affinity does
+ * not stop a BLOB from landing in `composerHeaders.composerId`, and node:sqlite
+ * hands those back as a Uint8Array; the bytes are the same UUID text Cursor
+ * writes everywhere else, so decoding them recovers a usable identity. Anything
+ * that is not a chat ID afterwards is not something we can match against the
+ * known projections, and the caller must not guess.
+ */
+function composerIdText(value: SqliteRowValue): string | null {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value instanceof Uint8Array) {
+    const decoded = Buffer.from(value).toString("utf8");
+    return COMPOSER_ID_PATTERN.test(decoded) ? decoded : null;
+  }
+  return null;
+}
+
+/**
+ * A header with no `composerData` row is usually Cursor keeping a list entry
+ * after pruning the conversation, but a helper that wrote headers and then died
+ * before the bodies looks exactly the same. The message therefore states what
+ * was observed and carries IDs, so a mass loss is diagnosable instead of
+ * reading as one reassuring line.
+ */
+function bodylessChatsWarning(composerIds: readonly string[]): string {
+  const sample = composerIds.slice(0, BODYLESS_SAMPLE_SIZE).join(", ");
+  const remainder = composerIds.length - Math.min(
+    composerIds.length,
+    BODYLESS_SAMPLE_SIZE,
+  );
+  return `Skipped ${composerIds.length} chat(s) whose conversation body is not in the database: ${sample}${
+    remainder === 0 ? "" : ` and ${remainder} more`
+  }. Expected when Cursor prunes a conversation and keeps its list entry; if you still expect one of these chats, its body was lost locally.`;
 }
 
 function findChatDeletions(

@@ -16,8 +16,28 @@ import { pathExists } from "../src/platform/files";
 
 const temporaryRoots: string[] = [];
 const { DatabaseSync } = sqlite;
-const describeWithBackup =
-  typeof sqlite.backup === "function" ? describe : describe.skip;
+// The offline helper needs `node:sqlite.backup` (see docs/compatibility.md), so
+// these tests cannot run without it.
+const hasBackup = typeof sqlite.backup === "function";
+const describeWithBackup = hasBackup ? describe : describe.skip;
+
+// A silent skip is worse than no test: the suite reports green while the entire
+// offline apply path — the one that decides whether a shutdown writes anything
+// at all — goes unexercised. Local runs on a Node without `backup` stay green,
+// but a release or CI run has to opt in and then cannot miss the gap.
+describe("offline database helper prerequisites", () => {
+  it("exercises the offline helper suite on a runtime that supports it", () => {
+    if (hasBackup) {
+      return;
+    }
+    const strict =
+      process.env.CI === "true" || process.env.REQUIRE_SQLITE_BACKUP === "1";
+    expect(
+      strict,
+      `Node ${process.version} does not expose node:sqlite.backup, so every offline database helper test was skipped. Run the suite on a Node build that provides it (Node 24 or newer) before releasing, or clear CI/REQUIRE_SQLITE_BACKUP to accept the gap locally.`,
+    ).toBe(false);
+  });
+});
 
 afterEach(async () => {
   await Promise.all(
@@ -76,6 +96,210 @@ describeWithBackup("offline database helper", () => {
 
     await expect(operation).rejects.toThrow("unsafe UI state key");
     expect(readItem(fixture.databasePath, "existing")).toBe("preserved");
+  });
+
+  it("still fails the whole request for a security-denied key alongside good changes", async () => {
+    const fixture = await createFixture();
+    const operation = applyGlobalDatabaseChanges(fixture.request, [
+      uiStateChange(
+        "workbench.panel.chatSidebar",
+        "text",
+        Buffer.from("peer layout", "utf8"),
+      ),
+      {
+        change: {
+          eventHash: "2".repeat(64),
+          changeIndex: 1,
+          resourceId: `ui-state/${encodeURIComponent("github.authenticationSessions")}`,
+          kind: "ui-state",
+          operation: "put",
+          semanticHash: "hash",
+          metadata: {
+            key: "github.authenticationSessions",
+            registeredUserTarget: true,
+          },
+        },
+        content: Buffer.from("[]", "utf8"),
+      },
+    ]);
+
+    await expect(operation).rejects.toThrow("unsafe UI state key");
+    // The whole transaction rolled back, including the change that preceded it.
+    expect(readItem(fixture.databasePath, "workbench.panel.chatSidebar")).toBe(
+      null,
+    );
+    expect(readItem(fixture.databasePath, "existing")).toBe("preserved");
+  });
+
+  it.each([
+    "workbench.auxiliarybar.pinnedPanels",
+    "workbench.panel.composerChatViewPane.1b4e28ba-2fa1-11d2-883f-b9a761bde3fb.hidden",
+  ])(
+    "skips the policy-excluded key %s and still applies the rest of the request",
+    async (excludedKey) => {
+      const fixture = await createFixture();
+      const result = await applyGlobalDatabaseChanges(fixture.request, [
+        {
+          change: {
+            eventHash: "7".repeat(64),
+            changeIndex: 0,
+            resourceId: `ui-state/${encodeURIComponent(excludedKey)}`,
+            kind: "ui-state",
+            operation: "put",
+            semanticHash: "hash",
+            metadata: { key: excludedKey, registeredUserTarget: true },
+          },
+          content: Buffer.from("[]", "utf8"),
+        },
+        uiStateChange(
+          "workbench.panel.chatSidebar",
+          "text",
+          Buffer.from("peer layout", "utf8"),
+        ),
+        {
+          change: {
+            eventHash: "7".repeat(64),
+            changeIndex: 2,
+            resourceId: "cursor-user-rules/aicontext.personalContext",
+            kind: "cursor-user-rules",
+            operation: "put",
+            semanticHash: "hash",
+            metadata: {
+              key: "aicontext.personalContext",
+              registeredUserTarget: false,
+            },
+          },
+          content: Buffer.from("Always respond safely.", "utf8"),
+        },
+      ]);
+
+      // Nothing was written for the excluded key...
+      expect(readItem(fixture.databasePath, excludedKey)).toBe(null);
+      // ...but every other change in the same request landed.
+      expect(readItem(fixture.databasePath, "workbench.panel.chatSidebar")).toBe(
+        "peer layout",
+      );
+      expect(
+        readItem(fixture.databasePath, "aicontext.personalContext"),
+      ).toBe("Always respond safely.");
+      // Accounted for, so it stops being pending instead of being retried on
+      // every shutdown forever, and the reason is recorded.
+      expect(result.applied).toContain(
+        `ui-state/${encodeURIComponent(excludedKey)}`,
+      );
+      expect(
+        result.skipped.some(
+          (entry) =>
+            entry.startsWith(`ui-state/${encodeURIComponent(excludedKey)}:`) &&
+            entry.includes("excluded from synchronization"),
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it("keeps the local row when a peer deletes a policy-excluded key", async () => {
+    const fixture = await createFixture();
+    const key = "workbench.auxiliarybar.pinnedPanels";
+    const database = new DatabaseSync(fixture.databasePath);
+    database
+      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
+      .run(key, "local panels");
+    database.close();
+
+    await applyGlobalDatabaseChanges(fixture.request, [
+      {
+        change: {
+          eventHash: "8".repeat(64),
+          changeIndex: 0,
+          resourceId: `ui-state/${encodeURIComponent(key)}`,
+          kind: "ui-state",
+          operation: "delete",
+          semanticHash: "hash",
+          metadata: { key, registeredUserTarget: true },
+        },
+      },
+    ]);
+
+    expect(readItem(fixture.databasePath, key)).toBe("local panels");
+  });
+
+  it("retains the local value for an ignored UI state key", async () => {
+    const fixture = await createFixture({
+      ignoredUiStateKeys: ["workbench.activity.pinnedViewlets2"],
+    });
+    const database = new DatabaseSync(fixture.databasePath);
+    database
+      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
+      .run("workbench.activity.pinnedViewlets2", "local layout");
+    database.close();
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      pinnedViewletsChange("put", Buffer.from("peer layout", "utf8")),
+    ]);
+
+    expect(
+      readItem(fixture.databasePath, "workbench.activity.pinnedViewlets2"),
+    ).toBe("local layout");
+    // Accounted for, so the change stops being pending and the user is not
+    // asked to restart for it again on every activation.
+    expect(result.applied).toContain(
+      "ui-state/workbench.activity.pinnedViewlets2",
+    );
+    expect(result.skipped).toContain(
+      "ui-state/workbench.activity.pinnedViewlets2: UI state key is ignored on this device; remove it from cursorSettingSync.ignoredUiStateKeys to accept changes for it",
+    );
+  });
+
+  it("keeps the local row when a peer deletes an ignored UI state key", async () => {
+    const fixture = await createFixture({
+      ignoredUiStateKeys: ["workbench.activity.*"],
+    });
+    const database = new DatabaseSync(fixture.databasePath);
+    database
+      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
+      .run("workbench.activity.pinnedViewlets2", "local layout");
+    database
+      .prepare(
+        `INSERT INTO ItemTable(key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(
+        "__$__targetStorageMarker",
+        Buffer.from(
+          JSON.stringify({ "workbench.activity.pinnedViewlets2": 0 }),
+          "utf8",
+        ),
+      );
+    database.close();
+
+    await applyGlobalDatabaseChanges(fixture.request, [
+      pinnedViewletsChange("delete"),
+    ]);
+
+    expect(
+      readItem(fixture.databasePath, "workbench.activity.pinnedViewlets2"),
+    ).toBe("local layout");
+    expect(
+      JSON.parse(readItem(fixture.databasePath, "__$__targetStorageMarker") ?? "{}"),
+    ).toEqual({ "workbench.activity.pinnedViewlets2": 0 });
+  });
+
+  it("still applies an ignored key's namesake when the list does not match", async () => {
+    const fixture = await createFixture({
+      ignoredUiStateKeys: ["workbench.activity.pinnedViewlets2"],
+    });
+
+    await applyGlobalDatabaseChanges(fixture.request, [
+      uiStateChange(
+        "workbench.panel.chatSidebar",
+        "text",
+        Buffer.from("peer layout", "utf8"),
+      ),
+    ]);
+
+    expect(readItem(fixture.databasePath, "workbench.panel.chatSidebar")).toBe(
+      "peer layout",
+    );
   });
 
   it("merges profiles by ID and preserves local and future fields", async () => {
@@ -835,7 +1059,9 @@ describe("stored profile file URIs per platform", () => {
   });
 });
 
-async function createFixture(): Promise<{
+async function createFixture(
+  syncOptions: Partial<HelperRequest["syncOptions"]> = {},
+): Promise<{
   request: HelperRequest;
   databasePath: string;
 }> {
@@ -917,9 +1143,29 @@ async function createFixture(): Promise<{
       syncChat: true,
       syncWorkspaceStorage: true,
       maxPayloadBytes: 128 * 1024 * 1024,
+      ...syncOptions,
     },
   };
   return { request, databasePath };
+}
+
+function pinnedViewletsChange(
+  operation: "put" | "delete",
+  content?: Buffer,
+): PreparedHelperChange {
+  const key = "workbench.activity.pinnedViewlets2";
+  return {
+    change: {
+      eventHash: "5".repeat(64),
+      changeIndex: 0,
+      resourceId: `ui-state/${encodeURIComponent(key)}`,
+      kind: "ui-state",
+      operation,
+      semanticHash: "hash",
+      metadata: { key, registeredUserTarget: true },
+    },
+    ...(content === undefined ? {} : { content }),
+  };
 }
 
 function readItem(databasePath: string, key: string): string | null {

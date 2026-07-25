@@ -109,8 +109,19 @@ export async function readJsonFile<T>(path: string): Promise<T> {
   return JSON.parse(content) as T;
 }
 
-export async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
-  await writeFileAtomic(path, Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8"));
+export async function writeJsonAtomic(
+  path: string,
+  value: unknown,
+  /**
+   * Pretty-print with two-space indentation. Files a human may open keep it;
+   * the local sync state, which holds one record per synchronized resource and
+   * is rewritten several times a minute, does not — the indentation there
+   * roughly doubles the bytes serialized and fsync'd for nobody's benefit.
+   */
+  pretty = true,
+): Promise<void> {
+  const json = pretty ? JSON.stringify(value, null, 2) : JSON.stringify(value);
+  await writeFileAtomic(path, Buffer.from(`${json}\n`, "utf8"));
 }
 
 export async function writeFileAtomic(

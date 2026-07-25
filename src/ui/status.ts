@@ -3,8 +3,10 @@ import * as vscode from "vscode";
 export type SyncStatus =
   | "unconfigured"
   | "locked"
+  | "disabled"
   | "syncing"
   | "up-to-date"
+  | "partial"
   | "pending-restart"
   | "conflict"
   | "error";
@@ -30,7 +32,7 @@ export class StatusController implements vscode.Disposable {
     this.item.backgroundColor =
       status === "error"
         ? new vscode.ThemeColor("statusBarItem.errorBackground")
-        : status === "conflict"
+        : status === "conflict" || status === "partial"
           ? new vscode.ThemeColor("statusBarItem.warningBackground")
           : undefined;
   }
@@ -64,8 +66,19 @@ function statusPresentation(status: SyncStatus): {
     case "locked":
       return {
         text: "$(lock) Cursor Setting Sync",
-        tooltip: "Unlock the synchronization repository.",
+        tooltip:
+          "The repository key is not available on this device. Click to re-enter the passphrase, or run \"Cursor Setting Sync: Disconnect\" to clear the local configuration.",
         command: "cursorSync.setup",
+      };
+    case "disabled":
+      // A configured repository with automatic sync switched off used to show
+      // "Setup", whose click opens the first-run folder picker against a
+      // working repository. It is paused, not unconfigured.
+      return {
+        text: "$(circle-slash) Cursor Setting Sync: Paused",
+        tooltip:
+          "Automatic synchronization is off (cursorSettingSync.enabled). Click to synchronize once.",
+        command: "cursorSync.syncNow",
       };
     case "syncing":
       return {
@@ -78,6 +91,16 @@ function statusPresentation(status: SyncStatus): {
         text: "$(check) Cursor Setting Sync",
         tooltip: "All locally available events are applied.",
         command: "cursorSync.syncNow",
+      };
+    case "partial":
+      // Everything that can sync is in sync, but whole resource kinds are
+      // switched off. A plain check mark there is a lie the user only
+      // discovers weeks later.
+      return {
+        text: "$(warning) Cursor Setting Sync: Partial",
+        tooltip:
+          "Some resource kinds are not synchronizing. Open diagnostics for details.",
+        command: "cursorSync.showDiagnostics",
       };
     case "pending-restart":
       return {

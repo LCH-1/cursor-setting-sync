@@ -1,8 +1,10 @@
 import {
   applyEdits,
+  createScanner,
   modify,
   parse,
   printParseErrorCode,
+  SyntaxKind,
   type ParseError,
 } from "jsonc-parser";
 import type { JsonValue, MergeOutcome } from "../types";
@@ -102,42 +104,159 @@ export function mergeJsoncBuffers(
   local: Buffer,
   remote: Buffer,
 ): MergeOutcome {
-  const baseValue = parseJsonc(base.toString("utf8"), "base");
-  const localValue = parseJsonc(local.toString("utf8"), "local");
-  const remoteValue = parseJsonc(remote.toString("utf8"), "remote");
+  const baseText = base.toString("utf8");
+  const localText = local.toString("utf8");
+  const remoteText = remote.toString("utf8");
+  const baseValue = parseJsonc(baseText, "base");
+  const localValue = parseJsonc(localText, "local");
+  const remoteValue = parseJsonc(remoteText, "remote");
   const result = mergeJsonValues(baseValue, localValue, remoteValue);
   if (result.conflicts.length > 0 || result.value === undefined) {
-    return {
-      status: "conflict",
-      conflictContent: Buffer.from(
-        `${JSON.stringify(
-          {
-            conflicts: result.conflicts,
-            base: baseValue,
-            local: localValue,
-            remote: remoteValue,
-          },
-          null,
-          2,
-        )}\n`,
-        "utf8",
-      ),
-    };
+    return jsoncMergeConflict(
+      result.conflicts,
+      baseValue,
+      localValue,
+      remoteValue,
+    );
   }
-  // The merged value is written back as property-level edits to the local
-  // text, so comments and formatting on untouched lines survive the merge.
-  let merged = local.toString("utf8");
-  for (const [propertyPath, value] of collectJsoncEdits(localValue, result.value, [])) {
-    merged =
+
+  // The merged value is written back as property-level edits, so comments and
+  // formatting on untouched lines survive the merge.
+  //
+  // Which text those edits are anchored on decides both what survives and
+  // whether the merge is deterministic. Two devices resolving the same fork
+  // see the same three buffers with "local" and "remote" SWAPPED, so the
+  // anchor has to be picked by a rule that treats the pair as unordered;
+  // anchoring on "local" unconditionally made each device write the other's
+  // values into its own formatting, so the two merge events had different
+  // bytes, never collapsed into one version, and re-conflicted.
+  //
+  // Anchoring on the base unconditionally is deterministic but deletes every
+  // comment either side added since the base, silently and with no conflict
+  // prompt. Comments are authored content, so the anchor is chosen from the
+  // comment trivia instead, which is a property of the unordered pair:
+  //
+  //   - neither side touched the comments -> anchor on base; the base carries
+  //     every comment both sides have, so nothing can be lost.
+  //   - exactly one side touched them -> anchor on THAT side's bytes. Both
+  //     devices identify the same side and anchor on the same bytes, so both
+  //     emit the same output, and the added comments survive.
+  //   - both sides touched them -> the two anchors are only usable if they
+  //     render identically (both sides made the same edit). Otherwise no
+  //     anchor can carry both sets of comments without inventing a merge that
+  //     the other device would have to reproduce byte for byte, so the case
+  //     falls through to manual conflict resolution rather than dropping one
+  //     side's annotations.
+  //
+  // Pure whitespace, key ordering and indentation still normalize to the
+  // chosen anchor. That loses no authored content and the merged value is
+  // exact, so it is not worth a conflict prompt.
+  const baseComments = collectComments(baseText);
+  const localEdited = !sameComments(collectComments(localText), baseComments);
+  const remoteEdited = !sameComments(collectComments(remoteText), baseComments);
+  let merged: string;
+  if (!localEdited && !remoteEdited) {
+    merged = renderJsoncMerge(baseText, baseValue, result.value);
+  } else if (localEdited && !remoteEdited) {
+    merged = renderJsoncMerge(localText, localValue, result.value);
+  } else if (remoteEdited && !localEdited) {
+    merged = renderJsoncMerge(remoteText, remoteValue, result.value);
+  } else {
+    const fromLocal = renderJsoncMerge(localText, localValue, result.value);
+    const fromRemote = renderJsoncMerge(remoteText, remoteValue, result.value);
+    if (fromLocal !== fromRemote) {
+      return jsoncMergeConflict(
+        ["$ (comments changed on both sides)"],
+        baseValue,
+        localValue,
+        remoteValue,
+      );
+    }
+    merged = fromLocal;
+  }
+  const content = Buffer.from(merged, "utf8");
+  return {
+    status: deepEqual(result.value, localValue) && local.equals(content)
+      ? "unchanged"
+      : "merged",
+    content,
+    // Every adapter that owns a JSON-merge kind - snippets, tasks, mcp.json and
+    // the other Cursor user files - hashes the raw file bytes, so the merge
+    // outcome must hash the same bytes. Publishing sha256 of the canonical JSON
+    // instead made the tip hash disagree with what the next scan computed, so
+    // the resource was republished on every cycle and could never be
+    // recognized as already applied.
+    semanticHash: sha256(content),
+  };
+}
+
+function jsoncMergeConflict(
+  conflicts: string[],
+  baseValue: JsonValue | undefined,
+  localValue: JsonValue | undefined,
+  remoteValue: JsonValue | undefined,
+): MergeOutcome {
+  return {
+    status: "conflict",
+    conflictContent: Buffer.from(
+      `${JSON.stringify(
+        {
+          conflicts,
+          base: baseValue,
+          local: localValue,
+          remote: remoteValue,
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    ),
+  };
+}
+
+/** Writes `merged` into `anchorText` as property-level edits. */
+function renderJsoncMerge(
+  anchorText: string,
+  anchorValue: JsonValue | undefined,
+  merged: JsonValue,
+): string {
+  let text = anchorText;
+  for (const [propertyPath, value] of collectJsoncEdits(anchorValue, merged, [])) {
+    text =
       propertyPath.length === 0
         ? `${JSON.stringify(value, null, 2)}\n`
-        : setJsoncProperty(merged, propertyPath, value);
+        : setJsoncProperty(text, propertyPath, value);
   }
-  return {
-    status: deepEqual(result.value, localValue) ? "unchanged" : "merged",
-    content: Buffer.from(merged, "utf8"),
-    semanticHash: semanticHash(result.value),
-  };
+  return text;
+}
+
+/**
+ * Every comment token in document order. Leading and trailing whitespace is
+ * trimmed so re-indenting a comment does not count as authoring one.
+ */
+function collectComments(source: string): string[] {
+  const scanner = createScanner(source, false);
+  const comments: string[] = [];
+  for (
+    let token = scanner.scan();
+    token !== SyntaxKind.EOF;
+    token = scanner.scan()
+  ) {
+    if (
+      token === SyntaxKind.LineCommentTrivia ||
+      token === SyntaxKind.BlockCommentTrivia
+    ) {
+      comments.push(scanner.getTokenValue().trim());
+    }
+  }
+  return comments;
+}
+
+function sameComments(left: readonly string[], right: readonly string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((comment, index) => comment === right[index])
+  );
 }
 
 function collectJsoncEdits(

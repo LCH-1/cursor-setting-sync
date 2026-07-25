@@ -1,3 +1,15 @@
+# Everything in the repository root is excluded, and only the files below are
+# added back. A stray scratch file dropped in the root - an editor "Untitled",
+# a screenshot, a note - used to match no pattern here and shipped inside the
+# VSIX. An allowlist cannot miss the next one.
+*
+!package.json
+!README.md
+!README.ko.md
+!CHANGELOG.md
+!LICENSE
+!icon.png
+
 .gitignore
 .vscode/**
 src/**
@@ -12,9 +24,6 @@ cursor-setting-sync-기획서.md
 **/*.map
 .vitest-cursor.*
 *.log
-image.png
 tmp/**
 icons/
 scripts/**
-image*.png
-image copy.png

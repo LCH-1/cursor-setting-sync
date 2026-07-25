@@ -1,5 +1,5 @@
 import { basename, join } from "node:path";
-import { readdir } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import type { CursorPaths } from "../platform/paths";
 import {
   isCaseInsensitivePathPlatform,
@@ -18,13 +18,54 @@ interface WorkspaceJson {
   workspace?: string;
 }
 
+interface WorkspaceDiscoveryMemo {
+  mtimeMs: number;
+  entryCount: number;
+  workspaces: WorkspaceIdentity[];
+}
+
+/**
+ * Cached per workspaceStorage root.
+ *
+ * Three callers rediscover this map independently - the chat scan, the
+ * workspaceStorage scan and the workspace-mapping prompt - and every one of
+ * them used to stat and read a `workspace.json` through the hardened path
+ * walker for each of what can be hundreds of never-garbage-collected
+ * workspaceStorage directories, on every 30-second poll. The set can only
+ * change when a directory is added or removed, which is exactly what the root
+ * directory's own mtime records; the entry count is compared as well so a
+ * filesystem with coarse timestamps still notices.
+ */
+const discoveryMemo = new Map<string, WorkspaceDiscoveryMemo>();
+
+/** Drops the memo; exported for tests that rewrite a workspaceStorage tree. */
+export function resetWorkspaceDiscoveryCache(): void {
+  discoveryMemo.clear();
+}
+
 export async function discoverWorkspaces(
   paths: CursorPaths,
 ): Promise<WorkspaceIdentity[]> {
   if (!(await pathExists(paths.workspaceStorageRoot))) {
+    discoveryMemo.delete(paths.workspaceStorageRoot);
     return [];
   }
   const entries = await readdir(paths.workspaceStorageRoot, { withFileTypes: true });
+  let rootMtimeMs: number | null = null;
+  try {
+    rootMtimeMs = (await stat(paths.workspaceStorageRoot)).mtimeMs;
+  } catch {
+    // Without a root timestamp the discovery simply runs in full.
+  }
+  const memo = discoveryMemo.get(paths.workspaceStorageRoot);
+  if (
+    rootMtimeMs !== null &&
+    memo !== undefined &&
+    memo.mtimeMs === rootMtimeMs &&
+    memo.entryCount === entries.length
+  ) {
+    return [...memo.workspaces];
+  }
   const workspaces: WorkspaceIdentity[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.isSymbolicLink()) {
@@ -57,7 +98,15 @@ export async function discoverWorkspaces(
       basename: workspaceBasename(uri),
     });
   }
-  return workspaces.sort((left, right) => left.id.localeCompare(right.id));
+  const sorted = workspaces.sort((left, right) => left.id.localeCompare(right.id));
+  if (rootMtimeMs !== null) {
+    discoveryMemo.set(paths.workspaceStorageRoot, {
+      mtimeMs: rootMtimeMs,
+      entryCount: entries.length,
+      workspaces: sorted,
+    });
+  }
+  return [...sorted];
 }
 
 export function resolveTargetWorkspace(

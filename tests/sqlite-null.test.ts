@@ -11,7 +11,10 @@ import {
 import { readStoreSnapshot } from "../src/chat/storeDb";
 import { captureWorkspaceDatabaseSnapshot } from "../src/helper/workspaceDatabaseMerge";
 import type { CursorPaths } from "../src/platform/paths";
-import { ExtensionsAdapter } from "../src/resources/extensions";
+import {
+  ExtensionsAdapter,
+  createExtensionIgnoreMatcher,
+} from "../src/resources/extensions";
 import { readPortableProfiles } from "../src/resources/profiles";
 import { UiStateAdapter } from "../src/resources/uiState";
 import { parseTargetStorageMarker } from "../src/resources/uiStatePolicy";
@@ -149,7 +152,7 @@ describe("chat scan over NULL SQLite values", () => {
     expect(result.deletions).toEqual([]);
     expect(result.warnings).toEqual([
       `Skipped chat ${COMPOSER_A}: cursorDiskKV key composerData:${COMPOSER_A} has an unsupported SQLite storage class: real.`,
-      `Skipped chat ${COMPOSER_C}: composerData row is missing.`,
+      `Skipped 1 chat(s) whose conversation body is not in the database: ${COMPOSER_C}. Expected when Cursor prunes a conversation and keeps its list entry; if you still expect one of these chats, its body was lost locally.`,
     ]);
   });
 
@@ -301,7 +304,7 @@ describe("extensions scan when the profile manifest is unreadable", () => {
     insertItem(database, "userDataProfiles", "{ not json");
     database.close();
 
-    const result = await new ExtensionsAdapter(paths, new Set()).scan({});
+    const result = await new ExtensionsAdapter(paths, createExtensionIgnoreMatcher([])).scan({});
 
     expect(result.snapshots).toEqual([]);
     expect(result.deletions).toEqual([]);
@@ -313,7 +316,7 @@ describe("extensions scan when the profile manifest is unreadable", () => {
     insertItem(database, "userDataProfiles", null);
     database.close();
 
-    const result = await new ExtensionsAdapter(paths, new Set()).scan({});
+    const result = await new ExtensionsAdapter(paths, createExtensionIgnoreMatcher([])).scan({});
 
     expect(
       result.warnings.some((warning) =>

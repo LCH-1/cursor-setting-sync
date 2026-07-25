@@ -36,7 +36,7 @@ This policy prioritizes forward migration and data safety. Reverse application t
 - Windows 10 or later, macOS, or Linux
 - Cursor with VS Code API 1.99 or later
 - A shared folder provided by OneDrive, Syncthing, or a similar file synchronization tool — or a git remote (the `git` CLI must be on PATH for git transport)
-- A repository passphrase of at least 12 characters
+- An optional repository passphrase (12+ characters when set; leaving it empty stores the key inside the repository, so only do that for a private local folder or a fully trusted private remote)
 
 File-based synchronization remains available when Cursor's embedded runtime does not provide the required SQLite capabilities. Profile, UI-state, extension-state, workspace storage, and database-backed chat synchronization require `node:sqlite`, online backup support, and a compatible local schema.
 
@@ -118,7 +118,7 @@ Git transport requires the `git` CLI on `PATH`. Authentication uses your system 
 
 **Conflicts and recovery**
 
-- **Resolve Conflicts** — Manually resolve edits made on two PCs that could not auto-merge. Shows a diff and lets you keep one side (or the current local content).
+- **Resolve Conflicts** — Manually resolve edits made on two PCs that could not auto-merge. Shows a diff and lets you keep one side (or the current local content). UI state never appears here: it is machine-local chrome, so a fork is always resolved automatically, including one where the two sides share no common ancestor. Only resources that carry something you wrote — settings, `.cursor` rules and user files, chat — ever ask. While a conflict is open, that resource keeps publishing this PC's version at most once an hour so the other side can still see it; resolving the conflict restores normal syncing immediately.
 - **Restore Version History** — Roll one resource back to an earlier version (like a git revert). Pick a resource, browse its versions with a diff preview, and publish the chosen one as a new version; history is preserved.
 - **Restore Backup** — Restore a database to an earlier backup snapshot. A SQLite backup is taken before every database write; pick one to restore. A "pre-restore" backup is also listed so a mistaken restore can be undone.
 
@@ -128,10 +128,11 @@ Git transport requires the `git` CLI on `PATH`. Authentication uses your system 
 - **Compact Safe Orphans** — Lightweight cleanup that removes object files no event references and stale temp files. It never touches event history.
 - **Archive Repository** — Copy the entire repository folder to a separate location as a backup archive.
 - **Forget Device** — Remove a device you no longer use from the list (local state only). Use it when an offline device is blocking pruning.
+- **Disconnect** — Stop synchronizing on this PC. Clears the stored repository, its encryption key, and the workspace mappings; the shared folder and its history are left untouched. Use it to switch repositories, to stop syncing, or to recover from "The configured folder now contains a different repository."
 
 **Diagnostics**
 
-- **Show Diagnostics** — View the current sync status, errors, and warning log. Start here when something looks wrong.
+- **Show Diagnostics** — View the current sync status, the settings actually in force, the machine-specific exclusions, every pending change with the reason it is waiting, the conflicting resources, and the standing warnings with their age. Start here when something looks wrong.
 - **Show Repository Usage** — Report how much space the repository uses; in git mode it also warns about files over the 100 MB GitHub limit.
 
 ## Settings
@@ -146,7 +147,10 @@ Git transport requires the `git` CLI on `PATH`. Authentication uses your system 
   "cursorSettingSync.syncWorkspaceStorage": true,
   "cursorSettingSync.gitSync": true,
   "cursorSettingSync.ignoredSettings": [],
+  "cursorSettingSync.useDefaultIgnoredSettings": true,
   "cursorSettingSync.ignoredExtensions": [],
+  "cursorSettingSync.ignoredUserFiles": [],
+  "cursorSettingSync.ignoredUiStateKeys": [],
   "cursorSettingSync.maxPayloadMiB": 128
 }
 ```
@@ -160,11 +164,51 @@ Git transport requires the `git` CLI on `PATH`. Authentication uses your system 
 | `syncChat` | `true` | Synchronize supported Cursor chat stores (composer conversations, agent transcripts, `store.db`). |
 | `syncWorkspaceStorage` | `true` | Back up `workspaceStorage` state. It is captured only after every Cursor process exits. |
 | `gitSync` | `true` | When the repository folder is a git worktree, pull before reading and commit/push after writing. Requires the `git` CLI. |
-| `ignoredSettings` | `[]` | Setting keys excluded from synchronization. Add sensitive values such as API keys here. |
-| `ignoredExtensions` | `[]` | Extension IDs excluded from synchronization. |
-| `maxPayloadMiB` | `128` | Maximum uncompressed size of one payload (MiB, 1–512). Larger resources are not published. |
+| `ignoredSettings` | `[]` | Setting keys in `settings.json` excluded from synchronization. Add sensitive values such as API keys here. Each entry is an exact key (`editor.fontSize`) or a wildcard (`remote.SSH.*`). |
+| `useDefaultIgnoredSettings` | `true` | Also exclude the built-in machine-specific key list below. Turn it off to synchronize those keys anyway. |
+| `ignoredExtensions` | `[]` | Extension IDs excluded from synchronization. Exact (`ms-python.python`) or wildcard (`ms-python.*`); matching ignores case. |
+| `ignoredUserFiles` | `[]` | Files under `~/.cursor` excluded from synchronization, by relative path. Use this — **not** `ignoredSettings` — to keep `mcp.json` or `cli-config.json` off the shared folder. An entry naming a directory (`rules` or `rules/`) excludes everything under it, and wildcards work: `rules/*.md`, `skills/**/secret.md`. |
+| `ignoredUiStateKeys` | `[]` | UI state keys excluded from synchronization. Each entry is an exact key such as `workbench.activity.pinnedViewlets2` or a wildcard such as `workbench.panel.*`. Ignoring a key only stops it from syncing; the value already on other devices is never deleted. |
+| `maxPayloadMiB` | `128` | Maximum uncompressed size of one payload (MiB, 1–512). A larger resource is skipped with a warning naming it; everything else in the cycle still synchronizes. |
+
+Every ignore list accepts the same patterns: an exact entry, `*` for any characters (stopping at `/` in the path-shaped `ignoredUserFiles`), and `**` to cross directory separators. For `ignoredSettings` and `ignoredUserFiles`, an entry that matches nothing is reported in the output channel, so a typo is visible.
 
 Values still present under the legacy `cursorSync.*` namespace are honored as a fallback.
+
+### Machine-specific settings excluded by default
+
+These describe the computer rather than a preference, and VS Code registers them in workbench code where scanning extension manifests cannot see them — a proxy URL carries credentials, a shell path points at an executable the other PC may not have, a zoom level belongs to a monitor. `cursorSettingSync.useDefaultIgnoredSettings: false` turns the whole list off.
+
+```
+application.shellEnvironmentResolutionTimeout   remote.WSL.*
+git.path                                        terminal.external.*
+http.proxy*                                     terminal.integrated.automationProfile.*
+http.systemCertificates                         terminal.integrated.cwd
+http.experimental.systemCertificatesV2          terminal.integrated.defaultProfile.*
+java.jdt.ls.java.home                           terminal.integrated.shell.*
+python.condaPath                                terminal.integrated.shellArgs.*
+python.defaultInterpreterPath                   window.zoomLevel
+remote.SSH.*                                    window.zoomPerWindow
+```
+
+Keys that VS Code's own Settings Sync propagates between machines are deliberately **not** on the list: `terminal.integrated.profiles.*`, `terminal.integrated.env.*` and `files.simpleDialog.enable` are ordinary application-scoped preferences, and `python.venvPath` is declared `machine`-scoped by the Python extension itself.
+
+Settings that an installed extension declares as `machine` or `machine-overridable` scope are excluded on top of this list.
+
+If a key on this list had already synchronized from this PC before the list started covering it, the output channel names it, and `Show Diagnostics` keeps the same notice under the standing warnings — so a key that stops travelling after an upgrade is never silent.
+
+### UI state keys excluded by default
+
+Two UI state families are never synchronized, on top of anything in `cursorSettingSync.ignoredUiStateKeys`:
+
+```
+workbench.panel.composerChatViewPane.<uuid>.hidden
+workbench.auxiliarybar.pinnedPanels
+```
+
+Cursor mints a GUID for every AI chat panel and never prunes either one, so both grow without bound and every GUID is meaningless on another machine. `workbench.auxiliarybar.pinnedPanels` collects one `workbench.panel.aichat.<uuid>` entry per panel either machine ever opened; merging it converges, but the merged array is the union of both machines' dead panels and nothing ever shrinks it again — a PC with two entries would permanently inherit the peer's hundreds. Panel *sizes* and the rest of the workbench layout still travel; only these two GUID-keyed families are held back.
+
+This is a policy, not a safety rule. A value published by an earlier version is skipped on arrival, is named in the output channel, and never fails the rest of the apply. The value already on other devices is never deleted.
 
 ## Security and privacy
 
@@ -172,7 +216,7 @@ Values still present under the legacy `cursorSync.*` namespace are honored as a 
 - The passphrase-derived key only wraps the master key; the passphrase is not stored in the repository.
 - The unlocked master key is kept in Cursor's `SecretStorage` on each PC.
 - Cursor/extension `SecretStorage` and known database-backed OAuth, authentication-session, password, credential, and token keys are excluded.
-- Inline values inside synchronized settings or MCP JSON are encrypted but are part of the payload. Prefer environment-variable references and add sensitive setting keys to `cursorSettingSync.ignoredSettings`.
+- Inline values inside synchronized settings or MCP JSON are encrypted but are part of the payload. Prefer environment-variable references. Sensitive keys inside `settings.json` go in `cursorSettingSync.ignoredSettings`; whole files under `~/.cursor` such as `mcp.json` and `cli-config.json` go in `cursorSettingSync.ignoredUserFiles`.
 - Workspace storage payloads are restricted to logical rows from `state.vscdb`, `notepads.json`, and files below `images/`; all payloads remain encrypted in the repository.
 - `workspace.json` is read only to derive encrypted workspace identity/URI metadata. It is never stored or restored as a payload, and mapped workspace IDs share one canonical resource identity.
 - Workspace-storage deletions are not propagated because each PC may have a different set of workspaces.
@@ -190,7 +234,8 @@ Shared-folder status only confirms a local file write. Always wait for OneDrive 
 - Workspace storage is captured only after every Cursor process exits; `Cursor Setting Sync: Sync Now` does not scan it while Cursor is running.
 - Workspace database imports are upsert-only in protocol v1: target-only rows are preserved, and a missing incoming row never deletes local state.
 - Agent transcripts alone may not fully recreate every Cursor sidebar entry.
-- Finalized events and tombstones are retained by repository protocol v1.
+- Finalized events and tombstones are retained by repository protocol v1; `Checkpoint & Prune History` folds and removes them, and once the event log passes 500 files a poll runs the same fold automatically (at most once every six hours, behind the same safety gates).
+- The machine-specific exclusion set is computed per PC. A key an extension declares as `machine`-scoped is only excluded where that extension is installed, so install order across the fleet can still let such a key travel. The built-in default list above applies everywhere and is not affected.
 
 See [usage](docs/usage.md), [protocol](docs/protocol.md), [security](docs/security.md), and [compatibility](docs/compatibility.md) for technical details.
 
@@ -202,4 +247,3 @@ See [usage](docs/usage.md), [protocol](docs/protocol.md), [security](docs/securi
 
 - [Repository](https://github.com/LCH-1/cursor-setting-sync)
 - [Issue tracker](https://github.com/LCH-1/cursor-setting-sync/issues)
-"# cursor-setting-sync" 

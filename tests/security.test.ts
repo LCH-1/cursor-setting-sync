@@ -22,7 +22,10 @@ import { validateEventManifest } from "../src/protocol/repository";
 import { parentsForLocalChange } from "../src/protocol/reconciler";
 import { isRepositoryPayloadFile } from "../src/sync/watch";
 import { CursorUserFilesAdapter } from "../src/resources/cursorUserFiles";
-import { SettingsAdapter } from "../src/resources/settings";
+import {
+  SettingsAdapter,
+  createSettingsIgnoreMatcher,
+} from "../src/resources/settings";
 import { ProfileFilesAdapter } from "../src/resources/profileFiles";
 import { semanticHash } from "../src/resources/jsonc";
 import { canonicalJson } from "../src/protocol/canonical";
@@ -171,8 +174,8 @@ describe("synchronization input boundaries", () => {
         userDataRoot: "C:/Cursor/User",
         profilesRoot: "C:/Cursor/User/profiles",
       } as CursorPaths,
-      new Set(),
-      new Set(),
+      createSettingsIgnoreMatcher([]),
+      createSettingsIgnoreMatcher([]),
     );
     await expect(
       adapter.apply({
@@ -197,8 +200,8 @@ describe("synchronization input boundaries", () => {
           userDataRoot: temporaryRoot,
           profilesRoot: join(temporaryRoot, "profiles"),
         } as CursorPaths,
-        new Set(["editor.fontSize"]),
-        new Set(),
+        createSettingsIgnoreMatcher(["editor.fontSize"]),
+        createSettingsIgnoreMatcher([]),
       );
 
       const result = await adapter.apply({
