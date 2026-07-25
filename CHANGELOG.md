@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.2] - 2026-07-25
+
+### Fixed
+
+- Chat synchronization crashed every cycle ("Adapter state-vscdb-chat scan failed... Received null") whenever a Cursor database row held a SQL NULL. NULL values are now carried with their SQLite storage class across every capture and apply path and round-trip as SQL NULL, and one unusable row is skipped with a warning instead of taking down the whole adapter scan.
+
 ## [0.0.1] - 2026-07-20
 
 ### Added
