@@ -51,8 +51,61 @@ export async function assertRealDirectory(path: string): Promise<string> {
   return resolved;
 }
 
+// Reading from a synchronized folder can fail transiently: a cloud provider
+// (OneDrive, Google Drive) may briefly lock a file while syncing it, or return
+// UNKNOWN/EIO while hydrating an online-only placeholder. These are not
+// corruption, so a short retry rides over them instead of aborting the whole
+// sync. ENOENT is deliberately excluded — a missing file is a real absence the
+// callers already handle. Genuine corruption surfaces later as a parse or hash
+// failure, which is never a transient code and is therefore never retried.
+const TRANSIENT_IO_CODES = new Set([
+  "UNKNOWN",
+  "EBUSY",
+  "EIO",
+  "EPERM",
+  "EACCES",
+  "EAGAIN",
+  "EMFILE",
+  "ENFILE",
+  "ETIMEDOUT",
+]);
+
+export function isTransientIoError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    TRANSIENT_IO_CODES.has(error.code)
+  );
+}
+
+export async function retryTransientRead<T>(
+  operation: () => Promise<T>,
+  attempts = 4,
+  baseDelayMs = 150,
+): Promise<T> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (attempt >= attempts || !isTransientIoError(error)) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, baseDelayMs * attempt));
+    }
+  }
+}
+
+export async function statResilient(path: string): Promise<Stats> {
+  return retryTransientRead(() => stat(path));
+}
+
+export async function readFileResilient(path: string): Promise<Buffer> {
+  return retryTransientRead(() => readFile(path));
+}
+
 export async function readJsonFile<T>(path: string): Promise<T> {
-  const content = await readFile(path, "utf8");
+  const content = await retryTransientRead(() => readFile(path, "utf8"));
   return JSON.parse(content) as T;
 }
 

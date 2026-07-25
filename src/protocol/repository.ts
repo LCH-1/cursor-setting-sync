@@ -2,7 +2,7 @@ import { gzip, gunzip } from "node:zlib";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { readFile, readdir, rm, stat } from "node:fs/promises";
+import { readdir, rm, stat } from "node:fs/promises";
 import {
   CHECKPOINT_ENVELOPE_VERSION,
   CHECKPOINT_EXTENSION,
@@ -52,8 +52,10 @@ import {
   isMissingPathError,
   listFilesRecursively,
   pathExists,
+  readFileResilient,
   readFileWithinRoot,
   readJsonFile,
+  statResilient,
   writeFileAtomic,
   writeJsonAtomic,
 } from "../platform/files";
@@ -496,7 +498,7 @@ export class SyncRepository {
   async readObject(reference: ObjectReference): Promise<Buffer> {
     validateObjectReference(reference, this.maxPayloadBytes);
     const path = this.objectPath(reference.deviceId, reference.objectId);
-    const fileInfo = await stat(path);
+    const fileInfo = await statResilient(path);
     const envelopeLimit = Math.min(
       MAX_OBJECT_ENVELOPE_BYTES,
       Math.ceil(this.maxPayloadBytes * 1.5) + 1024 * 1024,
@@ -1404,13 +1406,13 @@ export class SyncRepository {
     expectedHash: string,
     expectedLamport: number | null,
   ): Promise<LoadedCheckpoint> {
-    const fileInfo = await stat(path);
+    const fileInfo = await statResilient(path);
     if (fileInfo.size > MAX_CHECKPOINT_FILE_BYTES) {
       throw new Error(
         `Checkpoint file exceeds ${MAX_CHECKPOINT_FILE_BYTES} bytes: ${path}`,
       );
     }
-    const bytes = await readFile(path);
+    const bytes = await readFileResilient(path);
     const stored = JSON.parse(bytes.toString("utf8")) as StoredCheckpoint;
     validateStoredCheckpointEnvelope(stored);
     validateCheckpointHeader(stored.header, this.repository.repositoryId);
@@ -1613,11 +1615,11 @@ export class SyncRepository {
     fileName: string,
     expectedDeviceId: string,
   ): Promise<DecryptedEvent> {
-    const fileInfo = await stat(path);
+    const fileInfo = await statResilient(path);
     if (fileInfo.size > MAX_EVENT_FILE_BYTES) {
       throw new Error(`Event file exceeds its size limit: ${fileName}`);
     }
-    const bytes = await readFile(path);
+    const bytes = await readFileResilient(path);
     const stored = JSON.parse(bytes.toString("utf8")) as StoredEvent;
     validateStoredEventEnvelope(stored);
     validateEventHeader(stored.header, this.repository.repositoryId);
