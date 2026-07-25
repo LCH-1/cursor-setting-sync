@@ -100,6 +100,7 @@ import {
   isWorkspaceStateDatabasePath,
 } from "../resources/workspaceStorage";
 import { StateVscdbChatAdapter } from "../chat/stateVscdb";
+import { mergeChatSnapshotBuffers } from "../chat/chatMerge";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
 import {
@@ -769,13 +770,21 @@ export class SyncManager implements vscode.Disposable {
         await lock.release();
       }
     }
-    if (resolution.resolved > 0) {
-      await this.syncNow(true);
-    } else if (resolution.deferred.length > 0) {
+    // Reported whether or not anything else resolved. A bulk answer routinely
+    // covers most of the list and leaves a few out — a conflict between two
+    // *other* devices has no "this PC" side — and those used to disappear in
+    // silence whenever at least one conflict had been resolved alongside them.
+    if (resolution.deferred.length > 0) {
+      for (const entry of resolution.deferred) {
+        this.status.log(`Conflict deferred: ${entry}`);
+      }
       void vscode.window.showWarningMessage(
         `${resolution.deferred.length} conflict(s) are deferred. ${resolution.deferred[0]}`,
       );
-    } else {
+    }
+    if (resolution.resolved > 0) {
+      await this.syncNow(true);
+    } else if (resolution.deferred.length === 0) {
       void vscode.window.showInformationMessage(
         "There are no synchronization conflicts to resolve.",
       );
@@ -3531,16 +3540,41 @@ export async function autoMergeConflicts(
     ) {
       continue;
     }
-    const outcome = workspaceDatabase
-      ? mergeWorkspaceDatabaseBuffers(base.content, local.content, remote.content)
-      : conflict.kind === "ui-state"
-        ? mergeUiStateBuffers(base.content, local.content, remote.content)
-        : isJsonMergeKind(conflict.kind, localTip.metadata)
-          ? mergeJsoncBuffers(base.content, local.content, remote.content)
-          : validatedTextMergeOutcome(
-              conflict.kind,
-              mergeTextBuffers(base.content, local.content, remote.content),
-            );
+    // Replicated tip order, newest first: the one ordering of the two sides
+    // that does not depend on which device is running this.
+    const orderedTips = [...tips].sort(compareTips);
+    const newestTip = orderedTips[0];
+    const contentOf = (tip: ResourceTip): Buffer =>
+      tip.versionId === localTip.versionId
+        ? (local.content as Buffer)
+        : (remote.content as Buffer);
+    const olderTip = orderedTips[1];
+    const chatOutcome =
+      conflict.kind === "chat" &&
+      newestTip !== undefined &&
+      olderTip !== undefined
+        ? mergeChatSnapshotBuffers(base.content, [
+            contentOf(newestTip),
+            contentOf(olderTip),
+          ])
+        : undefined;
+    // chat is its own branch rather than a `??` in front of the chain, so it
+    // can never reach the diff3 fallback: a line-based merge of two chat
+    // snapshots can produce syntactically valid JSON that describes a
+    // conversation neither device has.
+    const outcome: MergeOutcome =
+      conflict.kind === "chat"
+        ? chatOutcome ?? { status: "conflict" }
+        : workspaceDatabase
+          ? mergeWorkspaceDatabaseBuffers(base.content, local.content, remote.content)
+          : conflict.kind === "ui-state"
+            ? mergeUiStateBuffers(base.content, local.content, remote.content)
+            : isJsonMergeKind(conflict.kind, localTip.metadata)
+              ? mergeJsoncBuffers(base.content, local.content, remote.content)
+              : validatedTextMergeOutcome(
+                  conflict.kind,
+                  mergeTextBuffers(base.content, local.content, remote.content),
+                );
     // A ui-state value with no structural merge still resolves without asking:
     // both devices sort the same two tips with the same replicated comparator,
     // so both republish the same side's bytes and the reconciler collapses the
@@ -3549,8 +3583,6 @@ export async function autoMergeConflicts(
     // continuously and where the manual resolver could only ever have offered
     // the same whole-tip either/or. It must never reach a kind whose loser
     // holds authored content — cursor-user-rules, settings, chat.
-    // Newest tip under the replicated comparator: same answer on every device.
-    const newestTip = [...tips].sort(compareTips)[0];
     const lastWriter =
       conflict.kind === "ui-state" && outcome.status === "conflict"
         ? newestTip
@@ -3571,22 +3603,31 @@ export async function autoMergeConflicts(
     ) {
       continue;
     }
+    // The merged content is a deterministic function of the tips, and the
+    // metadata has to be one too. `localTip` is whichever tip this device
+    // happens to own, so using it made two devices attach DIFFERENT metadata to
+    // byte-identical content; the reconciler collapses those two events on
+    // operation plus semanticHash alone, and an arbitrary tip pick then decided
+    // ui-state's `valueType` — the storage class the helper binds, TEXT or BLOB
+    // — for both devices. Every candidate below is elected the same way on every
+    // device: `newestTip` from the replicated comparator, and the chat winner
+    // from `lastUpdatedAt` inside the two payloads both devices read.
+    const metadataTip =
+      chatOutcome?.winner === undefined
+        ? lastWriter ?? newestTip ?? localTip
+        : orderedTips[chatOutcome.winner] ?? newestTip ?? localTip;
     const snapshot: ResourceSnapshot = {
       resourceId: conflict.resourceId,
       kind: conflict.kind,
       content: resolved.content,
       semanticHash: resolved.semanticHash ?? sha256(resolved.content),
       metadata: {
-        // The merged content is a deterministic function of the tips, and the
-        // metadata has to be one too. `localTip` is whichever tip this device
-        // happens to own, so using it made two devices attach DIFFERENT
-        // metadata to byte-identical content; the reconciler collapses those
-        // two events on operation plus semanticHash alone, and an arbitrary
-        // tip pick then decided ui-state's `valueType` — the storage class the
-        // helper binds, TEXT or BLOB — for both devices. The newest tip under
-        // `compareTips` is the same tip everywhere, and it is also the
-        // last-writer-wins winner whose own storage class must ride along.
-        ...((lastWriter ?? newestTip ?? localTip).metadata ?? {}),
+        ...(metadataTip.metadata ?? {}),
+        // The union of both sides' bubbles is what was published, so the count
+        // that travels with it has to describe the union, not the winner.
+        ...(chatOutcome?.bubbleCount === undefined
+          ? {}
+          : { bubbleCount: chatOutcome.bubbleCount }),
         syncOrigin: "auto-merge",
       },
     };
@@ -3606,16 +3647,93 @@ export async function autoMergeConflicts(
  * left for the user.
  *
  * A conflict with no common ancestor cannot be three-way merged, but picking a
- * winner never required a base. The list is deliberately just ui-state: a
- * ui-state value is machine-local chrome — a timestamp, a health-check result,
- * a panel position — that Cursor rewrites on its own on both machines, so the
- * losing side costs a piece of layout state that the next interaction
- * regenerates. Every kind that carries something the user authored
- * (`cursor-user-rules`, `settings`, `cursor-user-file`, `chat`, ...) is absent
- * on purpose: there, silently discarding the losing tip destroys content, and
- * an unresolved conflict is the correct outcome.
+ * winner never required a base.
+ *
+ * ui-state is here because a ui-state value is machine-local chrome — a
+ * timestamp, a health-check result, a panel position — that Cursor rewrites on
+ * its own on both machines, so the losing side costs a piece of layout state
+ * that the next interaction regenerates.
+ *
+ * Every kind that carries something the user authored (`cursor-user-rules`,
+ * `settings`, `cursor-user-file`, `chat`, ...) is absent on purpose: there,
+ * silently discarding the losing tip destroys content, and an unresolved
+ * conflict is the correct outcome. chat reaches an automatic resolution by a
+ * different route — {@link resolveBaseFreeChatConflict} combines the two sides
+ * instead of electing between them — and falls back to asking, not to an
+ * election, when it cannot.
  */
 const BASE_FREE_LAST_WRITER_KINDS: readonly ResourceKind[] = ["ui-state"];
+
+/**
+ * Resolves a base-free chat fork by merging the two snapshots structurally.
+ *
+ * A chat is the one content-bearing kind whose payload can be combined rather
+ * than chosen between: the conversation lives in keyed `bubbleId:` rows, so the
+ * union of both sides keeps every message either device captured, and no side
+ * has to be discarded for the conflict to clear. See
+ * {@link mergeChatSnapshotBuffers} for the election and ordering rules.
+ *
+ * The live repository that prompted this carried 36 base-free chat forks, 32 of
+ * which held the same conversation on both sides — identical bubble counts and
+ * identical `lastUpdatedAt` — and differed only in machine-local header fields.
+ * Asking a person to adjudicate those was the bug.
+ *
+ * Returns false — never throws — when either payload is unreadable or is not a
+ * snapshot this build can parse. The conflict then stays unresolved rather than
+ * falling back to an election that would throw a side away.
+ */
+async function resolveBaseFreeChatConflict(
+  repository: SyncRepository,
+  conflict: SyncConflict,
+  orderedPuts: readonly ResourceTip[],
+  onWarning: (warning: string) => void,
+): Promise<boolean> {
+  const [first, second] = orderedPuts;
+  if (first === undefined || second === undefined) {
+    return false;
+  }
+  const [firstData, secondData] = await Promise.all([
+    repository.tryReadVersion(first.versionId),
+    repository.tryReadVersion(second.versionId),
+  ]);
+  if (
+    firstData === null ||
+    secondData === null ||
+    firstData.content === null ||
+    secondData.content === null
+  ) {
+    return false;
+  }
+  const outcome = mergeChatSnapshotBuffers(null, [
+    firstData.content,
+    secondData.content,
+  ]);
+  if (outcome.content === undefined || outcome.winner === undefined) {
+    return false;
+  }
+  const winnerTip = outcome.winner === 0 ? first : second;
+  return publishAutoMerge(
+    repository,
+    conflict,
+    [
+      {
+        resourceId: conflict.resourceId,
+        kind: conflict.kind,
+        content: outcome.content,
+        semanticHash: outcome.semanticHash ?? sha256(outcome.content),
+        metadata: {
+          ...(winnerTip.metadata ?? {}),
+          ...(outcome.bubbleCount === undefined
+            ? {}
+            : { bubbleCount: outcome.bubbleCount }),
+          syncOrigin: "auto-merge",
+        },
+      },
+    ],
+    [],
+    onWarning,
+  );
+}
 
 /**
  * Resolves a fork with no common ancestor by republishing the winning tip
@@ -3645,10 +3763,27 @@ async function resolveBaseFreeConflict(
   tips: ResourceTip[],
   onWarning: (warning: string) => void,
 ): Promise<boolean> {
+  const puts = tips.filter((tip) => tip.operation === "put");
+  // A chat is combined, never chosen between: it takes the structural path or
+  // no automatic path at all. It is deliberately not in
+  // BASE_FREE_LAST_WRITER_KINDS, so a payload the merge cannot read — a future
+  // schema, a composer row whose ID is not a UUID — stays a conflict instead of
+  // silently losing a side.
+  if (conflict.kind === "chat") {
+    return (
+      puts.length === 2 &&
+      puts.length === tips.length &&
+      (await resolveBaseFreeChatConflict(
+        repository,
+        conflict,
+        [...puts].sort(compareTips),
+        onWarning,
+      ))
+    );
+  }
   if (!BASE_FREE_LAST_WRITER_KINDS.includes(conflict.kind)) {
     return false;
   }
-  const puts = tips.filter((tip) => tip.operation === "put");
   const winner = [...(puts.length > 0 ? puts : tips)].sort(compareTips)[0];
   if (winner === undefined) {
     return false;
@@ -3852,12 +3987,18 @@ function isAutoMergeKind(
   // the next time the user drags something. cursor-user-rules is prose the
   // user typed; a wrong merge there destroys authored content, so it keeps
   // asking.
+  //
+  // chat is here for the opposite reason to ui-state: not because losing a side
+  // is cheap, but because no side has to be lost. Its merge unions the keyed
+  // `bubbleId:` rows, so it is the one content-bearing kind where an automatic
+  // resolution keeps every message both devices captured.
   if (
     [
       "snippet",
       "task",
       "mcp",
       "prompt",
+      "chat",
       "chat-transcript",
       "keybindings",
       "ui-state",

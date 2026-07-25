@@ -89,15 +89,25 @@ Transient SQLite files (`*-wal`, `*-shm`, and `*-journal`), prior database backu
 ## Resolve conflicts
 
 1. Run `Cursor Setting Sync: Resolve Conflicts`.
-2. Inspect both versions in the diff editor.
-3. Select the version to keep.
-4. The extension publishes a resolution event referencing every conflicting tip.
+2. Every conflict is listed on one screen, named and with both sides' values beside it — `Setting: editor.fontSize · This PC: 14 vs Other PC: 16` — along with which PC wrote each side and when.
+3. Answer the whole list at once with **Keep the version written later everywhere**, **Keep this PC's version everywhere** or **Keep the other PC's version everywhere**, or pick a single entry to open its diff and decide it on its own. **Decide later** leaves everything as it is.
+4. The extension publishes a resolution event referencing every conflicting tip, batching the whole set into one event.
+
+Nothing is lost by deferring: both versions stay in the repository until the conflict is resolved, and `Cursor Setting Sync: Restore Version History` can recover a side that lost.
+
+A bulk answer only applies to the conflicts it names. With three or more PCs, a conflict between two *other* machines has no "this PC" side, so that conflict is left alone and reported rather than being given a different answer than the one asked for.
+
+"Written later" means the timestamps shown on the same screen, not the synchronization protocol's own ordering. The two differ routinely — a PC that has not synchronized in a week publishes behind one that just did, however recently it was written, and two PCs editing between the same two polls are ordered by a device identifier rather than by time. Since the resolver shows you the times, it decides by them. Where a side carries no time to compare — a version folded into a checkpoint keeps none — the entry says so and the later-published side wins instead.
 
 JSON and text resources attempt a semantic merge or diff3 merge when a common parent exists. Ambiguous changes remain conflicts. A JSON merge writes its result into the *common ancestor's* text, so both devices resolving the same fork emit identical bytes and the two independent merges collapse into one version; comments and formatting present in the ancestor survive.
 
 A resource larger than `cursorSettingSync.maxPayloadMiB` is not published. It is skipped with a warning naming the resource, its size, and the remedies, and the rest of the cycle publishes and applies normally.
 
-UI state resolves on its own instead of prompting. A value whose elements carry a stable `id` — pinned view containers (`workbench.activity.pinnedViewlets2`), every hidden-view list — is merged element by element, and anything else falls back to the newest writer, decided from replicated event ordering alone. Both devices compute the same bytes without talking to each other, so the two independent resolutions collapse into one version. This applies only to UI chrome: `.cursor` rules, settings, extensions, and chat still ask, because losing one side there loses content you wrote. Keys you would rather keep per-machine belong in `cursorSettingSync.ignoredUiStateKeys`.
+UI state resolves on its own instead of prompting. A value whose elements carry a stable `id` — pinned view containers (`workbench.activity.pinnedViewlets2`), every hidden-view list — is merged element by element, and anything else falls back to the newest writer, decided from replicated event ordering alone. Both devices compute the same bytes without talking to each other, so the two independent resolutions collapse into one version. Keys you would rather keep per-machine belong in `cursorSettingSync.ignoredUiStateKeys`.
+
+Chat resolves on its own too, but by combining the two sides rather than choosing between them. A chat is a header, a conversation body and a list of messages keyed by ID, so a fork merges into the union of both sides' messages — nothing either PC captured is dropped — while the header and body come whole from the side with the newer `lastUpdatedAt`, which both devices read out of the same two payloads and therefore agree on. This works with or without a common ancestor; with one, a message the ancestor had and one side removed stays removed. A payload this build cannot parse is left as a conflict rather than resolved by discarding a side.
+
+`.cursor` rules, settings, and extensions still ask, because there one side's loss is content you wrote and there is no way to combine the two.
 
 ## Apply database changes
 

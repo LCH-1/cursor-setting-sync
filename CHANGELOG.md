@@ -2,6 +2,22 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.6] - 2026-07-25
+
+### Added
+
+- Chat conflicts resolve themselves, by combining the two sides instead of choosing between them. A chat payload is a header, a conversation body and a list of messages keyed by ID, so a fork merges into the union of both sides' messages — nothing either PC captured is dropped — while the header and body are adopted whole from the side with the newer `lastUpdatedAt`. Both devices read that timestamp out of the same two payloads, so both elect the same winner and publish byte-identical content and identical metadata with no round trip. This works with or without a common ancestor; with one, a message the ancestor had and one side removed stays removed. A payload that fails the same parse the apply side performs is left as a conflict rather than resolved by discarding a side, so this never trades a conversation for a cleared warning. On the two-machine setup that prompted the change this was 36 unresolvable conflicts, 32 of which held the same conversation on both sides — identical message counts and identical `lastUpdatedAt` — and differed only in machine-local header fields such as `recency`. Nobody could have adjudicated those from a diff, which is why they had sat there.
+- `Cursor Setting Sync: Resolve Conflicts` lists every conflict on one screen and can answer all of them at once. Each entry is named by the resource's own name and shows both sides' values, which PC wrote each, and how long ago: `Setting: editor.fontSize · This PC: 14 vs Other PC: 16`. **Keep the version written later everywhere**, **Keep this PC's version everywhere** and **Keep the other PC's version everywhere** settle the whole list; a single entry can still be opened for its diff and decided alone. "Written later" means the times printed on that screen and not the protocol's own ordering, because the two disagree exactly when a fork is interesting: a PC that has not synchronized in a week publishes behind one that just did however recently it was written, and two PCs editing between the same two polls are ordered by a device identifier rather than by time. Where a side carries no time to compare — a version folded into a checkpoint keeps none — the entry says so and the later-published side wins. A bulk answer is applied only to the conflicts it actually names — with three or more PCs a conflict between two *other* machines has no "this PC" side, and that conflict is reported rather than given a different answer than the one asked for. The whole resolution is published as one event instead of one event per conflict, and a single resolution the repository refuses no longer costs the others in its batch.
+
+### Changed
+
+- A composer row whose ID is not a chat ID is no longer published. `parsePortableChatSnapshot` is the apply-side gate as well, so every device that received one rejected it; publishing it anyway cost an event, a payload object, a pending change that never cleared, and — once the other machine published its own copy — a conflict with no automatic resolution and nothing a person could adjudicate. Cursor keeps at least one of these permanently (`empty-state-draft`). Such a row is skipped in silence and never published as a deletion, so an existing value on another device is left untouched.
+
+### Fixed
+
+- The conflict resolver asked the user to choose between two hashes. Each conflict was presented as `Local · Lamport 42` against `Remote · Lamport 41` with a truncated semantic hash and a version ID — no resource name, no values, no wall-clock time, and a logical clock in place of one. It also opened a diff editor for *every* conflict before prompting, one modal prompt at a time, and cancelling any single prompt discarded every decision already made. Backing out of an individual conflict now returns to the list, and leaving the list keeps what was already decided.
+- Conflicts that could not be resolved were reported only when *nothing* resolved. A run that settled most of the list and skipped the rest — which is the normal outcome of a bulk answer — said nothing at all about the ones it skipped. Every deferred conflict is now named in the output channel and counted in the notification whatever else happened in the same run.
+
 ## [0.0.5] - 2026-07-25
 
 ### Added

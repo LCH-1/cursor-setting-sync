@@ -147,6 +147,21 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           continue;
         }
         const resourceId = `chat/${composerId}`;
+        // A composer whose ID is not a chat ID cannot be synchronized at all:
+        // `parsePortableChatSnapshot` is the apply-side gate as well, so every
+        // device that received one would reject it. Publishing it anyway cost
+        // an event, a payload object, a permanently pending change and — once
+        // the other machine published its own copy — a conflict that no
+        // automatic path could resolve and no person could adjudicate. Cursor
+        // keeps at least one of these permanently (`empty-state-draft`).
+        //
+        // It stays in `current` so it is never published as a deletion: a
+        // tombstone would be a claim about the resource rather than silence
+        // about it, and this build simply has nothing to say.
+        if (!COMPOSER_ID_PATTERN.test(composerId)) {
+          current.add(resourceId);
+          continue;
+        }
         // Only a timestamp that is a real number carries change information, and
         // the projection has to already be a chat for the comparison to mean
         // anything. Anything else falls through to the transactional capture,

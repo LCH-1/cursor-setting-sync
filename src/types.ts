@@ -192,6 +192,12 @@ export interface ResourceTip {
   changeIndex: number;
   kind: ResourceKind;
   lamport: number;
+  /**
+   * Wall clock of the event that carried this version, for display only.
+   * Absent for a version folded into a checkpoint, whose manifest does not
+   * retain one. Ordering decisions use `lamport` and never this.
+   */
+  createdAt?: string;
   deviceId: string;
   operation: ResourceOperation;
   semanticHash: string;

@@ -293,6 +293,9 @@ function buildResourceGraphs(
         changeIndex,
         kind: change.kind,
         lamport: event.manifest.lamport,
+        // Display only; the conflict resolver has nothing else to tell a person
+        // when one side of a fork happened. Never used to order anything.
+        createdAt: event.manifest.createdAt,
         deviceId: event.stored.header.deviceId,
         operation: change.operation,
         semanticHash: change.semanticHash,

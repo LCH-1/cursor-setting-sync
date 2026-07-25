@@ -143,6 +143,48 @@ describe("a composer header whose composerId has BLOB affinity", () => {
   });
 });
 
+describe("a composer row whose ID is not a chat ID", () => {
+  it("is not published, because no device could ever apply it", async () => {
+    // Cursor keeps `empty-state-draft` permanently. Publishing it cost an
+    // event, a payload, a pending change that never clears and — once the other
+    // machine published its own copy — a conflict with no automatic resolution
+    // and nothing a person could adjudicate from a diff.
+    const { paths, database } = await createGlobalDatabase();
+    insertHeader(database, { composerId: "empty-state-draft" });
+    insertKv(database, "composerData:empty-state-draft", "{}");
+    insertHeader(database, { composerId: COMPOSER_A });
+    insertKv(database, `composerData:${COMPOSER_A}`, "{}");
+    database.close();
+
+    const result = await new StateVscdbChatAdapter(paths).scan(
+      knownChats(COMPOSER_A),
+    );
+
+    expect(result.snapshots.map((item) => item.resourceId)).toEqual([
+      `chat/${COMPOSER_A}`,
+    ]);
+    // Silence, not a warning on every poll: this row is a normal thing for
+    // Cursor to hold, not a fault worth reporting.
+    expect(result.warnings).toEqual([]);
+  });
+
+  it("is never published as a deletion once a previous release published it", async () => {
+    const { paths, database } = await createGlobalDatabase();
+    insertHeader(database, { composerId: "empty-state-draft" });
+    insertKv(database, "composerData:empty-state-draft", "{}");
+    database.close();
+
+    const result = await new StateVscdbChatAdapter(paths).scan(
+      knownChats("empty-state-draft"),
+    );
+
+    // A tombstone would be a claim about the resource; this build has nothing
+    // to say about it, which is not the same thing.
+    expect(result.deletions).toEqual([]);
+    expect(result.snapshots).toEqual([]);
+  });
+});
+
 function knownChats(
   ...composerIds: string[]
 ): Record<string, LocalProjection> {
