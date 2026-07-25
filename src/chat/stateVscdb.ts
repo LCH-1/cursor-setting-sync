@@ -7,7 +7,11 @@ import type {
   ResourceSnapshot,
 } from "../types";
 import type { CursorPaths } from "../platform/paths";
-import { canonicalBytes, sha256 } from "../protocol/canonical";
+import {
+  canonicalBytes,
+  isCanonicalBase64Text,
+  sha256,
+} from "../protocol/canonical";
 import type { ResourceAdapter, ResourceApplyInput } from "../resources/resource";
 import { discoverWorkspaces } from "./workspace";
 
@@ -328,11 +332,9 @@ function isNullableText(value: unknown): value is string | null {
 }
 
 function isValidBase64(value: unknown): value is string {
-  if (typeof value !== "string" || value.length % 4 !== 0) {
-    return false;
-  }
   return (
-    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value) &&
+    typeof value === "string" &&
+    isCanonicalBase64Text(value) &&
     Buffer.from(value, "base64").toString("base64") === value
   );
 }

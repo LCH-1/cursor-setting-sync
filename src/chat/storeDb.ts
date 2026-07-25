@@ -15,7 +15,11 @@ import {
   normalizeResourcePath,
   pathExists,
 } from "../platform/files";
-import { canonicalBytes, sha256 } from "../protocol/canonical";
+import {
+  canonicalBytes,
+  isCanonicalBase64Text,
+  sha256,
+} from "../protocol/canonical";
 import type { ResourceAdapter, ResourceApplyInput } from "../resources/resource";
 
 export type PortableStoreValue =
@@ -162,8 +166,7 @@ function isPortableStoreValue(value: unknown): value is PortableStoreValue {
   return (
     candidate.type === "blob" &&
     typeof candidate.value === "string" &&
-    candidate.value.length % 4 === 0 &&
-    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(candidate.value) &&
+    isCanonicalBase64Text(candidate.value) &&
     Buffer.from(candidate.value, "base64").toString("base64") === candidate.value
   );
 }

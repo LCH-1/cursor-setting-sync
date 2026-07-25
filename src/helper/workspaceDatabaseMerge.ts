@@ -8,6 +8,7 @@ import {
   isCaseInsensitivePathPlatform,
   pathExists,
 } from "../platform/files";
+import { isCanonicalBase64Text } from "../protocol/canonical";
 
 export const WORKSPACE_DATABASE_SNAPSHOT_FORMAT =
   "cursor-setting-sync.workspace-database" as const;
@@ -1295,7 +1296,7 @@ function isCanonicalBase64(value: string): boolean {
   if (value.length === 0) {
     return true;
   }
-  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+  if (!isCanonicalBase64Text(value)) {
     return false;
   }
   return Buffer.from(value, "base64").toString("base64") === value;

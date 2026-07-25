@@ -27,6 +27,48 @@ export function hashesEqual(left: string, right: string): boolean {
   );
 }
 
+/**
+ * True when `value` is base64 in the shape `Buffer.toString("base64")` emits:
+ * a multiple of four characters, the standard alphabet, and padding only at the
+ * end.
+ *
+ * Deliberately a scan rather than a regular expression. The obvious pattern for
+ * this — `/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/` —
+ * makes V8 push a backtracking frame per four-character group as soon as the
+ * trailing optional group forces the star to give one back, and it throws
+ * `RangeError: Maximum call stack size exceeded` somewhere between two and four
+ * megabytes of decoded payload. Every payload in this repository is base64
+ * inside its envelope and a single chat with a few hundred messages clears that
+ * threshold, so the throw came out of `readObject` — from where it aborted the
+ * whole sync cycle rather than failing one resource.
+ *
+ * This does not verify that the bits under the padding are zero, matching what
+ * the pattern it replaces accepted. Call sites that need exact canonical form
+ * re-encode and compare, which is the only check that actually establishes it.
+ */
+export function isCanonicalBase64Text(value: string): boolean {
+  if (value.length % 4 !== 0) {
+    return false;
+  }
+  let padding = 0;
+  if (value.length > 0 && value.charCodeAt(value.length - 1) === 0x3d) {
+    padding = value.charCodeAt(value.length - 2) === 0x3d ? 2 : 1;
+  }
+  for (let index = 0; index < value.length - padding; index += 1) {
+    const code = value.charCodeAt(index);
+    if (
+      !(code >= 0x41 && code <= 0x5a) && // A-Z
+      !(code >= 0x61 && code <= 0x7a) && // a-z
+      !(code >= 0x30 && code <= 0x39) && // 0-9
+      code !== 0x2b && // +
+      code !== 0x2f // /
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function hasExactObjectKeys(
   value: unknown,
   expectedKeys: readonly string[],

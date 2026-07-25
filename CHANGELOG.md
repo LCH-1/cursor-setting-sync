@@ -2,6 +2,13 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.7] - 2026-07-26
+
+### Fixed
+
+- Reading any object larger than about four megabytes threw `RangeError: Maximum call stack size exceeded` and, from `autoMergeConflicts`, took the entire synchronization cycle with it — nothing published, nothing applied, no ack, on every poll. The base64 validator every envelope passes through used the pattern `/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/`, and V8 pushes a backtracking frame per four-character group as soon as the trailing optional group forces the star to give one back. It is now a character scan with no regular expression and no recursion, verified against the old pattern over 646,801 inputs for identical behaviour. The same pattern was in four places — the event, object and checkpoint envelopes, chat snapshots, `store.db` snapshots and workspace database snapshots — and all four are fixed. This was a latent fault in every release; 0.0.6 reached it because merging a chat conflict is the first thing that reads a multi-megabyte chat payload, and a chat is base64 message bodies, which do not compress.
+- One conflict can no longer end a synchronization cycle. `autoMergeConflicts` documented that an escaping error would stop the device permanently — the events are immutable, so the next poll rebuilds the identical conflict and throws again — but it only handled the failures it anticipated. Every conflict is now processed under a guard: an unexpected error leaves that one conflict for manual resolution, names it and its reason in the output channel, and the rest of the cycle runs.
+
 ## [0.0.6] - 2026-07-25
 
 ### Added

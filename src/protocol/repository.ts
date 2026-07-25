@@ -65,6 +65,7 @@ import {
   hashesEqual,
   hasExactObjectKeys,
   hmacSha256,
+  isCanonicalBase64Text,
   sha256,
 } from "./canonical";
 import {
@@ -2589,11 +2590,7 @@ function validateStoredObjectEnvelope(
 }
 
 function isCanonicalBase64(value: unknown, expectedBytes?: number): value is string {
-  if (
-    typeof value !== "string" ||
-    value.length % 4 !== 0 ||
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)
-  ) {
+  if (typeof value !== "string" || !isCanonicalBase64Text(value)) {
     return false;
   }
   const decoded = Buffer.from(value, "base64");

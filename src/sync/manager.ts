@@ -3471,173 +3471,190 @@ export async function autoMergeConflicts(
 ): Promise<boolean> {
   let mergedAny = false;
   for (const conflict of conflicts) {
-    if (
-      conflict.resolvedAt !== undefined ||
-      conflict.tipVersionIds.length !== 2
-    ) {
-      continue;
-    }
-    const tips = repository.state.tips[conflict.resourceId] ?? [];
-    if (tips.length !== 2 || !canMerge(tips)) {
-      continue;
-    }
-    if (conflict.baseVersionId === null) {
-      // No common ancestor, so no three-way merge is possible — but a
-      // last-writer-wins pick never needed one. Skipping these outright left
-      // every base-free fork unresolved forever: the user's live repository
-      // carried 23 of them, all ui-state, all re-prompting on every cycle.
-      if (await resolveBaseFreeConflict(repository, conflict, tips, onWarning)) {
-        conflict.resolvedAt = new Date().toISOString();
-        mergedAny = true;
+    // Nothing one conflict does may end the cycle. This function runs before
+    // the scan, the publish and applyProjections, so an escaping error means
+    // nothing published, nothing inbound applied and no ack written - and
+    // because the events are immutable the next poll rebuilds the identical
+    // conflict and throws again, permanently. Every failure mode reachable
+    // here was meant to be handled below; this is the guard for the ones that
+    // were not, and 0.0.6 shipped exactly such a case (a RangeError out of the
+    // base64 validator on a multi-megabyte chat payload).
+    try {
+      if (
+        conflict.resolvedAt !== undefined ||
+        conflict.tipVersionIds.length !== 2
+      ) {
+        continue;
       }
-      continue;
-    }
-    // A base folded away by a checkpoint reads as null; the conflict then
-    // degrades to manual resolution instead of throwing mid-sync.
-    const base = await repository.tryReadVersion(conflict.baseVersionId);
-    if (base === null) {
-      continue;
-    }
-    // A tip that merely re-asserts the base (e.g. a checkpoint marker
-    // concurrent with an unpublished edit) carries no change of its own, so
-    // the other tip wins for every kind before kind-specific merge policy.
-    if (
-      await resolveTrivialConflict(
-        repository,
-        conflict,
-        tips,
-        base.change,
-        onWarning,
-      )
-    ) {
+      const tips = repository.state.tips[conflict.resourceId] ?? [];
+      if (tips.length !== 2 || !canMerge(tips)) {
+        continue;
+      }
+      if (conflict.baseVersionId === null) {
+        // No common ancestor, so no three-way merge is possible — but a
+        // last-writer-wins pick never needed one. Skipping these outright left
+        // every base-free fork unresolved forever: the user's live repository
+        // carried 23 of them, all ui-state, all re-prompting on every cycle.
+        if (await resolveBaseFreeConflict(repository, conflict, tips, onWarning)) {
+          conflict.resolvedAt = new Date().toISOString();
+          mergedAny = true;
+        }
+        continue;
+      }
+      // A base folded away by a checkpoint reads as null; the conflict then
+      // degrades to manual resolution instead of throwing mid-sync.
+      const base = await repository.tryReadVersion(conflict.baseVersionId);
+      if (base === null) {
+        continue;
+      }
+      // A tip that merely re-asserts the base (e.g. a checkpoint marker
+      // concurrent with an unpublished edit) carries no change of its own, so
+      // the other tip wins for every kind before kind-specific merge policy.
+      if (
+        await resolveTrivialConflict(
+          repository,
+          conflict,
+          tips,
+          base.change,
+          onWarning,
+        )
+      ) {
+        mergedAny = true;
+        continue;
+      }
+      const workspaceDatabase =
+        conflict.kind === "workspace-storage" &&
+        isWorkspaceDatabaseTipMetadata(tips[0]?.metadata);
+      if (
+        tips.some((tip) => tip.operation !== "put") ||
+        !(workspaceDatabase || isAutoMergeKind(conflict.kind, tips[0]?.metadata))
+      ) {
+        continue;
+      }
+      const localTip =
+        tips.find((tip) => tip.deviceId === repository.state.device.deviceId) ??
+        tips[0];
+      const remoteTip = tips.find((tip) => tip.versionId !== localTip?.versionId);
+      if (localTip === undefined || remoteTip === undefined) {
+        continue;
+      }
+      const [local, remote] = await Promise.all([
+        repository.readVersion(localTip.versionId),
+        repository.readVersion(remoteTip.versionId),
+      ]);
+      if (
+        base.content === null ||
+        local.content === null ||
+        remote.content === null
+      ) {
+        continue;
+      }
+      // Replicated tip order, newest first: the one ordering of the two sides
+      // that does not depend on which device is running this.
+      const orderedTips = [...tips].sort(compareTips);
+      const newestTip = orderedTips[0];
+      const contentOf = (tip: ResourceTip): Buffer =>
+        tip.versionId === localTip.versionId
+          ? (local.content as Buffer)
+          : (remote.content as Buffer);
+      const olderTip = orderedTips[1];
+      const chatOutcome =
+        conflict.kind === "chat" &&
+        newestTip !== undefined &&
+        olderTip !== undefined
+          ? mergeChatSnapshotBuffers(base.content, [
+              contentOf(newestTip),
+              contentOf(olderTip),
+            ])
+          : undefined;
+      // chat is its own branch rather than a `??` in front of the chain, so it
+      // can never reach the diff3 fallback: a line-based merge of two chat
+      // snapshots can produce syntactically valid JSON that describes a
+      // conversation neither device has.
+      const outcome: MergeOutcome =
+        conflict.kind === "chat"
+          ? chatOutcome ?? { status: "conflict" }
+          : workspaceDatabase
+            ? mergeWorkspaceDatabaseBuffers(base.content, local.content, remote.content)
+            : conflict.kind === "ui-state"
+              ? mergeUiStateBuffers(base.content, local.content, remote.content)
+              : isJsonMergeKind(conflict.kind, localTip.metadata)
+                ? mergeJsoncBuffers(base.content, local.content, remote.content)
+                : validatedTextMergeOutcome(
+                    conflict.kind,
+                    mergeTextBuffers(base.content, local.content, remote.content),
+                  );
+      // A ui-state value with no structural merge still resolves without asking:
+      // both devices sort the same two tips with the same replicated comparator,
+      // so both republish the same side's bytes and the reconciler collapses the
+      // two merge events. This last-writer-wins step is deliberately restricted
+      // to ui-state, where the value is machine-local chrome that Cursor rewrites
+      // continuously and where the manual resolver could only ever have offered
+      // the same whole-tip either/or. It must never reach a kind whose loser
+      // holds authored content — cursor-user-rules, settings, chat.
+      const lastWriter =
+        conflict.kind === "ui-state" && outcome.status === "conflict"
+          ? newestTip
+          : undefined;
+      const resolved: MergeOutcome =
+        lastWriter === undefined
+          ? outcome
+          : {
+              status: "merged",
+              content:
+                lastWriter.versionId === localTip.versionId
+                  ? local.content
+                  : remote.content,
+            };
+      if (
+        resolved.status === "conflict" ||
+        resolved.content === undefined
+      ) {
+        continue;
+      }
+      // The merged content is a deterministic function of the tips, and the
+      // metadata has to be one too. `localTip` is whichever tip this device
+      // happens to own, so using it made two devices attach DIFFERENT metadata to
+      // byte-identical content; the reconciler collapses those two events on
+      // operation plus semanticHash alone, and an arbitrary tip pick then decided
+      // ui-state's `valueType` — the storage class the helper binds, TEXT or BLOB
+      // — for both devices. Every candidate below is elected the same way on every
+      // device: `newestTip` from the replicated comparator, and the chat winner
+      // from `lastUpdatedAt` inside the two payloads both devices read.
+      const metadataTip =
+        chatOutcome?.winner === undefined
+          ? lastWriter ?? newestTip ?? localTip
+          : orderedTips[chatOutcome.winner] ?? newestTip ?? localTip;
+      const snapshot: ResourceSnapshot = {
+        resourceId: conflict.resourceId,
+        kind: conflict.kind,
+        content: resolved.content,
+        semanticHash: resolved.semanticHash ?? sha256(resolved.content),
+        metadata: {
+          ...(metadataTip.metadata ?? {}),
+          // The union of both sides' bubbles is what was published, so the count
+          // that travels with it has to describe the union, not the winner.
+          ...(chatOutcome?.bubbleCount === undefined
+            ? {}
+            : { bubbleCount: chatOutcome.bubbleCount }),
+          syncOrigin: "auto-merge",
+        },
+      };
+      if (
+        !(await publishAutoMerge(repository, conflict, [snapshot], [], onWarning))
+      ) {
+        continue;
+      }
+      conflict.resolvedAt = new Date().toISOString();
       mergedAny = true;
+    } catch (error) {
+      onWarning(
+        `The automatic merge of ${conflict.resourceId} failed (${
+          error instanceof Error ? error.message : String(error)
+        }), so the conflict is waiting for "Cursor Setting Sync: Resolve Conflicts".`,
+      );
       continue;
     }
-    const workspaceDatabase =
-      conflict.kind === "workspace-storage" &&
-      isWorkspaceDatabaseTipMetadata(tips[0]?.metadata);
-    if (
-      tips.some((tip) => tip.operation !== "put") ||
-      !(workspaceDatabase || isAutoMergeKind(conflict.kind, tips[0]?.metadata))
-    ) {
-      continue;
-    }
-    const localTip =
-      tips.find((tip) => tip.deviceId === repository.state.device.deviceId) ??
-      tips[0];
-    const remoteTip = tips.find((tip) => tip.versionId !== localTip?.versionId);
-    if (localTip === undefined || remoteTip === undefined) {
-      continue;
-    }
-    const [local, remote] = await Promise.all([
-      repository.readVersion(localTip.versionId),
-      repository.readVersion(remoteTip.versionId),
-    ]);
-    if (
-      base.content === null ||
-      local.content === null ||
-      remote.content === null
-    ) {
-      continue;
-    }
-    // Replicated tip order, newest first: the one ordering of the two sides
-    // that does not depend on which device is running this.
-    const orderedTips = [...tips].sort(compareTips);
-    const newestTip = orderedTips[0];
-    const contentOf = (tip: ResourceTip): Buffer =>
-      tip.versionId === localTip.versionId
-        ? (local.content as Buffer)
-        : (remote.content as Buffer);
-    const olderTip = orderedTips[1];
-    const chatOutcome =
-      conflict.kind === "chat" &&
-      newestTip !== undefined &&
-      olderTip !== undefined
-        ? mergeChatSnapshotBuffers(base.content, [
-            contentOf(newestTip),
-            contentOf(olderTip),
-          ])
-        : undefined;
-    // chat is its own branch rather than a `??` in front of the chain, so it
-    // can never reach the diff3 fallback: a line-based merge of two chat
-    // snapshots can produce syntactically valid JSON that describes a
-    // conversation neither device has.
-    const outcome: MergeOutcome =
-      conflict.kind === "chat"
-        ? chatOutcome ?? { status: "conflict" }
-        : workspaceDatabase
-          ? mergeWorkspaceDatabaseBuffers(base.content, local.content, remote.content)
-          : conflict.kind === "ui-state"
-            ? mergeUiStateBuffers(base.content, local.content, remote.content)
-            : isJsonMergeKind(conflict.kind, localTip.metadata)
-              ? mergeJsoncBuffers(base.content, local.content, remote.content)
-              : validatedTextMergeOutcome(
-                  conflict.kind,
-                  mergeTextBuffers(base.content, local.content, remote.content),
-                );
-    // A ui-state value with no structural merge still resolves without asking:
-    // both devices sort the same two tips with the same replicated comparator,
-    // so both republish the same side's bytes and the reconciler collapses the
-    // two merge events. This last-writer-wins step is deliberately restricted
-    // to ui-state, where the value is machine-local chrome that Cursor rewrites
-    // continuously and where the manual resolver could only ever have offered
-    // the same whole-tip either/or. It must never reach a kind whose loser
-    // holds authored content — cursor-user-rules, settings, chat.
-    const lastWriter =
-      conflict.kind === "ui-state" && outcome.status === "conflict"
-        ? newestTip
-        : undefined;
-    const resolved: MergeOutcome =
-      lastWriter === undefined
-        ? outcome
-        : {
-            status: "merged",
-            content:
-              lastWriter.versionId === localTip.versionId
-                ? local.content
-                : remote.content,
-          };
-    if (
-      resolved.status === "conflict" ||
-      resolved.content === undefined
-    ) {
-      continue;
-    }
-    // The merged content is a deterministic function of the tips, and the
-    // metadata has to be one too. `localTip` is whichever tip this device
-    // happens to own, so using it made two devices attach DIFFERENT metadata to
-    // byte-identical content; the reconciler collapses those two events on
-    // operation plus semanticHash alone, and an arbitrary tip pick then decided
-    // ui-state's `valueType` — the storage class the helper binds, TEXT or BLOB
-    // — for both devices. Every candidate below is elected the same way on every
-    // device: `newestTip` from the replicated comparator, and the chat winner
-    // from `lastUpdatedAt` inside the two payloads both devices read.
-    const metadataTip =
-      chatOutcome?.winner === undefined
-        ? lastWriter ?? newestTip ?? localTip
-        : orderedTips[chatOutcome.winner] ?? newestTip ?? localTip;
-    const snapshot: ResourceSnapshot = {
-      resourceId: conflict.resourceId,
-      kind: conflict.kind,
-      content: resolved.content,
-      semanticHash: resolved.semanticHash ?? sha256(resolved.content),
-      metadata: {
-        ...(metadataTip.metadata ?? {}),
-        // The union of both sides' bubbles is what was published, so the count
-        // that travels with it has to describe the union, not the winner.
-        ...(chatOutcome?.bubbleCount === undefined
-          ? {}
-          : { bubbleCount: chatOutcome.bubbleCount }),
-        syncOrigin: "auto-merge",
-      },
-    };
-    if (
-      !(await publishAutoMerge(repository, conflict, [snapshot], [], onWarning))
-    ) {
-      continue;
-    }
-    conflict.resolvedAt = new Date().toISOString();
-    mergedAny = true;
   }
   return mergedAny;
 }
