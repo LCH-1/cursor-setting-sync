@@ -71,6 +71,14 @@ export const AUTOMATIC_CHECKPOINT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
  */
 export const CONFLICTED_REPUBLISH_INTERVAL_MS = 60 * 60 * 1000;
 
+/**
+ * How long the conflict resolver waits for the sync lock before giving up on
+ * applying answers the user has already given. A poll is seconds of work, so
+ * this only has to outlast one; it is not a deadline for anything the user is
+ * waiting on beyond that.
+ */
+export const CONFLICT_APPLY_LOCK_WAIT_MS = 60_000;
+
 export const DEFAULT_POLL_INTERVAL_SECONDS = 30;
 export const DEFAULT_CHAT_POLL_INTERVAL_SECONDS = 30;
 export const DEFAULT_MAX_PAYLOAD_MIB = 128;

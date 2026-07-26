@@ -2,6 +2,13 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.8] - 2026-07-26
+
+### Fixed
+
+- Answering the conflict resolver could throw away every answer. The prompt deliberately runs without the synchronization lock, because it can stay open indefinitely, and the lock is re-taken to publish the result — so a routine background poll starting in that window failed the whole set with "Another Cursor window or the offline helper is synchronizing", and the decisions were discarded. That window is at its widest exactly when it matters most, right after a large batch of conflicts is resolved and the cycles are long. The apply step now waits up to a minute for the poll to finish, showing what it is waiting for, and only gives up after that. The lock's own "another Cursor window" wording was the other half of the confusion: the holder is usually this window's own background cycle.
+- Every chat conflict was labelled with a raw JSON document — `Chat: {"type":"head","composerId":"empty-state-draft","lastUpdate...` — where the conversation's name belongs. `composerHeaders.value` is not a title but a record describing the conversation, and the title is its `name` field. A chat with no name yet falls back to its composer ID rather than to a brace.
+
 ## [0.0.7] - 2026-07-26
 
 ### Fixed

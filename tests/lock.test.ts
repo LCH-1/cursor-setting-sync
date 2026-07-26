@@ -11,7 +11,7 @@ import type * as FsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { acquireFileLock } from "../src/platform/lock";
+import { acquireFileLock, acquireFileLockWithin } from "../src/platform/lock";
 
 interface StoredLock {
   pid: number;
@@ -204,6 +204,104 @@ describe("file lock", () => {
       await lock.release();
       const stored = JSON.parse(await readFile(path, "utf8")) as StoredLock;
       expect(stored.token).toBe("other");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("acquireFileLockWithin", () => {
+  it("waits out a holder instead of failing immediately", async () => {
+    // The conflict resolver calls this once the user has already answered. A
+    // routine 30-second poll holding the lock must cost a short wait, not the
+    // whole set of answers.
+    const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
+    try {
+      const path = join(root, "sync.lock");
+      const held = await acquireFileLock(path);
+      if (held === null) {
+        throw new Error("Expected the free lock to be acquired.");
+      }
+      let waitedAnnounced = 0;
+      let elapsed = 0;
+      const sleep = async (ms: number): Promise<void> => {
+        elapsed += ms;
+        // The holder finishes partway through, exactly like a poll ending.
+        if (elapsed >= 500) {
+          await held.release();
+        }
+      };
+
+      const lock = await acquireFileLockWithin(
+        path,
+        60_000,
+        () => {
+          waitedAnnounced += 1;
+        },
+        sleep,
+        () => elapsed,
+      );
+
+      expect(lock).not.toBeNull();
+      // Announced once, not once per retry.
+      expect(waitedAnnounced).toBe(1);
+      await lock?.release();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("gives up at the deadline rather than waiting forever", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
+    try {
+      const path = join(root, "sync.lock");
+      const held = await acquireFileLock(path);
+      if (held === null) {
+        throw new Error("Expected the free lock to be acquired.");
+      }
+      let elapsed = 0;
+      const sleep = async (ms: number): Promise<void> => {
+        elapsed += ms;
+      };
+
+      const lock = await acquireFileLockWithin(
+        path,
+        1_000,
+        () => {},
+        sleep,
+        () => elapsed,
+      );
+
+      expect(lock).toBeNull();
+      expect(elapsed).toBeGreaterThanOrEqual(1_000);
+      await held.release();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns at once when the lock is free", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
+    try {
+      const path = join(root, "sync.lock");
+      let slept = false;
+      let announced = false;
+
+      const lock = await acquireFileLockWithin(
+        path,
+        60_000,
+        () => {
+          announced = true;
+        },
+        async () => {
+          slept = true;
+        },
+      );
+
+      expect(lock).not.toBeNull();
+      expect(slept).toBe(false);
+      expect(announced).toBe(false);
+      await lock?.release();
     } finally {
       await rm(root, { recursive: true, force: true });
     }

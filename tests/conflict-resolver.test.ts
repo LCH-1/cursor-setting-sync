@@ -38,6 +38,7 @@ vi.mock("vscode", () => ({
 
 import { EventReconciler, compareTips } from "../src/protocol/reconciler";
 import { ConflictController, tipForChoice } from "../src/ui/conflicts";
+import type { ConflictView } from "../src/ui/conflictSummary";
 import { describeConflict, describeValue } from "../src/ui/conflictSummary";
 import { SyncRepository } from "../src/protocol/repository";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
@@ -433,7 +434,16 @@ describe("describeConflict", () => {
           isSubagent: 0,
           recency: 0,
           checkpointAt: null,
-          value: title,
+          // The shape Cursor actually stores in composerHeaders.value: a JSON
+          // record whose `name` is the title shown in the chat list.
+          value: JSON.stringify({
+            type: "head",
+            composerId,
+            name: title,
+            subtitle: "a repository",
+            createdAt: 1,
+            isDraft: false,
+          }),
         },
         composerData: { key: `composerData:${composerId}`, valueBase64: "" },
         bubbles: Array.from({ length: bubbles }, (_unused, index) => ({
@@ -462,6 +472,22 @@ describe("describeConflict", () => {
     expect(view.name).toBe("Refactoring the backend");
     expect(view.sides[0]?.value).toContain("49 messages");
     expect(view.sides[1]?.value).toContain("47 messages");
+  });
+
+  it("never puts the raw header document where the chat's name belongs", () => {
+    // `composerHeaders.value` is a JSON record, not a title. Reading the column
+    // itself rendered every chat conflict as
+    // `Chat: {"type":"head","composerId":"empty-state-draft","lastUpdate...`.
+    const composerId = "026e7136-6ca9-4847-9328-6fc5a697c651";
+    const named = chatHeader(composerId, { name: "Refactoring the backend" });
+    const unnamed = chatHeader(composerId, {});
+
+    expect(describeChat(composerId, named).name).toBe("Refactoring the backend");
+    // With no name yet, the composer ID is at least an identifier - and either
+    // way nothing that starts with a brace reaches the label.
+    const fallback = describeChat(composerId, unnamed).name;
+    expect(fallback).toBe(composerId);
+    expect(fallback.startsWith("{")).toBe(false);
   });
 
   it("survives a peer timestamp that is finite but not a date", () => {
@@ -521,6 +547,49 @@ describe("describeConflict", () => {
     expect(view.sides[1]?.when).toBe("2 hours ago");
   });
 });
+
+/** A chat snapshot whose header carries the document Cursor really stores. */
+function chatHeader(
+  composerId: string,
+  head: Record<string, unknown>,
+): Buffer {
+  return canonicalBytes({
+    schemaVersion: 1,
+    composerId,
+    header: {
+      composerId,
+      workspaceId: null,
+      createdAt: 1,
+      lastUpdatedAt: 1783312486260,
+      isArchived: 0,
+      isSubagent: 0,
+      recency: 0,
+      checkpointAt: null,
+      value: JSON.stringify({ type: "head", composerId, ...head }),
+    },
+    composerData: { key: `composerData:${composerId}`, valueBase64: "" },
+    bubbles: [],
+  });
+}
+
+function describeChat(composerId: string, content: Buffer): ConflictView {
+  return describeConflict(
+    {
+      conflictId: "c",
+      resourceId: `chat/${composerId}`,
+      kind: "chat",
+      baseVersionId: null,
+      tipVersionIds: ["a#0"],
+      createdAt: "2026-07-25T12:00:00.000Z",
+    },
+    [{ ...tip("me", 2), versionId: "a#0", kind: "chat", metadata: { composerId } }],
+    {
+      localDeviceId: "me",
+      now: Date.parse("2026-07-25T12:00:00.000Z"),
+      contentOf: () => content,
+    },
+  );
+}
 
 function tip(deviceId: string, lamport: number): ResourceTip {
   return {

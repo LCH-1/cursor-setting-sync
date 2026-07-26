@@ -5,6 +5,7 @@ import {
   AUTOMATIC_CHECKPOINT_COOLDOWN_MS,
   AUTOMATIC_CHECKPOINT_EVENT_THRESHOLD,
   BACKUP_DIRECTORY,
+  CONFLICT_APPLY_LOCK_WAIT_MS,
   CONFLICTED_REPUBLISH_INTERVAL_MS,
   MAX_APPLY_BATCH_BYTES,
   REPOSITORY_FILE,
@@ -38,7 +39,11 @@ import {
   pathExists,
   readJsonFile,
 } from "../platform/files";
-import { acquireFileLock, describeLockHolder } from "../platform/lock";
+import {
+  acquireFileLock,
+  acquireFileLockWithin,
+  describeLockHolder,
+} from "../platform/lock";
 import {
   GitError,
   cloneRepository,
@@ -734,8 +739,22 @@ export class SyncManager implements vscode.Disposable {
       deferred: [...collected.deferred],
     };
     if (collected.selections.length > 0) {
-      const lock = await acquireFileLock(
-        this.syncLockPath(),
+      // The answers are already in hand, so this waits for a busy poll instead
+      // of failing. Losing a set of decisions to a routine 30-second cycle -
+      // which is what happened, because the prompt above deliberately runs
+      // without the lock - is never what the user would have chosen.
+      const lock = await this.withProgress(
+        "Cursor Setting Sync",
+        async (report) => {
+          report("Applying conflict resolutions...");
+          return acquireFileLockWithin(
+            this.syncLockPath(),
+            CONFLICT_APPLY_LOCK_WAIT_MS,
+            () => {
+              report("Waiting for the current synchronization to finish...");
+            },
+          );
+        },
       );
       if (lock === null) {
         throw await this.synchronizationBusyError();

@@ -25,6 +25,52 @@ export interface FileLock {
   release(): Promise<void>;
 }
 
+/**
+ * Acquires the lock, retrying until it is free or `timeoutMs` elapses.
+ *
+ * {@link acquireFileLock} tries exactly once, which is right where failing
+ * costs nothing — the caller has done no work yet and can be told to try again.
+ * It is wrong once the user has already answered something: the conflict
+ * resolver deliberately releases the lock while its prompt is open, so a
+ * routine background poll starting in that window made the whole set of answers
+ * fail with "Another Cursor window or the offline helper is synchronizing", and
+ * they were discarded. A poll is seconds of work, so waiting it out is both
+ * cheap and the only outcome the user would ever choose.
+ *
+ * `onWait` is called once, on the first attempt that has to wait, so the caller
+ * can say what is happening rather than appear frozen.
+ */
+export async function acquireFileLockWithin(
+  path: string,
+  timeoutMs: number,
+  onWait: () => void = () => {},
+  sleep: (ms: number) => Promise<void> = defaultSleep,
+  now: () => number = Date.now,
+): Promise<FileLock | null> {
+  const deadline = now() + timeoutMs;
+  let waited = false;
+  for (;;) {
+    const lock = await acquireFileLock(path);
+    if (lock !== null) {
+      return lock;
+    }
+    if (now() >= deadline) {
+      return null;
+    }
+    if (!waited) {
+      waited = true;
+      onWait();
+    }
+    await sleep(Math.min(LOCK_RETRY_INTERVAL_MS, Math.max(0, deadline - now())));
+  }
+}
+
+const LOCK_RETRY_INTERVAL_MS = 250;
+
+function defaultSleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 export async function acquireFileLock(path: string): Promise<FileLock | null> {
   await ensureDirectory(dirname(path));
   const content: LockContent = {
