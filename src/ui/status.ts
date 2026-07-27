@@ -1,8 +1,5 @@
 import * as vscode from "vscode";
-import {
-  RESTART_TO_APPLY_COMMAND,
-  RESTART_TO_APPLY_TITLE,
-} from "../constants";
+import { RESTART_TO_APPLY_TITLE } from "../constants";
 
 export type SyncStatus =
   | "unconfigured"
@@ -116,7 +113,12 @@ function statusPresentation(status: SyncStatus): {
         tooltip:
           `Changes from another device are queued. Run "${RESTART_TO_APPLY_TITLE}" to write them - ` +
           "quitting and reopening Cursor does not, because only that command applies the queue.",
-        command: RESTART_TO_APPLY_COMMAND,
+        // Reports, does not act. Clicking used to quit Cursor outright, which
+        // is a large thing to do to someone who was aiming for the item next to
+        // it - and the command is a rare, deliberate one, not something worth a
+        // permanent button. Diagnostics is the safe destination; the text and
+        // tooltip name the command so the palette is one step away.
+        command: "cursorSync.showDiagnostics",
       };
     case "conflict":
       return {

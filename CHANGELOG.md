@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.18] - 2026-07-27
+
+### Fixed
+
+- The synchronization lock went stale under a holder that was very much alive, and another process could take it over mid-write. `node:sqlite` is synchronous, so a large apply holds the event loop for minutes and the lock's heartbeat — an interval timer — never gets to run. The lock file's mtime stopped advancing, which is exactly what the staleness rule reads as an abandoned holder: a ten-minute apply came within five minutes of having its lock stolen while it was still writing to the database. It also made the busy message report the holder as "last active 8 minute(s) ago" about a helper that was working the whole time. `FileLock.refresh` was written for this and had no callers; the apply loops now call it between changes.
+
+### Changed
+
+- The status bar no longer quits Cursor when clicked. The pending-restart item ran `Restart to Apply` directly, which is a large thing to do to someone aiming for the item beside it, and the command is a rare deliberate one rather than something that earns a permanent button. Clicking now opens diagnostics; the item's text and tooltip still name the command, so the palette is one step away.
+
 ## [0.0.17] - 2026-07-27
 
 ### Fixed

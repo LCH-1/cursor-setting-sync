@@ -144,7 +144,9 @@ async function run(): Promise<void> {
         request.storageRoot,
         request.paths.globalDatabase,
       );
-      const result = await executeRequest(request, masterKey, collected);
+      const result = await executeRequest(request, masterKey, collected, () => {
+        lock.refresh();
+      });
       await writeResult(request, result);
       if (request.restart && result.success) {
         restartCursor(request.cursorExecutable);
@@ -194,6 +196,13 @@ async function executeRequest(
   request: HelperRequest,
   masterKey: Buffer,
   collected: CollectedBackups,
+  /**
+   * Keeps `sync.lock` alive across the apply. The writes are synchronous, so
+   * the lock's own heartbeat timer cannot run and the file goes stale under a
+   * holder that is very much alive - after which another process takes it over
+   * mid-write.
+   */
+  heartbeat: () => void = () => {},
 ): Promise<HelperResult> {
   const gitWarnings: string[] = [];
   const gitActive = await beginGitTransport(request, gitWarnings);
@@ -297,6 +306,7 @@ async function executeRequest(
     const globalResult = await applyGlobalDatabaseChanges(
       request,
       globalPrepared,
+      heartbeat,
     );
     backupPath = globalResult.backupPath;
     collected.backupPath = backupPath;
@@ -314,6 +324,7 @@ async function executeRequest(
     prepared,
     ensureExclusiveAccess,
     (backup) => collected.backups.push(backup),
+    heartbeat,
   );
   applied.push(...nonGlobalResult.applied);
   skipped.push(...nonGlobalResult.skipped);

@@ -68,6 +68,8 @@ export async function applyNonGlobalChanges(
   prepared: PreparedHelperChange[],
   ensureExclusiveAccess: () => Promise<void> = async () => {},
   onBackup: (backup: HelperBackup) => void = () => {},
+  /** See {@link applyGlobalDatabaseChanges}: keeps the caller's lock alive. */
+  heartbeat: () => void = () => {},
 ): Promise<NonGlobalApplyResult> {
   const applied: string[] = [];
   const skipped: string[] = [];
@@ -87,6 +89,7 @@ export async function applyNonGlobalChanges(
       : [];
 
   for (const item of prepared) {
+    heartbeat();
     const { change, content } = item;
     try {
       if (change.kind === "workspace-storage") {

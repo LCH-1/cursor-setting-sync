@@ -207,6 +207,17 @@ async function removeExpiredJournal(
 export async function applyGlobalDatabaseChanges(
   request: HelperRequest,
   prepared: PreparedHelperChange[],
+  /**
+   * Called between changes so the caller can keep its lock alive.
+   *
+   * `node:sqlite` is synchronous, so a large apply holds the event loop for
+   * minutes and the lock's heartbeat - an interval timer - never gets to run.
+   * The lock file's mtime then stops advancing, and after the staleness TTL
+   * another process concludes the holder has died and takes the lock over while
+   * this one is still writing to the database. `FileLock.refresh` is
+   * synchronous for exactly this reason.
+   */
+  heartbeat: () => void = () => {},
 ): Promise<DatabaseApplyResult> {
   const localWorkspaces = await preflightGlobalChanges(request, prepared);
   const databasePath = request.paths.globalDatabase;
@@ -258,6 +269,7 @@ export async function applyGlobalDatabaseChanges(
       request,
       prepared,
       localWorkspaces,
+      heartbeat,
     );
     assertCheck(database, "integrity_check");
     database.exec("COMMIT");
@@ -631,6 +643,7 @@ function applyPreparedChanges(
   request: HelperRequest,
   prepared: PreparedHelperChange[],
   localWorkspaces: Awaited<ReturnType<typeof discoverWorkspaces>>,
+  heartbeat: () => void = () => {},
 ): { applied: string[]; skipped: string[] } {
   const applied: string[] = [];
   const skipped: string[] = [];
@@ -643,6 +656,7 @@ function applyPreparedChanges(
   );
 
   for (const item of prepared) {
+    heartbeat();
     // A savepoint keeps a rejected change from leaving partial writes behind,
     // so one unparseable snapshot never discards the rest of the batch.
     database.exec("SAVEPOINT cursor_sync_change");
