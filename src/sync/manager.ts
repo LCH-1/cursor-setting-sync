@@ -2319,6 +2319,16 @@ export class SyncManager implements vscode.Disposable {
         );
         continue;
       }
+      if (typeof sourceWorkspaceUri !== "string") {
+        // A workspaceStorage directory with no folder URI belongs to a window
+        // that had nothing open. Its name is the millisecond it was created, so
+        // it names a window on one computer and can never name one here - and
+        // the prompt for it listed every local workspace under a bare number,
+        // with no correct answer anywhere in the list, forever.
+        pending.blockedReason =
+          "This workspace storage belongs to a window with no folder open, so it has no counterpart on this computer.";
+        continue;
+      }
       if (pending.kind === "chat") {
         // A chat is content, not per-workspace scaffolding: it is worth having
         // on this computer whether or not the folder it was written in exists

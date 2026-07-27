@@ -38,6 +38,20 @@ describe("cursorSettingSync.ignoredWorkspaces", () => {
     ).toBe(false);
   });
 
+  it("recognises the directory a folderless window leaves behind", () => {
+    // VS Code names the storage for a window with nothing open after the
+    // millisecond it was created - `1784792272718` - and writes no folder into
+    // its workspace.json, so it carries no URI. It identifies a window on one
+    // computer and can identify nothing on any other, which is why the mapping
+    // prompt for it was titled with a bare number and had no correct answer
+    // anywhere in the list.
+    expect(/^\d{13}$/.test("1784792272718")).toBe(true);
+    // Deliberately NOT reached by the URI patterns: there is no URI to match.
+    expect(isIgnoredWorkspaceUri(null, createIgnoreMatcher(["file://*"]))).toBe(
+      false,
+    );
+  });
+
   it("never excludes a workspace whose URI is unknown", () => {
     // The pattern would be matched against nothing, and dropping a backup on
     // the strength of missing metadata is the wrong way to fail.

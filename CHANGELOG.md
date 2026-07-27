@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.13] - 2026-07-27
+
+### Fixed
+
+- A window with no folder open produced a mapping prompt that could never be answered. VS Code names the storage for such a window after the millisecond it was created, so the modal read *Map incoming workspace storage workspace `1784792272718`* over a list of every local workspace — none of which was it, because that name identifies a window on one computer and can identify nothing on any other. It reappeared on every attempt, and until it was answered nothing else in the queue could apply. Incoming workspaceStorage that carries no folder URI is now set aside with a reason instead of asked about. It is still published by the device that owns it; leaving that alone needs `discoverWorkspaces` to distinguish "no workspace.json" from "workspace.json this scan could not read", and treating the second as the first would silently drop a real backup.
+
 ## [0.0.12] - 2026-07-27
 
 ### Fixed
