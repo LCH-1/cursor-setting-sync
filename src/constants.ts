@@ -125,6 +125,12 @@ export const RESTART_TO_APPLY_TITLE = "Cursor Setting Sync: Restart to Apply";
 export const QUIT_START_GRACE_MS = 15_000;
 
 /**
+ * The built-in workspace exclusion `cursorSettingSync.syncLocalWorkspaces`
+ * switches off. Matches every local folder workspace and nothing remote.
+ */
+export const LOCAL_WORKSPACE_PATTERN = "file://*";
+
+/**
  * How long a shutdown finalizer waits for Cursor to exit before giving up.
  *
  * Effectively "however long this editing session lasts", and deliberately so.

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { isIgnoredWorkspaceUri } from "../src/resources/workspaceStorage";
 import { createIgnoreMatcher } from "../src/resources/ignorePatterns";
+import { LOCAL_WORKSPACE_PATTERN } from "../src/constants";
 import manifest from "../package.json";
 
 const LOCAL = "file:///c%3A/Users/ckdgh/Desktop/projects/cursor-setting-sync";
@@ -50,6 +51,24 @@ describe("cursorSettingSync.ignoredWorkspaces", () => {
     const matcher = createIgnoreMatcher([]);
     expect(isIgnoredWorkspaceUri(LOCAL, matcher)).toBe(false);
     expect(isIgnoredWorkspaceUri(REMOTE, matcher)).toBe(false);
+  });
+
+  it("is the built-in default, expressed by syncLocalWorkspaces", () => {
+    // The exclusion ships on. A local folder path is only ever matched by
+    // another computer that happens to use the identical path, so asking about
+    // the rest is a modal with no right answer in it.
+    const local =
+      manifest.contributes.configuration.properties[
+        "cursorSettingSync.syncLocalWorkspaces"
+      ];
+    expect(local?.default).toBe(false);
+    expect(local?.scope).toBe("machine");
+    expect(isIgnoredWorkspaceUri(LOCAL, createIgnoreMatcher([LOCAL_WORKSPACE_PATTERN]))).toBe(
+      true,
+    );
+    expect(
+      isIgnoredWorkspaceUri(REMOTE, createIgnoreMatcher([LOCAL_WORKSPACE_PATTERN])),
+    ).toBe(false);
   });
 
   it("is machine-scoped so curating one computer cannot switch off the other", () => {

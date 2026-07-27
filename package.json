@@ -2,7 +2,7 @@
   "name": "cursor-setting-sync",
   "displayName": "Cursor Setting Sync",
   "description": "Securely synchronize Cursor settings, workspace state, profiles, extensions, user files, and chat data across devices.",
-  "version": "0.0.10",
+  "version": "0.0.11",
   "publisher": "lch",
   "icon": "icon.png",
   "license": "MIT",
@@ -143,6 +143,13 @@
           "default": true,
           "description": "Back up allowlisted Cursor workspaceStorage data after Cursor exits and restore it offline."
         },
+        "cursorSettingSync.syncLocalWorkspaces": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "description": "Back up and write workspaceStorage for local folder workspaces (file://) as well as Remote-SSH ones. Off by default: a local folder path exists on exactly one computer unless both machines happen to use the identical path, so its incoming storage usually has nothing to match on the other side and does nothing but sit in the queue asking to be mapped to a workspace that is not there. Turn it on if the same projects live at the same paths on every computer. Remote-SSH workspaces are always synchronized; chats are unaffected either way. Machine-scoped, so it does not travel between computers.",
+          "markdownDescription": "Back up and write workspaceStorage for local folder workspaces (`file://`) as well as Remote-SSH ones. **Off by default**: a local folder path exists on exactly one computer unless both machines happen to use the identical path, so its incoming storage usually has nothing to match on the other side and does nothing but sit in the queue asking to be mapped to a workspace that is not there. Turn it on if the same projects live at the same paths on every computer. Remote-SSH workspaces are always synchronized; chats are unaffected either way. Machine-scoped, so it does not travel between computers."
+        },
         "cursorSettingSync.ignoredWorkspaces": {
           "type": "array",
           "default": [],
@@ -150,7 +157,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Workspaces whose workspaceStorage this computer neither backs up nor writes, matched against the workspace URI. Set [\"file://*\"] to keep only Remote-SSH workspaces, which are the ones that exist on more than one computer; a local folder path never matches another machine and its incoming storage can only ever sit in the queue asking to be mapped. Wildcards such as vscode-remote://ssh-remote+staging*  are supported. This setting is machine-scoped and does not travel between computers. Chats are not affected."
+          "description": "Further workspaces whose workspaceStorage this computer neither backs up nor writes, on top of the local-folder exclusion that cursorSettingSync.syncLocalWorkspaces controls. Entries are matched against the workspace URI, and the percent-encoded form Cursor stores is matched against the readable pattern you write. Wildcards such as vscode-remote://ssh-remote+staging* are supported. This setting is machine-scoped and does not travel between computers. Chats are not affected."
         },
         "cursorSettingSync.ignoredSettings": {
           "type": "array",

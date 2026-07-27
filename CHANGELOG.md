@@ -2,6 +2,13 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.11] - 2026-07-27
+
+### Changed
+
+- **Local folder workspaces no longer take part in workspaceStorage sync by default.** A `file://` workspace is identified by its path, so unless both computers open the same project at the identical path there is nothing on the other side for its storage to land on — and what actually happened to those resources was a modal listing hundreds of unrelated workspaces, asking the user to map one that does not exist, which had to be answered before anything else could apply. Remote-SSH workspaces, which are the ones that genuinely exist on more than one computer, are unaffected and always synchronize; chats are unaffected either way. `cursorSettingSync.syncLocalWorkspaces` turns the old behaviour back on for anyone whose projects do live at the same paths everywhere, and like `ignoredWorkspaces` it is machine-scoped, so answering the question on one computer does not answer it for the other.
+- A workspace this device had already been backing up that the new default now excludes is named in a warning rather than dropped in silence. The same reasoning as the built-in machine-specific settings list: a resource that stops travelling with no tombstone, no status change and a green check mark is one the user discovers only when they need the backup. Existing backups stay in the repository.
+
 ## [0.0.10] - 2026-07-27
 
 ### Added

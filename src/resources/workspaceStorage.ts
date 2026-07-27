@@ -73,6 +73,7 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
     }
     const mappingTargets = new Set(Object.values(this.workspaceMappings));
     const candidates = new Map<string, WorkspaceStorageCandidate>();
+    const silenced = new Set<string>();
 
     const listed = await listBackedUpWorkspaceStoragePaths(
       this.paths.workspaceStorageRoot,
@@ -91,14 +92,6 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
         if (!isBackedUpWorkspaceStorageFile(actualRelativePath)) {
           continue;
         }
-        if (
-          isIgnoredWorkspaceUri(
-            workspaceUris.get(actualWorkspaceId),
-            this.ignoredWorkspaces,
-          )
-        ) {
-          continue;
-        }
         const canonicalWorkspaceId = canonicalWorkspaceStorageId(
           actualWorkspaceId,
           this.workspaceMappings,
@@ -108,6 +101,22 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
           ...actualRelativePath.split("/").slice(1),
         ].join("/");
         const resourceId = workspaceStorageResourceId(canonicalRelativePath);
+        if (
+          isIgnoredWorkspaceUri(
+            workspaceUris.get(actualWorkspaceId),
+            this.ignoredWorkspaces,
+          )
+        ) {
+          // A workspace that was being backed up until the exclusion covered it
+          // otherwise stops travelling in total silence - no tombstone, no
+          // status change, a green check mark - and the user only finds out
+          // when they need the backup. Same reasoning as the built-in
+          // machine-specific settings defaults.
+          if (known[resourceId] !== undefined) {
+            silenced.add(actualWorkspaceId);
+          }
+          continue;
+        }
         const candidate: WorkspaceStorageCandidate = {
           actualWorkspaceId,
           canonicalRelativePath,
@@ -188,6 +197,16 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
       }
     }
 
+    if (silenced.size > 0) {
+      warnings.push(
+        `${silenced.size} workspace(s) this device had already backed up are now excluded from workspaceStorage sync: ${[
+          ...silenced,
+        ]
+          .sort()
+          .slice(0, 10)
+          .join(", ")}. Their existing backups stay in the repository; set cursorSettingSync.syncLocalWorkspaces to true, or narrow cursorSettingSync.ignoredWorkspaces, to keep backing them up.`,
+      );
+    }
     return { snapshots, deletions: [], warnings };
   }
 

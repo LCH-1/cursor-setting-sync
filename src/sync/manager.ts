@@ -2403,7 +2403,7 @@ export class SyncManager implements vscode.Disposable {
     null;
 
   private ignoredWorkspaceMatcher(): IgnoreMatcher {
-    const patterns = this.configuration.ignoredWorkspaces;
+    const patterns = this.configuration.effectiveIgnoredWorkspaces;
     const key = patterns.join(" ");
     if (this.ignoredWorkspaceCache?.key !== key) {
       this.ignoredWorkspaceCache = {
@@ -2552,7 +2552,7 @@ export class SyncManager implements vscode.Disposable {
         this.paths,
         this.configuration.workspaceMappings,
         this.configuration.maxPayloadBytes,
-        createIgnoreMatcher(this.configuration.ignoredWorkspaces),
+        this.ignoredWorkspaceMatcher(),
       ),
     ];
     if (this.compatibility.compatible) {
@@ -2690,7 +2690,10 @@ export class SyncManager implements vscode.Disposable {
       ignoredExtensions: this.configuration.ignoredExtensions,
       ignoredUserFiles: this.configuration.ignoredUserFiles,
       ignoredUiStateKeys: this.configuration.ignoredUiStateKeys,
-      ignoredWorkspaces: this.configuration.ignoredWorkspaces,
+      // The resolved list, not the raw setting: the shutdown export is the only
+      // path that scans workspaceStorage, so it has to see the built-in
+      // local-workspace exclusion too or the two halves disagree.
+      ignoredWorkspaces: this.configuration.effectiveIgnoredWorkspaces,
       // Already includes the built-in defaults, so the helper applies exactly
       // the same exclusions the extension host does.
       machineScopedSettings: this.machineSpecificSettingPatterns(),

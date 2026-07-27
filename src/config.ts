@@ -4,6 +4,7 @@ import {
   MAX_APPLY_BATCH_BYTES,
   DEFAULT_MAX_PAYLOAD_MIB,
   DEFAULT_POLL_INTERVAL_SECONDS,
+  LOCAL_WORKSPACE_PATTERN,
 } from "./constants";
 import { activateRepository } from "./configRepository";
 
@@ -125,6 +126,31 @@ export class ExtensionConfiguration {
    */
   get ignoredWorkspaces(): string[] {
     return stringArray(setting<string[]>("ignoredWorkspaces", []));
+  }
+
+  /**
+   * Whether local folder workspaces take part in workspaceStorage sync at all.
+   *
+   * Off by default. A `file://` workspace is identified by its path, so unless
+   * both computers happen to open the same project at the identical path there
+   * is nothing on the other side for it to land on - and the only thing that
+   * ever happened to those resources was a modal listing hundreds of unrelated
+   * workspaces, asking the user to map one that does not exist.
+   */
+  get syncLocalWorkspaces(): boolean {
+    return setting<boolean>("syncLocalWorkspaces", false);
+  }
+
+  /**
+   * The exclusion list actually in force: the user's own entries plus the
+   * built-in local-workspace exclusion when it is enabled. Every consumer -
+   * the scan, the apply gate and the offline helper - reads this one, so the
+   * two settings cannot disagree between halves of the sync.
+   */
+  get effectiveIgnoredWorkspaces(): string[] {
+    return this.syncLocalWorkspaces
+      ? this.ignoredWorkspaces
+      : [LOCAL_WORKSPACE_PATTERN, ...this.ignoredWorkspaces];
   }
 
   get maxPayloadBytes(): number {
