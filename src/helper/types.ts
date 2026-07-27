@@ -41,6 +41,14 @@ export interface HelperRequest {
     ignoredUserFiles?: string[];
     /** Absent in helper-request files written before this option existed. */
     ignoredUiStateKeys?: string[];
+    /**
+     * Absent in helper-request files written before this option existed.
+     *
+     * The shutdown export is the only path that ever scans workspaceStorage, so
+     * without this the exclusion would hold on the apply side and be ignored by
+     * the half that actually takes the backups.
+     */
+    ignoredWorkspaces?: string[];
     machineScopedSettings: string[];
     syncChat: boolean;
     syncWorkspaceStorage: boolean;

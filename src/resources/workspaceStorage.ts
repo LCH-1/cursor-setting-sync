@@ -16,6 +16,7 @@ import {
 } from "../platform/files";
 import { sha256 } from "../protocol/canonical";
 import { discoverWorkspaces } from "../chat/workspace";
+import { EMPTY_IGNORE_MATCHER, type IgnoreMatcher } from "./ignorePatterns";
 import type { ResourceAdapter, ResourceApplyInput } from "./resource";
 import {
   captureWorkspaceDatabaseSnapshot,
@@ -44,6 +45,13 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
      * the capture stops at the same number.
      */
     private readonly maxPayloadBytes: number | undefined = undefined,
+    /**
+     * Workspaces this computer stays out of, matched against the workspace URI.
+     * A workspace with no URI is never excluded: the entry would be matched on
+     * nothing, and dropping a backup on the strength of missing metadata is the
+     * wrong direction to fail in.
+     */
+    private readonly ignoredWorkspaces: IgnoreMatcher = EMPTY_IGNORE_MATCHER,
   ) {}
 
   async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
@@ -81,6 +89,14 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
           actualRelativePath,
         );
         if (!isBackedUpWorkspaceStorageFile(actualRelativePath)) {
+          continue;
+        }
+        if (
+          isIgnoredWorkspaceUri(
+            workspaceUris.get(actualWorkspaceId),
+            this.ignoredWorkspaces,
+          )
+        ) {
           continue;
         }
         const canonicalWorkspaceId = canonicalWorkspaceStorageId(
@@ -237,6 +253,38 @@ async function listBackedUpWorkspaceStoragePaths(
     paths: paths.sort((left, right) => left.localeCompare(right)),
     warnings,
   };
+}
+
+/**
+ * Whether `cursorSettingSync.ignoredWorkspaces` covers this workspace.
+ *
+ * Both halves of the sync consult this - the scan, so an excluded workspace is
+ * never backed up, and the apply side, so an incoming one is never written and
+ * never raises the mapping prompt. A workspace whose URI is unknown is left in,
+ * because the pattern would be matched against nothing and silently dropping a
+ * backup is the worse of the two mistakes.
+ */
+export function isIgnoredWorkspaceUri(
+  uri: string | null | undefined,
+  ignored: IgnoreMatcher,
+): boolean {
+  if (typeof uri !== "string" || uri.length === 0) {
+    return false;
+  }
+  return ignored.matches(uri) || ignored.matches(decodeWorkspaceUriSafely(uri));
+}
+
+/**
+ * `file://*` has to match a URI Cursor stored as `file:///c%3A/...`, and a user
+ * writing a path pattern will write the readable form, so both spellings are
+ * offered to the matcher.
+ */
+function decodeWorkspaceUriSafely(uri: string): string {
+  try {
+    return decodeURIComponent(uri);
+  } catch {
+    return uri;
+  }
 }
 
 export function validateWorkspaceStorageRelativePath(

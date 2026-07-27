@@ -143,7 +143,7 @@ describe("the queued-changes status detail", () => {
 
   it("offers nothing to apply when every change is deferred", () => {
     const detail = pendingRestartDetail(pending("chat", 4, true));
-    expect(detail).toBe("4 newer-version database change(s) are deferred.");
+    expect(detail).toBe("4 change(s) are deferred: Created by a newer Cursor.");
     expect(detail).not.toContain(RESTART_TO_APPLY_TITLE);
   });
 
@@ -153,7 +153,21 @@ describe("the queued-changes status detail", () => {
       ...pending("extension", 1, true),
     ]);
     expect(detail).toContain("2 change(s)");
-    expect(detail).toContain("1 newer-version database change(s) are deferred.");
+    expect(detail).toContain("1 change(s) are deferred: Created by a newer Cursor.");
+  });
+
+  it("names the reason the entries actually carry, not the only one there used to be", () => {
+    // An excluded workspace is a deferral too, and reporting it as a
+    // newer-Cursor problem would send the user looking for an upgrade.
+    const excluded = pending("workspace-storage", 3, true).map((change) => ({
+      ...change,
+      blockedReason:
+        "This workspace is excluded by cursorSettingSync.ignoredWorkspaces on this computer.",
+    }));
+    const detail = pendingRestartDetail([...excluded, ...pending("chat", 1, true)]);
+    expect(detail).toContain("4 change(s) are deferred:");
+    expect(detail).toContain("cursorSettingSync.ignoredWorkspaces");
+    expect(detail).not.toContain("newer Cursor");
   });
 });
 

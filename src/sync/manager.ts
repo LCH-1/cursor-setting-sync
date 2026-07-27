@@ -9,6 +9,7 @@ import {
   CONFLICTED_REPUBLISH_INTERVAL_MS,
   LOCK_SKIP_REMINDER_MS,
   MAX_APPLY_BATCH_BYTES,
+  QUIT_START_GRACE_MS,
   REPOSITORY_FILE,
   RESTART_TO_APPLY_COMMAND,
   RESTART_TO_APPLY_TITLE,
@@ -108,8 +109,13 @@ import {
 } from "../resources/extensions";
 import {
   WorkspaceStorageAdapter,
+  isIgnoredWorkspaceUri,
   isWorkspaceStateDatabasePath,
 } from "../resources/workspaceStorage";
+import {
+  createIgnoreMatcher,
+  type IgnoreMatcher,
+} from "../resources/ignorePatterns";
 import { StateVscdbChatAdapter } from "../chat/stateVscdb";
 import { mergeChatSnapshotBuffers } from "../chat/chatMerge";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
@@ -740,6 +746,16 @@ export class SyncManager implements vscode.Disposable {
           );
         }
         await this.startFinalizer();
+      },
+      () => {
+        this.status.log(QUIT_STALLED_MESSAGE);
+        void vscode.window.showWarningMessage(QUIT_STALLED_MESSAGE).then(
+          () => {},
+          () => {
+            // The window may be mid-teardown; the output-channel line above is
+            // the durable record either way.
+          },
+        );
       },
     );
   }
@@ -2378,6 +2394,26 @@ export class SyncManager implements vscode.Disposable {
     }
   }
 
+  /**
+   * Rebuilt only when the patterns change: this is consulted once per changed
+   * projection per cycle, and compiling a pattern list on a repository with
+   * thousands of workspaceStorage resources is not free.
+   */
+  private ignoredWorkspaceCache: { key: string; matcher: IgnoreMatcher } | null =
+    null;
+
+  private ignoredWorkspaceMatcher(): IgnoreMatcher {
+    const patterns = this.configuration.ignoredWorkspaces;
+    const key = patterns.join(" ");
+    if (this.ignoredWorkspaceCache?.key !== key) {
+      this.ignoredWorkspaceCache = {
+        key,
+        matcher: createIgnoreMatcher(patterns),
+      };
+    }
+    return this.ignoredWorkspaceCache.matcher;
+  }
+
   private resourceApplyBlockReason(tip: ResourceTip): string | null {
     const configuredBlock = resourceConfigurationBlockReason(tip.kind, {
       syncChat: this.configuration.syncChat,
@@ -2385,6 +2421,21 @@ export class SyncManager implements vscode.Disposable {
     });
     if (configuredBlock !== null) {
       return configuredBlock;
+    }
+    // Checked before the capability reasons so an excluded workspace never
+    // reaches `ensureWorkspaceMappings`, whose prompt is the whole point of
+    // excluding it: a local folder from another computer has no answer on this
+    // one, and the modal has to be answered before anything else can apply.
+    if (
+      tip.kind === "workspace-storage" &&
+      isIgnoredWorkspaceUri(
+        typeof tip.metadata?.workspaceUri === "string"
+          ? tip.metadata.workspaceUri
+          : null,
+        this.ignoredWorkspaceMatcher(),
+      )
+    ) {
+      return "This workspace is excluded by cursorSettingSync.ignoredWorkspaces on this computer.";
     }
     return databaseApplyBlockReason(
       tip.kind,
@@ -2501,6 +2552,7 @@ export class SyncManager implements vscode.Disposable {
         this.paths,
         this.configuration.workspaceMappings,
         this.configuration.maxPayloadBytes,
+        createIgnoreMatcher(this.configuration.ignoredWorkspaces),
       ),
     ];
     if (this.compatibility.compatible) {
@@ -2638,6 +2690,7 @@ export class SyncManager implements vscode.Disposable {
       ignoredExtensions: this.configuration.ignoredExtensions,
       ignoredUserFiles: this.configuration.ignoredUserFiles,
       ignoredUiStateKeys: this.configuration.ignoredUiStateKeys,
+      ignoredWorkspaces: this.configuration.ignoredWorkspaces,
       // Already includes the built-in defaults, so the helper applies exactly
       // the same exclusions the extension host does.
       machineScopedSettings: this.machineSpecificSettingPatterns(),
@@ -3111,6 +3164,20 @@ export function settledStatus(input: {
 }
 
 /**
+ * What the user is told when the automatic quit did not take effect.
+ *
+ * Deliberately does not mention killing anything: the offline helper is itself
+ * a `Cursor.exe`, and so is a shutdown finalizer whose only job is the
+ * workspaceStorage backup - "end all Cursor.exe tasks" destroys the very thing
+ * the user is trying to move. Closing windows is enough, because the helper
+ * waits on the process list rather than on the command it issued.
+ */
+export const QUIT_STALLED_MESSAGE =
+  `Cursor Setting Sync asked Cursor to close ${Math.round(QUIT_START_GRACE_MS / 1000)} seconds ago and it is still open, so the queued changes have not been written. ` +
+  "Closing Cursor yourself in the next couple of minutes still completes it - the offline helper is waiting for the windows to go away, not for the command it sent - " +
+  "and it will then write the changes and reopen Cursor. Nothing is lost if you would rather keep working; the queue stays where it is.";
+
+/**
  * Whether a file in the extension storage root is a helper result.
  *
  * `writeFileAtomic` writes `<path>.<pid>.<uuid>.partial` and then renames, and
@@ -3160,18 +3227,38 @@ export function pendingRestartDetail(
   pending: readonly PendingDatabaseChange[],
 ): string {
   const ready = pending.filter((change) => change.blockedReason === undefined);
-  const blocked = pending.length - ready.length;
+  const deferred = pending.filter((change) => change.blockedReason !== undefined);
   return [
     ready.length === 0
       ? ""
       : `${ready.length} change(s) from another device (${summarizePendingKinds(ready)}) are queued. ` +
         `Run "${RESTART_TO_APPLY_TITLE}" to write them - quitting and reopening Cursor does not.`,
-    blocked === 0
+    deferred.length === 0
       ? ""
-      : `${blocked} newer-version database change(s) are deferred.`,
+      : `${deferred.length} change(s) are deferred: ${commonestBlockedReason(deferred)}`,
   ]
     .filter((message) => message.length > 0)
     .join(" ");
+}
+
+/**
+ * Deferrals used to be reported as "newer-version database change(s)", which
+ * was the only reason there was. A workspace excluded on this computer is now
+ * another, and a count with the wrong explanation attached is worse than a
+ * count with none - so the reason is read off the entries themselves.
+ */
+function commonestBlockedReason(
+  deferred: readonly PendingDatabaseChange[],
+): string {
+  const counts = new Map<string, number>();
+  for (const change of deferred) {
+    const reason = change.blockedReason ?? "";
+    counts.set(reason, (counts.get(reason) ?? 0) + 1);
+  }
+  const [reason] = [...counts.entries()].sort(
+    (left, right) => right[1] - left[1] || left[0].localeCompare(right[0]),
+  )[0] ?? [""];
+  return reason.length === 0 ? "Update Cursor and try again." : reason;
 }
 
 function summarizePendingKinds(

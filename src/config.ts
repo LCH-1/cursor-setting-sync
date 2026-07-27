@@ -115,6 +115,18 @@ export class ExtensionConfiguration {
     return stringArray(setting<string[]>("ignoredUserFiles", []));
   }
 
+  /**
+   * Workspace URIs whose workspaceStorage this computer stays out of.
+   *
+   * Machine-scoped on purpose. Which projects live on this computer is a fact
+   * about this computer, and every other `cursorSettingSync.*` key travels with
+   * the settings themselves - so a shared list would switch the other machine's
+   * backups off as a side effect of curating this one's.
+   */
+  get ignoredWorkspaces(): string[] {
+    return stringArray(setting<string[]>("ignoredWorkspaces", []));
+  }
+
   get maxPayloadBytes(): number {
     const raw = setting<number>("maxPayloadMiB", DEFAULT_MAX_PAYLOAD_MIB);
     const mebibytes = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_PAYLOAD_MIB;

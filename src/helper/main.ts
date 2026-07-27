@@ -9,6 +9,8 @@ import {
   parseCursorProcessIds,
 } from "../platform/compatibility";
 import {
+  CURSOR_EXIT_WAIT_MS,
+  FINALIZER_EXIT_WAIT_MS,
   HELPER_REQUEST_VERSION,
   MAX_APPLY_BATCH_BYTES,
   REPOSITORY_FILE,
@@ -56,6 +58,7 @@ import {
   createExtensionIgnoreMatcher,
 } from "../resources/extensions";
 import { WorkspaceStorageAdapter } from "../resources/workspaceStorage";
+import { createIgnoreMatcher } from "../resources/ignorePatterns";
 import type { ResourceAdapter } from "../resources/resource";
 import {
   applyGlobalDatabaseChanges,
@@ -122,7 +125,9 @@ async function run(): Promise<void> {
     }
     const cancelled = await waitForCursorExit(
       request,
-      request.mode === "final-export" ? 30 * 24 * 60 * 60 * 1000 : 180_000,
+      request.mode === "final-export"
+        ? FINALIZER_EXIT_WAIT_MS
+        : CURSOR_EXIT_WAIT_MS,
     );
     if (cancelled) {
       await writeResult(
@@ -433,6 +438,7 @@ async function exportFinalChanges(
         request.paths,
         workspaceMappings,
         request.syncOptions.maxPayloadBytes,
+        createIgnoreMatcher(request.syncOptions.ignoredWorkspaces ?? []),
       ),
     );
   }

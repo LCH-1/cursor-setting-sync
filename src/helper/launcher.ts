@@ -4,7 +4,9 @@ import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
 import * as vscode from "vscode";
 import {
+  CURSOR_EXIT_WAIT_MS,
   HELPER_REQUEST_VERSION,
+  QUIT_START_GRACE_MS,
 } from "../constants";
 import type { CompatibilityReport } from "../types";
 import { cursorExecutableForRestart } from "../platform/compatibility";
@@ -21,11 +23,12 @@ export type HelperSyncOptions = HelperRequest["syncOptions"];
  * A re-armed finalizer is itself a Cursor.exe process, so re-arming before the
  * helper gives up would keep it from ever seeing zero other Cursor processes.
  */
-const QUIT_VETO_CHECK_DELAY_MS = 210_000;
+export const QUIT_VETO_CHECK_DELAY_MS = CURSOR_EXIT_WAIT_MS + 30_000;
 
 export class HelperLauncher {
   private finalizer: ChildProcess | null = null;
   private quitVetoTimer: NodeJS.Timeout | null = null;
+  private quitStartedTimer: NodeJS.Timeout | null = null;
   private readonly cancelFinalizersPath: string;
 
   constructor(
@@ -85,6 +88,7 @@ export class HelperLauncher {
     workspaceMappings: Record<string, string>,
     syncOptions: HelperSyncOptions,
     onQuitVetoed: () => Promise<void> = async () => {},
+    onQuitStalled: () => void = () => {},
   ): Promise<void> {
     await writeFileAtomic(
       this.cancelFinalizersPath,
@@ -102,8 +106,13 @@ export class HelperLauncher {
     );
     await this.launch(request, masterKey);
     await vscode.commands.executeCommand("workbench.action.files.saveAll");
-    await vscode.commands.executeCommand("workbench.action.quit");
+    // Armed before the quit, not after. `workbench.action.quit` is awaited, and
+    // a quit whose promise never settles left both timers unarmed - so the
+    // shutdown finalizer was never re-armed either, costing the session its
+    // only workspaceStorage export on exactly the runs where the quit misfired.
+    this.scheduleQuitStartedCheck(onQuitStalled);
     this.scheduleQuitVetoCheck(onQuitVetoed);
+    await vscode.commands.executeCommand("workbench.action.quit");
   }
 
   async restoreAndRestart(
@@ -135,8 +144,9 @@ export class HelperLauncher {
     }
     await this.launch(request, masterKey);
     await vscode.commands.executeCommand("workbench.action.files.saveAll");
-    await vscode.commands.executeCommand("workbench.action.quit");
+    // Armed before the quit for the same reason as in `applyAndRestart`.
     this.scheduleQuitVetoCheck(onQuitVetoed);
+    await vscode.commands.executeCommand("workbench.action.quit");
   }
 
   /**
@@ -158,10 +168,36 @@ export class HelperLauncher {
     this.quitVetoTimer.unref();
   }
 
+  /**
+   * Says something while the helper is still waiting, rather than after it has
+   * given up.
+   *
+   * `workbench.action.quit` is advisory. When nothing acts on it there is no
+   * error and no dialog: the helper waits out its whole budget and the failure
+   * surfaces minutes later, by which time the user has concluded the feature is
+   * broken. This timer only survives to fire if the quit did not happen, since
+   * a successful one tears the extension host down first, and it is unref'd so
+   * it never keeps the host alive.
+   */
+  private scheduleQuitStartedCheck(onQuitStalled: () => void): void {
+    if (this.quitStartedTimer !== null) {
+      clearTimeout(this.quitStartedTimer);
+    }
+    this.quitStartedTimer = setTimeout(() => {
+      this.quitStartedTimer = null;
+      onQuitStalled();
+    }, QUIT_START_GRACE_MS);
+    this.quitStartedTimer.unref();
+  }
+
   dispose(): void {
     if (this.quitVetoTimer !== null) {
       clearTimeout(this.quitVetoTimer);
       this.quitVetoTimer = null;
+    }
+    if (this.quitStartedTimer !== null) {
+      clearTimeout(this.quitStartedTimer);
+      this.quitStartedTimer = null;
     }
   }
 

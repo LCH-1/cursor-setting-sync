@@ -163,6 +163,7 @@ Git 전송에는 `git` CLI가 `PATH`에 있어야 합니다. 인증은 시스템
 | `autoApplyFiles` | `true` | Cursor 실행 중 충돌 없는 파일 리소스를 자동 적용할지. 수동 `Sync Now`는 이 값과 무관하게 적용합니다. |
 | `syncChat` | `true` | 지원되는 Cursor 채팅 저장소(composer 대화·에이전트 트랜스크립트·`store.db`) 동기화 여부. |
 | `syncWorkspaceStorage` | `true` | `workspaceStorage` 상태 백업 여부. 모든 Cursor 프로세스가 종료된 뒤에만 캡처됩니다. |
+| `ignoredWorkspaces` | `[]` | 이 컴퓨터가 백업도 쓰기도 하지 않을 워크스페이스. 워크스페이스 URI로 매칭합니다. `["file://*"]`로 두면 Remote-SSH 워크스페이스만 남습니다 — 로컬 폴더 경로는 한 컴퓨터에만 존재하므로 다른 컴퓨터에서는 대응시킬 대상이 없고, 매핑을 묻는 대기열에만 쌓입니다. 와일드카드도 됩니다: `vscode-remote://ssh-remote+staging*`. **기기 범위(machine scope)**라 다른 설정과 달리 컴퓨터 간에 전파되지 않습니다. 어떤 프로젝트가 이 기기에 있는지는 그 기기의 사실이기 때문입니다. 채팅에는 영향이 없습니다. |
 | `gitSync` | `true` | 저장소 폴더가 git 워크트리일 때 읽기 전 pull·쓰기 후 commit/push를 사용할지. `git` CLI가 필요합니다. |
 | `ignoredSettings` | `[]` | `settings.json`에서 동기화 제외할 설정 키 목록. API 키 등 민감한 값을 여기에 추가하세요. 각 항목은 정확한 키(`editor.fontSize`) 또는 와일드카드(`remote.SSH.*`)입니다. |
 | `useDefaultIgnoredSettings` | `true` | 아래의 기기 전용 설정 기본 목록도 함께 제외할지. 끄면 해당 키들도 동기화됩니다. |

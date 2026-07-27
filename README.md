@@ -163,6 +163,7 @@ Git transport requires the `git` CLI on `PATH`. Authentication uses your system 
 | `autoApplyFiles` | `true` | Whether non-conflicting file resources apply while Cursor runs. A manual `Sync Now` applies regardless of this value. |
 | `syncChat` | `true` | Synchronize supported Cursor chat stores (composer conversations, agent transcripts, `store.db`). |
 | `syncWorkspaceStorage` | `true` | Back up `workspaceStorage` state. It is captured only after every Cursor process exits. |
+| `ignoredWorkspaces` | `[]` | Workspaces this computer neither backs up nor writes, matched against the workspace URI. Set `["file://*"]` to keep only Remote-SSH workspaces — a local folder path exists on one computer only, so its incoming storage can never be matched on another and just sits in the queue asking to be mapped. Wildcards work: `vscode-remote://ssh-remote+staging*`. **Machine-scoped**: unlike every other setting here it does not travel between computers, because which projects live on a machine is a fact about that machine. Chats are unaffected. |
 | `gitSync` | `true` | When the repository folder is a git worktree, pull before reading and commit/push after writing. Requires the `git` CLI. |
 | `ignoredSettings` | `[]` | Setting keys in `settings.json` excluded from synchronization. Add sensitive values such as API keys here. Each entry is an exact key (`editor.fontSize`) or a wildcard (`remote.SSH.*`). |
 | `useDefaultIgnoredSettings` | `true` | Also exclude the built-in machine-specific key list below. Turn it off to synchronize those keys anyway. |

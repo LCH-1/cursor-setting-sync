@@ -108,6 +108,46 @@ export const LOCK_SKIP_REMINDER_MS = 5 * 60_000;
 export const RESTART_TO_APPLY_COMMAND = "cursorSync.restartToApply";
 export const RESTART_TO_APPLY_TITLE = "Cursor Setting Sync: Restart to Apply";
 
+/**
+ * How long after issuing the quit this window waits before concluding that the
+ * quit never started.
+ *
+ * `workbench.action.quit` is advisory, and when it does nothing there is no
+ * error and no dialog - the helper simply waits out its whole exit budget and
+ * reports a timeout minutes later. A user on 0.0.9 sat through the full 180
+ * seconds with no indication anything was wrong, then found Cursor still open.
+ *
+ * A quit that is working tears this extension host down in a second or two, so
+ * a timer this long cannot fire during a healthy shutdown; and it is far short
+ * of the helper's own budget, so the news arrives while the helper is still
+ * waiting and closing Cursor by hand still completes the apply.
+ */
+export const QUIT_START_GRACE_MS = 15_000;
+
+/**
+ * How long a shutdown finalizer waits for Cursor to exit before giving up.
+ *
+ * Effectively "however long this editing session lasts", and deliberately so.
+ * A finalizer that times out throws out of `waitForCursorExit` before
+ * `exportFinalChanges` ever runs, and `restart` is false for this mode, so
+ * nothing recovers and nothing re-arms until the next activation - meaning the
+ * session's shutdown export, the only path that ever backs up workspaceStorage,
+ * is silently lost. Anyone who leaves Cursor open longer than the budget and
+ * then quits pays that price, so the budget has to outlast any plausible
+ * session. Shortening it to make the waiting process tidy would trade a
+ * cosmetic problem for a data one.
+ */
+export const FINALIZER_EXIT_WAIT_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * How long an apply or restore helper waits for every Cursor process to exit.
+ *
+ * Deliberately shorter than {@link QUIT_VETO_CHECK_DELAY_MS} in the launcher: a
+ * re-armed shutdown finalizer is itself a `Cursor.exe`, so re-arming before
+ * this budget elapses would keep the helper from ever seeing zero.
+ */
+export const CURSOR_EXIT_WAIT_MS = 180_000;
+
 export const DEFAULT_POLL_INTERVAL_SECONDS = 30;
 export const DEFAULT_CHAT_POLL_INTERVAL_SECONDS = 30;
 export const DEFAULT_MAX_PAYLOAD_MIB = 128;

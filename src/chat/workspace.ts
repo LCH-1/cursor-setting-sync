@@ -148,12 +148,64 @@ export function normalizeWorkspaceUri(
   uri: string,
   platform: NodeJS.Platform = process.platform,
 ): string {
-  const decoded = decodeWorkspaceUri(uri);
+  const decoded = normalizeRemoteHost(decodeWorkspaceUri(uri));
   const separated = platform === "win32" ? decoded.replaceAll("\\", "/") : decoded;
   const trimmed = separated.replace(/\/+$/, "");
   return isCaseInsensitivePathPlatform(platform)
     ? trimmed.toLocaleLowerCase("en-US")
     : trimmed;
+}
+
+/**
+ * Collapses the two spellings Cursor uses for one SSH host.
+ *
+ * The same server is recorded either as the plain alias from the SSH config -
+ * `ssh-remote+geekdive_local2` - or as a hex-encoded JSON descriptor,
+ * `ssh-remote+7b22686f73744e616d65223a226765656b646976655f6c6f63616c32227d`,
+ * which is `{"hostName":"geekdive_local2"}`. Which one appears depends on how
+ * the connection was opened, and both forms occur on a single machine: one
+ * user's `workspaceStorage` held 36 workspaces under the alias and 15 more
+ * under the descriptor for that same server.
+ *
+ * VS Code hashes the URI into the workspaceStorage directory name, so the same
+ * folder on the same server becomes two unrelated workspaces - which is why an
+ * incoming remote workspace matched nothing locally and every chat written
+ * there stopped at a mapping prompt the user had no way to answer.
+ */
+function normalizeRemoteHost(uri: string): string {
+  return uri.replace(
+    /^(vscode-remote:\/\/ssh-remote\+)([0-9a-fA-F]+)(?=\/|$)/,
+    (whole, prefix: string, encoded: string) => {
+      const hostName = remoteHostFromDescriptor(encoded);
+      return hostName === null ? whole : `${prefix}${hostName}`;
+    },
+  );
+}
+
+/**
+ * The `hostName` inside a hex-encoded connection descriptor, or null for
+ * anything else - including an alias that happens to be all hex characters,
+ * which only a successful parse can distinguish from a real descriptor.
+ */
+function remoteHostFromDescriptor(encoded: string): string | null {
+  if (encoded.length < 2 || encoded.length % 2 !== 0) {
+    return null;
+  }
+  const bytes = Buffer.from(encoded, "hex");
+  if (bytes.length * 2 !== encoded.length) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+  const hostName = (parsed as { hostName?: unknown }).hostName;
+  return typeof hostName === "string" && hostName.length > 0 ? hostName : null;
 }
 
 function workspaceBasename(uri: string): string {

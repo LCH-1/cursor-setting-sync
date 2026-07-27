@@ -2,6 +2,19 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.10] - 2026-07-27
+
+### Added
+
+- `cursorSettingSync.ignoredWorkspaces` keeps a computer out of workspaces it has no business holding. Set it to `["file://*"]` and only Remote-SSH workspaces are backed up or written — a local folder path exists on exactly one machine, so its incoming workspaceStorage can never be matched on another and does nothing but sit in the queue asking to be mapped to something that is not there. Wildcards work (`vscode-remote://ssh-remote+staging*`), and the percent-encoded form Cursor stores is matched against the readable pattern a person would write. The setting is machine-scoped: unlike every other `cursorSettingSync.*` key it does not travel, because which projects live on a computer is a fact about that computer, and a shared list would switch the other machine's backups off as a side effect of curating this one's. Chats are unaffected.
+
+### Fixed
+
+- The same SSH server was treated as two unrelated machines. Cursor records a Remote-SSH host either as the plain alias — `ssh-remote+geekdive_local2` — or as a hex-encoded JSON descriptor, `ssh-remote+7b22686f73744e616d65223a226765656b646976655f6c6f63616c32227d`, which is `{"hostName":"geekdive_local2"}`; which one appears depends on how the connection was opened, and both occur on one machine. VS Code hashes that URI into the workspaceStorage directory name, so the same folder on the same server became two workspaces with nothing in common — and every chat written there stopped at a mapping prompt offering hundreds of entries, none of which was the right answer. On the setup that prompted this, 35 remote folders were split that way, including the one whose chats had gone missing. The two spellings now compare equal.
+- The automatic quit could fail silently for three minutes. `Restart to Apply` issues `workbench.action.quit`, which is advisory: when nothing acts on it there is no error and no dialog, and the first sign of trouble was the offline helper reporting a timeout long afterwards. If Cursor is still open fifteen seconds after the command, this now says so while the helper is still waiting — closing Cursor by hand at that point still completes the apply, because the helper waits for the windows to go away rather than for the command it sent. The message deliberately never suggests ending Cursor tasks: the helper is itself a `Cursor.exe`, and so is the shutdown finalizer whose only job is the workspaceStorage backup.
+- Both post-quit timers were armed after the awaited quit, so a quit whose promise never settled left them unarmed — and with them the shutdown finalizer un-rearmed, costing the session its only workspaceStorage export on exactly the runs where the quit misfired. They are armed before the quit now.
+- A deferred change is reported with the reason it actually carries. The status bar said "newer-version database change(s) are deferred" because that was once the only reason there was; an excluded workspace is another, and a count with the wrong explanation attached sends the user looking for a Cursor upgrade that would not help.
+
 ## [0.0.9] - 2026-07-27
 
 ### Fixed
