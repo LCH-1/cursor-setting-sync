@@ -170,6 +170,17 @@ export const FINALIZER_EXIT_WAIT_MS = 30 * 24 * 60 * 60 * 1000;
  */
 export const CURSOR_EXIT_WAIT_MS = 180_000;
 
+/**
+ * How fresh `shutdown-finalizer.lock` must be before its recorded pid is
+ * believed and excluded from the running-Cursor count.
+ *
+ * The holder refreshes the file every minute, so a lock older than this has no
+ * live owner - and trusting a stale one would subtract a recycled pid, which is
+ * to say a genuine Cursor window, from the list the exit wait depends on.
+ * Matches the lock layer's own staleness rule.
+ */
+export const FINALIZER_LOCK_TRUST_MS = 15 * 60_000;
+
 export const DEFAULT_POLL_INTERVAL_SECONDS = 30;
 export const DEFAULT_CHAT_POLL_INTERVAL_SECONDS = 30;
 export const DEFAULT_MAX_PAYLOAD_MIB = 128;

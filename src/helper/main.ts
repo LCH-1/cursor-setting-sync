@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, rm } from "node:fs/promises";
+import { readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { inspectSqliteCapabilities, openDatabase } from "../platform/sqlite";
 import {
@@ -11,6 +11,7 @@ import {
 import {
   CURSOR_EXIT_WAIT_MS,
   FINALIZER_EXIT_WAIT_MS,
+  FINALIZER_LOCK_TRUST_MS,
   HELPER_REQUEST_VERSION,
   MAX_APPLY_BATCH_BYTES,
   REPOSITORY_FILE,
@@ -259,7 +260,7 @@ async function executeRequest(
     return successResult(request, [], [...warnings], null, [], warnings);
   }
   const ensureExclusiveAccess = async (): Promise<void> => {
-    if (!(await noOtherCursorProcesses())) {
+    if (!(await noOtherCursorProcesses(request))) {
       throw new CursorReopenedError(
         "Cursor was reopened before offline changes could be applied. Close Cursor and try again.",
       );
@@ -752,7 +753,7 @@ async function waitForCursorExit(
     }
     if (
       !isProcessAlive(request.extensionHostPid) &&
-      (await noOtherCursorProcesses())
+      (await noOtherCursorProcesses(request))
     ) {
       return false;
     }
@@ -760,7 +761,7 @@ async function waitForCursorExit(
   }
   let survivors: number[] | null = null;
   try {
-    survivors = await otherCursorProcessIds();
+    survivors = await otherCursorProcessIds(request);
   } catch {
     // The listing is a nicety on this path; failing it must not replace the
     // timeout with a different error.
@@ -813,16 +814,51 @@ async function acquireSyncLock(
   throw new Error("Timed out waiting for the synchronization lock.");
 }
 
-async function noOtherCursorProcesses(): Promise<boolean> {
-  return (await otherCursorProcessIds()).length === 0;
+async function noOtherCursorProcesses(request: HelperRequest): Promise<boolean> {
+  return (await otherCursorProcessIds(request)).length === 0;
+}
+
+/**
+ * The shutdown finalizer's pid, when one holds a live lock.
+ *
+ * A finalizer is a headless `Cursor.exe` of this extension's own making, and
+ * once it is past its own wait it stops re-checking the cancel file - so it
+ * stays in the process table for as long as its export takes, which on a
+ * repository with a thousand workspaceStorage resources is minutes. An apply
+ * helper counted it as a running Cursor and gave up after its 180 seconds,
+ * reporting "1 Cursor process(es) are still running" about a process the user
+ * cannot close and must not kill.
+ *
+ * Excluding it is safe because it is not what the wait is for: exclusivity
+ * against a real Cursor is unaffected, and the two helpers still serialize
+ * against each other on `sync.lock`, which is the actual mutex.
+ *
+ * The lock's own liveness rule is applied before trusting the pid, because a
+ * stale lock naming a recycled pid would remove a genuine Cursor from the list.
+ */
+async function liveFinalizerPid(request: HelperRequest): Promise<number | null> {
+  const path = join(request.storageRoot, "shutdown-finalizer.lock");
+  try {
+    const [raw, stats] = await Promise.all([readFile(path, "utf8"), stat(path)]);
+    if (Date.now() - stats.mtimeMs > FINALIZER_LOCK_TRUST_MS) {
+      return null;
+    }
+    const pid = (JSON.parse(raw) as { pid?: unknown }).pid;
+    return typeof pid === "number" && isProcessAlive(pid) ? pid : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
  * Every live Cursor process except this helper, which is itself spawned as
  * `Cursor.exe` with ELECTRON_RUN_AS_NODE and would otherwise wait for itself.
  */
-async function otherCursorProcessIds(): Promise<number[]> {
+async function otherCursorProcessIds(
+  request: HelperRequest,
+): Promise<number[]> {
   const platform = process.platform;
+  const finalizerPid = await liveFinalizerPid(request);
   const { stdout } =
     platform === "win32"
       ? await execFileAsync(
@@ -832,7 +868,7 @@ async function otherCursorProcessIds(): Promise<number[]> {
         )
       : await execFileAsync("ps", ["-axo", "pid=,comm="], { timeout: 10_000 });
   return parseCursorProcessIds(stdout, platform).filter(
-    (pid) => pid !== process.pid,
+    (pid) => pid !== process.pid && pid !== finalizerPid,
   );
 }
 

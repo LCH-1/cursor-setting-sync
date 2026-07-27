@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.16] - 2026-07-27
+
+### Fixed
+
+- "1 Cursor process(es) are still running" named a process this extension had started itself. The shutdown finalizer is a headless `Cursor.exe`, and once past its own wait it stops checking whether it has been cancelled — so it stays in the process table for as long as its export takes, which on a repository holding a thousand workspaceStorage resources is minutes. An apply helper counted it as a running Cursor, waited out its full 180 seconds and gave up, telling the user to close a window that does not exist and naming a process they must not kill: it is the only path that ever backs up workspaceStorage. Its pid is now read from the lock it holds and left out of the count — but only while that lock is fresh, because a stale one names a recycled pid, and subtracting that would remove a genuine Cursor window from the list the exit wait depends on. Exclusivity against a real Cursor is unchanged, and the two helpers still serialize on `sync.lock`, which is the actual mutex.
+
 ## [0.0.15] - 2026-07-27
 
 ### Changed
