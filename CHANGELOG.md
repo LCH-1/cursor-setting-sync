@@ -2,6 +2,17 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.15] - 2026-07-27
+
+### Changed
+
+- Setting up a new computer is one flow. A machine that has just joined necessarily has a full queue — extensions, profiles, chats and UI state all arrive at once, and none of them can be written while Cursor is running — so setup ended with a toast and left the user to discover a second command on their own. It now offers the apply directly. Declining is free and the status bar still carries it. The offer deliberately fires only from setup, because setup is also the documented way to unlock an established device, and on that device the queue is the ordinary flow of incoming chats rather than a one-time cost of joining. The wording does not promise the queue will empty in one pass: a large one exceeds the 512 MiB apply batch and needs another.
+- The "configured" notice, which names `mcp.json` and `cli-config.json` as files that may carry API keys, is now written to the output channel as well as shown. The offer above can quit Cursor within seconds of it appearing.
+
+### Fixed
+
+- Applying an extension copied the entire global database, once per extension, whether or not anything changed. `updateExtensionEnablement` took a full `backupDatabase` before it read the row it might modify, and named the copy after the extension — so a request touching a dozen extensions wrote a dozen copies of a database that is 1,239 MiB on a real user's machine, blew the 2 GiB retention budget, and evicted the global apply's own backup along with it. Almost none of those copies protected anything: an extension arrives enabled and is simply absent from the disabled list, so there was nothing to write. The row is now read first, on a read-only connection, and the backup is taken only when the write would actually change it. An unreadable database still takes the backup, which is exactly when it earns its keep.
+
 ## [0.0.14] - 2026-07-27
 
 ### Fixed

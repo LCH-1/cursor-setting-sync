@@ -441,9 +441,53 @@ export class SyncManager implements vscode.Disposable {
       await this.startFinalizer();
     });
     this.startWatching();
-    void vscode.window.showInformationMessage(
-      'Cursor Setting Sync is configured. The check mark confirms a local shared-folder write, not OneDrive cloud upload completion. The encrypted sync set includes ~/.cursor/mcp.json and cli-config.json, which may contain API keys - add them to "cursorSettingSync.ignoredUserFiles" to keep them on this device only.',
+    const configured =
+      'Cursor Setting Sync is configured. The check mark confirms a local shared-folder write, not OneDrive cloud upload completion. The encrypted sync set includes ~/.cursor/mcp.json and cli-config.json, which may contain API keys - add them to "cursorSettingSync.ignoredUserFiles" to keep them on this device only.';
+    // Also to the channel: the offer below can quit Cursor within seconds, and
+    // this notice names files that may carry API keys.
+    this.status.log(configured);
+    void vscode.window.showInformationMessage(configured);
+    await this.offerFirstApply();
+  }
+
+  /**
+   * Offers the apply straight after setup, so joining is one flow.
+   *
+   * A computer that has just joined necessarily has a full queue - extensions,
+   * profiles, chats and UI state all arrive at once, and none of them can be
+   * written while Cursor runs. Ending setup with a toast and leaving the user
+   * to discover a second command is the friction people report: they set the
+   * thing up, nothing appears, and nothing says why.
+   *
+   * Deliberately not called from anywhere else. `setup()` is also the documented
+   * way to unlock an established device, and on that device the queue is the
+   * ordinary flow of incoming chats rather than a one-time cost of joining.
+   */
+  private async offerFirstApply(): Promise<void> {
+    const repository = this.repository;
+    if (repository === null) {
+      return;
+    }
+    const pending = repository.state.pendingDatabaseChanges.filter(
+      (change) => change.blockedReason === undefined,
     );
+    if (pending.length === 0) {
+      return;
+    }
+    const action = "Apply now";
+    const choice = await vscode.window.showWarningMessage(
+      `${pending.length} change(s) from your other computers (${summarizePendingKinds(pending)}) are waiting. ` +
+        "They live in databases Cursor keeps open, so they can only be written while it is closed: choosing to apply saves your editors, quits Cursor, writes them and reopens it. " +
+        "A large queue may need more than one pass; the status bar says so if any remain. You can also do this later from the status bar.",
+      { modal: true },
+      action,
+    );
+    if (choice !== action) {
+      return;
+    }
+    // Delegated rather than inlined so this shares the workspace mapping, the
+    // quit-stall warning and the finalizer re-arm with the command itself.
+    await this.restartToApply();
   }
 
   /**

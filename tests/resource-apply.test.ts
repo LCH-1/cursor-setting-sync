@@ -264,6 +264,39 @@ describeWithBackup("extension enablement over a NULL disabled list", () => {
       ),
     ).toBe(JSON.stringify([{ id: "some.extension" }]));
   });
+
+  it("takes no database backup when the row already says what is being applied", async () => {
+    // `backupDatabase` copies the whole file - 1,239 MiB on a real user's
+    // global database - and this ran once per extension inside the install
+    // loop, before even reading the row it might change. A request touching a
+    // dozen extensions therefore wrote a dozen full copies and blew the entire
+    // 2 GiB retention budget, evicting the global apply's own backup with it.
+    // Almost none of them protected anything: an extension arrives enabled and
+    // is simply absent from the disabled list, so there was nothing to change.
+    const fixture = await createFixture();
+    await createProfileDatabase(fixture.paths.globalDatabase, null);
+    await stubCursorCli(fixture);
+
+    const result = await applyNonGlobalChanges(fixture.request, [
+      extensionPut("extension/default/some.extension", "some.extension"),
+    ]);
+
+    expect(result.applied).toEqual(["extension/default/some.extension"]);
+    expect(result.backups).toEqual([]);
+  });
+
+  it("still takes one when the row does have to change", async () => {
+    const fixture = await createFixture();
+    await createProfileDatabase(fixture.paths.globalDatabase, null);
+    await stubCursorCli(fixture);
+
+    const result = await applyNonGlobalChanges(fixture.request, [
+      extensionPut("extension/default/some.extension", "some.extension", false),
+    ]);
+
+    expect(result.backups).toHaveLength(1);
+    expect(result.backups[0]?.targetPath).toBe(fixture.paths.globalDatabase);
+  });
 });
 
 describeWithBackup("non-global resource apply with backups", () => {

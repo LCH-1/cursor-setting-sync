@@ -620,6 +620,17 @@ async function updateExtensionEnablement(
     normalizeResourcePath(relative(request.paths.userDataRoot, databasePath)),
     { finalType: "file" },
   );
+  // Read before backing up. `backupDatabase` copies the whole file - 1.2 GiB on
+  // a real user's global database - and this runs once per extension inside the
+  // install loop, so a request touching a dozen extensions wrote a dozen full
+  // copies and blew the entire 2 GiB retention budget, evicting the global
+  // apply's own backup with it. Almost none of those copies protected anything:
+  // an extension that arrives enabled is simply absent from the disabled list,
+  // so there was nothing to change. Nothing below this point writes, so nothing
+  // below this point needs a backup.
+  if (!(await enablementWouldChange(databasePath, extensionId, enabled))) {
+    return;
+  }
   const backupRoot = join(request.storageRoot, "backups");
   await ensureDirectory(backupRoot);
   const backupPath = join(
@@ -691,6 +702,48 @@ async function updateExtensionEnablement(
       }
     }
     throw error;
+  } finally {
+    database.close();
+  }
+}
+
+/**
+ * Whether writing the enablement row would actually change it.
+ *
+ * Deliberately mirrors the write below rather than approximating it: the same
+ * `parseDisabledExtensions`, the same case-folded identifier match, and the
+ * same "a no-op enable must not replace an absent or NULL row with `[]`" rule.
+ * A read-only connection, so it cannot be the thing that needs a backup.
+ */
+async function enablementWouldChange(
+  databasePath: string,
+  extensionId: string,
+  enabled: boolean,
+): Promise<boolean> {
+  const database = openDatabase(databasePath, { readOnly: true });
+  try {
+    database.exec("PRAGMA busy_timeout=5000");
+    database.exec("PRAGMA query_only=ON");
+    const row = database
+      .prepare("SELECT value FROM ItemTable WHERE key = ?")
+      .get("extensionsIdentifiers/disabled") as
+      | { value?: SqliteStorageValue }
+      | undefined;
+    const raw = row?.value;
+    const disabled = parseDisabledExtensions(raw);
+    const listed = disabled.some(
+      (item) => disabledExtensionId(item)?.toLowerCase() === extensionId,
+    );
+    // The list records what is DISABLED, so the two agree exactly when work is
+    // needed: enabled-and-listed has to be removed from it, disabled-and-absent
+    // has to be added to it. The other two combinations rewrite what is already
+    // there, which is the common case after an install - a freshly installed
+    // extension arrives enabled and is simply not in the list.
+    return enabled === listed;
+  } catch {
+    // An unreadable or unexpected database is exactly when the backup earns its
+    // keep; fall through to the guarded write path rather than skipping it.
+    return true;
   } finally {
     database.close();
   }
