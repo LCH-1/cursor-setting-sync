@@ -114,7 +114,7 @@ Git transport requires the `git` CLI on `PATH`. Authentication uses your system 
 
 - **Setup** — First-time configuration. Pick the repository folder and transport (plain / clone / new git), then enter the encryption passphrase (12+ characters, the same on every PC, never stored in the folder).
 - **Sync Now** — Run one synchronization immediately. Synchronization is otherwise automatic (30-second polling plus file watching); this publishes local changes and pulls remote ones on demand.
-- **Restart to Apply** — Quit and relaunch Cursor to apply pending database changes. Files apply while Cursor runs, but `state.vscdb` (chat, UI state, workspace databases) is written safely with SQL only after Cursor exits.
+- **Restart to Apply** — Applies pending database changes. The command hands the queue to the offline helper, quits Cursor, waits for every process to exit, writes the rows, and relaunches. Quitting and reopening Cursor yourself does **not** apply them: the shutdown helper only exports this device's changes, so the queue is still there afterwards. Files apply while Cursor runs, but `state.vscdb` (chat, UI state, workspace databases) is written safely with SQL only after Cursor exits.
 
 **Conflicts and recovery**
 

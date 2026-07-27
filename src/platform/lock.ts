@@ -117,20 +117,38 @@ export async function acquireFileLock(path: string): Promise<FileLock | null> {
 }
 
 /**
+ * Who is holding `path`, both as a sentence for the user and as the holder's
+ * PID.
+ *
+ * The sentence carries an age that changes every minute, so it cannot be
+ * compared against the previous observation to decide whether anything actually
+ * changed. The poll path needs exactly that comparison to stop logging the same
+ * skip twice a minute forever, and the PID is the part that identifies the
+ * holder; see {@link noteLockSkip}.
+ */
+export interface LockHolderReport {
+  /** Null when the lock file has already gone or cannot be parsed. */
+  pid: number | null;
+  description: string;
+}
+
+/**
  * Explains who is holding `path`, for the message shown when a command cannot
  * take the lock. The lock file already records the PID and the creation time
  * and self-heals on a dead PID or after the TTL, but none of that used to reach
  * the user: every command failed with the same six words and no way to learn
  * that closing the other window - or simply waiting - fixes it.
  */
-export async function describeLockHolder(path: string): Promise<string> {
+export async function reportLockHolder(path: string): Promise<LockHolderReport> {
   const existing = await readLock(path);
   if (existing === null) {
-    return (
-      "Another Cursor window or the offline helper is synchronizing. " +
-      "Close other Cursor windows, or try again in a moment. " +
-      `Lock file: ${path}.`
-    );
+    return {
+      pid: null,
+      description:
+        "Another Cursor window or the offline helper is synchronizing. " +
+        "Close other Cursor windows, or try again in a moment. " +
+        `Lock file: ${path}.`,
+    };
   }
   let heldFor = "";
   try {
@@ -143,12 +161,18 @@ export async function describeLockHolder(path: string): Promise<string> {
     // The age is a nicety; the PID alone is already actionable.
   }
   const staleMinutes = Math.round(STALE_LOCK_TTL_MS / 60_000);
-  return (
-    `Another Cursor window or the offline helper (pid ${existing.pid}${heldFor}) is synchronizing. ` +
-    "Close other Cursor windows, or wait - a lock whose holder has exited is " +
-    `released automatically, and any lock goes stale after ${staleMinutes} minutes. ` +
-    `Lock file: ${path}.`
-  );
+  return {
+    pid: existing.pid,
+    description:
+      `Another Cursor window or the offline helper (pid ${existing.pid}${heldFor}) is synchronizing. ` +
+      "Close other Cursor windows, or wait - a lock whose holder has exited is " +
+      `released automatically, and any lock goes stale after ${staleMinutes} minutes. ` +
+      `Lock file: ${path}.`,
+  };
+}
+
+export async function describeLockHolder(path: string): Promise<string> {
+  return (await reportLockHolder(path)).description;
 }
 
 function isSameLock(

@@ -4,6 +4,7 @@ import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { inspectSqliteCapabilities, openDatabase } from "../platform/sqlite";
 import {
+  cursorExitTimeoutDetail,
   cursorLaunchCommand,
   parseCursorProcessIds,
 } from "../platform/compatibility";
@@ -73,11 +74,12 @@ interface CollectedBackups {
 }
 
 class CursorExitTimeoutError extends Error {
-  constructor() {
-    super("Timed out waiting for Cursor to exit.");
+  constructor(detail: string) {
+    super(`Timed out waiting for Cursor to exit. ${detail}`);
     this.name = "CursorExitTimeoutError";
   }
 }
+
 
 void run();
 
@@ -750,7 +752,34 @@ async function waitForCursorExit(
     }
     await delay(500);
   }
-  throw new CursorExitTimeoutError();
+  let survivors: number[] | null = null;
+  try {
+    survivors = await otherCursorProcessIds();
+  } catch {
+    // The listing is a nicety on this path; failing it must not replace the
+    // timeout with a different error.
+  }
+  throw new CursorExitTimeoutError(
+    cursorExitTimeoutDetail(survivors, await shutdownFinalizerPid(request)),
+  );
+}
+
+/**
+ * The pid of a shutdown finalizer, if one holds the lock. It is a headless
+ * `Cursor.exe` of this extension's own making, so it must never be reported as
+ * a window the user should close.
+ */
+async function shutdownFinalizerPid(request: HelperRequest): Promise<number | null> {
+  try {
+    const raw = await readFile(
+      join(request.storageRoot, "shutdown-finalizer.lock"),
+      "utf8",
+    );
+    const pid = (JSON.parse(raw) as { pid?: unknown }).pid;
+    return typeof pid === "number" ? pid : null;
+  } catch {
+    return null;
+  }
 }
 
 async function isFinalizerCancelled(request: HelperRequest): Promise<boolean> {
@@ -779,6 +808,14 @@ async function acquireSyncLock(
 }
 
 async function noOtherCursorProcesses(): Promise<boolean> {
+  return (await otherCursorProcessIds()).length === 0;
+}
+
+/**
+ * Every live Cursor process except this helper, which is itself spawned as
+ * `Cursor.exe` with ELECTRON_RUN_AS_NODE and would otherwise wait for itself.
+ */
+async function otherCursorProcessIds(): Promise<number[]> {
   const platform = process.platform;
   const { stdout } =
     platform === "win32"
@@ -788,8 +825,8 @@ async function noOtherCursorProcesses(): Promise<boolean> {
           { windowsHide: true, timeout: 10_000 },
         )
       : await execFileAsync("ps", ["-axo", "pid=,comm="], { timeout: 10_000 });
-  return parseCursorProcessIds(stdout, platform).every(
-    (pid) => pid === process.pid,
+  return parseCursorProcessIds(stdout, platform).filter(
+    (pid) => pid !== process.pid,
   );
 }
 

@@ -154,6 +154,45 @@ export function isExpectedCursorExecutable(
   return isLinuxCursorProcessName(name);
 }
 
+/**
+ * What the user has to close when the offline helper gives up waiting.
+ *
+ * The bare "Timed out waiting for Cursor to exit." told a real user nothing:
+ * they had already quit, and there was no way to learn what was still holding
+ * the databases open. Two processes must never be listed as something to close
+ * - the helper itself, which exits on its own, and a shutdown finalizer, whose
+ * whole job is the workspaceStorage backup that killing it would destroy.
+ */
+export function cursorExitTimeoutDetail(
+  survivors: readonly number[] | null,
+  finalizerPid: number | null,
+): string {
+  if (survivors === null) {
+    return (
+      "The list of running Cursor processes could not be read, so what is still " +
+      "holding the databases open is unknown. Close every Cursor window and try again."
+    );
+  }
+  const closable = survivors.filter((pid) => pid !== finalizerPid);
+  if (closable.length === 0) {
+    return survivors.length === 0
+      ? "Cursor has since exited, so running the command again should work."
+      : "Only this extension's own shutdown helper is still running, and it exits on its own; running the command again shortly should work.";
+  }
+  const listed = closable.slice(0, LISTED_SURVIVOR_PIDS).join(", ");
+  const remainder = Math.max(0, closable.length - LISTED_SURVIVOR_PIDS);
+  return (
+    `${closable.length} Cursor process(es) are still running (pid ${listed}${
+      remainder === 0 ? "" : `, and ${remainder} more`
+    }). ` +
+    "Close every Cursor window - including any that is minimized, on another " +
+    "desktop, or waiting on a 'save your changes?' prompt, which keeps the whole " +
+    "application alive until it is answered - then run the command again."
+  );
+}
+
+const LISTED_SURVIVOR_PIDS = 8;
+
 export function parseCursorProcessIds(
   output: string,
   platform: NodeJS.Platform = process.platform,

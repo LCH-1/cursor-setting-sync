@@ -7,8 +7,11 @@ import {
   BACKUP_DIRECTORY,
   CONFLICT_APPLY_LOCK_WAIT_MS,
   CONFLICTED_REPUBLISH_INTERVAL_MS,
+  LOCK_SKIP_REMINDER_MS,
   MAX_APPLY_BATCH_BYTES,
   REPOSITORY_FILE,
+  RESTART_TO_APPLY_COMMAND,
+  RESTART_TO_APPLY_TITLE,
   SYNC_INDICATOR_DELAY_MS,
 } from "../constants";
 import type {
@@ -35,6 +38,7 @@ import {
   copyFileAtomic,
   directorySize,
   ensureDirectory,
+  isMissingPathError,
   listFilesRecursively,
   pathExists,
   readJsonFile,
@@ -43,7 +47,9 @@ import {
   acquireFileLock,
   acquireFileLockWithin,
   describeLockHolder,
+  reportLockHolder,
 } from "../platform/lock";
+import type { LockHolderReport } from "../platform/lock";
 import {
   GitError,
   cloneRepository,
@@ -212,6 +218,20 @@ export class SyncManager implements vscode.Disposable {
    */
   private readonly conflictedRepublishAt = new Map<string, number>();
   private syncIndicatorTimer: NodeJS.Timeout | null = null;
+  /** The run of consecutive polls that could not take the sync lock, if any. */
+  private lockSkip: LockSkipState | null = null;
+  /**
+   * The last offline-helper failure nothing has superseded.
+   *
+   * A bare `setStatus("error", ...)` did not survive one cycle: `updateStatus`
+   * runs in performSync's finally block and rebuilds the status from repository
+   * state alone, so a failed "Restart to Apply" was repainted with the queue
+   * that same failure had left behind - the command that had just failed,
+   * offered again as if nothing happened. In memory only: the result file is
+   * deleted on consumption, so nothing could re-derive it after a reload, and
+   * the retry it asks for is what clears it.
+   */
+  private helperFailure: string | null = null;
   private automaticMaintenanceAt = 0;
   private maintenanceRequested = false;
   private largeFileCheckAt = 0;
@@ -693,6 +713,11 @@ export class SyncManager implements vscode.Disposable {
       }
       return;
     }
+    // The retry the failure asked for is under way, so the red bar has served
+    // its purpose; leaving it latched would outlive the thing it described.
+    // Cleared here rather than on entry because everything above can throw or
+    // return early, and a burnt latch would hide a failure still in force.
+    this.helperFailure = null;
     await this.helper.applyAndRestart(
       this.configuration.repositoryPath ?? repository.root,
       masterKey,
@@ -700,6 +725,20 @@ export class SyncManager implements vscode.Disposable {
       this.configuration.workspaceMappings,
       this.helperSyncOptions(),
       async () => {
+        // The quit was vetoed, so the helper is about to give up and write a
+        // failure nobody would otherwise read until the next launch. The
+        // consume is best-effort because `scheduleQuitVetoCheck` invokes this
+        // with `void`: a throw here would go unhandled AND cost the session its
+        // shutdown export, which is the only workspaceStorage backup there is.
+        try {
+          await this.consumeHelperResults({ atStartup: false });
+        } catch (error) {
+          this.status.log(
+            `Could not read the offline helper's result: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
         await this.startFinalizer();
       },
     );
@@ -1610,18 +1649,26 @@ export class SyncManager implements vscode.Disposable {
     this.syncRepositoryLimit(repository);
     const lock = await acquireFileLock(this.syncLockPath());
     if (lock === null) {
-      this.status.log(
-        `Skipped sync: ${await describeLockHolder(this.syncLockPath())}`,
-      );
+      await this.noteLockSkipped(manual);
       // The other holder may own the lock continuously, so this window would
       // otherwise keep displaying whatever it last computed — including a
       // stale "up-to-date" while conflicts are outstanding.
       this.updateStatus(repository);
       return;
     }
+    const resumed = lockSkipResumedLine(this.lockSkip);
+    this.lockSkip = null;
+    if (resumed !== null) {
+      this.status.log(resumed);
+    }
     let failed = false;
     this.beginSyncIndicator(repository);
     try {
+      // Inside the lock so two cycling windows do not both report - and both
+      // delete - the same result. A helper that fails while Cursor is still
+      // running (a vetoed quit, or the exit wait expiring) leaves its result
+      // here and nothing restarts, so the startup consume never arrives.
+      await this.consumeHelperResults({ atStartup: false });
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
       const checkpoint = await absorbedCheckpointManifest(repository);
@@ -1901,6 +1948,52 @@ export class SyncManager implements vscode.Disposable {
 
   private syncLockPath(): string {
     return join(this.paths.extensionStorage, "sync.lock");
+  }
+
+  /**
+   * Raises a helper failure where the user is looking.
+   *
+   * The status item's "error" presentation points at Show Diagnostics, so
+   * latching the failure takes away the one-click path to the retry the text
+   * itself asks for. The action puts it back.
+   */
+  private announceHelperFailure(detail: string): void {
+    void vscode.window
+      .showErrorMessage(detail, RESTART_TO_APPLY_TITLE)
+      .then((choice) => {
+        if (choice === RESTART_TO_APPLY_TITLE) {
+          return vscode.commands.executeCommand(RESTART_TO_APPLY_COMMAND);
+        }
+        return undefined;
+      });
+  }
+
+  /**
+   * Records a poll that could not take the sync lock, saying so only when the
+   * situation has actually changed; see {@link noteLockSkip}.
+   */
+  private async noteLockSkipped(manual: boolean): Promise<void> {
+    let holder: LockHolderReport;
+    try {
+      holder = await reportLockHolder(this.syncLockPath());
+    } catch {
+      // `readLock` rethrows anything that is not a missing or malformed file,
+      // and EPERM/EBUSY against a lock another process is rewriting is routine
+      // on Windows. A skipped poll must not become a failed cycle over it, and
+      // carrying the previous PID forward keeps the transient error from
+      // reading as a change of holder and re-opening the log.
+      holder = {
+        pid: this.lockSkip?.pid ?? null,
+        description:
+          "Another Cursor window or the offline helper is synchronizing. " +
+          `Lock file: ${this.syncLockPath()}.`,
+      };
+    }
+    const decision = noteLockSkip(this.lockSkip, holder, Date.now(), manual);
+    if (decision.line !== null) {
+      this.status.log(decision.line);
+    }
+    this.lockSkip = decision.state;
   }
 
   /**
@@ -2597,19 +2690,15 @@ export class SyncManager implements vscode.Disposable {
         "conflict",
         `${activeConflicts.length} synchronization conflict(s) require attention.`,
       );
+    } else if (this.helperFailure !== null) {
+      // Ranked above the queue and below conflicts: a conflict blocks the apply
+      // this failure is about, so resolving it comes first - but the queue on
+      // its own must never repaint over the news that writing it just failed.
+      this.status.setStatus("error", this.helperFailure);
     } else if (repository.state.pendingDatabaseChanges.length > 0) {
-      const blocked = repository.state.pendingDatabaseChanges.filter(
-        (change) => change.blockedReason !== undefined,
-      ).length;
-      const ready = repository.state.pendingDatabaseChanges.length - blocked;
       this.status.setStatus(
         "pending-restart",
-        [
-          ready > 0 ? `${ready} change(s) are waiting for restart.` : "",
-          blocked > 0
-            ? `${blocked} newer-version database change(s) are deferred.`
-            : "",
-        ].filter((message) => message.length > 0).join(" "),
+        pendingRestartDetail(repository.state.pendingDatabaseChanges),
       );
     } else if (!this.configuration.enabled) {
       this.status.setStatus("disabled");
@@ -2644,13 +2733,57 @@ export class SyncManager implements vscode.Disposable {
     );
   }
 
-  private async consumeHelperResults(): Promise<void> {
+  /**
+   * Reads whatever the offline helper left behind.
+   *
+   * `atStartup` is false on the sync-cycle path, and it gates the two halves
+   * that are only correct once. The warning half must not run per cycle because
+   * `startFinalizer` supersedes the waiting finalizer, which then writes a
+   * success result with `warnings: []` - and an empty structured warnings array
+   * is how `helperWarningObservation` says "the helper ran and found nothing",
+   * which deletes the bucket. That bucket is the only signal that a shutdown
+   * export dropped workspaceStorage, the one path that ever backs it up.
+   */
+  private async consumeHelperResults(
+    options: { atStartup: boolean } = { atStartup: true },
+  ): Promise<void> {
     const consumed: HelperResult[] = [];
-    for (const path of await listFilesRecursively(this.paths.extensionStorage)) {
-      if (!basename(path).startsWith("helper-result-")) {
+    let names: string[];
+    try {
+      names = (
+        await readdir(this.paths.extensionStorage, { withFileTypes: true })
+      )
+        .filter((entry) => entry.isFile() && isHelperResultFileName(entry.name))
+        .map((entry) => entry.name);
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        // `listFilesRecursively` tolerated a missing root; a bare readdir does
+        // not, and this now runs inside a sync cycle whose failure is recorded
+        // against the repository.
+        return;
+      }
+      throw error;
+    }
+    for (const name of names) {
+      const path = join(this.paths.extensionStorage, name);
+      let result: HelperResult;
+      try {
+        result = await readJsonFile<HelperResult>(path);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          // Another window consumed it between the listing and the read.
+          continue;
+        }
+        // A truncated result never becomes readable, so leaving it would
+        // rethrow on every cycle from here on.
+        this.status.log(
+          `Discarded an unreadable helper result (${name}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        await rm(path, { force: true });
         continue;
       }
-      const result = await readJsonFile<HelperResult>(path);
       consumed.push(result);
       await this.recordHelperBackups(result);
       if (result.success) {
@@ -2666,11 +2799,19 @@ export class SyncManager implements vscode.Disposable {
             }`,
           );
         }
+        // A later success is the only evidence that whatever failed before has
+        // been dealt with; without this the bar stays red until a reload.
+        this.helperFailure = null;
       } else {
         this.status.log(`Helper ${result.requestId} failed: ${result.error ?? "unknown"}`);
-        this.status.setStatus("error", result.error ?? "Offline helper failed.");
+        this.helperFailure = helperFailureDetail(result.error);
+        this.status.setStatus("error", this.helperFailure);
+        this.announceHelperFailure(this.helperFailure);
       }
       await rm(path, { force: true });
+    }
+    if (!options.atStartup) {
+      return;
     }
     // The result file is deleted above, so this is the only chance to record
     // what the helper reported. A warning raised here stands until a later
@@ -2685,7 +2826,7 @@ export class SyncManager implements vscode.Disposable {
     const helperWarnings = this.warnings.standingFor(
       HELPER_WARNING_SOURCE,
     ).length;
-    if (helperWarnings > 0 && consumed.every((result) => result.success)) {
+    if (helperWarnings > 0 && this.helperFailure === null) {
       // `initialize` consumes results before the repository is open, so the
       // "partial" that `updateStatus` would set has to wait for the first
       // successful cycle — and never arrives at all on a device that is locked
@@ -2967,6 +3108,151 @@ export function settledStatus(input: {
         : "up-to-date",
     detail: `${details.join(" ")} Run "Cursor Setting Sync: Show Diagnostics".`,
   };
+}
+
+/**
+ * Whether a file in the extension storage root is a helper result.
+ *
+ * `writeFileAtomic` writes `<path>.<pid>.<uuid>.partial` and then renames, and
+ * that temp file starts with the result prefix too. Matching it meant parsing a
+ * half-written buffer; from the only caller there used to be that threw out of
+ * `initialize()` and reached the user as "activation failed" and nothing else.
+ * Consuming on every sync cycle would have made it routine.
+ */
+export function isHelperResultFileName(name: string): boolean {
+  return name.startsWith("helper-result-") && name.endsWith(".json");
+}
+
+/**
+ * One actionable sentence from whatever the helper died of.
+ *
+ * `HelperResult.error` is `error.stack ?? error.message`, so what arrives is a
+ * class name followed by frames of `helper.js` line numbers. That was the whole
+ * of the user-facing text, in a status bar tooltip, on a device where the
+ * failure meant 146 incoming chats stayed unwritten.
+ */
+export function helperFailureDetail(error: string | null): string {
+  const summary = (error ?? "")
+    .split("\n")[0]
+    ?.trim()
+    .replace(/^[A-Za-z]*Error:\s*/, "") ?? "";
+  const retry = `Close every other Cursor window and run "${RESTART_TO_APPLY_TITLE}" again.`;
+  return summary.length === 0
+    ? `The offline helper failed. ${retry}`
+    : `${summary} Nothing was applied, so the queued changes are still here. ${retry}`;
+}
+
+/**
+ * What the status bar says while database changes sit in the queue.
+ *
+ * The old text was "N change(s) are waiting for restart." A user with 146
+ * incoming chats read that as an instruction to restart Cursor, did exactly
+ * that - repeatedly, eventually force-quitting every process - and the queue
+ * was untouched each time, because the shutdown finalizer exports without
+ * applying and only the command writes anything. So the sentence names the
+ * command and says outright that a restart is not it.
+ *
+ * The per-kind breakdown is what makes the number recognizable: "175 chat"
+ * tells the user which of their data is missing, where "227 change(s)" does
+ * not.
+ */
+export function pendingRestartDetail(
+  pending: readonly PendingDatabaseChange[],
+): string {
+  const ready = pending.filter((change) => change.blockedReason === undefined);
+  const blocked = pending.length - ready.length;
+  return [
+    ready.length === 0
+      ? ""
+      : `${ready.length} change(s) from another device (${summarizePendingKinds(ready)}) are queued. ` +
+        `Run "${RESTART_TO_APPLY_TITLE}" to write them - quitting and reopening Cursor does not.`,
+    blocked === 0
+      ? ""
+      : `${blocked} newer-version database change(s) are deferred.`,
+  ]
+    .filter((message) => message.length > 0)
+    .join(" ");
+}
+
+function summarizePendingKinds(
+  pending: readonly PendingDatabaseChange[],
+): string {
+  const counts = new Map<string, number>();
+  for (const change of pending) {
+    counts.set(change.kind, (counts.get(change.kind) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([kind, count]) => `${count} ${kind}`)
+    .join(", ");
+}
+
+/** What the poll path remembers about a sync lock it keeps failing to take. */
+export interface LockSkipState {
+  pid: number | null;
+  loggedAt: number;
+  skipped: number;
+}
+
+/**
+ * Whether a poll that could not take the sync lock should say so again.
+ *
+ * A held lock is the ordinary state while a long cycle or the offline helper
+ * runs, and every skipped poll wrote its own line. At a thirty-second poll, per
+ * window, that is two lines a minute for as long as it lasts: a real session
+ * buried its standing warnings under the repetition, which is the one thing the
+ * output channel exists to show. Suppression keys on the holder's PID rather
+ * than on the sentence, because the sentence carries an age that changes every
+ * minute and so never repeats exactly.
+ *
+ * Silence is not the goal — a lock held for an hour is something the user has
+ * to be able to see — so a new holder or {@link LOCK_SKIP_REMINDER_MS} says it
+ * again, and a manual sync always answers the person who asked.
+ */
+export function noteLockSkip(
+  previous: LockSkipState | null,
+  holder: LockHolderReport,
+  now: number,
+  manual: boolean,
+): { line: string | null; state: LockSkipState } {
+  const skipped = (previous?.skipped ?? 0) + 1;
+  if (
+    previous !== null &&
+    !manual &&
+    previous.pid === holder.pid &&
+    now - previous.loggedAt < LOCK_SKIP_REMINDER_MS
+  ) {
+    return {
+      line: null,
+      state: { pid: holder.pid, loggedAt: previous.loggedAt, skipped },
+    };
+  }
+  // The count only means something while it is the same holder still working;
+  // across a change of holder it would read as one long wait that never was.
+  const repetition =
+    previous !== null && previous.pid === holder.pid && skipped > 1
+      ? ` (${skipped} cycle(s) skipped so far)`
+      : "";
+  return {
+    line: `Skipped sync${repetition}: ${holder.description}`,
+    state: { pid: holder.pid, loggedAt: now, skipped },
+  };
+}
+
+/**
+ * Closes out a run of skipped polls. Without it the last thing the channel says
+ * about a lock is that sync was skipped, which reads as still-stuck long after
+ * the cycle recovered.
+ */
+export function lockSkipResumedLine(
+  previous: LockSkipState | null,
+): string | null {
+  // A single poll losing a race to a neighbouring window mid-cycle is the
+  // ordinary case and already cost one line; adding a second saying it is over
+  // would double the volume this change exists to cut.
+  return previous === null || previous.skipped < 2
+    ? null
+    : `Synchronization resumed after ${previous.skipped} skipped cycle(s).`;
 }
 
 /**

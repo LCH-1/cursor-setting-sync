@@ -1,4 +1,8 @@
 import * as vscode from "vscode";
+import {
+  RESTART_TO_APPLY_COMMAND,
+  RESTART_TO_APPLY_TITLE,
+} from "../constants";
 
 export type SyncStatus =
   | "unconfigured"
@@ -103,10 +107,16 @@ function statusPresentation(status: SyncStatus): {
         command: "cursorSync.showDiagnostics",
       };
     case "pending-restart":
+      // Naming the command in the item itself, not just the tooltip: the old
+      // text said "restart", the user quit and relaunched Cursor, and the queue
+      // was still there afterwards - because the shutdown finalizer exports
+      // without applying. Nobody hovers a status item to discover that.
       return {
-        text: "$(debug-restart) Cursor Setting Sync",
-        tooltip: "Restart Cursor to apply database-backed resources.",
-        command: "cursorSync.restartToApply",
+        text: `$(debug-restart) ${RESTART_TO_APPLY_TITLE}`,
+        tooltip:
+          `Changes from another device are queued. Run "${RESTART_TO_APPLY_TITLE}" to write them - ` +
+          "quitting and reopening Cursor does not, because only that command applies the queue.",
+        command: RESTART_TO_APPLY_COMMAND,
       };
     case "conflict":
       return {

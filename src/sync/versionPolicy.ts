@@ -36,11 +36,33 @@ export function shouldPublishSnapshot(
   return projection?.semanticHash !== snapshot.semanticHash;
 }
 
+/**
+ * A tip this device wrote on someone else's behalf rather than by scanning its
+ * own disk.
+ *
+ * Both callers hang off that distinction. `applyProjections` skips a tip
+ * carrying this device's own deviceId, because re-applying its own scan is
+ * pointless; and the publish step protects a synthetic tip from being
+ * overwritten by the local scan before it has been applied. A synthetic tip
+ * fails both assumptions: the content came out of the repository, so the local
+ * disk does not hold it yet.
+ *
+ * `checkpoint-marker` belongs here for the same reason as the rest. Pruning
+ * republishes one current tip so old builds meet a v2 event and fail loudly,
+ * and it reads that content from the repository blob - which on a device that
+ * has not applied the resource yet is purely the other device's work wearing
+ * this device's identity. Left unmarked, the marker took the own-scan
+ * short-circuit and the resource was recorded as applied without anything
+ * being written; for the kinds that only the offline helper can apply, the
+ * next scan then found a projection with no matching row and published a
+ * tombstone over the other device's copy.
+ */
 export function isSyntheticTip(tip: ResourceTip): boolean {
   return (
     tip.metadata?.syncOrigin === "conflict-resolution" ||
     tip.metadata?.syncOrigin === "auto-merge" ||
-    tip.metadata?.syncOrigin === "version-restore"
+    tip.metadata?.syncOrigin === "version-restore" ||
+    tip.metadata?.syncOrigin === "checkpoint-marker"
   );
 }
 

@@ -79,6 +79,35 @@ export const CONFLICTED_REPUBLISH_INTERVAL_MS = 60 * 60 * 1000;
  */
 export const CONFLICT_APPLY_LOCK_WAIT_MS = 60_000;
 
+/**
+ * How long the poll path stays quiet about a sync lock it keeps failing to take.
+ *
+ * A held lock is the normal state while a long cycle or the offline helper runs,
+ * and every skipped poll used to write its own line: two lines every thirty
+ * seconds, per window, for as long as it lasted. A real session buried its
+ * standing warnings under thousands of them. Going silent instead is not an
+ * option either — a lock held for an hour is a problem the user has to be able
+ * to see — so the first skip is reported, and after that only a change of holder
+ * or this interval says it again. Three reminders fit inside the lock's own
+ * fifteen-minute staleness window.
+ */
+export const LOCK_SKIP_REMINDER_MS = 5 * 60_000;
+
+/**
+ * The command that writes queued database changes, spelled exactly as the
+ * palette contributes it.
+ *
+ * Chat, chat transcripts, UI state, extensions, profiles and workspaceStorage
+ * can only be written while Cursor is not running, and the shutdown finalizer
+ * deliberately exports without applying - so quitting and reopening Cursor,
+ * which is what "waiting for restart" reads as, provably does nothing. A user
+ * lost 146 incoming chats to that reading, force-quitting and relaunching
+ * repeatedly while the queue sat untouched. Every affordance that mentions the
+ * queue therefore names this command instead of the word "restart".
+ */
+export const RESTART_TO_APPLY_COMMAND = "cursorSync.restartToApply";
+export const RESTART_TO_APPLY_TITLE = "Cursor Setting Sync: Restart to Apply";
+
 export const DEFAULT_POLL_INTERVAL_SECONDS = 30;
 export const DEFAULT_CHAT_POLL_INTERVAL_SECONDS = 30;
 export const DEFAULT_MAX_PAYLOAD_MIB = 128;

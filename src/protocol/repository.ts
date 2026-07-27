@@ -37,6 +37,7 @@ import type {
   RepositoryFile,
   ResourceChange,
   ResourceDeletion,
+  ResourceKind,
   ResourceSnapshot,
   ResourceTip,
   ResourceVersionSummary,
@@ -45,7 +46,7 @@ import type {
   StoredEvent,
   StoredObject,
 } from "../types";
-import { isSupportedResourceKind } from "../types";
+import { HELPER_APPLIED_KINDS, isSupportedResourceKind } from "../types";
 import {
   assertSafeIdentifier,
   assertRealDirectory,
@@ -1846,11 +1847,36 @@ export class SyncRepository {
     return `has not absorbed checkpoint ${targetHash}`;
   }
 
+  /**
+   * Chooses the tip pruning republishes so old builds meet a v2 event.
+   *
+   * Whichever resource is chosen gets a new version that this device did not
+   * write, and every device - including this one - then sees an incoming change
+   * for it. For a kind the running Cursor can write itself that costs nothing.
+   * For a kind only the offline helper can apply it costs a permanent
+   * `pendingDatabaseChanges` entry and a "Restart to Apply" prompt, on every
+   * device, for a resource whose bytes are already on disk - and the marker
+   * used to pick one of those every time, because `chat-store/`,
+   * `chat-transcript/` and `chat/` sort ahead of `settings/`.
+   *
+   * So the helper-applied kinds are considered only when nothing else is
+   * available; the marker still gets published, which is what the v2 guarantee
+   * needs.
+   */
   private async prepareCheckpointMarker(): Promise<PreparedCheckpointMarker | null> {
+    return (
+      (await this.checkpointMarkerFrom((kind) => !HELPER_APPLIED_KINDS.has(kind))) ??
+      (await this.checkpointMarkerFrom(() => true))
+    );
+  }
+
+  private async checkpointMarkerFrom(
+    accepts: (kind: ResourceKind) => boolean,
+  ): Promise<PreparedCheckpointMarker | null> {
     let tombstone: { resourceId: string; tip: ResourceTip } | null = null;
     for (const resourceId of Object.keys(this.state.tips).sort()) {
       const active = chooseCheckpointTip(this.state.tips[resourceId] ?? []);
-      if (active === undefined) {
+      if (active === undefined || !accepts(active.kind)) {
         continue;
       }
       if (active.operation === "put" && active.payload !== undefined) {

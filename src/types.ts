@@ -51,6 +51,26 @@ export const SUPPORTED_RESOURCE_KINDS = [
 
 export type ResourceKind = (typeof SUPPORTED_RESOURCE_KINDS)[number];
 
+/**
+ * The kinds only the offline helper can write, mirroring every adapter whose
+ * `appliesWhileRunning` is false. Cursor holds those databases open while it
+ * runs, so a change to one of them cannot land until Cursor has exited.
+ *
+ * Kept here rather than derived from the adapters because the repository layer
+ * needs it and must not depend on them; `tests/offline-apply-kinds.test.ts`
+ * compares the two so they cannot drift apart.
+ */
+export const HELPER_APPLIED_KINDS: ReadonlySet<ResourceKind> = new Set([
+  "extension",
+  "profile",
+  "ui-state",
+  "cursor-user-rules",
+  "chat",
+  "chat-transcript",
+  "chat-store",
+  "workspace-storage",
+]);
+
 export function isSupportedResourceKind(value: unknown): value is ResourceKind {
   return (
     typeof value === "string" &&
