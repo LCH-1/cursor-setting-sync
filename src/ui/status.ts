@@ -108,20 +108,22 @@ function statusPresentation(status: SyncStatus): {
         command: "cursorSync.showDiagnostics",
       };
     case "pending-restart":
-      // Naming the command in the item itself, not just the tooltip: the old
-      // text said "restart", the user quit and relaunched Cursor, and the queue
-      // was still there afterwards - because the shutdown finalizer exports
-      // without applying. Nobody hovers a status item to discover that.
+      // Describes the state, and only the state.
+      //
+      // It read like the name of the command, which was a promise the click
+      // stopped keeping the moment that click was pointed somewhere harmless:
+      // pressing a button labelled "Restart to Apply" and being handed a
+      // diagnostics document instead is worse than either behaviour alone.
+      // Quitting Cursor is too large a thing to sit one misclick away from the
+      // item beside it, so the click still only reports - and the label no
+      // longer claims otherwise. The command is in the palette, where running
+      // it is deliberate, and the tooltip says so.
       return {
-        text: `$(debug-restart) ${RESTART_TO_APPLY_TITLE}`,
+        text: "$(debug-restart) Cursor Setting Sync: Queued",
         tooltip:
-          `Changes from another device are queued. Run "${RESTART_TO_APPLY_TITLE}" to write them - ` +
-          "quitting and reopening Cursor does not, because only that command applies the queue.",
-        // Reports, does not act. Clicking used to quit Cursor outright, which
-        // is a large thing to do to someone who was aiming for the item next to
-        // it - and the command is a rare, deliberate one, not something worth a
-        // permanent button. Diagnostics is the safe destination; the text and
-        // tooltip name the command so the palette is one step away.
+          "Changes from another device are waiting to be written. " +
+          `Run "${RESTART_TO_APPLY_TITLE}" from the command palette to apply them - quitting and reopening Cursor does not, ` +
+          "because only that command applies the queue. Clicking here opens diagnostics.",
         command: "cursorSync.showDiagnostics",
       };
     case "conflict":

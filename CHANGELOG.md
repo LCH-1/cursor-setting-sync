@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.23] - 2026-07-28
+
+### Fixed
+
+- The status bar item read like the name of a command it no longer ran. 0.0.18 pointed its click at diagnostics so that quitting Cursor was never one misclick away from the item beside it, but left the label saying **Restart to Apply** - so pressing it handed back a diagnostics document, which is worse than either behaviour on its own. It now describes the state it is in, **Cursor Setting Sync: Queued**, and the tooltip says where the command lives. The click still only reports.
+
 ## [0.0.22] - 2026-07-28
 
 ### Fixed
