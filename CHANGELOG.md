@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.24] - 2026-07-28
+
+### Fixed
+
+- Sixty-nine chats were held back by a rule that was never about them. 0.0.13 stopped asking about workspaceStorage from a window with no folder open - its directory is named after the millisecond the window was created, so it identifies a window on one computer and nothing at all on any other - but the check ran before the branch that handles chats, so a chat carrying a workspace ID whose URI had not travelled was deferred too, under a message about workspace storage that no one could act on. The queue reported **71 database change(s) are deferred** when two of them were workspaceStorage. The check is scoped to workspaceStorage now.
+
+### Changed
+
+- workspaceStorage from a folderless window is no longer backed up either. Not asking about incoming ones only fixed half of it; the device that owned them went on publishing them, so they accumulated in the repository as changes no other computer could ever place. With local folder workspaces already excluded by default, what remains is Remote-SSH - the workspaces that genuinely exist on more than one machine. The exclusion is skipped entirely when workspace discovery returns nothing, because a workspace missing from a map that was never built is not evidence about that workspace, and dropping a backup on that basis is the one mistake this adapter must not make.
+
 ## [0.0.23] - 2026-07-28
 
 ### Fixed

@@ -74,6 +74,7 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
     const mappingTargets = new Set(Object.values(this.workspaceMappings));
     const candidates = new Map<string, WorkspaceStorageCandidate>();
     const silenced = new Set<string>();
+    const folderless = new Set<string>();
 
     const listed = await listBackedUpWorkspaceStoragePaths(
       this.paths.workspaceStorageRoot,
@@ -101,6 +102,23 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
           ...actualRelativePath.split("/").slice(1),
         ].join("/");
         const resourceId = workspaceStorageResourceId(canonicalRelativePath);
+        if (workspaceUris.size > 0 && !workspaceUris.has(actualWorkspaceId)) {
+          // A directory with no folder URI belongs to a window that had nothing
+          // open - `discoverWorkspaces` lists only those with a folder or a
+          // .code-workspace file. VS Code names those after the millisecond the
+          // window was created, so the name identifies a window on this
+          // computer and can identify nothing on any other. Publishing one only
+          // ever produced a change the far side could not place.
+          //
+          // Gated on a non-empty map so a discovery that failed or found
+          // nothing excludes nothing: a workspace missing from a map that was
+          // never built is not evidence about that workspace, and dropping a
+          // backup on that basis is the one mistake this adapter must not make.
+          if (known[resourceId] !== undefined) {
+            folderless.add(actualWorkspaceId);
+          }
+          continue;
+        }
         if (
           isIgnoredWorkspaceUri(
             workspaceUris.get(actualWorkspaceId),
@@ -197,6 +215,16 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
       }
     }
 
+    if (folderless.size > 0) {
+      warnings.push(
+        `${folderless.size} workspaceStorage director(ies) belong to windows with no folder open and are no longer backed up: ${[
+          ...folderless,
+        ]
+          .sort()
+          .slice(0, 10)
+          .join(", ")}. They are named after the moment the window was created, so no other computer could place them.`,
+      );
+    }
     if (silenced.size > 0) {
       warnings.push(
         `${silenced.size} workspace(s) this device had already backed up are now excluded from workspaceStorage sync: ${[
