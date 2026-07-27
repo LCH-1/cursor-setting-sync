@@ -2295,10 +2295,6 @@ export class SyncManager implements vscode.Disposable {
         pending.blockedReason = "Incoming workspace metadata is missing a workspace ID.";
         continue;
       }
-      if (handled.has(sourceWorkspaceId)) {
-        continue;
-      }
-      handled.add(sourceWorkspaceId);
       const resolved = resolveTargetWorkspace(
         sourceWorkspaceId,
         typeof sourceWorkspaceUri === "string" ? sourceWorkspaceUri : null,
@@ -2323,8 +2319,23 @@ export class SyncManager implements vscode.Disposable {
         );
         continue;
       }
-      const resourceLabel =
-        pending.kind === "workspace-storage" ? "workspace storage" : "chat";
+      if (pending.kind === "chat") {
+        // A chat is content, not per-workspace scaffolding: it is worth having
+        // on this computer whether or not the folder it was written in exists
+        // here. The helper writes it under the workspace ID it came with, so a
+        // question with no answerable option is never asked - and asking it was
+        // not free, because the modal had to be answered before ANY queued
+        // change could apply. On a two-machine setup that is how 146 incoming
+        // conversations stayed undelivered behind a list of unrelated projects.
+        delete pending.blockedReason;
+        continue;
+      }
+      if (handled.has(sourceWorkspaceId)) {
+        continue;
+      }
+      handled.add(sourceWorkspaceId);
+      // Only workspaceStorage reaches here; chats returned above.
+      const resourceLabel = "workspace storage";
       const items: Array<{
         label: string;
         description: string;
@@ -2388,7 +2399,10 @@ export class SyncManager implements vscode.Disposable {
       }
       if (reason === null) {
         delete pending.blockedReason;
-      } else {
+      } else if (pending.kind === "workspace-storage") {
+        // Only workspaceStorage is held back for a missing mapping. A chat is
+        // written under the workspace ID it came with, so declining to map a
+        // workspace must not also withhold the conversations from it.
         pending.blockedReason = reason;
       }
     }

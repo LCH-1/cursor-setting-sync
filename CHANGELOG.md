@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.12] - 2026-07-27
+
+### Fixed
+
+- A chat written in a folder that exists on only one computer never reached the other one. The apply path answered `workspace mapping required` and dropped the change, while the extension host raised a modal — *Map incoming chat workspace `file:///…/projects/cbtpassmap`* — listing every local workspace, none of which was that folder, because that folder had never existed on this machine. There was no answerable option, and until the modal was answered nothing else in the queue could apply either. A chat is content rather than per-workspace scaffolding, so it is now written under the workspace ID it was created with instead of being withheld: that ID is a hash of the folder URI, so if this computer ever opens the same folder at the same path the conversation is already where Cursor looks for it, and a workspace ID naming nothing local is a state Cursor already handles — it is what a deleted workspace folder leaves behind. Declining to map a workspace no longer withholds its conversations either. The prompt remains for workspaceStorage alone, where writing to an unmapped location really would be wrong.
+
 ## [0.0.11] - 2026-07-27
 
 ### Changed

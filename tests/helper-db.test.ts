@@ -884,6 +884,72 @@ describeWithBackup("offline database helper", () => {
     }
   });
 
+  it("writes a chat whose workspace is not on this computer instead of dropping it", async () => {
+    // The apply path answered "workspace mapping required" and skipped the
+    // change, while the extension host raised a modal listing every local
+    // workspace - none of which was the folder in question, because that
+    // folder only ever existed on the other machine. Together that is how
+    // conversations from a one-machine project never arrived at all.
+    const fixture = await createFixture();
+    const composerId = "00000000-0000-4000-8000-000000000009";
+    const foreignWorkspace = "598c263dae4dcb731e5b78c884124368";
+    const snapshot = {
+      schemaVersion: 1,
+      composerId,
+      header: {
+        composerId,
+        workspaceId: foreignWorkspace,
+        createdAt: 1,
+        lastUpdatedAt: 2,
+        isArchived: 0,
+        isSubagent: 0,
+        recency: 0,
+        checkpointAt: null,
+        value: JSON.stringify({ name: "written on the other PC" }),
+      },
+      composerData: {
+        key: `composerData:${composerId}`,
+        valueBase64: Buffer.from("{}", "utf8").toString("base64"),
+        valueType: "text",
+      },
+      bubbles: [],
+    };
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      {
+        change: {
+          eventHash: "9".repeat(64),
+          changeIndex: 0,
+          resourceId: `chat/${composerId}`,
+          kind: "chat",
+          operation: "put",
+          semanticHash: "hash",
+          metadata: {
+            composerId,
+            workspaceId: foreignWorkspace,
+            workspaceUri: "file:///c%3A/Users/ckdgh/Desktop/projects/cbtpassmap",
+          },
+        },
+        content: Buffer.from(JSON.stringify(snapshot), "utf8"),
+      },
+    ]);
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(result.skipped.join("\n")).not.toContain("workspace mapping");
+
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      const row = database
+        .prepare("SELECT workspaceId FROM composerHeaders WHERE composerId = ?")
+        .get(composerId) as { workspaceId: string | null };
+      // Preserved rather than nulled: the ID is a hash of the folder URI, so
+      // opening that folder here later puts the chat where Cursor looks for it.
+      expect(row.workspaceId).toBe(foreignWorkspace);
+    } finally {
+      database.close();
+    }
+  });
+
   it("skips one rejected change instead of discarding the whole batch", async () => {
     const fixture = await createFixture();
     const composerId = "00000000-0000-4000-8000-000000000003";

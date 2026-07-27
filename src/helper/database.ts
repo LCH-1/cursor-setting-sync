@@ -729,7 +729,16 @@ function applyPreparedChange(
       request.workspaceMappings,
     );
     if (targetWorkspaceId === null) {
-      return { status: "skipped", reason: "workspace mapping required" };
+      // No local counterpart, so the chat is written under the workspace ID it
+      // was created with rather than dropped. Skipping it meant a conversation
+      // that exists on one computer never reached the other at all, for the
+      // whole class of projects that live on one machine - and the workspace ID
+      // is a hash of the folder URI, so if this computer ever opens that folder
+      // at the same path the chat is already where Cursor will look for it.
+      // Writing a workspace ID that names nothing local is a state Cursor
+      // already handles: it is what a deleted workspace folder leaves behind.
+      upsertChat(database, snapshot, sourceWorkspaceId);
+      return { status: "applied" };
     }
     upsertChat(database, snapshot, targetWorkspaceId);
     return { status: "applied" };
