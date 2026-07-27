@@ -173,6 +173,8 @@ export function cursorExitTimeoutDetail(
       "holding the databases open is unknown. Close every Cursor window and try again."
     );
   }
+  // Callers already drop this extension's own helpers and Cursor's inert
+  // children; whatever is left is something the user can actually close.
   const closable = survivors.filter((pid) => pid !== finalizerPid);
   if (closable.length === 0) {
     return survivors.length === 0

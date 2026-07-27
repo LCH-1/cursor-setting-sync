@@ -878,10 +878,78 @@ async function otherCursorProcessIds(
           { windowsHide: true, timeout: 10_000 },
         )
       : await execFileAsync("ps", ["-axo", "pid=,comm="], { timeout: 10_000 });
-  return parseCursorProcessIds(stdout, platform).filter(
+  const survivors = parseCursorProcessIds(stdout, platform).filter(
     (pid) => pid !== process.pid && pid !== finalizerPid,
   );
+  if (survivors.length === 0) {
+    return survivors;
+  }
+  const inert = await inertCursorProcessIds(survivors, platform);
+  return survivors.filter((pid) => !inert.has(pid));
 }
+
+/**
+ * Cursor processes that are not Cursor: children that share the executable name
+ * but hold nothing and can outlive the application.
+ *
+ * `crashpad-handler` is the one that matters. It exists to catch a crash during
+ * shutdown, so it is deliberately among the last to go and on Windows it is
+ * routinely orphaned entirely - one machine sat with a single crashpad-handler
+ * and no window at all, and every helper waited its whole budget for a process
+ * that was never going to exit. It opens no database; treating it as a running
+ * Cursor is simply wrong.
+ *
+ * The classification needs command lines, which `tasklist` does not give, so it
+ * is done only once survivors exist - the ordinary case is none - and the
+ * answer is cached for the rest of this process's wait, since a pid that is a
+ * crash handler does not become something else.
+ */
+const inertCursorPids = new Set<number>();
+const classifiedCursorPids = new Set<number>();
+
+async function inertCursorProcessIds(
+  survivors: readonly number[],
+  platform: NodeJS.Platform,
+): Promise<Set<number>> {
+  if (survivors.every((pid) => classifiedCursorPids.has(pid))) {
+    return inertCursorPids;
+  }
+  try {
+    const { stdout } =
+      platform === "win32"
+        ? await execFileAsync(
+            "powershell",
+            [
+              "-NoProfile",
+              "-NonInteractive",
+              "-Command",
+              "Get-CimInstance Win32_Process -Filter \"Name='Cursor.exe'\" | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }",
+            ],
+            { windowsHide: true, timeout: 15_000 },
+          )
+        : await execFileAsync("ps", ["-axo", "pid=,command="], {
+            timeout: 15_000,
+          });
+    for (const line of stdout.split(/\r?\n/)) {
+      const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+      const pid = Number(match?.[1]);
+      if (!Number.isSafeInteger(pid) || pid === 0) {
+        continue;
+      }
+      classifiedCursorPids.add(pid);
+      if (INERT_CURSOR_PROCESS.test(match?.[2] ?? "")) {
+        inertCursorPids.add(pid);
+      }
+    }
+  } catch {
+    // Without command lines every survivor keeps counting, which is the
+    // behaviour that existed before this and errs towards waiting rather than
+    // towards writing while Cursor is alive.
+  }
+  return inertCursorPids;
+}
+
+const INERT_CURSOR_PROCESS = /--type=crashpad-handler\b/;
 
 function isProcessAlive(pid: number): boolean {
   try {

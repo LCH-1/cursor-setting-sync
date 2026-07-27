@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.21] - 2026-07-28
+
+### Fixed
+
+- The offline helper waited for a process that was never going to exit. Cursor's `crashpad-handler` shares the `Cursor.exe` name, exists to catch a crash during shutdown - so it is deliberately among the last to go - and on Windows it is routinely orphaned outright. One machine sat with a single crashpad-handler, no window at all, and a helper that had been waiting twenty minutes; the count it consults saw a running Cursor and would have gone on seeing one forever. It holds no database, and every `CursorExitTimeoutError` in this series, including the ones reporting "1 Cursor process(es) are still running", traces back to counting it. It is excluded now. The classification needs command lines, which `tasklist` does not provide, so it runs only when survivors exist - the ordinary case is none - and is cached for the rest of the wait. If command lines cannot be read at all, every survivor keeps counting, which errs towards waiting rather than towards writing while Cursor is alive.
+
 ## [0.0.20] - 2026-07-27
 
 ### Fixed
