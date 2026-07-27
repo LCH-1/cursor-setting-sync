@@ -734,10 +734,25 @@ async function assertRuntimeVersion(request: HelperRequest): Promise<void> {
     );
     return;
   }
-  const product = JSON.parse(productContent) as {
-    version?: string;
-    vscodeVersion?: string;
-  };
+  let product: { version?: string; vscodeVersion?: string };
+  try {
+    product = JSON.parse(productContent) as {
+      version?: string;
+      vscodeVersion?: string;
+    };
+  } catch (error) {
+    // Same downgrade as an unreadable file, for the same reason: a torn or
+    // half-written product.json is a fact about the installation, not about
+    // whether these changes are safe to apply. Letting `JSON.parse` throw here
+    // took the whole helper down before it had applied anything, and before
+    // stderr was captured that failure was completely silent.
+    process.stderr.write(
+      `Skipping the Cursor version re-check; product.json is unparseable: ${
+        error instanceof Error ? error.message : String(error)
+      }\n`,
+    );
+    return;
+  }
   if (
     product.version !== request.expectedCursorVersion ||
     product.vscodeVersion !== request.expectedVscodeVersion

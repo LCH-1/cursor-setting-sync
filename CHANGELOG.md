@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.22] - 2026-07-28
+
+### Fixed
+
+- A malformed `product.json` killed the helper outright. An unreadable one already downgraded the version re-check to a warning — for the AppImage whose root unmounts together with the process that created the request — but a torn or half-written one reached `JSON.parse`, which threw past that guard and took the whole apply down before it had written anything. Both are facts about the installation rather than about whether the queued changes are safe to apply, so both downgrade now.
+
+### Added
+
+- An end-to-end test that runs the built `dist/helper.js` the way the extension runs it: a request file on disk, the repository key on stdin, a real spawn. It publishes a change as another device, applies it, and checks that the row reaches the database, that the pre-apply backup exists and predates the write, and that restoring that backup rolls the write back. Every failure in this series lived in the orchestration around the apply — the exit wait, what counts as a running Cursor, the lock, the request and result files — and not one unit test could see any of it, because none of them ran the bundle. This one found the `product.json` defect above on its first run. It skips itself while Cursor is running, since the helper's first act is to wait for Cursor to exit.
+
 ## [0.0.21] - 2026-07-28
 
 ### Fixed
