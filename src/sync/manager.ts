@@ -1,5 +1,5 @@
 import { basename, isAbsolute, join, relative } from "node:path";
-import { readdir, rm } from "node:fs/promises";
+import { readFile, readdir, rm } from "node:fs/promises";
 import * as vscode from "vscode";
 import {
   AUTOMATIC_CHECKPOINT_COOLDOWN_MS,
@@ -126,6 +126,7 @@ import {
 } from "../chat/workspace";
 import { HelperLauncher } from "../helper/launcher";
 import type { HelperSyncOptions } from "../helper/launcher";
+import type { HelperRequest } from "../helper/types";
 import type { DatabaseContract } from "../helper/database";
 import type { HelperChange, HelperResult } from "../helper/types";
 import {
@@ -2942,6 +2943,7 @@ export class SyncManager implements vscode.Disposable {
     if (!options.atStartup) {
       return;
     }
+    await this.reportAbandonedHelpers();
     // The result file is deleted above, so this is the only chance to record
     // what the helper reported. A warning raised here stands until a later
     // helper run reports it gone: nothing else re-derives it, because nothing
@@ -2968,6 +2970,55 @@ export class SyncManager implements vscode.Disposable {
         disabledKinds: "",
       });
       this.status.setStatus(settled.status, settled.detail);
+    }
+  }
+
+  /**
+   * Reports helpers that were launched and never reported back.
+   *
+   * The helper deletes its own request file in a `finally` that survives almost
+   * everything, so a surviving request means the process never reached `run` at
+   * all - and until now the only trace was a queue that did not shrink. The
+   * commonest cause is an upgrade: the request records the helper script inside
+   * the version that wrote it, and installing a new version deletes that
+   * directory, so a finalizer armed moments earlier points at a file that no
+   * longer exists. That one is harmless and is cleared silently; anything else
+   * is named, together with whatever the process managed to write to stderr.
+   */
+  private async reportAbandonedHelpers(): Promise<void> {
+    let names: string[];
+    try {
+      names = (await readdir(this.paths.extensionStorage)).filter((name) =>
+        name.startsWith("helper-request-"),
+      );
+    } catch {
+      return;
+    }
+    for (const name of names.filter((entry) => entry.endsWith(".json"))) {
+      const requestPath = join(this.paths.extensionStorage, name);
+      const logPath = `${requestPath}.stderr.log`;
+      let scriptMissing = false;
+      try {
+        const request = await readJsonFile<HelperRequest>(requestPath);
+        scriptMissing = !(await pathExists(request.paths.helperScript));
+      } catch {
+        // An unreadable request is itself worth reporting.
+      }
+      let stderr = "";
+      try {
+        stderr = (await readFile(logPath, "utf8")).trim();
+      } catch {
+        // No log: this predates the change that captures one.
+      }
+      if (!scriptMissing) {
+        this.status.log(
+          `The offline helper for ${name} never reported a result.${
+            stderr.length === 0 ? "" : ` It wrote: ${stderr.slice(0, 2000)}`
+          }`,
+        );
+      }
+      await rm(requestPath, { force: true });
+      await rm(logPath, { force: true });
     }
   }
 

@@ -2,6 +2,13 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.20] - 2026-07-27
+
+### Fixed
+
+- A helper that died before it could report anything left no trace at all. It was spawned with stderr discarded, so a failure at import time - a missing module, a bad runtime, a script that is no longer on disk - produced nothing but an unconsumed request file and a queue that never shrank. stderr now goes to a log beside the request, and any helper that was launched and never reported back is named in the output channel on the next start, together with whatever it managed to write.
+- Upgrading left orphaned helper requests behind. A request records the helper script inside the extension version that wrote it, and installing a new version deletes that directory - so a shutdown finalizer armed moments before an upgrade points at a file that no longer exists and can never start. Seven of them had accumulated on one machine. That case is recognised and cleared silently; every other kind of abandoned request is reported.
+
 ## [0.0.19] - 2026-07-27
 
 ### Changed

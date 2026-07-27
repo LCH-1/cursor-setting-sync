@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { open } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
@@ -245,12 +246,19 @@ export class HelperLauncher {
       ...process.env,
       ELECTRON_RUN_AS_NODE: "1",
     };
+    // stderr was discarded, so a helper that died before it could write a
+    // result - a missing module, a bad runtime, anything at import time -
+    // left nothing behind but an unconsumed request file and a queue that
+    // never shrank. It goes to a file next to the request instead, which
+    // `consumeHelperResults` reports and removes.
+    const errorLog = await open(`${requestPath}.stderr.log`, "a");
     const child = spawn(process.execPath, [this.paths.helperScript, requestPath], {
       detached: true,
       windowsHide: true,
-      stdio: ["pipe", "ignore", "ignore"],
+      stdio: ["pipe", "ignore", errorLog.fd],
       env: environment,
     });
+    void errorLog.close();
     await new Promise<void>((resolve, reject) => {
       const stdin = child.stdin;
       if (stdin === null) {
