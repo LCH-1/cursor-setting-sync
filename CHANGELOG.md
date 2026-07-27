@@ -2,6 +2,17 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.19] - 2026-07-27
+
+### Changed
+
+- The status bar says when it is working. A cycle on a large repository runs for minutes, and the item was deliberately left untouched whenever a conflict or a queued change existed — so during exactly the wait that matters, someone watching for their chats to arrive saw a state that never changed and no way to tell progress from a stall. It now reads **Cursor Setting Sync: Syncing…** while a cycle is running, and returns to the actionable state the moment it ends. Short cycles still never touch the item; the two-second delay that prevented flicker is unchanged.
+- The item's wording follows the state it is in: **Setup** before there is a repository, **Restart to Apply** while changes are queued, **Syncing…** while a cycle runs, and a plain check mark once everything has landed.
+
+### Fixed
+
+- A raw NUL byte had been written into `src/sync/manager.ts` as the separator in a cache key, which compiled and ran correctly but made every text tool treat the file as binary — `grep` reported "Binary file matches" instead of results. It is the same separator, spelled as an escape.
+
 ## [0.0.18] - 2026-07-27
 
 ### Fixed

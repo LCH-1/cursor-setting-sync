@@ -1693,7 +1693,7 @@ export class SyncManager implements vscode.Disposable {
       this.status.log(resumed);
     }
     let failed = false;
-    this.beginSyncIndicator(repository);
+    this.beginSyncIndicator();
     try {
       // Inside the lock so two cycling windows do not both report - and both
       // delete - the same result. A helper that fails while Cursor is still
@@ -1954,14 +1954,15 @@ export class SyncManager implements vscode.Disposable {
    * never displaces the status the user can act on, and a conflict or a pending
    * restart is never displaced at all — those outrank "work is happening".
    */
-  private beginSyncIndicator(repository: SyncRepository): void {
+  private beginSyncIndicator(): void {
     this.clearSyncIndicator();
-    if (
-      unresolvedConflicts(repository).length > 0 ||
-      repository.state.pendingDatabaseChanges.length > 0
-    ) {
-      return;
-    }
+    // A conflict or a queued change used to suppress this outright, so that a
+    // status the user can act on was never displaced by one they cannot. On a
+    // repository whose cycles run for minutes that reads as nothing happening
+    // at all - which is precisely the state someone waiting for their chats
+    // needs to be able to tell apart from a stall. The delay below already
+    // keeps a short cycle from touching the item, and the actionable status
+    // returns the moment the cycle ends.
     this.syncIndicatorTimer = setTimeout(() => {
       this.syncIndicatorTimer = null;
       if (!this.disposed) {
@@ -2476,7 +2477,7 @@ export class SyncManager implements vscode.Disposable {
 
   private ignoredWorkspaceMatcher(): IgnoreMatcher {
     const patterns = this.configuration.effectiveIgnoredWorkspaces;
-    const key = patterns.join(" ");
+    const key = patterns.join("\u0000");
     if (this.ignoredWorkspaceCache?.key !== key) {
       this.ignoredWorkspaceCache = {
         key,

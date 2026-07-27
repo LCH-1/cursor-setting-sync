@@ -82,8 +82,12 @@ function statusPresentation(status: SyncStatus): {
         command: "cursorSync.syncNow",
       };
     case "syncing":
+      // Says the word, not just a spinning glyph. A cycle on a large repository
+      // runs for minutes, and an icon that changes shape is not something
+      // anyone reads as "busy" while they are waiting to know whether their
+      // chats have arrived.
       return {
-        text: "$(sync~spin) Cursor Setting Sync",
+        text: "$(sync~spin) Cursor Setting Sync: Syncing...",
         tooltip: "Synchronization is in progress.",
         command: "cursorSync.showDiagnostics",
       };
