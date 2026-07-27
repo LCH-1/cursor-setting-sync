@@ -8,9 +8,10 @@ tmp/
 
 # Screenshots and editor scratch files land in the repository root. They are
 # never part of the extension, and an untracked pile of them hides real
-# changes in `git status`.
+# changes in `git status`. `image.png` was once excepted here and so was
+# tracked and published; it is a scratch file like the rest and carried
+# whatever happened to be on screen, so there is no exception for it.
 image*.png
 !icon.png
-!image.png
 Untitled
 Untitled *
