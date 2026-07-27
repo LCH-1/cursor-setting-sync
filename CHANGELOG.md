@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.17] - 2026-07-27
+
+### Fixed
+
+- One never-saved scratch buffer stopped `Restart to Apply` from working at all. The command ran `workbench.action.files.saveAll` before quitting, and for an untitled document that opens the native **Save As** dialog and waits — so the `await` never resolved, `workbench.action.quit` on the very next line was never issued, and the offline helper sat through its entire exit budget before reporting that Cursor had not exited. The dialog is easy to miss behind the window, which is why this looked like a quit that silently did nothing. Dirty editors that already have a file are still saved; untitled ones are left to `files.hotExit`, which preserves them across a quit by default and is exactly what would have happened had the command never asked.
+
 ## [0.0.16] - 2026-07-27
 
 ### Fixed

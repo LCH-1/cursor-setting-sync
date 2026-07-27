@@ -105,7 +105,7 @@ export class HelperLauncher {
       syncOptions,
     );
     await this.launch(request, masterKey);
-    await vscode.commands.executeCommand("workbench.action.files.saveAll");
+    await saveNamedEditors();
     // Armed before the quit, not after. `workbench.action.quit` is awaited, and
     // a quit whose promise never settles left both timers unarmed - so the
     // shutdown finalizer was never re-armed either, costing the session its
@@ -143,7 +143,7 @@ export class HelperLauncher {
       request.restoreContract = restoreTarget.contract;
     }
     await this.launch(request, masterKey);
-    await vscode.commands.executeCommand("workbench.action.files.saveAll");
+    await saveNamedEditors();
     // Armed before the quit for the same reason as in `applyAndRestart`.
     this.scheduleQuitVetoCheck(onQuitVetoed);
     await vscode.commands.executeCommand("workbench.action.quit");
@@ -284,6 +284,27 @@ export class HelperLauncher {
     }
     throw new Error("Timed out replacing the shutdown finalizer.");
   }
+}
+
+/**
+ * Saves every dirty editor that already has a file, and deliberately not the
+ * ones that do not.
+ *
+ * This used to be `workbench.action.files.saveAll`, which for an untitled
+ * document opens the native Save As dialog and waits. The await then never
+ * resolves, so `workbench.action.quit` on the next line was never issued at
+ * all - and the helper, which is waiting for the process list to empty, sat
+ * through its whole budget and reported that Cursor had not exited. One
+ * scratch buffer somebody had never saved was enough to make "Restart to
+ * Apply" fail every single time, with a dialog that is easy to miss behind
+ * the window.
+ *
+ * Nothing is lost by skipping them: VS Code's `files.hotExit` preserves
+ * untitled buffers across a quit by default, which is exactly what would have
+ * happened had the command never asked.
+ */
+async function saveNamedEditors(): Promise<void> {
+  await vscode.workspace.saveAll(false);
 }
 
 function delay(milliseconds: number): Promise<void> {
