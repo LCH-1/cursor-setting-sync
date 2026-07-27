@@ -80,6 +80,22 @@ export const CONFLICTED_REPUBLISH_INTERVAL_MS = 60 * 60 * 1000;
 export const CONFLICT_APPLY_LOCK_WAIT_MS = 60_000;
 
 /**
+ * How long a command the user invoked waits for the synchronization lock.
+ *
+ * Every command took the lock in a single attempt and failed outright if a
+ * routine poll happened to hold it - and `Restart to Apply` runs a full sync
+ * first, so it released the lock and then raced the background cycle for it a
+ * moment later. The user is told "another Cursor window or the offline helper
+ * is synchronizing" about, usually, this window's own poll, and the command
+ * they asked for simply does not happen.
+ *
+ * A poll is seconds of work, so waiting it out is the only outcome anyone would
+ * choose. This only has to outlast one cycle; it is not a deadline for anything
+ * the user is waiting on beyond that.
+ */
+export const COMMAND_LOCK_WAIT_MS = 60_000;
+
+/**
  * How long the poll path stays quiet about a sync lock it keeps failing to take.
  *
  * A held lock is the normal state while a long cycle or the offline helper runs,

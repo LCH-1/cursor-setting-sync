@@ -5,6 +5,7 @@ import {
   AUTOMATIC_CHECKPOINT_COOLDOWN_MS,
   AUTOMATIC_CHECKPOINT_EVENT_THRESHOLD,
   BACKUP_DIRECTORY,
+  COMMAND_LOCK_WAIT_MS,
   CONFLICT_APPLY_LOCK_WAIT_MS,
   CONFLICTED_REPUBLISH_INTERVAL_MS,
   LOCK_SKIP_REMINDER_MS,
@@ -47,10 +48,9 @@ import {
 import {
   acquireFileLock,
   acquireFileLockWithin,
-  describeLockHolder,
   reportLockHolder,
 } from "../platform/lock";
-import type { LockHolderReport } from "../platform/lock";
+import type { FileLock, LockHolderReport } from "../platform/lock";
 import {
   GitError,
   cloneRepository,
@@ -691,10 +691,14 @@ export class SyncManager implements vscode.Disposable {
     const masterKey = this.requireMasterKey();
     assertCompatibleForDatabaseWrite(this.compatibility);
     await this.syncNow(true);
-    const lock = await acquireFileLock(this.syncLockPath());
-    if (lock === null) {
-      throw await this.synchronizationBusyError();
-    }
+    // The sync above releases the lock, so this races the background cycle for
+    // it a moment later - which is how the command the user asked for failed
+    // with "another Cursor window is synchronizing" about this window's own
+    // poll. Waiting is shown rather than silent, because it can take a cycle.
+    const lock = await this.withProgress(
+      RESTART_TO_APPLY_TITLE,
+      async (report) => this.takeCommandLock(report),
+    );
     let changes: HelperChange[];
     try {
       await this.openGitWindow(repository);
@@ -762,12 +766,7 @@ export class SyncManager implements vscode.Disposable {
 
   async resolveConflicts(): Promise<void> {
     const repository = this.requireRepository();
-    const refreshLock = await acquireFileLock(
-      this.syncLockPath(),
-    );
-    if (refreshLock === null) {
-      throw await this.synchronizationBusyError();
-    }
+    const refreshLock = await this.takeCommandLock();
     try {
       await this.openGitWindow(repository);
       await repository.refreshState();
@@ -867,12 +866,7 @@ export class SyncManager implements vscode.Disposable {
 
   async restoreVersion(): Promise<void> {
     const repository = this.requireRepository();
-    const refreshLock = await acquireFileLock(
-      this.syncLockPath(),
-    );
-    if (refreshLock === null) {
-      throw await this.synchronizationBusyError();
-    }
+    const refreshLock = await this.takeCommandLock();
     try {
       await this.openGitWindow(repository);
       await repository.refreshState();
@@ -1003,12 +997,7 @@ export class SyncManager implements vscode.Disposable {
     if (confirmed !== "Restore Version") {
       return;
     }
-    const lock = await acquireFileLock(
-      this.syncLockPath(),
-    );
-    if (lock === null) {
-      throw await this.synchronizationBusyError();
-    }
+    const lock = await this.takeCommandLock();
     try {
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
@@ -1286,12 +1275,7 @@ export class SyncManager implements vscode.Disposable {
 
   async forgetDevice(): Promise<void> {
     const repository = this.requireRepository();
-    const firstLock = await acquireFileLock(
-      this.syncLockPath(),
-    );
-    if (firstLock === null) {
-      throw await this.synchronizationBusyError();
-    }
+    const firstLock = await this.takeCommandLock();
     let candidates: Array<{
       label: string;
       description?: string;
@@ -1329,12 +1313,7 @@ export class SyncManager implements vscode.Disposable {
     if (selected === undefined) {
       return;
     }
-    const secondLock = await acquireFileLock(
-      this.syncLockPath(),
-    );
-    if (secondLock === null) {
-      throw await this.synchronizationBusyError();
-    }
+    const secondLock = await this.takeCommandLock();
     try {
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
@@ -1378,10 +1357,7 @@ export class SyncManager implements vscode.Disposable {
 
   private async compactSafeOrphans(): Promise<void> {
     const repository = this.requireRepository();
-    const lock = await acquireFileLock(this.syncLockPath());
-    if (lock === null) {
-      throw await this.synchronizationBusyError();
-    }
+    const lock = await this.takeCommandLock();
     try {
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
@@ -1445,12 +1421,7 @@ export class SyncManager implements vscode.Disposable {
     overrideAgeGate: boolean,
     report: (message: string) => void,
   ): Promise<CheckpointCommandOutcome> {
-    const lock = await acquireFileLock(
-      this.syncLockPath(),
-    );
-    if (lock === null) {
-      throw await this.synchronizationBusyError();
-    }
+    const lock = await this.takeCommandLock(report);
     try {
       report("Reading the repository...");
       const gitActive = await this.openGitWindow(repository);
@@ -2017,8 +1988,41 @@ export class SyncManager implements vscode.Disposable {
    * the holder, its age and the file, so "busy" is something the user can act
    * on rather than a dead end.
    */
+  /**
+   * Takes the synchronization lock on behalf of a command the user invoked,
+   * waiting out a poll instead of failing on one; see
+   * {@link COMMAND_LOCK_WAIT_MS}. `report` says what the wait is for, so the
+   * command does not simply appear frozen.
+   */
+  private async takeCommandLock(
+    report: (message: string) => void = () => {},
+  ): Promise<FileLock> {
+    const lock = await acquireFileLockWithin(
+      this.syncLockPath(),
+      COMMAND_LOCK_WAIT_MS,
+      () => {
+        report("Waiting for the current synchronization to finish...");
+      },
+    );
+    if (lock === null) {
+      throw await this.synchronizationBusyError();
+    }
+    return lock;
+  }
+
   private async synchronizationBusyError(): Promise<Error> {
-    return new Error(await describeLockHolder(this.syncLockPath()));
+    const holder = await reportLockHolder(this.syncLockPath());
+    if (holder.pid === process.pid) {
+      // "Another Cursor window or the offline helper" sent people hunting for a
+      // window that was not there: the holder is this window's own background
+      // cycle, which is also the only case a command can do nothing about by
+      // closing something.
+      return new Error(
+        "This window's own background synchronization is still running and did not finish in time. " +
+          "It is a long cycle rather than a second window; try the command again in a moment.",
+      );
+    }
+    return new Error(holder.description);
   }
 
   private async scanLocalResources(

@@ -2,6 +2,13 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.14] - 2026-07-27
+
+### Fixed
+
+- Every command could be defeated by a routine background poll. Each took the synchronization lock in a single attempt and failed outright if the thirty-second cycle happened to hold it, so `Restart to Apply`, `Checkpoint & Prune History`, `Restore Version`, `Compact Safe Orphans`, `Forget Device` and the conflict resolver's refresh all reported *another Cursor window or the offline helper is synchronizing* and did nothing. `Restart to Apply` was the worst of them: it runs a full sync first, which releases the lock, and then raced the background cycle for it a moment later — so the command reliably lost to its own preparation. All of them now wait up to a minute, showing *Waiting for the current synchronization to finish…*, which is the only outcome anyone would have chosen: a poll is seconds of work. Only the poll itself still gives up immediately, which is what it should do. 0.0.6 fixed this for the conflict resolver's apply step; the other eight call sites were left behind.
+- The busy message no longer sends people looking for a window that is not there. When the lock is held by this window's own background cycle — which is the usual case, and the only one closing something cannot fix — it says so instead of naming "another Cursor window or the offline helper".
+
 ## [0.0.13] - 2026-07-27
 
 ### Fixed
