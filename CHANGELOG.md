@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.29] - 2026-07-28
+
+### Fixed
+
+- An apply could carry less than it said it would, without saying so. A queued change whose payload does not fit the remaining per-apply budget was dropped from the request with a bare `continue`: the helper then reported a complete success, the queue went down by less than the dialog had counted, and what was left looked exactly like the queue that would not drain - a reading this project has already chased twice for other reasons. The remainder is counted now. The offer says how many are too large to carry in the same pass and that they are offered again once this one finishes, and the output channel records the split before Cursor quits, which is where it survives the window being closed. The prompt's old hedge that a large queue "may need more than one pass" is gone: it appeared on every queue alike, including the ones that fit whole.
+
+### Added
+
+- An end-to-end test for the helper's `restore-backup` mode, which is what **Cursor Setting Sync: Restore Backup** launches. The restore itself was covered, but nothing had ever run the bundle in that mode, and its request carries three fields no other mode uses - a typo in any of them would have failed only in front of a user who had already lost something.
+
 ## [0.0.28] - 2026-07-28
 
 ### Fixed

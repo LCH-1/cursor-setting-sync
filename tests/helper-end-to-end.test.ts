@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, backup } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { SyncRepository } from "../src/protocol/repository";
 import { restoreDatabaseBackup } from "../src/helper/database";
@@ -126,6 +126,52 @@ describeBuilt("the offline helper, end to end", () => {
       fixture.request.storageRoot,
     );
     expect(readComposerIds(fixture.databasePath)).not.toContain(COMPOSER);
+  }, 120_000);
+
+  it("restores a backup through the bundle the way the command does", async () => {
+    // restoreDatabaseBackup is covered directly, but nothing had ever run the
+    // helper in restore-backup mode - the mode Cursor Setting Sync: Restore
+    // Backup actually launches. Its request carries fields no other mode uses,
+    // and a typo in any of them fails only here.
+    const fixture = await createFixture();
+    await fixture.repository.saveState();
+
+    const before = readComposerIds(fixture.databasePath);
+    const backupPath = join(fixture.request.storageRoot, "backups", "chosen.vscdb");
+    await mkdir(join(fixture.request.storageRoot, "backups"), { recursive: true });
+    const source = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      await backup(source, backupPath, { rate: 100 });
+    } finally {
+      source.close();
+    }
+
+    // Something lands in the database after that backup was taken.
+    const live = new DatabaseSync(fixture.databasePath);
+    live.exec(
+      `INSERT INTO composerHeaders (composerId, workspaceId, createdAt, lastUpdatedAt,
+        isArchived, isSubagent, recency, checkpointAt, value)
+       VALUES ('${COMPOSER}', NULL, 1, 2, 0, 0, 0, NULL, '{}')`,
+    );
+    live.close();
+    expect(readComposerIds(fixture.databasePath)).toContain(COMPOSER);
+
+    fixture.request.mode = "restore-backup";
+    fixture.request.backupToRestore = backupPath;
+    const result = await runHelper(fixture);
+
+    expect(result.error).toBeNull();
+    expect(result.success).toBe(true);
+    // The write is rolled back, and the state before it is captured first so
+    // the restore is itself undoable.
+    expect(readComposerIds(fixture.databasePath)).toEqual(before);
+    const preRestore = (
+      await readdir(join(fixture.request.storageRoot, "backups"))
+    ).filter((name) => name.startsWith("pre-restore-") && name.endsWith(".vscdb"));
+    expect(preRestore).toHaveLength(1);
+    expect(
+      readComposerIds(join(fixture.request.storageRoot, "backups", preRestore[0] ?? "")),
+    ).toContain(COMPOSER);
   }, 120_000);
 
   it("consumes its request file and reports rather than vanishing", async () => {

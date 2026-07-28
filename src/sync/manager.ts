@@ -521,7 +521,8 @@ export class SyncManager implements vscode.Disposable {
     // question as `restartToApply` makes the offer and the command agree by
     // construction, so the dialog can no longer describe a queue the command
     // would then report as empty.
-    const pending = pendingHelperChanges(repository);
+    const batch = pendingHelperBatch(repository);
+    const pending = batch.changes;
     if (pending.length === 0) {
       return;
     }
@@ -540,7 +541,7 @@ export class SyncManager implements vscode.Disposable {
     try {
       const action = "Apply now";
       choice = await vscode.window.showWarningMessage(
-        queuedApplyPrompt(pending),
+        queuedApplyPrompt(pending, batch.deferredForBatchLimit),
         { modal: true },
         action,
       );
@@ -817,16 +818,17 @@ export class SyncManager implements vscode.Disposable {
       RESTART_TO_APPLY_TITLE,
       async (report) => this.takeCommandLock(report),
     );
-    let changes: HelperChange[];
+    let batch: PendingHelperBatch;
     try {
       await this.openGitWindow(repository);
       await repository.refreshState();
       await this.applyPendingRunningResources(repository);
       await this.ensureWorkspaceMappings(repository);
-      changes = pendingHelperChanges(repository);
+      batch = pendingHelperBatch(repository);
     } finally {
       await lock.release();
     }
+    const changes = batch.changes;
     if (changes.length === 0) {
       const blocked = repository.state.pendingDatabaseChanges.filter(
         (change) => change.blockedReason !== undefined,
@@ -846,6 +848,13 @@ export class SyncManager implements vscode.Disposable {
     // Cleared here rather than on entry because everything above can throw or
     // return early, and a burnt latch would hide a failure still in force.
     this.helperFailure = null;
+    if (batch.deferredForBatchLimit > 0) {
+      // Durable, because the toast below dies with the window this is about to
+      // quit. Without it the queue simply comes back smaller than promised.
+      this.status.log(
+        `Applying ${changes.length} change(s); ${batch.deferredForBatchLimit} more exceed the per-apply size limit, stay queued, and are offered again after this pass.`,
+      );
+    }
     await this.helper.applyAndRestart(
       this.configuration.repositoryPath ?? repository.root,
       masterKey,
@@ -3519,12 +3528,18 @@ function summarizePendingKinds(
  */
 export function queuedApplyPrompt(
   pending: readonly { kind: string }[],
+  deferredForBatchLimit = 0,
 ): string {
   return (
     `${pending.length} change(s) from your other computers (${summarizePendingKinds(pending)}) are waiting. ` +
     "They live in databases Cursor keeps open, so they can only be written while it is closed: choosing to apply saves your editors, quits Cursor, writes them and reopens it. " +
-    "Restarting Cursor yourself does not write them - only this does. " +
-    "A large queue may need more than one pass; the status bar says so if any remain."
+    "Restarting Cursor yourself does not write them - only this does." +
+    // Said exactly, or not at all. The old text hedged that a large queue
+    // "may need more than one pass" on every queue alike, which was noise on
+    // the ones that fit and no help on the ones that did not.
+    (deferredForBatchLimit > 0
+      ? ` ${deferredForBatchLimit} more are too large to carry in the same pass; they stay queued and are offered again once this one finishes.`
+      : "")
   );
 }
 
@@ -4072,9 +4087,26 @@ function prunePending(
     );
 }
 
-function pendingHelperChanges(repository: SyncRepository): HelperChange[] {
+/**
+ * What one apply can carry, and what it leaves for the next one.
+ *
+ * The batch limit exists so a single request cannot ask the helper to hold
+ * half a gigabyte of payloads in memory at once, but a change that falls
+ * outside it used to be dropped from the request without a word. The apply
+ * then succeeded, the queue went down by less than the user was told, and the
+ * remainder looked exactly like the queue that would not drain - which is a
+ * failure this project has already chased twice for other reasons.
+ */
+interface PendingHelperBatch {
+  changes: HelperChange[];
+  /** Applicable now, but over the batch limit; a later pass will carry them. */
+  deferredForBatchLimit: number;
+}
+
+function pendingHelperBatch(repository: SyncRepository): PendingHelperBatch {
   const changes: HelperChange[] = [];
   let totalBytes = 0;
+  let deferredForBatchLimit = 0;
   for (const pending of repository.state.pendingDatabaseChanges) {
       if (pending.blockedReason !== undefined) {
         continue;
@@ -4097,6 +4129,9 @@ function pendingHelperChanges(repository: SyncRepository): HelperChange[] {
       }
       const payloadBytes = tip.payload?.plainBytes ?? 0;
       if (totalBytes + payloadBytes > MAX_APPLY_BATCH_BYTES) {
+        // Counted rather than silently skipped: the caller says so, and the
+        // entry stays queued for the next pass.
+        deferredForBatchLimit += 1;
         continue;
       }
       const change: HelperChange = {
@@ -4116,7 +4151,7 @@ function pendingHelperChanges(repository: SyncRepository): HelperChange[] {
       changes.push(change);
       totalBytes += payloadBytes;
   }
-  return changes;
+  return { changes, deferredForBatchLimit };
 }
 
 function pendingLastUpdatedAt(
