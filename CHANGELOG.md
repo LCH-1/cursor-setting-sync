@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.28] - 2026-07-28
+
+### Fixed
+
+- Journal sidecars were evicting the backups they belonged to. `backup()` copies the journal mode of its source, so a snapshot of a live Cursor database is itself in WAL mode, and every later read-only open of it - the validation that runs immediately after it is written, a restore's `ATTACH` - recreates `-wal` and `-shm` beside it and cannot unlink them again, because a read-only connection may not run the closing checkpoint. Written last, they were also the newest files in the directory, so newest-first retention kept them and deleted real recovery points to stay inside its budget. On the machine this was found on, twenty-two of the thirty retained files were sidecars holding nothing and eight were backups. A backup is now sealed into rollback-journal mode as soon as it is written, so reading it creates nothing; retention treats a snapshot and its sidecars as one recovery point, counted once and evicted together; and a sidecar whose database is gone is removed on sight, which is what clears a directory earlier versions filled.
+
+### Changed
+
+- The local backup budget is 4 GiB rather than 2 GiB, and the count limit is thirty backups rather than thirty files. 2 GiB is less than twice the size a heavily used global database reaches - 1.29 GiB on the machine measured - so the budget held exactly one global snapshot and every apply deleted the previous one. The only recovery point was the state immediately before the newest apply, so an apply whose damage was noticed one apply later had nothing left to roll back to. Two generations now fit, alongside the small per-workspace snapshots taken in the same run.
+
 ## [0.0.27] - 2026-07-28
 
 ### Fixed

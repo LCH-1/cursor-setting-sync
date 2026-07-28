@@ -2,6 +2,7 @@ import type { DatabaseSync, SqliteStorageValue } from "../platform/sqlite";
 import {
   backupDatabase,
   openDatabase,
+  sealBackupFile,
   sqliteStorageText,
 } from "../platform/sqlite";
 import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
@@ -254,6 +255,7 @@ export async function applyGlobalDatabaseChanges(
     } finally {
       backupSource.close();
     }
+    await sealBackupFile(backupPath);
     validateDatabaseFile(backupPath, "global");
     await enforceBackupRetention(request.storageRoot, { exemptPath: backupPath });
     validateDatabaseFile(backupPath, "global");
@@ -411,6 +413,7 @@ async function createPreRestoreBackup(
   } finally {
     preRestoreSource.close();
   }
+  await sealBackupFile(preRestoreBackupPath);
   validateDatabaseFile(preRestoreBackupPath, contract);
   return preRestoreBackupPath;
 }

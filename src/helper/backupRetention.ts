@@ -50,10 +50,33 @@ export interface BackupRetentionResult {
 }
 
 export const DEFAULT_BACKUP_RETENTION = Object.freeze({
+  /**
+   * Counted in backups, not files: a snapshot and its journal sidecars are one
+   * entry, so a directory of 30 backups is 30 recovery points rather than the
+   * ten it used to work out to.
+   */
   maxFiles: 30,
   maxAgeMs: 30 * DAY_MS,
-  maxTotalBytes: 2 * 1_024 * 1_024 * 1_024,
+  /**
+   * Two generations of a large Cursor database, plus room for the small
+   * per-workspace snapshots taken in the same run.
+   *
+   * This was 2 GiB, which is less than twice the size a heavily used global
+   * database reaches - 1.29 GiB on the machine this was found on. The budget
+   * could therefore hold exactly one global snapshot, so every apply deleted
+   * the previous one and the only recovery point was the state immediately
+   * before the newest apply. An apply whose damage is noticed one apply later
+   * had nothing left to roll back to.
+   */
+  maxTotalBytes: 4 * 1_024 * 1_024 * 1_024,
 });
+
+/**
+ * SQLite's sidecars for a database file. A backup is a snapshot with no
+ * readers to coordinate with, so these carry nothing once it is sealed; they
+ * exist only because opening a WAL-mode file read-only recreates them.
+ */
+const SIDECAR_SUFFIXES = ["-wal", "-shm", "-journal"] as const;
 
 interface NormalizedRetentionPolicy {
   maxFiles: number;
@@ -81,6 +104,20 @@ interface FileIdentity {
 interface ScanResult {
   files: BackupFile[];
   skipped: SkippedBackupEntry[];
+}
+
+/**
+ * One recovery point: a snapshot together with any SQLite sidecars sitting
+ * beside it. Retention decides about the group rather than about each file,
+ * because a sidecar is worth nothing without its database and a database is
+ * still usable without its sidecars.
+ */
+interface BackupGroup {
+  /** The snapshot, or null for sidecars whose database is already gone. */
+  primary: BackupFile | null;
+  files: BackupFile[];
+  mtimeMs: number;
+  relativePath: string;
 }
 
 /**
@@ -129,38 +166,76 @@ export async function enforceBackupRetention(
   );
   scan.files.sort(compareNewestFirst);
 
-  const exemptPath = options.exemptPath ?? scan.files[0]?.path;
+  const groups = groupBackupFiles(scan.files);
+  // The default exempts the newest snapshot rather than the newest file, which
+  // after a backup is one of its sidecars.
+  const exemptPath =
+    options.exemptPath ??
+    groups.find((group) => group.primary !== null)?.primary?.path;
   const retained: BackupFile[] = [];
   const deletionPlan: BackupFile[] = [];
   let retainedBytes = 0;
+  let retainedBackups = 0;
   let newestPrefixOpen = true;
-  for (const file of scan.files) {
-    const ageMs = Math.max(0, policy.nowMs - file.mtimeMs);
-    const withinAge = ageMs <= policy.maxAgeMs;
-    const withinCount = retained.length < policy.maxFiles;
-    const withinBytes =
-      file.size <= policy.maxTotalBytes - retainedBytes;
-    if (newestPrefixOpen && withinAge && withinCount && withinBytes) {
-      retained.push(file);
-      retainedBytes += file.size;
+  for (const group of groups) {
+    if (group.primary === null) {
+      // A journal sidecar whose database is gone restores nothing. These used
+      // to outlive the snapshots they belonged to: sidecars are written last,
+      // so newest-first ordering kept them and spent the count and byte budget
+      // the real backups needed.
+      if (exemptPath !== undefined && groupContainsPath(group, exemptPath)) {
+        scan.skipped.push({
+          path: group.files[0]?.path ?? exemptPath,
+          reason: "The exempt backup is never removed by retention.",
+        });
+        continue;
+      }
+      deletionPlan.push(...group.files);
       continue;
     }
-    if (exemptPath !== undefined && pathsEqual(file.path, exemptPath)) {
+    // Sidecars beside a snapshot that is being kept are spent too. New backups
+    // are sealed at write time so they never grow any; removing them here is
+    // what clears the ones earlier versions left behind.
+    const spent = group.files.filter(
+      (file) => file !== group.primary && isSpentSidecar(file),
+    );
+    const live = group.files.filter((file) => !spent.includes(file));
+    const liveBytes = live.reduce((total, file) => total + file.size, 0);
+
+    const ageMs = Math.max(0, policy.nowMs - group.mtimeMs);
+    const withinAge = ageMs <= policy.maxAgeMs;
+    const withinCount = retainedBackups < policy.maxFiles;
+    const withinBytes = liveBytes <= policy.maxTotalBytes - retainedBytes;
+    if (newestPrefixOpen && withinAge && withinCount && withinBytes) {
+      retained.push(...live);
+      retainedBytes += liveBytes;
+      retainedBackups += 1;
+      deletionPlan.push(...spent);
+      continue;
+    }
+    if (exemptPath !== undefined && groupContainsPath(group, exemptPath)) {
       // Deleting the backup of the running request would fail its
       // post-retention validation and abort the apply forever.
       scan.skipped.push({
-        path: file.path,
+        path: group.primary.path,
         reason: "The exempt backup is never removed by retention.",
       });
+      deletionPlan.push(...spent);
       continue;
     }
     if (!withinAge || !withinCount) {
-      // Only age and count violations close the newest prefix. A file that
+      // Only age and count violations close the newest prefix. A backup that
       // alone exceeds the remaining byte budget is deleted without closing
       // the prefix, so healthy older backups that still fit stay retained.
       newestPrefixOpen = false;
     }
-    deletionPlan.push(file);
+    // The snapshot is listed before its sidecars so that the reversed plan
+    // removes it last; an interruption then leaves a usable backup behind
+    // rather than sidecars with nothing to attach to.
+    deletionPlan.push(
+      group.primary,
+      ...group.files.filter((file) => file !== group.primary),
+    );
   }
 
   const deleted: BackupFile[] = [];
@@ -414,6 +489,83 @@ function compareNewestFirst(left: BackupFile, right: BackupFile): number {
     return right.mtimeMs - left.mtimeMs;
   }
   return comparePath(right.relativePath, left.relativePath);
+}
+
+/**
+ * Collects each snapshot with its sidecars. A group is dated by its snapshot,
+ * not by its newest file, so a sidecar recreated later by a read-only open
+ * cannot make an old backup look fresh.
+ */
+function groupBackupFiles(files: BackupFile[]): BackupGroup[] {
+  const snapshots = new Map<string, BackupGroup>();
+  for (const file of files) {
+    if (sidecarBasePath(file.path) === null) {
+      snapshots.set(groupKey(file.path), {
+        primary: file,
+        files: [file],
+        mtimeMs: file.mtimeMs,
+        relativePath: file.relativePath,
+      });
+    }
+  }
+  const orphans: BackupGroup[] = [];
+  for (const file of files) {
+    const base = sidecarBasePath(file.path);
+    if (base === null) {
+      continue;
+    }
+    const group = snapshots.get(groupKey(base));
+    if (group === undefined) {
+      orphans.push({
+        primary: null,
+        files: [file],
+        mtimeMs: file.mtimeMs,
+        relativePath: file.relativePath,
+      });
+      continue;
+    }
+    group.files.push(file);
+  }
+  return [...snapshots.values(), ...orphans].sort(compareGroupsNewestFirst);
+}
+
+function compareGroupsNewestFirst(left: BackupGroup, right: BackupGroup): number {
+  if (left.mtimeMs !== right.mtimeMs) {
+    return right.mtimeMs - left.mtimeMs;
+  }
+  return comparePath(right.relativePath, left.relativePath);
+}
+
+/** The database a sidecar belongs to, or null when the path is not one. */
+function sidecarBasePath(path: string): string | null {
+  const lower = path.toLowerCase();
+  for (const suffix of SIDECAR_SUFFIXES) {
+    if (lower.length > suffix.length && lower.endsWith(suffix)) {
+      return path.slice(0, path.length - suffix.length);
+    }
+  }
+  return null;
+}
+
+/**
+ * A sidecar that cannot be holding anything the snapshot needs. `-shm` is a
+ * shared-memory index SQLite rebuilds on demand, and retention only ever runs
+ * with no Cursor process alive to have one mapped. An empty log is likewise
+ * spent; one with content is left alone rather than guessed about.
+ */
+function isSpentSidecar(file: BackupFile): boolean {
+  const lower = file.path.toLowerCase();
+  return lower.endsWith("-shm") || file.size === 0;
+}
+
+function groupContainsPath(group: BackupGroup, path: string): boolean {
+  return group.files.some((file) => pathsEqual(file.path, path));
+}
+
+function groupKey(path: string): string {
+  return isCaseInsensitivePathPlatform(process.platform)
+    ? resolve(path).toLowerCase()
+    : resolve(path);
 }
 
 function comparePath(left: string, right: string): number {

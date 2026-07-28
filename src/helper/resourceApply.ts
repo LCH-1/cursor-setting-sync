@@ -4,6 +4,7 @@ import type { DatabaseSync, SqliteStorageValue } from "../platform/sqlite";
 import {
   backupDatabase,
   openDatabase,
+  sealBackupFile,
   sqliteStorageText,
 } from "../platform/sqlite";
 import { dirname, join, relative } from "node:path";
@@ -361,6 +362,7 @@ async function applyStoreSnapshot(
     } finally {
       source.close();
     }
+    await sealBackupFile(backupPath);
     const backup = openDatabase(backupPath, { readOnly: true });
     try {
       backup.exec("PRAGMA query_only=ON");
@@ -647,6 +649,7 @@ async function updateExtensionEnablement(
     assertItemTableSchema(database);
     assertIntegrity(database);
     await backupDatabase(database, backupPath, { rate: 100 });
+    await sealBackupFile(backupPath);
     const backup = openDatabase(backupPath, { readOnly: true });
     try {
       backup.exec("PRAGMA query_only=ON");

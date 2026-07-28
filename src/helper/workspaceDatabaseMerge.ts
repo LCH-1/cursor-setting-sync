@@ -2,7 +2,11 @@ import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import type { DatabaseSync } from "../platform/sqlite";
-import { backupDatabase, openDatabase } from "../platform/sqlite";
+import {
+  backupDatabase,
+  openDatabase,
+  sealBackupFile,
+} from "../platform/sqlite";
 import {
   ensureDirectory,
   isCaseInsensitivePathPlatform,
@@ -447,6 +451,7 @@ export async function applyWorkspaceDatabaseSnapshot(
   } finally {
     backupSource.close();
   }
+  await sealBackupFile(options.backupPath);
   const backupSnapshot = captureWorkspaceDatabaseSnapshot(options.backupPath, {
     workspaceId: options.targetWorkspaceId,
     includeComposerHeaders,

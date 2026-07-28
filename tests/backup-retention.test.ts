@@ -104,6 +104,115 @@ describe("local backup retention", () => {
     ]);
   });
 
+  it("does not let journal sidecars evict the snapshots they belong to", async () => {
+    // The shape this was found in: every backup had a `-wal` and a `-shm`
+    // written just after it, so newest-first ordering saw the sidecars first
+    // and spent the file budget on them. Twenty-two of thirty retained files
+    // were sidecars and real recovery points were being deleted to fit.
+    const fixture = await createFixture();
+    const newest = await createBackup(fixture.backupRoot, "newest.vscdb", 4, 1);
+    const newestWal = await createBackup(fixture.backupRoot, "newest.vscdb-wal", 0, 0.99);
+    const newestShm = await createBackup(fixture.backupRoot, "newest.vscdb-shm", 8, 0.98);
+    const older = await createBackup(fixture.backupRoot, "older.vscdb", 4, 5);
+    const olderWal = await createBackup(fixture.backupRoot, "older.vscdb-wal", 0, 4.99);
+    const olderShm = await createBackup(fixture.backupRoot, "older.vscdb-shm", 8, 4.98);
+
+    const result = await enforceBackupRetention(fixture.storageRoot, {
+      maxFiles: 2,
+      maxAgeMs: 30 * 24 * 60 * 60 * 1_000,
+      maxTotalBytes: 100,
+      nowMs: NOW,
+    });
+
+    // Two backups fit in a budget of two, and the sidecars cost nothing.
+    expect(result.retainedPaths).toEqual([newest, older]);
+    expect(result.deletedPaths.map((path) => basename(path)).sort()).toEqual([
+      "newest.vscdb-shm",
+      "newest.vscdb-wal",
+      "older.vscdb-shm",
+      "older.vscdb-wal",
+    ]);
+    expect(await existing([newest, newestWal, newestShm, older, olderWal, olderShm])).toEqual([
+      "newest.vscdb",
+      "older.vscdb",
+    ]);
+  });
+
+  it("removes a sidecar whose database is already gone", async () => {
+    const fixture = await createFixture();
+    const keep = await createBackup(fixture.backupRoot, "keep.vscdb", 4, 1);
+    const ghostWal = await createBackup(fixture.backupRoot, "ghost.vscdb-wal", 0, 0.5);
+    const ghostShm = await createBackup(fixture.backupRoot, "ghost.vscdb-shm", 8, 0.4);
+
+    const result = await enforceBackupRetention(fixture.storageRoot, {
+      maxFiles: 10,
+      maxAgeMs: 30 * 24 * 60 * 60 * 1_000,
+      maxTotalBytes: 1_000,
+      nowMs: NOW,
+    });
+
+    // Nothing was over any limit; the orphans go because they restore nothing.
+    expect(result.retainedPaths).toEqual([keep]);
+    expect(result.deletedPaths.map((path) => basename(path)).sort()).toEqual([
+      "ghost.vscdb-shm",
+      "ghost.vscdb-wal",
+    ]);
+    expect(await existing([keep, ghostWal, ghostShm])).toEqual(["keep.vscdb"]);
+  });
+
+  it("keeps a write-ahead log that still has content and charges it to its backup", async () => {
+    const fixture = await createFixture();
+    const newest = await createBackup(fixture.backupRoot, "newest.vscdb", 4, 1);
+    const newestWal = await createBackup(fixture.backupRoot, "newest.vscdb-wal", 16, 0.99);
+    const older = await createBackup(fixture.backupRoot, "older.vscdb", 4, 5);
+    const olderWal = await createBackup(fixture.backupRoot, "older.vscdb-wal", 16, 4.99);
+
+    const result = await enforceBackupRetention(fixture.storageRoot, {
+      maxFiles: 10,
+      maxAgeMs: 30 * 24 * 60 * 60 * 1_000,
+      // Room for one backup and its log, not two.
+      maxTotalBytes: 25,
+      nowMs: NOW,
+    });
+
+    expect(result.retainedPaths.map((path) => basename(path)).sort()).toEqual([
+      "newest.vscdb",
+      "newest.vscdb-wal",
+    ]);
+    expect(result.retainedBytes).toBe(20);
+    // The older backup and its log are evicted together rather than leaving
+    // one without the other.
+    expect(result.deletedPaths.map((path) => basename(path)).sort()).toEqual([
+      "older.vscdb",
+      "older.vscdb-wal",
+    ]);
+    expect(await existing([newest, newestWal, older, olderWal])).toEqual([
+      "newest.vscdb",
+      "newest.vscdb-wal",
+    ]);
+  });
+
+  it("exempts the newest snapshot rather than the newest sidecar", async () => {
+    const fixture = await createFixture();
+    const newest = await createBackup(fixture.backupRoot, "newest.vscdb", 100, 1);
+    await createBackup(fixture.backupRoot, "newest.vscdb-shm", 8, 0.99);
+
+    const result = await enforceBackupRetention(fixture.storageRoot, {
+      maxFiles: 3,
+      maxAgeMs: 30 * 24 * 60 * 60 * 1_000,
+      maxTotalBytes: 10,
+      nowMs: NOW,
+    });
+
+    expect(result.skipped).toEqual([
+      {
+        path: newest,
+        reason: "The exempt backup is never removed by retention.",
+      },
+    ]);
+    expect(await existing([newest])).toEqual(["newest.vscdb"]);
+  });
+
   it("never deletes an explicitly exempted backup path", async () => {
     const fixture = await createFixture();
     const oldest = await createBackup(fixture.backupRoot, "oldest.vscdb", 1, 8);
