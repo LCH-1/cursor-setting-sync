@@ -239,6 +239,15 @@ export class SyncManager implements vscode.Disposable {
    * the retry it asks for is what clears it.
    */
   private helperFailure: string | null = null;
+  /**
+   * Whether the queued-apply offer has already been turned down this session.
+   *
+   * The offer is shown once per window launch and never again after a "no": it
+   * exists to make the queue impossible to miss, not to argue about it. Nothing
+   * persists it, so the next launch asks again - which is right, because the
+   * queue is still there and the answer "not now" was about now.
+   */
+  private queuedApplyDeclined = false;
   private automaticMaintenanceAt = 0;
   private maintenanceRequested = false;
   private largeFileCheckAt = 0;
@@ -292,6 +301,18 @@ export class SyncManager implements vscode.Disposable {
     await this.syncNow(false);
     await this.startFinalizer();
     this.startWatching();
+    // Last, and guarded: activation is finished by the lines above, and an
+    // offer that threw - a lock it could not take, a quit that failed - must
+    // not take the poll timer and the finalizer down with it.
+    try {
+      await this.offerQueuedApply("launch");
+    } catch (error) {
+      this.status.log(
+        `Could not offer to apply the queued changes: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   async configurationChanged(): Promise<void> {
@@ -448,11 +469,12 @@ export class SyncManager implements vscode.Disposable {
     // this notice names files that may carry API keys.
     this.status.log(configured);
     void vscode.window.showInformationMessage(configured);
-    await this.offerFirstApply();
+    await this.offerQueuedApply("setup");
   }
 
   /**
-   * Offers the apply straight after setup, so joining is one flow.
+   * Offers to apply the queue, after setup and again on every launch that finds
+   * one waiting.
    *
    * A computer that has just joined necessarily has a full queue - extensions,
    * profiles, chats and UI state all arrive at once, and none of them can be
@@ -460,13 +482,21 @@ export class SyncManager implements vscode.Disposable {
    * to discover a second command is the friction people report: they set the
    * thing up, nothing appears, and nothing says why.
    *
-   * Deliberately not called from anywhere else. `setup()` is also the documented
-   * way to unlock an established device, and on that device the queue is the
-   * ordinary flow of incoming chats rather than a one-time cost of joining.
+   * The launch case is the same failure one restart later, and it was the worse
+   * one, because the user has every reason to believe they already did the
+   * thing. Quitting and reopening Cursor is exactly what the queue is waiting
+   * for and exactly what does not drain it - only the command does - so a
+   * device could sit at "Queued" indefinitely while its owner restarted over
+   * and over. Nothing else was going to say so: the status item deliberately
+   * does not run the apply on a click, since quitting Cursor is too large a
+   * thing to sit one misclick away from the item beside it.
+   *
+   * Self-limiting rather than rate-limited: it can only appear while something
+   * is genuinely waiting, and applying is what makes it stop.
    */
-  private async offerFirstApply(): Promise<void> {
+  private async offerQueuedApply(occasion: "setup" | "launch"): Promise<void> {
     const repository = this.repository;
-    if (repository === null) {
+    if (repository === null || this.queuedApplyDeclined) {
       return;
     }
     const pending = repository.state.pendingDatabaseChanges.filter(
@@ -475,19 +505,42 @@ export class SyncManager implements vscode.Disposable {
     if (pending.length === 0) {
       return;
     }
-    const action = "Apply now";
-    const choice = await vscode.window.showWarningMessage(
-      `${pending.length} change(s) from your other computers (${summarizePendingKinds(pending)}) are waiting. ` +
-        "They live in databases Cursor keeps open, so they can only be written while it is closed: choosing to apply saves your editors, quits Cursor, writes them and reopens it. " +
-        "A large queue may need more than one pass; the status bar says so if any remain. You can also do this later from the status bar.",
-      { modal: true },
-      action,
+    // Every window runs its own extension host and would otherwise raise its
+    // own modal over the same queue. Whoever claims this first speaks for the
+    // session; the rest stay quiet rather than stacking dialogs that all quit
+    // the same application. Held across the dialog, so the claim lasts as long
+    // as the question is on screen.
+    const lock = await acquireFileLock(
+      join(this.paths.extensionStorage, "apply-offer.lock"),
     );
-    if (choice !== action) {
+    if (lock === null) {
       return;
+    }
+    let choice: string | undefined;
+    try {
+      const action = "Apply now";
+      choice = await vscode.window.showWarningMessage(
+        queuedApplyPrompt(pending),
+        { modal: true },
+        action,
+      );
+      if (choice !== action) {
+        this.queuedApplyDeclined = true;
+        this.status.log(
+          `${pending.length} queued change(s) were left unapplied at the user's request; run "${RESTART_TO_APPLY_TITLE}" to apply them.`,
+        );
+        return;
+      }
+    } finally {
+      await lock.release();
     }
     // Delegated rather than inlined so this shares the workspace mapping, the
     // quit-stall warning and the finalizer re-arm with the command itself.
+    // Released above first: `restartToApply` quits Cursor on success, and a
+    // lock still held at that point would outlive the process that took it.
+    this.status.log(
+      `Applying ${pending.length} queued change(s) offered at ${occasion}.`,
+    );
     await this.restartToApply();
   }
 
@@ -3405,6 +3458,27 @@ function summarizePendingKinds(
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
     .map(([kind, count]) => `${count} ${kind}`)
     .join(", ");
+}
+
+/**
+ * What the queued-apply offer says.
+ *
+ * The third sentence is the one that had to be added. The queue is written by
+ * an offline helper that runs while Cursor is closed, so every part of the
+ * description - "waiting", "can only be written while it is closed" - reads as
+ * an instruction to close Cursor, and closing Cursor is precisely what does not
+ * write it. A user acting on the obvious reading restarts, sees the same queue,
+ * and concludes the feature is broken. Say it outright instead.
+ */
+export function queuedApplyPrompt(
+  pending: readonly PendingDatabaseChange[],
+): string {
+  return (
+    `${pending.length} change(s) from your other computers (${summarizePendingKinds(pending)}) are waiting. ` +
+    "They live in databases Cursor keeps open, so they can only be written while it is closed: choosing to apply saves your editors, quits Cursor, writes them and reopens it. " +
+    "Restarting Cursor yourself does not write them - only this does. " +
+    "A large queue may need more than one pass; the status bar says so if any remain."
+  );
 }
 
 /** What the poll path remembers about a sync lock it keeps failing to take. */

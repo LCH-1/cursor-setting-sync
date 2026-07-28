@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.25] - 2026-07-28
+
+### Fixed
+
+- A queue that nothing but the command palette could drain. Everything about the wait says to close Cursor - the changes "can only be written while Cursor is closed", the status item reads "Queued" - and closing Cursor is the one thing that does not write them, because the queue is applied by an offline helper that only **Cursor Setting Sync: Restart to Apply** launches. A device sat at seventy-one queued changes across three restarts: the owner had done what the queue appeared to ask for, the number never moved, and nothing on screen distinguished that from a broken feature. The offer that until now appeared only at the end of setup is raised on any launch that finds changes waiting, and says outright that restarting Cursor is not what applies them. Declining is remembered for the session, one window raises it rather than every window, and it stops appearing when the queue is empty - which is what applying it does.
+
 ## [0.0.24] - 2026-07-28
 
 ### Fixed
