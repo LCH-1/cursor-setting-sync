@@ -484,6 +484,17 @@ const COMPOSER_ID_PATTERN =
 const BODYLESS_SAMPLE_SIZE = 5;
 
 /**
+ * Whether a composer ID names a chat this build can carry between devices.
+ *
+ * The scan already refuses to publish anything else; exported so the inbound
+ * side can refuse the same set, which it has to, because a resource the scan
+ * will not produce is one nothing can ever observe as applied.
+ */
+export function isSyncableComposerId(composerId: string): boolean {
+  return COMPOSER_ID_PATTERN.test(composerId);
+}
+
+/**
  * Resolves the identity of a composer header row. SQLite column affinity does
  * not stop a BLOB from landing in `composerHeaders.composerId`, and node:sqlite
  * hands those back as a Uint8Array; the bytes are the same UUID text Cursor

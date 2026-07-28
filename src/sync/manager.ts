@@ -116,7 +116,10 @@ import {
   createIgnoreMatcher,
   type IgnoreMatcher,
 } from "../resources/ignorePatterns";
-import { StateVscdbChatAdapter } from "../chat/stateVscdb";
+import {
+  StateVscdbChatAdapter,
+  isSyncableComposerId,
+} from "../chat/stateVscdb";
 import { mergeChatSnapshotBuffers } from "../chat/chatMerge";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
@@ -499,9 +502,15 @@ export class SyncManager implements vscode.Disposable {
     if (repository === null || this.queuedApplyDeclined) {
       return;
     }
-    const pending = repository.state.pendingDatabaseChanges.filter(
-      (change) => change.blockedReason === undefined,
-    );
+    // Counted the way the command counts it, rather than off the raw queue.
+    // "Unblocked" is not the same question as "would the helper be given this":
+    // an entry can be dropped on arrival, or fall outside the batch, and a queue
+    // made entirely of those raised a modal about work that did not exist - once
+    // for real, seconds before the entries were dropped. Asking the same
+    // question as `restartToApply` makes the offer and the command agree by
+    // construction, so the dialog can no longer describe a queue the command
+    // would then report as empty.
+    const pending = pendingHelperChanges(repository);
     if (pending.length === 0) {
       return;
     }
@@ -3448,7 +3457,7 @@ function commonestBlockedReason(
 }
 
 function summarizePendingKinds(
-  pending: readonly PendingDatabaseChange[],
+  pending: readonly { kind: string }[],
 ): string {
   const counts = new Map<string, number>();
   for (const change of pending) {
@@ -3471,7 +3480,7 @@ function summarizePendingKinds(
  * and concludes the feature is broken. Say it outright instead.
  */
 export function queuedApplyPrompt(
-  pending: readonly PendingDatabaseChange[],
+  pending: readonly { kind: string }[],
 ): string {
   return (
     `${pending.length} change(s) from your other computers (${summarizePendingKinds(pending)}) are waiting. ` +
@@ -3896,6 +3905,54 @@ function markProjection(
 }
 
 /**
+ * True for an inbound resource this device's own scan is never going to produce.
+ *
+ * Leaving the queue is observational: an entry is dropped when a later scan
+ * finds the local resource already carrying the incoming value. Nothing is
+ * dequeued on the helper's say-so, and that is deliberate - the helper reporting
+ * a write is not evidence that Cursor kept it. The price is that a resource the
+ * scan does not emit can never be seen to arrive, so it stays queued for good:
+ * offered at launch, handed to a helper that skips it, offered again next time.
+ * Three restarts of that is what a device looked like with three of these left.
+ *
+ * Both kinds below are already refused on the publish side, and the missing
+ * mirror of that refusal is the whole defect. A workspaceStorage directory with
+ * no folder URI belongs to a window that had nothing open; it is named after the
+ * millisecond that window opened, or `empty-window`, so it names a window here
+ * and nothing whatsoever anywhere else. A composer whose ID is not a chat ID is
+ * Cursor's own scratch row - every installation has `empty-state-draft` - and
+ * `parsePortableChatSnapshot` rejects it on apply regardless.
+ *
+ * Measured against this repository before it was written: 8 of 1237
+ * workspaceStorage resources and 1 of 513 chats, which is exactly the set that
+ * would not drain and nothing else.
+ */
+export function isUnscannableIncomingResource(
+  resourceId: string,
+  kind: ResourceKind,
+  metadata: ResourceTip["metadata"],
+): boolean {
+  if (kind === "workspace-storage") {
+    return typeof metadata?.workspaceUri !== "string";
+  }
+  if (kind !== "chat") {
+    return false;
+  }
+  const prefix = "chat/";
+  if (!resourceId.startsWith(prefix)) {
+    return false;
+  }
+  let composerId: string;
+  try {
+    composerId = decodeURIComponent(resourceId.slice(prefix.length));
+  } catch {
+    // Not decodable is not evidence of anything; leave it to the normal path.
+    return false;
+  }
+  return !isSyncableComposerId(composerId);
+}
+
+/**
  * True for an inbound ui-state resource this build declines to synchronize.
  *
  * Read from the resource ID rather than the tip metadata: the ID is what the
@@ -3925,7 +3982,10 @@ function queuePending(
   blockedReason?: string,
 ): void {
   const tip = projection.tip;
-  if (isPolicyExcludedUiStateResource(projection.resourceId, tip.kind)) {
+  if (
+    isPolicyExcludedUiStateResource(projection.resourceId, tip.kind) ||
+    isUnscannableIncomingResource(projection.resourceId, tip.kind, tip.metadata)
+  ) {
     // Never hand the helper a change it is only going to skip. Any entry an
     // earlier run of this build already queued is dropped here too, so an
     // existing repository stops asking for a restart that would do nothing.
@@ -3990,6 +4050,11 @@ function pendingHelperChanges(repository: SyncRepository): HelperChange[] {
       }
       const tip = findTip(repository, pending.eventHash, pending.changeIndex);
       if (tip === undefined) {
+        continue;
+      }
+      if (
+        isUnscannableIncomingResource(pending.resourceId, tip.kind, tip.metadata)
+      ) {
         continue;
       }
       const payloadBytes = tip.payload?.plainBytes ?? 0;

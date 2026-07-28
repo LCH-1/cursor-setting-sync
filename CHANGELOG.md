@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.26] - 2026-07-28
+
+### Fixed
+
+- Three changes that no number of applies could drain, offered again on every launch. Leaving the queue is observational: an entry goes when a later scan finds the value already local, and nothing is dequeued on the helper's word - that the helper wrote a row is not evidence Cursor kept it. The cost is that a resource this device's own scan never emits can never be seen to arrive. Both kinds that hit it were already refused on the way out and had no matching refusal on the way in: workspaceStorage from a window with no folder open, whose directory is named after the millisecond that window opened, and `empty-state-draft`, the non-UUID composer row every Cursor installation keeps. Both devices publish their own copy, the copies conflict, and neither side can ever apply the other's. They are now dropped from the queue on arrival rather than deferred, so nothing asks about them again. Measured against this repository: 8 of 1237 workspaceStorage resources and 1 of 513 chats - exactly the set that would not drain.
+
+### Changed
+
+- The launch offer counts what the command would actually apply, not what is merely unblocked. A queue made entirely of entries that are dropped on arrival, or that fall outside the batch, raised a dialog about work that did not exist - once for real, seconds before those entries were dropped.
+
 ## [0.0.25] - 2026-07-28
 
 ### Fixed
