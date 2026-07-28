@@ -299,7 +299,24 @@ export interface ResourceDeletion {
 export interface ResourceScanResult {
   snapshots: ResourceSnapshot[];
   deletions: ResourceDeletion[];
+  /**
+   * Something did not reach the repository that was meant to. These become
+   * standing warnings and turn the status item amber.
+   */
   warnings: string[];
+  /**
+   * Something was left out on purpose, and saying so is the only way the user
+   * finds out. A workspace excluded by a setting, a settings key the built-in
+   * machine-scoped list took over, a conversation whose body Cursor pruned:
+   * the scan is behaving exactly as configured, and it re-derives the same
+   * notice on every single run.
+   *
+   * Kept apart from {@link warnings} because sharing that channel meant a
+   * device that had merely been configured sat permanently at "Partial - some
+   * resources were not saved to the repository", which was not true of any of
+   * them. Logged and listed in diagnostics; never promoted, never amber.
+   */
+  notices?: string[];
 }
 
 export interface MergeOutcome {
@@ -392,6 +409,8 @@ export interface DiagnosticSnapshot {
   /** The adapters currently constructed; absent kinds are not synchronizing. */
   adapters: string[];
   standingWarnings: DiagnosticStandingWarning[];
+  /** Deliberate exclusions. Reported, never counted; see ResourceScanResult.notices. */
+  deliberateExclusions?: DiagnosticStandingWarning[];
   lastSyncAt: string | null;
   lastError: string | null;
   repositoryBytes?: number;

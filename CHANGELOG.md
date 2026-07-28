@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.27] - 2026-07-28
+
+### Fixed
+
+- A configured device sat permanently at **Partial - some resources were not saved to the repository** for doing exactly what it was configured to do. Local workspaces excluded by `syncLocalWorkspaces`, storage from windows with no folder open, settings keys the built-in machine-scoped list took over, and conversations whose body Cursor pruned all travelled on the same channel as a genuine failure to save, and the scan re-derives every one of them on every run - so the amber never cleared and the sentence describing it was untrue of all four. Deliberate exclusions now have their own channel: still logged, still listed in diagnostics under `deliberateExclusions`, never counted and never amber. What remains amber is what the words say - on this repository, one workspaceStorage database whose SQLite index is corrupt and which therefore genuinely is not being backed up.
+
 ## [0.0.26] - 2026-07-28
 
 ### Fixed

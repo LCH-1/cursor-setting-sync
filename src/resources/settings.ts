@@ -106,6 +106,7 @@ export class SettingsAdapter implements ResourceAdapter {
   async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
     const snapshots: ResourceSnapshot[] = [];
     const warnings: string[] = [];
+    const notices: string[] = [];
     const current = new Set<string>();
     const scannedProfiles = new Set<string>();
     const nativeIgnoredByProfile = new Map<string, IgnoreMatcher>();
@@ -184,7 +185,7 @@ export class SettingsAdapter implements ResourceAdapter {
     // stable, so StandingWarningRegistry logs it once and then only on its
     // reminder interval, and Show Diagnostics lists it under this adapter.
     if (silencedByDefaults.size > 0) {
-      warnings.push(
+      notices.push(
         `Built-in machine-specific defaults now exclude settings keys this device had already synchronized: ${[
           ...silencedByDefaults,
         ]
@@ -204,6 +205,7 @@ export class SettingsAdapter implements ResourceAdapter {
       snapshots,
       deletions: findDeletions(known, current, scannedProfiles, isIgnoredKey),
       warnings,
+      notices,
     };
   }
 

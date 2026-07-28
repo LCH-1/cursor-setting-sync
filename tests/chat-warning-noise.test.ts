@@ -43,7 +43,8 @@ describe("chat headers whose conversation body was pruned", () => {
       knownChats(COMPOSER_A),
     );
 
-    expect(result.warnings).toEqual([bodyless(1, COMPOSER_A)]);
+    expect(result.notices).toEqual([bodyless(1, COMPOSER_A)]);
+    expect(result.warnings).toEqual([]);
     expect(result.snapshots).toEqual([]);
     expect(result.deletions).toEqual([]);
   });
@@ -58,9 +59,10 @@ describe("chat headers whose conversation body was pruned", () => {
       knownChats(COMPOSER_A, COMPOSER_B),
     );
 
-    expect(result.warnings).toEqual([
+    expect(result.notices).toEqual([
       bodyless(2, `${COMPOSER_A}, ${COMPOSER_B}`),
     ]);
+    expect(result.warnings).toEqual([]);
     expect(result.deletions).toEqual([]);
   });
 
@@ -78,9 +80,10 @@ describe("chat headers whose conversation body was pruned", () => {
       knownChats(...composerIds),
     );
 
-    expect(result.warnings).toEqual([
+    expect(result.notices).toEqual([
       bodyless(7, composerIds.slice(0, 5).join(", "), 2),
     ]);
+    expect(result.warnings).toEqual([]);
   });
 
   it("keeps the per-chat warning for a genuinely broken row alongside the aggregate", async () => {
@@ -96,10 +99,13 @@ describe("chat headers whose conversation body was pruned", () => {
       knownChats(COMPOSER_A, COMPOSER_B, COMPOSER_C),
     );
 
+    // A broken row is a warning; a pruned body is not. They are reported on
+    // separate channels precisely so one cannot make the other look like a
+    // failure to save.
     expect(result.warnings).toEqual([
       `Skipped chat ${COMPOSER_A}: cursorDiskKV key composerData:${COMPOSER_A} has an unsupported SQLite storage class: real.`,
-      bodyless(1, COMPOSER_B),
     ]);
+    expect(result.notices).toEqual([bodyless(1, COMPOSER_B)]);
     expect(result.snapshots.map((item) => item.resourceId)).toEqual([
       `chat/${COMPOSER_C}`,
     ]);

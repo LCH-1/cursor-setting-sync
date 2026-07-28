@@ -251,14 +251,14 @@ async function executeRequest(
     );
   }
 
-  const exportWarnings = await exportFinalChanges(request, repository);
+  const exported = await exportFinalChanges(request, repository);
   // Everything that means a resource did NOT reach the repository: a git
   // transport failure, an adapter that threw during the shutdown scan, or a
   // snapshot dropped for exceeding the payload limit. These are reported apart
   // from the routine `skipped` entries so the extension host can raise a
   // standing warning for them without also flagging every deliberately
   // retained tombstone and every superseded change.
-  const warnings = [...gitWarnings, ...exportWarnings];
+  const warnings = [...gitWarnings, ...exported.warnings];
   if (request.mode === "final-export") {
     await finishGitTransport(
       gitActive,
@@ -266,7 +266,14 @@ async function executeRequest(
       `shutdown export (${repository.state.device.deviceId.slice(0, 8)})`,
       warnings,
     );
-    return successResult(request, [], [...warnings], null, [], warnings);
+    return successResult(
+      request,
+      [],
+      [...warnings, ...exported.notices],
+      null,
+      [],
+      warnings,
+    );
   }
   const ensureExclusiveAccess = async (): Promise<void> => {
     if (!(await noOtherCursorProcesses(request))) {
@@ -348,7 +355,7 @@ async function executeRequest(
   return successResult(
     request,
     applied,
-    [...warnings, ...skipped],
+    [...warnings, ...skipped, ...exported.notices],
     backupPath,
     collected.backups,
     warnings,
@@ -399,7 +406,7 @@ async function finishGitTransport(
 async function exportFinalChanges(
   request: HelperRequest,
   repository: SyncRepository,
-): Promise<string[]> {
+): Promise<{ warnings: string[]; notices: string[] }> {
   const reconciler = new EventReconciler();
   const preResult = reconciler.reconcile(
     await repository.listEvents(),
@@ -464,6 +471,11 @@ async function exportFinalChanges(
   const snapshots: ResourceSnapshot[] = [];
   const deletions: ResourceDeletion[] = [];
   const warnings: string[] = [];
+  // Deliberate exclusions, kept out of `warnings` so a device that has merely
+  // been configured does not sit permanently at "Partial - some resources were
+  // not saved to the repository". They are re-derived on every run and none of
+  // them is a failure.
+  const notices: string[] = [];
   for (const adapter of adapters) {
     let result: ResourceScanResult;
     try {
@@ -476,6 +488,7 @@ async function exportFinalChanges(
       continue;
     }
     warnings.push(...result.warnings);
+    notices.push(...(result.notices ?? []));
     snapshots.push(
       ...result.snapshots.filter(
         (snapshot) => {
@@ -582,7 +595,7 @@ async function exportFinalChanges(
   }
   await repository.saveState();
   await repository.writeAck();
-  return warnings;
+  return { warnings, notices };
 }
 
 async function resolveWorkspaceStorageMappings(

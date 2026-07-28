@@ -219,6 +219,17 @@ export class SyncManager implements vscode.Disposable {
   private readonly gitWarningsShown = new Set<GitErrorKind>();
   private readonly warnings = new StandingWarningRegistry();
   /**
+   * Deliberate exclusions, kept in their own registry.
+   *
+   * Sharing the one above meant `standingFor` counted them, `settledStatus`
+   * turned amber on them, and a device that had done nothing but accept the
+   * defaults read "Partial - some resources were not saved to the repository"
+   * on every cycle for as long as it stayed configured that way. The user still
+   * has to be able to find out why a workspace or a settings key stopped
+   * travelling, so they are logged and listed - just never counted.
+   */
+  private readonly notices = new StandingWarningRegistry();
+  /**
    * Resource id -> epoch ms of the last time this device republished its own
    * tip while that resource was in an unresolved conflict. See
    * {@link throttleConflictedRepublish}. Deliberately in memory only: the loop
@@ -1302,6 +1313,14 @@ export class SyncManager implements vscode.Disposable {
         this.warnings.standing(),
         Date.now(),
       ),
+      // Listed separately, and named for what they are. These are the things
+      // this device is deliberately not synchronizing; the answer to "why did
+      // that stop travelling" lives here rather than under a heading that calls
+      // it a warning.
+      deliberateExclusions: standingWarningDiagnostics(
+        this.notices.standing(),
+        Date.now(),
+      ),
       lastSyncAt: repository?.state.lastSyncAt ?? null,
       lastError: repository?.state.lastError ?? null,
       ...(repository === null
@@ -1960,6 +1979,17 @@ export class SyncManager implements vscode.Disposable {
       ]);
       for (const entry of this.warnings.observe({
         sources: observed,
+        now: Date.now(),
+        force: manual,
+      })) {
+        this.status.log(formatWarningLine(entry));
+      }
+      // Logged through the same registry, so they are deduplicated the same way
+      // and do not repeat every thirty seconds - but kept out of `observed`, so
+      // nothing here can make the status item amber. A notice is the scan doing
+      // what it was configured to do.
+      for (const entry of this.notices.observe({
+        sources: scan.noticesBySource,
         now: Date.now(),
         force: manual,
       })) {
@@ -3279,6 +3309,12 @@ export interface LocalScanResult {
    * relies on that distinction to leave an unrun adapter's bucket alone.
    */
   warningsBySource: Map<string, string[]>;
+  /**
+   * Deliberate exclusions, keyed the same way. Logged so the user can find out
+   * why something stopped travelling, but never promoted to a standing warning:
+   * the scan re-derives them every cycle and none of them is a failure.
+   */
+  noticesBySource: Map<string, string[]>;
 }
 
 export async function scanAdapters(
@@ -3290,6 +3326,7 @@ export async function scanAdapters(
   const snapshots: ResourceSnapshot[] = [];
   const deletions: ResourceDeletion[] = [];
   const warningsBySource = new Map<string, string[]>();
+  const noticesBySource = new Map<string, string[]>();
   for (const adapter of adapters.filter((candidate) =>
     shouldScanAdapter(candidate, scope, requiredKinds),
   )) {
@@ -3300,6 +3337,7 @@ export async function scanAdapters(
       snapshots.push(...result.snapshots);
       deletions.push(...result.deletions);
       warningsBySource.set(adapter.id, [...result.warnings]);
+      noticesBySource.set(adapter.id, [...(result.notices ?? [])]);
     } catch (error) {
       warningsBySource.set(adapter.id, [
         `Adapter ${adapter.id} scan failed: ${
@@ -3308,7 +3346,7 @@ export async function scanAdapters(
       ]);
     }
   }
-  return { snapshots, deletions, warningsBySource };
+  return { snapshots, deletions, warningsBySource, noticesBySource };
 }
 
 /**

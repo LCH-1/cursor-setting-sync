@@ -152,6 +152,8 @@ describe("chat scan over NULL SQLite values", () => {
     expect(result.deletions).toEqual([]);
     expect(result.warnings).toEqual([
       `Skipped chat ${COMPOSER_A}: cursorDiskKV key composerData:${COMPOSER_A} has an unsupported SQLite storage class: real.`,
+    ]);
+    expect(result.notices).toEqual([
       `Skipped 1 chat(s) whose conversation body is not in the database: ${COMPOSER_C}. Expected when Cursor prunes a conversation and keeps its list entry; if you still expect one of these chats, its body was lost locally.`,
     ]);
   });

@@ -215,8 +215,9 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
       }
     }
 
+    const notices: string[] = [];
     if (folderless.size > 0) {
-      warnings.push(
+      notices.push(
         `${folderless.size} workspaceStorage director(ies) belong to windows with no folder open and are no longer backed up: ${[
           ...folderless,
         ]
@@ -226,7 +227,7 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
       );
     }
     if (silenced.size > 0) {
-      warnings.push(
+      notices.push(
         `${silenced.size} workspace(s) this device had already backed up are now excluded from workspaceStorage sync: ${[
           ...silenced,
         ]
@@ -235,7 +236,7 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
           .join(", ")}. Their existing backups stay in the repository; set cursorSettingSync.syncLocalWorkspaces to true, or narrow cursorSettingSync.ignoredWorkspaces, to keep backing them up.`,
       );
     }
-    return { snapshots, deletions: [], warnings };
+    return { snapshots, deletions: [], warnings, notices };
   }
 
   async apply(_input: ResourceApplyInput): Promise<void> {

@@ -100,6 +100,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
     const database = openDatabase(this.paths.globalDatabase, { readOnly: true });
     const snapshots: ResourceSnapshot[] = [];
     const warnings: string[] = [];
+    const notices: string[] = [];
     const current = new Set<string>();
     const bodyless: string[] = [];
     let identityUnknown = false;
@@ -234,7 +235,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         });
       }
       if (bodyless.length > 0) {
-        warnings.push(bodylessChatsWarning(bodyless));
+        notices.push(bodylessChatsWarning(bodyless));
       }
     } finally {
       database.close();
@@ -244,6 +245,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
       snapshots,
       deletions: identityUnknown ? [] : findChatDeletions(known, current),
       warnings,
+      notices,
     };
   }
 

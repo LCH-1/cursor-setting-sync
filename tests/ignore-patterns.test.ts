@@ -235,7 +235,11 @@ describe("settings keys the built-in defaults took over", () => {
       createSettingsIgnoreMatcher([...DEFAULT_IGNORED_SETTINGS]),
       createSettingsIgnoreMatcher([...DEFAULT_IGNORED_SETTINGS]),
     );
-    return (await adapter.scan(known)).warnings;
+    const result = await adapter.scan(known);
+    // A key the built-in defaults took over is a deliberate exclusion, not a
+    // failure to save it.
+    expect(result.warnings).toEqual([]);
+    return result.notices ?? [];
   }
 
   it("names every previously synchronized key an upgrade newly excluded", async () => {
