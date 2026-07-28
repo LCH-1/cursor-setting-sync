@@ -323,9 +323,15 @@ describeWithSqlite("workspaceStorage database snapshot", () => {
     source.exec("PRAGMA wal_autocheckpoint=0");
     source.exec("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)");
     source.exec("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)");
+    const insertItem = source.prepare(
+      "INSERT INTO ItemTable(key, value) VALUES (?, ?)",
+    );
+    insertItem.run("notepadData", "notepad-value");
+    // Machine chrome: must stay on this machine, so it must not be captured.
+    insertItem.run("workbench.panel.hidden", "false");
     source
-      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
-      .run("workspace-key", "workspace-value");
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run("kv-key", "kv-value");
 
     let result;
     try {
@@ -350,13 +356,23 @@ describeWithSqlite("workspaceStorage database snapshot", () => {
       snapshot?.content ?? Buffer.alloc(0),
     );
     expect(captured.workspaceId).toBe("workspace-a");
+    const itemRows = captured.tables.find(
+      (table) => table.name === "ItemTable",
+    )?.rows;
+    expect(itemRows?.find((row) => row.key === "notepadData")).toEqual({
+      key: "notepadData",
+      values: [{ type: "text", value: "notepad-value" }],
+    });
+    expect(
+      itemRows?.find((row) => row.key === "workbench.panel.hidden"),
+    ).toBeUndefined();
     expect(
       captured.tables
-        .find((table) => table.name === "ItemTable")
-        ?.rows.find((row) => row.key === "workspace-key"),
+        .find((table) => table.name === "cursorDiskKV")
+        ?.rows.find((row) => row.key === "kv-key"),
     ).toEqual({
-      key: "workspace-key",
-      values: [{ type: "text", value: "workspace-value" }],
+      key: "kv-key",
+      values: [{ type: "text", value: "kv-value" }],
     });
     expect(snapshot?.content.subarray(0, 15).toString("utf8")).not.toContain(
       "SQLite format 3",
@@ -513,15 +529,22 @@ describeWithSqliteBackup("workspaceStorage database merge", () => {
     );
     await createWorkspaceDatabase(targetPath, "local");
     const existingConnection = new sqlite.DatabaseSync(targetPath);
-    existingConnection
-      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
-      .run("local-only", "preserved");
+    const insertLocal = existingConnection.prepare(
+      "INSERT INTO ItemTable(key, value) VALUES (?, ?)",
+    );
+    insertLocal.run("notepadData", "local");
+    insertLocal.run("local-only", "preserved");
     const incomingPath = join(fixture.paths.extensionStorage, "incoming.vscdb");
     await createWorkspaceDatabase(incomingPath, "remote");
     const incomingDatabase = new sqlite.DatabaseSync(incomingPath);
+    const insertIncoming = incomingDatabase.prepare(
+      "INSERT INTO ItemTable(key, value) VALUES (?, ?)",
+    );
+    insertIncoming.run("notepadData", "remote");
+    insertIncoming.run("interactive.sessions", "added");
     incomingDatabase
-      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
-      .run("remote-only", "added");
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run("kv-remote", "added");
     incomingDatabase.close();
     const incoming = serializeWorkspaceDatabaseSnapshot(
       captureWorkspaceDatabaseSnapshot(incomingPath, {
@@ -534,14 +557,25 @@ describeWithSqliteBackup("workspaceStorage database merge", () => {
     ]);
 
     expect(result.applied).toEqual([workspaceStorageResourceId(relativePath)]);
-    expect(readWorkspaceDatabaseItem(existingConnection, "workspace-key")).toBe(
+    // Portable rows travel: an update, an insert, and a cursorDiskKV row.
+    expect(readWorkspaceDatabaseItem(existingConnection, "notepadData")).toBe(
       "remote",
+    );
+    expect(
+      readWorkspaceDatabaseItem(existingConnection, "interactive.sessions"),
+    ).toBe("added");
+    expect(
+      (existingConnection
+        .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
+        .get("kv-remote") as { value?: string } | undefined)?.value ?? null,
+    ).toBe("added");
+    // Non-portable rows do not: the incoming side's copy of workspace-key is
+    // machine chrome now, so the local value survives the apply.
+    expect(readWorkspaceDatabaseItem(existingConnection, "workspace-key")).toBe(
+      "local",
     );
     expect(readWorkspaceDatabaseItem(existingConnection, "local-only")).toBe(
       "preserved",
-    );
-    expect(readWorkspaceDatabaseItem(existingConnection, "remote-only")).toBe(
-      "added",
     );
     existingConnection.close();
     expect(result.backupPaths).toHaveLength(1);
@@ -622,7 +656,9 @@ describeWithSqliteBackup("workspaceStorage database merge", () => {
         | undefined;
       expect(header?.workspaceId).toBe("workspace-a");
       expect(header?.value).toBe("{}");
-      expect(readWorkspaceDatabaseItem(target, "workspace-key")).toBe("remote");
+      // workspace-key is not a portable ItemTable row, so the incoming copy is
+      // dropped and the local value stays.
+      expect(readWorkspaceDatabaseItem(target, "workspace-key")).toBe("local");
     } finally {
       target.close();
     }

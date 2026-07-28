@@ -312,6 +312,9 @@ describe("UI state key policy", () => {
     for (const key of [
       "workbench.auxiliarybar.pinnedPanels",
       "workbench.panel.composerChatViewPane.fe374843-0376-48d0-bbc4-948b7a99c55b.hidden",
+      // Rewritten by Cursor every 15-30 seconds while it runs; syncing it
+      // published an event on virtually every poll.
+      "src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser",
     ]) {
       expect(isPolicyExcludedUiStateKey(key)).toBe(true);
       expect(isSecurityDeniedUiStateKey(key)).toBe(false);

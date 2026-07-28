@@ -2,6 +2,17 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.31] - 2026-07-29
+
+### Changed
+
+- Workspace state.vscdb synchronization carries content, not this machine's UI. A survey of every Remote-SSH workspace database on a real profile found ~160 distinct ItemTable keys, and all but a handful were per-machine workbench state - layout mementos, open-tab lists, view sizes, search history, extension scratch, cmd-K usage logs - rows both computers rewrite continuously whenever they have the same workspace open. Two machines quitting around the same time forked those rows into a conflict no row-level merge can resolve, and the manual resolver's whole-tip answer threw one side's layout away for nothing. ItemTable is now restricted to an allowlist of portable rows (`notepadData`, `notepad.reactiveStorageId`, `interactive.sessions`, `debug.breakpoint`); `cursorDiskKV` and `composerHeaders` still travel whole, because Cursor uses them for conversation-class data. The filter is symmetric - scan, helper apply, and conflict merge - so chrome in events published by earlier versions is skipped on write and cannot make a filtered snapshot read as having deleted it, which would have turned the transition itself into a conflict. Each machine's UI state stays its own; the helper's physical pre-write backups still copy whole database files, so local restore coverage is unchanged. Chats are unaffected - they live in the global database and merge per conversation.
+
+### Fixed
+
+- Cursor's reactive-storage blob (`src.vs.platform.reactivestorage...persistentStorage.applicationUser`) is policy-excluded from ui-state sync. Cursor registers it as a roaming key, but it is a ~360 KiB JSON document the app rewrites continuously while it runs - measured on this repository at a new event every 15-30 seconds for six hours straight on an otherwise idle machine, over 1,100 events in one evening. A value both machines rewrite nonstop can never converge; it only churns the repository and elects arbitrary last-writer winners. Policy exclusion, not a security denial: events already published for it are skipped harmlessly, never fatal, and no deletion is published for it.
+- A workspace kept open on two computers no longer republishes its storage snapshot on every cycle: the published bytes were changing whenever the workbench touched a chrome row, and now they only change when portable content does.
+
 ## [0.0.30] - 2026-07-28
 
 A full-code inspection pass: seven reviewers over every subsystem, each finding adversarially re-verified against the code before being accepted. 34 confirmed defects fixed.

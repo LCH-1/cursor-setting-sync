@@ -348,9 +348,11 @@ describeWithBackup("non-global resource apply with backups", () => {
     );
     await createWorkspaceDatabase(targetPath, "local-key", "kept");
 
+    // Portable ItemTable keys: chrome would be filtered before the write, and
+    // this test needs each apply to leave a visible row behind.
     const result = await applyNonGlobalChanges(fixture.request, [
-      await workspaceDatabaseChange(fixture, "remote-a", "remote-a-key"),
-      await workspaceDatabaseChange(fixture, "remote-b", "remote-b-key"),
+      await workspaceDatabaseChange(fixture, "remote-a", "notepadData"),
+      await workspaceDatabaseChange(fixture, "remote-b", "interactive.sessions"),
     ]);
 
     expect(result.applied).toEqual([
@@ -365,8 +367,8 @@ describeWithBackup("non-global resource apply with backups", () => {
       await expect(stat(backupPath)).resolves.toBeDefined();
     }
     expect(readItemTableValue(targetPath, "local-key")).toBe("kept");
-    expect(readItemTableValue(targetPath, "remote-a-key")).toBe("value");
-    expect(readItemTableValue(targetPath, "remote-b-key")).toBe("value");
+    expect(readItemTableValue(targetPath, "notepadData")).toBe("value");
+    expect(readItemTableValue(targetPath, "interactive.sessions")).toBe("value");
   });
 
   it("registers earlier backups with the caller before a mid-batch abort", async () => {

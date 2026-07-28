@@ -204,7 +204,9 @@ describeBuilt("a second computer joining and merging", () => {
       join(paths.workspaceStorageRoot, WORKSPACE_B, "state.vscdb"),
     );
     expect(merged["only-on-this-computer"]).toBe("kept");
-    expect(merged["only-on-the-other-computer"]).toBe("remote");
+    expect(merged["notepadData"]).toBe("remote");
+    // The other computer's chrome row is not written here.
+    expect(merged["only-on-the-other-computer"]).toBeUndefined();
     expect(existsSync(join(paths.workspaceStorageRoot, WORKSPACE_A))).toBe(false);
     // The local `file://` workspace is not carried between computers by default.
     expect(
@@ -418,9 +420,12 @@ function workspaceStorageSnapshot(
   database.exec(
     "CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
   );
-  database
-    .prepare("INSERT INTO ItemTable (key, value) VALUES (?, ?)")
-    .run("only-on-the-other-computer", marker);
+  const insert = database.prepare(
+    "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+  );
+  // One portable row that must arrive, one chrome row that must not.
+  insert.run("notepadData", marker);
+  insert.run("only-on-the-other-computer", marker);
   database.close();
   const content = serializeWorkspaceDatabaseSnapshot(
     captureWorkspaceDatabaseSnapshot(path, { workspaceId }).snapshot,

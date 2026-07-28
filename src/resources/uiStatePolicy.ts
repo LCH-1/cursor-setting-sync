@@ -50,6 +50,15 @@ const POLICY_EXCLUDED_KEY_PATTERNS = [
   // opened. Merging it converges, but the merged array is the union of both
   // machines' dead panels and nothing ever shrinks it again.
   /^workbench\.auxiliarybar\.pinnedPanels$/,
+  // Cursor's reactive-storage service persists its application state as one
+  // ~360 KiB JSON blob that the app rewrites continuously while it runs -
+  // measured at a new version every 15-30 seconds for six hours straight on an
+  // otherwise idle machine, which as a synced key meant an event published on
+  // virtually every poll, ~185 an hour, around the clock. Cursor registers the
+  // key as USER-target, but a value both machines rewrite nonstop can never
+  // converge between them; it only churns the repository and elects arbitrary
+  // last writers.
+  /^src\.vs\.platform\.reactivestorage\./,
 ];
 
 /** A key whose arrival is a protocol violation; see the pattern list. */

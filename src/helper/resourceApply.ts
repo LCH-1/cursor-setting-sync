@@ -45,6 +45,7 @@ import {
   applyWorkspaceDatabaseSnapshot,
   parseWorkspaceDatabaseSnapshot,
 } from "./workspaceDatabaseMerge";
+import { filterPortableWorkspaceRows } from "../resources/workspaceStatePolicy";
 
 const execFileAsync = promisify(execFile);
 
@@ -335,10 +336,15 @@ async function mergeWorkspaceStateDatabase(
   registerBackup: (backup: HelperBackup) => void,
   exemptBackupPaths: () => readonly string[] = () => [],
 ): Promise<void> {
-  const incoming = parseWorkspaceDatabaseSnapshot(content);
-  if (incoming.workspaceId !== sourceWorkspaceId) {
+  const parsed = parseWorkspaceDatabaseSnapshot(content);
+  if (parsed.workspaceId !== sourceWorkspaceId) {
     throw new Error("Workspace database payload does not match its workspace metadata.");
   }
+  // Events published before the portable-rows policy carry machine chrome from
+  // the other computer; writing it would overwrite this machine's live layout
+  // with rows the scan no longer even publishes back. Skipped, not fatal - the
+  // events are immutable and this extension wrote them.
+  const incoming = filterPortableWorkspaceRows(parsed);
   const backupRoot = join(request.storageRoot, "backups");
   await ensureDirectory(backupRoot);
   // The resource digest keeps names unique when two remote workspaces resolve

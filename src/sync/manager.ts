@@ -112,6 +112,7 @@ import {
   isIgnoredWorkspaceUri,
   isWorkspaceStateDatabasePath,
 } from "../resources/workspaceStorage";
+import { filterPortableWorkspaceRows } from "../resources/workspaceStatePolicy";
 import {
   createIgnoreMatcher,
   type IgnoreMatcher,
@@ -4786,10 +4787,14 @@ function mergeWorkspaceDatabaseBuffers(
   remote: Buffer,
 ): MergeOutcome {
   try {
+    // All three sides drop non-portable rows before the walk. A base or tip an
+    // older build published still carries machine chrome, and against a
+    // filtered tip every such row would read as a deletion - one side changing
+    // it becomes a concurrent-delete conflict this merge exists to avoid.
     const merged = mergeWorkspaceDatabaseSnapshots(
-      parseWorkspaceDatabaseSnapshot(base),
-      parseWorkspaceDatabaseSnapshot(local),
-      parseWorkspaceDatabaseSnapshot(remote),
+      filterPortableWorkspaceRows(parseWorkspaceDatabaseSnapshot(base)),
+      filterPortableWorkspaceRows(parseWorkspaceDatabaseSnapshot(local)),
+      filterPortableWorkspaceRows(parseWorkspaceDatabaseSnapshot(remote)),
     );
     if (merged.status !== "merged" || merged.snapshot === undefined) {
       return { status: "conflict" };

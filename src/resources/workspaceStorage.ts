@@ -22,6 +22,7 @@ import {
   captureWorkspaceDatabaseSnapshot,
   serializeWorkspaceDatabaseSnapshot,
 } from "../helper/workspaceDatabaseMerge";
+import { filterPortableWorkspaceRows } from "./workspaceStatePolicy";
 
 interface WorkspaceStorageCandidate {
   actualWorkspaceId: string;
@@ -442,7 +443,12 @@ async function snapshotWorkspaceDatabase(
         ? {}
         : { limits: { maxPlainBytes: maxPayloadBytes } }),
     });
-    const content = serializeWorkspaceDatabaseSnapshot(captured.snapshot);
+    // Machine-local UI rows stay on this machine; see workspaceStatePolicy.
+    // Filtering before serializing also keeps the published bytes stable while
+    // Cursor churns chrome rows, so an open workspace stops republishing.
+    const content = serializeWorkspaceDatabaseSnapshot(
+      filterPortableWorkspaceRows(captured.snapshot),
+    );
     // The capture limit counts DECODED bytes, but the payload is base64 inside
     // JSON — roughly 4/3 of the blobs plus structure. A database that passed
     // capture can therefore still be far above the publish limit, and letting

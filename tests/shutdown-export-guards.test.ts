@@ -164,9 +164,11 @@ describeWithSqlite("workspaceStorage capture-side payload cap", () => {
     database.exec("CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)");
     // 60 KiB of blob decodes to 60 KiB but serializes to ~80 KiB of base64
     // inside JSON, so it passes a 64 KiB decoded-bytes cap and fails the real
-    // one. That gap is exactly what used to reach `publish` and throw.
+    // one. That gap is exactly what used to reach `publish` and throw. It
+    // lives in cursorDiskKV because ItemTable rows outside the portable
+    // allowlist no longer reach the serialized snapshot at all.
     database
-      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
       .run("blob", Buffer.alloc(60 * 1024, 7));
     database.close();
 
