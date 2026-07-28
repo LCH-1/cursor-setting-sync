@@ -89,6 +89,30 @@ describe("shutdown export publish guards", () => {
     });
   });
 
+  it("splits by estimated manifest bytes long before the count cap", async () => {
+    // publish hard-fails past MAX_EVENT_FILE_BYTES, and far fewer than ten
+    // thousand changes reach it when each record carries fat metadata - a
+    // batch split only by count aborted the whole cycle exactly there.
+    await withRepository(16 * 1024 * 1024, async (repository) => {
+      const wide = "m".repeat(1024 * 1024);
+      const snapshots = Array.from({ length: 6 }, (_unused, index) => ({
+        ...snapshot(`workspace-storage/wide-${index}`, "workspace-storage", "x"),
+        metadata: { relativePath: `wide-${index}/state.vscdb`, padding: wide },
+      }));
+
+      await expect(repository.publish([...snapshots], [])).rejects.toThrow(
+        /exceeds/i,
+      );
+
+      const published = await publishInBatches(repository, snapshots, []);
+
+      expect(published.size).toBeGreaterThan(1);
+      expect(publishedResourceIds(await repository.listEvents())).toHaveLength(
+        snapshots.length,
+      );
+    });
+  });
+
   it("splits an export larger than MAX_EVENT_CHANGES across events", async () => {
     await withRepository(1024 * 1024, async (repository) => {
       const snapshots = [

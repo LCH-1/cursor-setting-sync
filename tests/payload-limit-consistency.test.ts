@@ -63,6 +63,47 @@ describe("the publish size guard and publish itself", () => {
       await rm(temporaryRoot, { recursive: true, force: true });
     }
   });
+
+  it("keeps history readable for a device whose limit is lower than the publisher's", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-setting-sync-limit-"),
+    );
+    try {
+      const publisher = await SyncRepository.create(
+        join(temporaryRoot, "repository"),
+        join(temporaryRoot, "storage-a"),
+        "a sufficiently long test passphrase",
+        RAISED_LIMIT,
+        producer,
+      );
+      const large = snapshot("chat-store/store.db", 2 * 1024 * 1024);
+      await publisher.publish([large], []);
+
+      // Device B never raised its setting. What A already published is history
+      // now; judging it by B's live limit failed every one of B's cycles with
+      // "Object reference is invalid", and settings sync could not repair it
+      // because settings ride the same wedged event log.
+      const reader = await SyncRepository.open(
+        join(temporaryRoot, "repository"),
+        join(temporaryRoot, "storage-b"),
+        "a sufficiently long test passphrase",
+        SMALL_LIMIT,
+        producer,
+      );
+      const events = await reader.listEvents();
+      const resourceIds = events.flatMap((event) =>
+        event.manifest.changes.map((change) => change.resourceId),
+      );
+      expect(resourceIds).toContain("chat-store/store.db");
+
+      // B's own publishes stay bounded by B's own limit.
+      await expect(
+        reader.publish([snapshot("chat-store/other.db", 2 * 1024 * 1024)], []),
+      ).rejects.toThrow("Payload exceeds configured limit");
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 /** Exactly what performSync does: guard against the repository's own limit. */

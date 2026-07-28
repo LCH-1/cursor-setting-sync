@@ -97,6 +97,7 @@ async function run(): Promise<void> {
 
   let masterKey: Buffer | null = null;
   let request: HelperRequest | null = null;
+  let cursorExitConfirmed = false;
   let finalizerLock: FileLock | null = null;
   const collected: CollectedBackups = { backupPath: null, backups: [] };
   try {
@@ -137,12 +138,26 @@ async function run(): Promise<void> {
       );
       return;
     }
+    cursorExitConfirmed = true;
     const lock = await acquireSyncLock(request.storageRoot, 180_000);
 
     try {
+      // The exit wait finished before the lock wait began, and the lock can
+      // take minutes when a finalizer is mid-export - long enough for the
+      // user to have relaunched Cursor. Every destructive write below
+      // re-checks through this rather than trusting the wait above.
+      const cursorRequest = request;
+      const ensureCursorStillClosed = async (): Promise<void> => {
+        if (!(await noOtherCursorProcesses(cursorRequest))) {
+          throw new CursorReopenedError(
+            "Cursor was reopened before offline changes could be applied. Close Cursor and try again.",
+          );
+        }
+      };
       await recoverInterruptedApplyJournals(
         request.storageRoot,
         request.paths.globalDatabase,
+        ensureCursorStillClosed,
       );
       const result = await executeRequest(request, masterKey, collected, () => {
         lock.refresh();
@@ -169,11 +184,15 @@ async function run(): Promise<void> {
       await writeResult(request, result);
       // When Cursor is already running again, spawning another instance would
       // only multiply windows; restart applies to a fully closed Cursor.
+      // `cursorExitConfirmed` covers every failure thrown before the exit
+      // wait finished - enumerating error classes did not, so a validation
+      // error during the wait relaunched Cursor beside the one still open.
       const cursorStillRunning =
         error instanceof CursorReopenedError ||
         error instanceof CursorExitTimeoutError;
       if (
         request.restart &&
+        cursorExitConfirmed &&
         !cursorStillRunning &&
         (await databaseIsHealthy(request.paths.globalDatabase))
       ) {
@@ -205,7 +224,13 @@ async function executeRequest(
   heartbeat: () => void = () => {},
 ): Promise<HelperResult> {
   const gitWarnings: string[] = [];
-  const gitActive = await beginGitTransport(request, gitWarnings);
+  // A restore reads no events and publishes none, so the network pull is pure
+  // window: up to ten minutes during which Cursor is visibly closed and the
+  // user has every reason to reopen it before the destructive write begins.
+  const gitActive =
+    request.mode === "restore-backup"
+      ? false
+      : await beginGitTransport(request, gitWarnings);
   const repositoryFile = await readJsonFile<RepositoryFile>(
     join(request.repositoryRoot, REPOSITORY_FILE),
   );
@@ -221,6 +246,13 @@ async function executeRequest(
       vscodeVersion: request.expectedVscodeVersion,
     },
   );
+  const ensureExclusiveAccess = async (): Promise<void> => {
+    if (!(await noOtherCursorProcesses(request))) {
+      throw new CursorReopenedError(
+        "Cursor was reopened before offline changes could be applied. Close Cursor and try again.",
+      );
+    }
+  };
 
   if (request.mode === "restore-backup") {
     if (request.backupToRestore === undefined) {
@@ -235,6 +267,11 @@ async function executeRequest(
       request.storageRoot,
       request.requestId,
       restoreContract,
+      // Re-checked immediately before the DELETE+INSERT, not just at the exit
+      // wait: validating a 1.3 GiB backup and capturing the pre-restore
+      // snapshot takes minutes, and a restore committed under a relaunched
+      // Cursor is silently undone by its in-memory write-back at quit.
+      ensureExclusiveAccess,
     );
     collected.backups.push({
       backupPath: preRestoreBackupPath,
@@ -275,13 +312,6 @@ async function executeRequest(
       warnings,
     );
   }
-  const ensureExclusiveAccess = async (): Promise<void> => {
-    if (!(await noOtherCursorProcesses(request))) {
-      throw new CursorReopenedError(
-        "Cursor was reopened before offline changes could be applied. Close Cursor and try again.",
-      );
-    }
-  };
   await ensureExclusiveAccess();
 
   const reconciler = new EventReconciler();
@@ -332,6 +362,10 @@ async function executeRequest(
     ensureExclusiveAccess,
     (backup) => collected.backups.push(backup),
     heartbeat,
+    // The pre-apply global snapshot above must survive every retention pass
+    // the non-global applies run; it is the request's only pre-apply recovery
+    // point for the global database.
+    () => collected.backups.map((backup) => backup.backupPath),
   );
   applied.push(...nonGlobalResult.applied);
   skipped.push(...nonGlobalResult.skipped);

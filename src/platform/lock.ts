@@ -88,6 +88,15 @@ export async function acquireFileLock(path: string): Promise<FileLock | null> {
   if (existing !== null && !(await isLockStale(path, existing))) {
     return null;
   }
+  if (existing === null && !(await isUnreadableFileStale(path))) {
+    // An unreadable lock file is usually another contender caught between its
+    // open("wx") and its writeFile - milliseconds old, very much alive. Taking
+    // it over on unreadability alone stole locks mid-creation and left two
+    // processes both convinced they held one. Age is the tiebreaker: a file
+    // that stays unreadable past the TTL is corrupt, not nascent, and the TTL
+    // is the same self-healing the readable path already applies.
+    return null;
+  }
 
   // Renaming the stale file away is atomic, so exactly one contender takes it
   // over. A plain remove-then-create would let a slow racer delete the lock a
@@ -109,6 +118,14 @@ export async function acquireFileLock(path: string): Promise<FileLock | null> {
   // still the stale lock observed above; otherwise put it back and lose.
   const moved = await readLock(takeoverPath);
   if (!isSameLock(existing, moved)) {
+    await undoTakeover(path, takeoverPath);
+    return null;
+  }
+  if (existing === null && !(await isUnreadableFileStale(takeoverPath))) {
+    // Both reads were null, which isSameLock alone cannot distinguish from
+    // "the writer finished in between and the holder heartbeated it" - the
+    // rename preserves mtime, so re-checking the age of the moved file closes
+    // that window. A fresh mtime means the lock came back to life; restore it.
     await undoTakeover(path, takeoverPath);
     return null;
   }
@@ -232,6 +249,18 @@ async function readLock(path: string): Promise<LockContent | null> {
   } catch (error) {
     if (isMissingPathError(error) || error instanceof SyntaxError) {
       return null;
+    }
+    throw error;
+  }
+}
+
+/** Staleness for a lock whose content cannot be read: age is all there is. */
+async function isUnreadableFileStale(path: string): Promise<boolean> {
+  try {
+    return Date.now() - (await stat(path)).mtimeMs > STALE_LOCK_TTL_MS;
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return true;
     }
     throw error;
   }

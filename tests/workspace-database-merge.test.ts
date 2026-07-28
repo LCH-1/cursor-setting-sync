@@ -136,6 +136,78 @@ describe("portable workspace database snapshots", () => {
 });
 
 describe("workspace database snapshot three-way merge", () => {
+  it("keeps an optional table when one side's schema does not have it at all", () => {
+    // A snapshot from a Cursor whose schema lacks composerHeaders (the reason
+    // the descriptor is required:false) is no opinion about its rows. Read as
+    // "every row deleted", each base-equal local row took the absent side's
+    // nothing and the whole table vanished from the auto-resolved merge.
+    const withHeaders = (value: string): Buffer =>
+      Buffer.from(
+        JSON.stringify({
+          format: "cursor-setting-sync.workspace-database",
+          version: 1,
+          workspaceId: "workspace-a",
+          sqliteUserVersion: 0,
+          tables: [
+            {
+              name: "ItemTable",
+              keyColumn: "key",
+              columns: ["value"],
+              rows: [],
+            },
+            {
+              name: "cursorDiskKV",
+              keyColumn: "key",
+              columns: ["value"],
+              rows: [],
+            },
+            {
+              name: "composerHeaders",
+              keyColumn: "composerId",
+              columns: [
+                "workspaceId",
+                "createdAt",
+                "lastUpdatedAt",
+                "isArchived",
+                "isSubagent",
+                "recency",
+                "checkpointAt",
+                "value",
+              ],
+              rows: [
+                {
+                  key: "composer-1",
+                  values: [
+                    { type: "text", value: "workspace-a" },
+                    { type: "integer", value: "1" },
+                    { type: "integer", value: "2" },
+                    { type: "integer", value: "0" },
+                    { type: "integer", value: "0" },
+                    { type: "integer", value: "0" },
+                    { type: "null" },
+                    { type: "text", value },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+        "utf8",
+      );
+    const base = parseWorkspaceDatabaseSnapshot(withHeaders("kept"));
+    const local = parseWorkspaceDatabaseSnapshot(withHeaders("kept"));
+    // The other device's Cursor has no composerHeaders table to export.
+    const remote = makeSnapshot("workspace-a", {});
+
+    const result = mergeWorkspaceDatabaseSnapshots(base, local, remote);
+
+    expect(result.status).toBe("merged");
+    const headers = result.snapshot?.tables.find(
+      (candidate) => candidate.name === "composerHeaders",
+    );
+    expect(headers?.rows).toHaveLength(1);
+  });
+
   it("merges independent updates and a one-sided deletion", () => {
     const base = makeSnapshot("workspace-a", {
       ItemTable: {

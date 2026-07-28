@@ -79,6 +79,18 @@ describe("shared ignore patterns", () => {
     expect(matcher.matches("rules/secret.md")).toBe(false);
   });
 
+  it("matches zero directories for a leading double star", () => {
+    // gitignore and VS Code globs both read "**/x" as "x at any depth,
+    // including the top level"; compiled naively it became "anything, then a
+    // separator", which never matched the top-level file the user meant.
+    const matcher = createIgnoreMatcher(["**/secret.md"], { separator: "/" });
+
+    expect(matcher.matches("secret.md")).toBe(true);
+    expect(matcher.matches("a/secret.md")).toBe(true);
+    expect(matcher.matches("a/b/secret.md")).toBe(true);
+    expect(matcher.matches("visible.md")).toBe(false);
+  });
+
   it("treats a wildcard-free path entry as the whole directory", () => {
     const matcher = createIgnoreMatcher(["rules", "mcp.json"], {
       separator: "/",

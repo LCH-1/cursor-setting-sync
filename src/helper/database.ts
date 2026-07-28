@@ -82,6 +82,14 @@ const COMPLETED_JOURNAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 export async function recoverInterruptedApplyJournals(
   storageRoot: string,
   databasePath: string,
+  /**
+   * Re-verifies that Cursor is still closed; its throw aborts the whole run
+   * with the pending journal intact, to be replayed by the next closed-Cursor
+   * helper. Every other replay failure is recorded on its own journal and the
+   * loop continues - one journal whose backup no longer validates must not
+   * take down every later apply and every shutdown export forever.
+   */
+  ensureCursorStillClosed: () => Promise<void> = async () => {},
 ): Promise<void> {
   const journalPaths = await listJournalFiles(storageRoot);
   for (const path of journalPaths) {
@@ -97,7 +105,7 @@ export async function recoverInterruptedApplyJournals(
       await removeExpiredJournal(path, journal.completedAt);
       continue;
     }
-    await recoverRestoreJournal(path, journal);
+    await recoverRestoreJournal(path, journal, ensureCursorStillClosed);
   }
   for (const path of journalPaths) {
     const name = basename(path);
@@ -258,7 +266,12 @@ export async function applyGlobalDatabaseChanges(
     await sealBackupFile(backupPath);
     validateDatabaseFile(backupPath, "global");
     await enforceBackupRetention(request.storageRoot, { exemptPath: backupPath });
-    validateDatabaseFile(backupPath, "global");
+    // Retention is contractually unable to touch the exempt backup, so a
+    // second full integrity pass over a possibly multi-GiB file bought
+    // nothing; existence is the only thing left to confirm.
+    if (!(await pathExists(backupPath))) {
+      throw new Error(`The pre-apply backup disappeared during retention: ${backupPath}`);
+    }
     journal.status = "backed-up";
     journal.backupPath = backupPath;
     await writeJsonAtomic(journalPath, journal);
@@ -333,6 +346,14 @@ export async function restoreDatabaseBackup(
   storageRoot: string,
   requestId: string = randomUUID(),
   contract: DatabaseContract = "global",
+  /**
+   * Called immediately before the destructive DELETE+INSERT. Everything above
+   * it - validating a multi-GiB backup, capturing the pre-restore snapshot -
+   * takes minutes, and a restore committed after Cursor was relaunched is
+   * silently undone by Cursor's in-memory write-back at its next quit. Throw
+   * to abort with the live database untouched.
+   */
+  beforeDestructiveWrite: () => Promise<void> = async () => {},
 ): Promise<string> {
   if (!(await pathExists(backupPath))) {
     throw new Error(`Backup does not exist: ${backupPath}`);
@@ -376,6 +397,7 @@ export async function restoreDatabaseBackup(
     journal.preRestoreBackupPath = preRestoreBackupPath;
     await writeJsonAtomic(journalPath, journal);
 
+    await beforeDestructiveWrite();
     journal.status = "applying";
     await writeJsonAtomic(journalPath, journal);
     restoreKnownTablesWithQueries(databasePath, backupPath, contract);
@@ -551,6 +573,7 @@ function validateDatabaseFile(
 async function recoverRestoreJournal(
   journalPath: string,
   journal: RestoreJournal,
+  ensureCursorStillClosed: () => Promise<void> = async () => {},
 ): Promise<void> {
   const contract = journal.contract ?? "global";
   if (!(await pathExists(journal.backupPath))) {
@@ -558,7 +581,20 @@ async function recoverRestoreJournal(
     journal.status = "failed";
     journal.error = "Interrupted restore source is missing; the live database was left untouched.";
   } else {
-    validateDatabaseFile(journal.backupPath, contract);
+    try {
+      validateDatabaseFile(journal.backupPath, contract);
+    } catch (error) {
+      // A source that stopped validating - damaged since the interruption, or
+      // written for a schema Cursor has since changed - is a permanent fact
+      // about this journal. It used to throw out of the recovery loop, and
+      // because every helper run recovers journals first, one bad journal
+      // failed every later apply AND every shutdown export, forever.
+      journal.status = "failed";
+      journal.error = `The interrupted restore's source no longer validates and was not replayed: ${formatUnknownError(error)}. The live database was left untouched.`;
+      journal.completedAt = new Date().toISOString();
+      await writeJsonAtomic(journalPath, journal);
+      return;
+    }
     // Recovery may run long after the interruption, so the journal's original
     // pre-restore backup is stale; replaying the destructive restore without a
     // fresh one would discard everything written since.
@@ -580,12 +616,28 @@ async function recoverRestoreJournal(
     }
     journal.preRestoreBackupPath = preRestoreBackupPath;
     await writeJsonAtomic(journalPath, journal);
-    restoreKnownTablesWithQueries(
-      journal.databasePath,
-      journal.backupPath,
-      contract,
-    );
-    validateDatabaseFile(journal.databasePath, contract);
+    // Deliberately outside the catch below: Cursor having reopened is not a
+    // fact about this journal, so it aborts the run and leaves the journal
+    // pending for the next closed-Cursor helper.
+    await ensureCursorStillClosed();
+    try {
+      restoreKnownTablesWithQueries(
+        journal.databasePath,
+        journal.backupPath,
+        contract,
+      );
+      validateDatabaseFile(journal.databasePath, contract);
+    } catch (error) {
+      // The replay transaction rolled back, so the live database holds what
+      // it held before; prove that before recording the failure, because a
+      // database that no longer validates must abort the run loudly instead.
+      validateDatabaseFile(journal.databasePath, contract);
+      journal.status = "failed";
+      journal.error = `Replaying the interrupted restore failed and was not retried: ${formatUnknownError(error)}. The live database was validated and left as it is; the pre-restore backup captures its current state.`;
+      journal.completedAt = new Date().toISOString();
+      await writeJsonAtomic(journalPath, journal);
+      return;
+    }
     journal.status = "verified";
     journal.error = "Recovered an interrupted logical restore with a SQL transaction.";
   }

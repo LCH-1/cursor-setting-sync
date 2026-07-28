@@ -43,7 +43,18 @@ export async function inspectCompatibility(
   extensionVersion: string,
 ): Promise<CompatibilityReport> {
   const warnings: string[] = [];
-  const product = await readProduct(paths.appRoot);
+  // Every other probe in this function converts failure into report data; a
+  // torn or missing product.json is a fact about the installation, not a
+  // reason activation should die before any command is registered.
+  let product: CursorProduct;
+  try {
+    product = await readProduct(paths.appRoot);
+  } catch (error) {
+    product = {};
+    warnings.push(
+      `Could not read product.json (${formatError(error)}); Cursor and VS Code versions are unknown.`,
+    );
+  }
   const cursorVersion = product.version ?? "unknown";
   const vscodeVersion = product.vscodeVersion ?? "unknown";
   const sqlite = inspectSqliteCapabilities();

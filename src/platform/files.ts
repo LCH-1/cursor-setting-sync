@@ -175,7 +175,22 @@ export async function copyFileAtomic(source: string, destination: string): Promi
   await ensureDirectory(parent);
   const temporaryPath = `${destination}.${process.pid}.${randomUUID()}.partial`;
   await copyFile(source, temporaryPath, constants.COPYFILE_EXCL);
-  await rename(temporaryPath, destination);
+  // Same durability contract as writeFileAtomic above: the caller is
+  // archiveRepository, the user's explicit safety copy, so a copy that
+  // evaporates on power loss defeats the reason it was taken.
+  const handle = await open(temporaryPath, "r+");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await rename(temporaryPath, destination);
+  } catch (error) {
+    await rm(temporaryPath, { force: true });
+    throw error;
+  }
+  await syncDirectoryBestEffort(parent);
 }
 
 export async function listFilesRecursively(root: string): Promise<string[]> {

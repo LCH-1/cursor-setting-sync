@@ -2,6 +2,43 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.30] - 2026-07-28
+
+A full-code inspection pass: seven reviewers over every subsystem, each finding adversarially re-verified against the code before being accepted. 34 confirmed defects fixed.
+
+### Fixed - backup safety
+
+- One enablement backup per database per request, and retention now exempts every backup the running request has taken. Each extension whose enablement changed used to trigger its own full copy of the target database - three default-profile extensions at 1.3 GiB apiece blew the 4 GiB budget, and because each retention pass exempted only its own newest file, it evicted the same request's pre-apply global backup: the exact loss the budget was introduced to prevent, arriving through a different door. The enablement path also threads the lock heartbeat through its multi-GiB integrity passes now.
+- A workspace whose `workspace.json` is unreadable - a 0-byte file from a crash mid-write - is no longer classified as a window with no folder open and silently dropped from the shutdown backup. Unknown is not folderless: its storage is backed up, and the discovery result is not memoized while any entry is unreadable, so the repaired file is noticed.
+- `restore-backup` mode re-verifies that Cursor is still closed immediately before its destructive DELETE+INSERT - previously the only check was the exit wait, minutes earlier, and a user relaunching Cursor in that window got a restore reported as successful and then silently undone by Cursor's in-memory write-back at its next quit. The pre-restore git pull is skipped entirely (a restore reads no events), which removes the largest part of the window; replaying an interrupted restore journal re-checks the same way.
+- A restore journal whose backup no longer validates - damaged since the interruption, or written for a schema Cursor has since changed - is marked failed and skipped instead of throwing out of the recovery loop. That loop runs first in every helper mode, so one bad journal used to fail every later apply AND every shutdown export, forever.
+- Plain-file workspaceStorage writes (notepads.json, images) and chat transcripts re-check exclusivity before writing, like every database branch already did; Cursor appends to live transcripts, so writing one under a relaunched Cursor truncates a session it is still recording.
+- An optional table absent from one side's snapshot - a Cursor whose schema has no `composerHeaders` - is treated as no opinion rather than as "every row deleted", which silently dropped the whole table from an auto-resolved workspace database merge.
+- `archiveRepository` holds the sync lock for the whole copy, so its own window's poll, automatic maintenance, or the offline helper can no longer delete files mid-enumeration and tear the archive; `copyFileAtomic` fsyncs and cleans up its temp file like `writeFileAtomic` always has.
+- A backup file with a far-future mtime (clock rollback, restored directory) can no longer pin itself permanently at the top of the retention order.
+
+### Fixed - cross-device
+
+- Historical events and checkpoints are validated against the protocol ceiling rather than this device's live `maxPayloadMiB`. Device A raising the limit and publishing something large wedged every cycle on device B until a human raised B's setting too - and settings sync could not fix it, because settings ride the same wedged log. Reads are widened; local publishes stay bounded by the live setting.
+- `git clone` runs under the 600-second network timeout it was always meant to have. The subcommand detector took the first argument not starting with a dash, which in `-c core.autocrlf=false clone ...` is `core.autocrlf=false` - so joins of a large repository over a slow link were killed at 120 s, the partial clone deleted, nothing resumable. Timeout kill messages also report the timeout that actually applied.
+- An unreadable sync lock file is no longer taken over on unreadability alone - it is usually another window caught in the milliseconds between creating the file and writing its content, and stealing it there let two processes run full cycles concurrently. Age is the tiebreaker now, with the same TTL the readable path uses, re-checked after the takeover rename.
+
+### Fixed - resilience and honesty
+
+- Re-running Setup with a wrong passphrase no longer kills sync until reload: the replacement repository is opened before the running state is torn down, so a failed open leaves the previous configuration synchronizing untouched - instead of a zeroed-but-non-null master key that a later Restart to Apply would hand to the helper.
+- A "Sync Now" issued while automatic maintenance holds the lock is no longer silently swallowed: the drain loop re-checks the queue after maintenance instead of resolving the caller's await with no sync run.
+- The red helper-failure bar clears when the queue it described is empty, and Disconnect resets it together with notices and the declined-offer memory.
+- Startup no longer reports a live, deliberately waiting helper as "never reported a result" and deletes its request file: a fresh finalizer heartbeat or a request younger than the exit-wait budget is a helper that has not had time yet, not an abandoned one.
+- One invalid directory under `User/profiles` ("New folder", a Syncthing conflict) no longer disables the entire settings and profile-files scans on every cycle; the entry is skipped, matching what Cursor itself does with it.
+- The extension scan's CLI memo is no longer invalidated by the global database's mtime, which moves on virtually every poll during active use - the default profile spawned Electron-as-node every thirty seconds for the life of the session. The database mtime now refreshes only the cheap disabled-list read it actually feeds.
+- Ignore patterns starting with `**/` match zero directories, as they do in gitignore: `**/secret.md` now covers a top-level `secret.md`.
+- A profile settings file that fails to parse no longer causes every configured `ignoredSettings` entry to be misreported as a typo excluding nothing.
+- Torn `product.json` degrades to unknown versions in the compatibility report instead of killing activation before any command is registered; a failure before the helper's exit wait finished no longer relaunches Cursor beside the one still open; `restoreAndRestart` arms the quit-stall warning it was missing; reconciliation survives 100k-event backlogs and 10k-deep version chains (argument-spread and recursion limits); `publishInBatches` splits by estimated manifest bytes as well as change count; the device no longer schedules a redundant sync cycle over its own checkpoint; a duplicated multi-GiB integrity pass per backup is gone.
+
+### Added
+
+- Tests for every restore contract the Restore Backup command can request (workspace, store, item-table), for `final-export` mode through the built bundle - the only path that ever exports workspaceStorage had no test at any level - and its supersede handling, for restore-journal failure recovery, for the quit-timer arming order, and pins for the retention defaults and the sidecar/exemption rules. A release run now fails loudly if the end-to-end suite would be skipped because the bundle was not built.
+
 ## [0.0.29] - 2026-07-28
 
 ### Fixed

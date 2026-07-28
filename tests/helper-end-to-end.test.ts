@@ -57,6 +57,23 @@ function cursorIsRunning(): boolean {
 const runnable = existsSync(HELPER) && !cursorIsRunning();
 const describeBuilt = runnable ? describe : describe.skip;
 
+// A silent skip here restores the exact blind spot this file documents: every
+// orchestration failure in the series shipped because nothing ran the bundle.
+// A release run has to opt in and then cannot miss a skipped-because-missing
+// bundle; a running Cursor is still a legitimate reason to skip.
+describe("helper end-to-end prerequisites", () => {
+  it("has the built bundle when a release run demands it", () => {
+    const strict =
+      process.env.CI === "true" || process.env.REQUIRE_SQLITE_BACKUP === "1";
+    if (!strict || existsSync(HELPER)) {
+      return;
+    }
+    throw new Error(
+      `dist/helper.js is missing, so the end-to-end helper suite was silently skipped. Run "npm run build" before the suite, or clear CI/REQUIRE_SQLITE_BACKUP to accept the gap locally.`,
+    );
+  });
+});
+
 afterEach(async () => {
   await Promise.all(
     temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
@@ -185,6 +202,75 @@ describeBuilt("the offline helper, end to end", () => {
 
     expect(result.success).toBe(true);
     expect(await pathExists(fixture.requestPath)).toBe(false);
+  }, 120_000);
+
+  it("exports workspaceStorage in final-export mode", async () => {
+    // final-export is the ONLY path that ever backs up workspaceStorage, and
+    // nothing had ever run the bundle in that mode: a regression anywhere in
+    // it makes every shutdown export a silent no-op, indefinitely, with all
+    // tests green.
+    const fixture = await createFixture();
+    await fixture.repository.saveState();
+    const workspaceId = "fe1a6c7f473850204df9f61b8a9f6a82";
+    const workspaceRoot = join(
+      fixture.request.paths.workspaceStorageRoot,
+      workspaceId,
+    );
+    await mkdir(workspaceRoot, { recursive: true });
+    await writeFile(
+      join(workspaceRoot, "workspace.json"),
+      JSON.stringify({
+        folder:
+          "vscode-remote://ssh-remote%2Bgeekdive_local2/home/ubuntu/server/backend",
+      }),
+      "utf8",
+    );
+    const workspaceDatabase = new DatabaseSync(join(workspaceRoot, "state.vscdb"));
+    workspaceDatabase.exec(
+      "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
+    );
+    workspaceDatabase.exec(
+      "CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
+    );
+    workspaceDatabase.exec("INSERT INTO ItemTable(key, value) VALUES ('k', 'v')");
+    workspaceDatabase.close();
+
+    fixture.request.mode = "final-export";
+    fixture.request.restart = false;
+    fixture.request.syncOptions.syncWorkspaceStorage = true;
+    const result = await runHelper(fixture);
+
+    expect(result.error).toBeNull();
+    expect(result.success).toBe(true);
+    const events = await fixture.repository.listEvents();
+    const exportedKinds = events.flatMap((event) =>
+      event.manifest.changes.map((change) => change.kind),
+    );
+    expect(exportedKinds).toContain("workspace-storage");
+    const exportedIds = events.flatMap((event) =>
+      event.manifest.changes.map((change) => change.resourceId),
+    );
+    expect(exportedIds.some((id) => id.includes(workspaceId))).toBe(true);
+  }, 120_000);
+
+  it("supersedes a final export when a newer session cancelled it", async () => {
+    const fixture = await createFixture();
+    await fixture.repository.saveState();
+    fixture.request.mode = "final-export";
+    fixture.request.restart = false;
+    // The cancel file records when the finalizers were superseded; a stamp
+    // after this request's createdAt means a newer session took over.
+    await writeFile(
+      join(fixture.request.storageRoot, "cancel-finalizers"),
+      new Date(Date.now() + 1_000).toISOString(),
+      "utf8",
+    );
+
+    const result = await runHelper(fixture);
+
+    expect(result.success).toBe(true);
+    expect(result.skipped).toContain("Final export was superseded.");
+    expect(await fixture.repository.listEvents()).toEqual([]);
   }, 120_000);
 });
 

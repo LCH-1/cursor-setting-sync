@@ -164,6 +164,13 @@ function compileGlob(pattern: string, separator: string | undefined): RegExp {
       : `[^${escapeCharacterClass(separator)}]*`;
   let source = "^";
   let index = 0;
+  if (separator !== undefined && pattern.startsWith(`**${separator}`)) {
+    // A leading `**/` also matches zero directories in gitignore and VS Code
+    // globs, so `**/x` has to match a top-level `x`. Compiled naively it
+    // became "anything, then a separator", which never matches zero levels.
+    source += `(?:[\\s\\S]*${escapeRegExp(separator)})?`;
+    index = 2 + separator.length;
+  }
   while (index < pattern.length) {
     if (
       separator !== undefined &&

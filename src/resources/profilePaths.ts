@@ -36,7 +36,15 @@ export async function discoverProfileResourcePaths(
   const entries = await readdir(paths.profilesRoot, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory() && !entry.isSymbolicLink()) {
-      profiles.push(createProfilePaths(entry.name, join(paths.profilesRoot, entry.name)));
+      try {
+        profiles.push(createProfilePaths(entry.name, join(paths.profilesRoot, entry.name)));
+      } catch {
+        // One "New folder" or Syncthing conflict directory under User/profiles
+        // is not a profile; throwing here disabled the entire settings and
+        // profile-files scans, wholesale, on every cycle until it was deleted.
+        // Cursor itself would never read such a directory either - skipping it
+        // synchronizes exactly what Cursor sees.
+      }
     }
   }
   return profiles.sort((left, right) => left.profileId.localeCompare(right.profileId));

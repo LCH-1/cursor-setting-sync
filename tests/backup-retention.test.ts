@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import {
+  DEFAULT_BACKUP_RETENTION,
   enforceBackupRetention,
   pathsEqual,
   type BackupRetentionOptions,
@@ -211,6 +212,61 @@ describe("local backup retention", () => {
       },
     ]);
     expect(await existing([newest])).toEqual(["newest.vscdb"]);
+  });
+
+  it("ships defaults that hold two generations of a large global database", () => {
+    // The production call sites pass no limits, so these ARE the policy. At
+    // 2 GiB the budget held exactly one ~1.3 GiB global snapshot: every apply
+    // deleted the previous recovery point, and damage noticed one apply late
+    // had nothing to roll back to. A revert would pass every other test.
+    expect(DEFAULT_BACKUP_RETENTION.maxTotalBytes).toBe(4 * 1024 * 1024 * 1024);
+    expect(DEFAULT_BACKUP_RETENTION.maxFiles).toBe(30);
+    expect(DEFAULT_BACKUP_RETENTION.maxAgeMs).toBe(30 * 24 * 60 * 60 * 1_000);
+  });
+
+  it("never deletes any backup of the running request via exemptPaths", async () => {
+    // One request takes several backups - the pre-apply global snapshot, then
+    // per-workspace and per-profile ones. A pass that exempted only its own
+    // newest was able to evict the same request's earlier ones, including the
+    // only pre-apply recovery point.
+    const fixture = await createFixture();
+    const globalSnapshot = await createBackup(fixture.backupRoot, "state-request.vscdb", 8, 3);
+    const workspaceSnapshot = await createBackup(fixture.backupRoot, "workspace-request.vscdb", 8, 2);
+    const newest = await createBackup(fixture.backupRoot, "extensions-request.vscdb", 8, 1);
+
+    const result = await enforceBackupRetention(fixture.storageRoot, {
+      maxFiles: 1,
+      maxAgeMs: 30 * 24 * 60 * 60 * 1_000,
+      maxTotalBytes: 8,
+      nowMs: NOW,
+      exemptPaths: [globalSnapshot, workspaceSnapshot, newest],
+    });
+
+    expect(result.deletedPaths).toEqual([]);
+    expect(await existing([globalSnapshot, workspaceSnapshot, newest])).toEqual([
+      "extensions-request.vscdb",
+      "state-request.vscdb",
+      "workspace-request.vscdb",
+    ]);
+  });
+
+  it("does not let a future mtime pin a backup at the top of the prefix", async () => {
+    const fixture = await createFixture();
+    const fromTheFuture = await createBackup(fixture.backupRoot, "future.vscdb", 4, -365);
+    const current = await createBackup(fixture.backupRoot, "current.vscdb", 4, 1);
+
+    const result = await enforceBackupRetention(fixture.storageRoot, {
+      maxFiles: 1,
+      maxAgeMs: 30 * 24 * 60 * 60 * 1_000,
+      maxTotalBytes: 100,
+      nowMs: NOW,
+      exemptPath: current,
+    });
+
+    // Clamped to now, the future file no longer outranks the genuinely
+    // newest backup, so the count budget keeps the real one.
+    expect(result.retainedPaths).toEqual([current]);
+    expect(result.deletedPaths).toEqual([fromTheFuture]);
   });
 
   it("never deletes an explicitly exempted backup path", async () => {

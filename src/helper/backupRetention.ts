@@ -20,6 +20,7 @@ import {
 } from "../platform/files";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
+const FUTURE_MTIME_TOLERANCE_MS = 60_000;
 
 export interface BackupRetentionOptions {
   maxFiles?: number;
@@ -33,6 +34,14 @@ export interface BackupRetentionOptions {
    * file so post-retention validation of a fresh backup cannot fail.
    */
   exemptPath?: string;
+  /**
+   * Every backup the running request has taken so far. One request can take
+   * several - the pre-apply global snapshot, then per-workspace and
+   * per-profile ones - and a retention pass that exempts only its own newest
+   * backup was able to evict the same request's earlier ones, including the
+   * only pre-apply recovery point.
+   */
+  exemptPaths?: readonly string[];
 }
 
 export interface SkippedBackupEntry {
@@ -164,14 +173,36 @@ export async function enforceBackupRetention(
     canonicalBackupRoot,
     rootIdentity,
   );
+  // A future mtime - clock rollback, a restored backup directory - must not
+  // pin a file permanently at the top of the newest prefix, where the age
+  // clamp keeps it forever young and the ordering keeps it forever first.
+  // Within the tolerance it is benign skew and clamps to now; beyond it the
+  // timestamp is not evidence of recency at all, so the file is ordered at
+  // the age boundary instead - retained while there is room, first out under
+  // pressure, and never occupying the newest slot.
+  for (const file of scan.files) {
+    if (file.mtimeMs > policy.nowMs + FUTURE_MTIME_TOLERANCE_MS) {
+      file.mtimeMs = policy.nowMs - policy.maxAgeMs;
+    } else if (file.mtimeMs > policy.nowMs) {
+      file.mtimeMs = policy.nowMs;
+    }
+  }
   scan.files.sort(compareNewestFirst);
 
   const groups = groupBackupFiles(scan.files);
   // The default exempts the newest snapshot rather than the newest file, which
   // after a backup is one of its sidecars.
-  const exemptPath =
-    options.exemptPath ??
-    groups.find((group) => group.primary !== null)?.primary?.path;
+  const fallbackExempt =
+    options.exemptPath === undefined && (options.exemptPaths?.length ?? 0) === 0
+      ? groups.find((group) => group.primary !== null)?.primary?.path
+      : undefined;
+  const exemptPaths = [
+    ...(options.exemptPath === undefined ? [] : [options.exemptPath]),
+    ...(options.exemptPaths ?? []),
+    ...(fallbackExempt === undefined ? [] : [fallbackExempt]),
+  ];
+  const isExemptGroup = (group: BackupGroup): boolean =>
+    exemptPaths.some((path) => groupContainsPath(group, path));
   const retained: BackupFile[] = [];
   const deletionPlan: BackupFile[] = [];
   let retainedBytes = 0;
@@ -183,9 +214,9 @@ export async function enforceBackupRetention(
       // to outlive the snapshots they belonged to: sidecars are written last,
       // so newest-first ordering kept them and spent the count and byte budget
       // the real backups needed.
-      if (exemptPath !== undefined && groupContainsPath(group, exemptPath)) {
+      if (isExemptGroup(group)) {
         scan.skipped.push({
-          path: group.files[0]?.path ?? exemptPath,
+          path: group.files[0]?.path ?? exemptPaths[0] ?? "",
           reason: "The exempt backup is never removed by retention.",
         });
         continue;
@@ -213,8 +244,8 @@ export async function enforceBackupRetention(
       deletionPlan.push(...spent);
       continue;
     }
-    if (exemptPath !== undefined && groupContainsPath(group, exemptPath)) {
-      // Deleting the backup of the running request would fail its
+    if (isExemptGroup(group)) {
+      // Deleting a backup of the running request would fail its
       // post-retention validation and abort the apply forever.
       scan.skipped.push({
         path: group.primary.path,

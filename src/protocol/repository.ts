@@ -1001,6 +1001,10 @@ export class SyncRepository {
     const fileName = `${String(lamport).padStart(16, "0")}-${hash}${CHECKPOINT_EXTENSION}`;
     const filePath = join(this.sharedCheckpointsRoot, fileName);
     await writeFileAtomic(filePath, storedBytes, false);
+    // Same suppression publish and writeObject use: the watcher forwards
+    // checkpoint files, and without this the device schedules a redundant
+    // cycle over its own checkpoint.
+    this.noteSelfWrite(fileName);
     try {
       await this.readCheckpointFile(filePath, hash, lamport);
     } catch (error) {
@@ -1733,7 +1737,11 @@ export class SyncRepository {
       canonicalBytes(stored.header),
     );
     const manifest = JSON.parse(plaintext.toString("utf8")) as CheckpointManifest;
-    validateCheckpointManifest(manifest, stored.header, this.maxPayloadBytes);
+    // The ceiling, not the live setting - same reasoning as readEvent: a
+    // checkpoint folded under a larger limit must stay readable after the
+    // setting shrinks, or the failure surfaces as a spurious "checkpoint
+    // rollback detected" that tells the user to wait for nothing.
+    validateCheckpointManifest(manifest, stored.header, MAX_APPLY_BATCH_BYTES);
     return { hash: actualHash, bytes, stored, manifest };
   }
 
@@ -1965,7 +1973,14 @@ export class SyncRepository {
     }
     const plaintext = decryptAead(this.eventKey, stored, canonicalBytes(stored.header));
     const manifest = JSON.parse(plaintext.toString("utf8")) as EventManifest;
-    validateEventManifest(manifest, this.maxPayloadBytes);
+    // Validated against the absolute ceiling, not this device's live
+    // maxPayloadBytes: an event already in the log was published under
+    // whatever limit its producer had, and a device whose setting is lower
+    // must still be able to READ it - the same widening readObject applies.
+    // Judging history by the current setting wedged every cycle on device B
+    // the moment device A raised its limit and published something large,
+    // and settings sync could not fix it because settings ride the same log.
+    validateEventManifest(manifest, MAX_APPLY_BATCH_BYTES);
     return { path, fileName, eventHash: actualHash, stored, manifest };
   }
 

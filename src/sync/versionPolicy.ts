@@ -204,26 +204,65 @@ export async function publishInBatches(
       published.add(eventHash);
     }
   };
-  if (snapshots.length + deletions.length <= MAX_EVENT_CHANGES) {
-    record((await repository.publish([...snapshots], [...deletions])).eventHash);
-    return published;
-  }
   let snapshotIndex = 0;
   let deletionIndex = 0;
-  while (snapshotIndex < snapshots.length || deletionIndex < deletions.length) {
-    const batchSnapshots = snapshots.slice(
-      snapshotIndex,
-      snapshotIndex + MAX_EVENT_CHANGES,
-    );
-    snapshotIndex += batchSnapshots.length;
-    const room = MAX_EVENT_CHANGES - batchSnapshots.length;
-    const batchDeletions =
-      room > 0 ? deletions.slice(deletionIndex, deletionIndex + room) : [];
-    deletionIndex += batchDeletions.length;
+  do {
+    // Bounded by estimated manifest bytes as well as by count: publish hard-
+    // fails past MAX_EVENT_FILE_BYTES, and ten thousand changes whose records
+    // average a kilobyte reach it long before the count cap does. An item is
+    // always admitted into an empty batch so an oversized single record still
+    // reaches publish, whose own limit is the one that decides.
+    const batchSnapshots: ResourceSnapshot[] = [];
+    const batchDeletions: ResourceDeletion[] = [];
+    let estimatedBytes = 0;
+    const admit = (item: ResourceSnapshot | ResourceDeletion): boolean => {
+      const cost = estimatedChangeRecordBytes(item);
+      const count = batchSnapshots.length + batchDeletions.length;
+      if (count > 0 && (count >= MAX_EVENT_CHANGES || estimatedBytes + cost > EVENT_MANIFEST_BYTE_BUDGET)) {
+        return false;
+      }
+      estimatedBytes += cost;
+      return true;
+    };
+    while (snapshotIndex < snapshots.length) {
+      const item = snapshots[snapshotIndex];
+      if (item === undefined || !admit(item)) {
+        break;
+      }
+      batchSnapshots.push(item);
+      snapshotIndex += 1;
+    }
+    while (deletionIndex < deletions.length) {
+      const item = deletions[deletionIndex];
+      if (item === undefined || !admit(item)) {
+        break;
+      }
+      batchDeletions.push(item);
+      deletionIndex += 1;
+    }
     record((await repository.publish(batchSnapshots, batchDeletions)).eventHash);
-  }
+  } while (snapshotIndex < snapshots.length || deletionIndex < deletions.length);
   return published;
 }
+
+/**
+ * What one change contributes to the event manifest: the record - id, hashes,
+ * parents, metadata - not the payload, which travels as a separate object.
+ * The budget below leaves room for the ~4/3 base64 expansion the encrypted
+ * envelope adds on top of these estimates.
+ */
+function estimatedChangeRecordBytes(
+  item: ResourceSnapshot | ResourceDeletion,
+): number {
+  return (
+    item.resourceId.length +
+    (item.parents?.reduce((total, parent) => total + parent.length + 4, 0) ?? 0) +
+    (item.metadata === undefined ? 0 : JSON.stringify(item.metadata).length) +
+    256
+  );
+}
+
+const EVENT_MANIFEST_BYTE_BUDGET = 4 * 1024 * 1024;
 
 /** The one wording used wherever a payload is refused for being too large. */
 export function oversizedPayloadWarning(

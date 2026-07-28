@@ -18,6 +18,17 @@ interface WorkspaceJson {
   workspace?: string;
 }
 
+export interface WorkspaceDiscovery {
+  workspaces: WorkspaceIdentity[];
+  /**
+   * Directories whose `workspace.json` was missing, torn, or unparseable at
+   * scan time. Unknown is not folderless: a crash while VS Code writes the
+   * file leaves it empty, and treating that as "a window with no folder open"
+   * silently dropped the workspace's storage from the shutdown backup.
+   */
+  unreadableIds: string[];
+}
+
 interface WorkspaceDiscoveryMemo {
   mtimeMs: number;
   entryCount: number;
@@ -46,9 +57,15 @@ export function resetWorkspaceDiscoveryCache(): void {
 export async function discoverWorkspaces(
   paths: CursorPaths,
 ): Promise<WorkspaceIdentity[]> {
+  return (await discoverWorkspacesDetailed(paths)).workspaces;
+}
+
+export async function discoverWorkspacesDetailed(
+  paths: CursorPaths,
+): Promise<WorkspaceDiscovery> {
   if (!(await pathExists(paths.workspaceStorageRoot))) {
     discoveryMemo.delete(paths.workspaceStorageRoot);
-    return [];
+    return { workspaces: [], unreadableIds: [] };
   }
   const entries = await readdir(paths.workspaceStorageRoot, { withFileTypes: true });
   let rootMtimeMs: number | null = null;
@@ -64,15 +81,20 @@ export async function discoverWorkspaces(
     memo.mtimeMs === rootMtimeMs &&
     memo.entryCount === entries.length
   ) {
-    return [...memo.workspaces];
+    return { workspaces: [...memo.workspaces], unreadableIds: [] };
   }
   const workspaces: WorkspaceIdentity[] = [];
+  const unreadableIds: string[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.isSymbolicLink()) {
       continue;
     }
     const metadataPath = join(paths.workspaceStorageRoot, entry.name, "workspace.json");
     if (!(await pathExists(metadataPath))) {
+      // A directory without its workspace.json is a window mid-creation or a
+      // torn write, not a decided state; callers must not treat it as a
+      // window that had nothing open.
+      unreadableIds.push(entry.name);
       continue;
     }
     let metadata: WorkspaceJson;
@@ -86,6 +108,7 @@ export async function discoverWorkspaces(
         ).toString("utf8"),
       ) as WorkspaceJson;
     } catch {
+      unreadableIds.push(entry.name);
       continue;
     }
     const uri = metadata.folder ?? metadata.workspace;
@@ -99,14 +122,20 @@ export async function discoverWorkspaces(
     });
   }
   const sorted = workspaces.sort((left, right) => left.id.localeCompare(right.id));
-  if (rootMtimeMs !== null) {
+  // A scan that hit an unreadable workspace.json is not memoized: the file's
+  // later arrival or repair changes neither the root's mtime nor the entry
+  // count, so a memo taken now would keep serving the incomplete answer.
+  if (rootMtimeMs !== null && unreadableIds.length === 0) {
     discoveryMemo.set(paths.workspaceStorageRoot, {
       mtimeMs: rootMtimeMs,
       entryCount: entries.length,
       workspaces: sorted,
     });
   }
-  return [...sorted];
+  return {
+    workspaces: [...sorted],
+    unreadableIds: unreadableIds.sort((left, right) => left.localeCompare(right)),
+  };
 }
 
 export function resolveTargetWorkspace(

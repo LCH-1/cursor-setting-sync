@@ -548,10 +548,38 @@ async function runGit(
 }
 
 function gitTimeoutFor(args: string[]): number {
-  const subcommand = args.find((argument) => !argument.startsWith("-"));
+  const subcommand = gitSubcommandOf(args);
   return subcommand !== undefined && NETWORK_SUBCOMMANDS.has(subcommand)
     ? GIT_NETWORK_TIMEOUT_MS
     : GIT_TIMEOUT_MS;
+}
+
+/**
+ * The first argument that is actually the subcommand. "First that does not
+ * start with a dash" is not it: `-c key=value` takes a separate value argument,
+ * so clone invocations spelled `['-c','core.autocrlf=false','clone',...]`
+ * resolved to `core.autocrlf=false` and the clone ran under the short local
+ * timeout instead of the network one - which killed every join of a large
+ * repository over a slow link at 120 s, deleted the partial clone, and left
+ * nothing to resume.
+ */
+function gitSubcommandOf(args: string[]): string | undefined {
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === undefined) {
+      continue;
+    }
+    if (argument === "-c" || argument === "-C") {
+      // Both take their value as the next argument.
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("-")) {
+      continue;
+    }
+    return argument;
+  }
+  return undefined;
 }
 
 function assertNotSquashBranch(branch: string): void {
@@ -591,6 +619,7 @@ async function execGitRaw(
       `Git repository directory does not exist: ${cwd}`,
     );
   }
+  const timeoutMs = gitTimeoutFor(args);
   return new Promise((resolvePromise, rejectPromise) => {
     execFile(
       "git",
@@ -607,7 +636,7 @@ async function execGitRaw(
           GCM_INTERACTIVE: "never",
         },
         maxBuffer: GIT_MAX_BUFFER_BYTES,
-        timeout: gitTimeoutFor(args),
+        timeout: timeoutMs,
         windowsHide: true,
       },
       (error, stdout, stderr) => {
@@ -633,7 +662,7 @@ async function execGitRaw(
           rejectPromise(
             new GitError(
               "command",
-              `git ${args.join(" ")} timed out after ${GIT_TIMEOUT_MS / 1000} seconds or was terminated (signal ${failure.signal ?? "unknown"}).`,
+              `git ${args.join(" ")} timed out after ${timeoutMs / 1000} seconds or was terminated (signal ${failure.signal ?? "unknown"}).`,
             ),
           );
           return;

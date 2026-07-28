@@ -71,6 +71,13 @@ export async function applyNonGlobalChanges(
   onBackup: (backup: HelperBackup) => void = () => {},
   /** See {@link applyGlobalDatabaseChanges}: keeps the caller's lock alive. */
   heartbeat: () => void = () => {},
+  /**
+   * Backups taken earlier in the same request, typically the pre-apply global
+   * snapshot. Every retention pass in this batch exempts them: a pass that
+   * exempted only its own newest backup was able to evict the same request's
+   * pre-apply recovery point while the request was still running.
+   */
+  priorBackups: () => readonly string[] = () => [],
 ): Promise<NonGlobalApplyResult> {
   const applied: string[] = [];
   const skipped: string[] = [];
@@ -81,6 +88,10 @@ export async function applyNonGlobalChanges(
     backups.push(backup);
     onBackup(backup);
   };
+  const exemptBackupPaths = (): string[] => [
+    ...priorBackups(),
+    ...backups.map((backup) => backup.backupPath),
+  ];
   const retainedLocal: string[] = [];
   const retainedLocalHashes: Record<string, string> = {};
   const localWorkspaces =
@@ -161,8 +172,13 @@ export async function applyNonGlobalChanges(
             change.resourceId,
             content,
             registerBackup,
+            exemptBackupPaths,
           );
         } else {
+          // Plain files get the same re-check as every database branch: the
+          // batch can run for minutes, and a notepads.json replaced under a
+          // relaunched Cursor is a live file swapped out from beneath it.
+          await ensureExclusiveAccess();
           await writeFileAtomicWithinRoot(
             request.paths.workspaceStorageRoot,
             targetRelativePath,
@@ -209,6 +225,9 @@ export async function applyNonGlobalChanges(
           throw new Error(`Transcript path is not allowlisted: ${relativePath}`);
         }
         const target = assertSafeRelativePath(request.paths.cursorProjects, relativePath);
+        // Cursor appends to live transcripts; writing one under a relaunched
+        // Cursor would truncate a session it is still recording.
+        await ensureExclusiveAccess();
         await writeFileAtomicWithinRoot(
           request.paths.cursorHome,
           normalizeResourcePath(relative(request.paths.cursorHome, target)),
@@ -260,6 +279,7 @@ export async function applyNonGlobalChanges(
           request.storageRoot,
           request.requestId,
           registerBackup,
+          exemptBackupPaths,
         );
         const appliedHash = sha256(
           canonicalBytes(readStoreSnapshot(target, snapshot.relativePath)),
@@ -289,6 +309,8 @@ export async function applyNonGlobalChanges(
     prepared,
     ensureExclusiveAccess,
     registerBackup,
+    heartbeat,
+    exemptBackupPaths,
   );
   applied.push(...extensionResult.applied);
   skipped.push(...extensionResult.skipped);
@@ -311,6 +333,7 @@ async function mergeWorkspaceStateDatabase(
   resourceId: string,
   content: Buffer,
   registerBackup: (backup: HelperBackup) => void,
+  exemptBackupPaths: () => readonly string[] = () => [],
 ): Promise<void> {
   const incoming = parseWorkspaceDatabaseSnapshot(content);
   if (incoming.workspaceId !== sourceWorkspaceId) {
@@ -331,7 +354,9 @@ async function mergeWorkspaceStateDatabase(
     incoming,
     hooks: {
       afterBackupValidated: async () => {
-        await enforceBackupRetention(request.storageRoot, { exemptPath: backupPath });
+        await enforceBackupRetention(request.storageRoot, {
+          exemptPaths: [...exemptBackupPaths(), backupPath],
+        });
         registerBackup({ backupPath, contract: "workspace", targetPath: target });
       },
     },
@@ -344,6 +369,7 @@ async function applyStoreSnapshot(
   storageRoot: string,
   requestId: string,
   registerBackup: (backup: HelperBackup) => void,
+  exemptBackupPaths: () => readonly string[] = () => [],
 ): Promise<void> {
   await ensureDirectory(dirname(target));
   if (await pathExists(target)) {
@@ -371,14 +397,14 @@ async function applyStoreSnapshot(
     } finally {
       backup.close();
     }
-    await enforceBackupRetention(storageRoot, { exemptPath: backupPath });
-    const retainedBackup = openDatabase(backupPath, { readOnly: true });
-    try {
-      retainedBackup.exec("PRAGMA query_only=ON");
-      assertStoreSchema(retainedBackup);
-      assertIntegrity(retainedBackup);
-    } finally {
-      retainedBackup.close();
+    await enforceBackupRetention(storageRoot, {
+      exemptPaths: [...exemptBackupPaths(), backupPath],
+    });
+    // Retention is contractually unable to touch an exempt backup, so
+    // existence is the only thing left to confirm; the full re-verification
+    // this used to run bought nothing.
+    if (!(await pathExists(backupPath))) {
+      throw new Error(`The store backup disappeared during retention: ${backupPath}`);
     }
     registerBackup({ backupPath, contract: "store", targetPath: target });
   }
@@ -438,6 +464,8 @@ async function applyExtensionChanges(
   prepared: PreparedHelperChange[],
   ensureExclusiveAccess: () => Promise<void>,
   registerBackup: (backup: HelperBackup) => void,
+  heartbeat: () => void = () => {},
+  exemptBackupPaths: () => readonly string[] = () => [],
 ): Promise<{ applied: string[]; skipped: string[]; retainedLocal: string[] }> {
   const applied: string[] = [];
   const skipped: string[] = [];
@@ -563,6 +591,8 @@ async function applyExtensionChanges(
           extensionId,
           desired.enabled,
           registerBackup,
+          heartbeat,
+          exemptBackupPaths,
         );
       } catch (error) {
         if (error instanceof CursorReopenedError) {
@@ -607,6 +637,8 @@ async function updateExtensionEnablement(
   extensionId: string,
   enabled: boolean,
   registerBackup: (backup: HelperBackup) => void,
+  heartbeat: () => void = () => {},
+  exemptBackupPaths: () => readonly string[] = () => [],
 ): Promise<void> {
   const databasePath =
     profileId === "default"
@@ -638,36 +670,48 @@ async function updateExtensionEnablement(
   }
   const backupRoot = join(request.storageRoot, "backups");
   await ensureDirectory(backupRoot);
+  // Named per database and request, NOT per extension: the rollback point for
+  // this request's enablement writes is the database before its FIRST such
+  // write, and one 1.3 GiB copy per extension was how three default-profile
+  // extensions blew the byte budget and evicted the same request's pre-apply
+  // global backup - the exact data loss the budget exists to prevent.
   const backupPath = join(
     backupRoot,
-    `extensions-${profileId}-${extensionId}-${request.requestId}.vscdb`,
+    `extensions-${profileId}-${request.requestId}.vscdb`,
   );
+  const backupAlreadyTaken = await pathExists(backupPath);
   const database = openDatabase(databasePath);
   let transactionStarted = false;
   try {
     database.exec("PRAGMA busy_timeout=5000");
     assertItemTableSchema(database);
-    assertIntegrity(database);
-    await backupDatabase(database, backupPath, { rate: 100 });
-    await sealBackupFile(backupPath);
-    const backup = openDatabase(backupPath, { readOnly: true });
-    try {
-      backup.exec("PRAGMA query_only=ON");
-      assertItemTableSchema(backup);
-      assertIntegrity(backup);
-    } finally {
-      backup.close();
+    if (!backupAlreadyTaken) {
+      // The integrity pass over a possibly multi-GiB file is synchronous and
+      // starves the lock heartbeat; refresh it explicitly on either side.
+      heartbeat();
+      assertIntegrity(database);
+      await backupDatabase(database, backupPath, { rate: 100 });
+      await sealBackupFile(backupPath);
+      heartbeat();
+      const backup = openDatabase(backupPath, { readOnly: true });
+      try {
+        backup.exec("PRAGMA query_only=ON");
+        assertItemTableSchema(backup);
+        assertIntegrity(backup);
+      } finally {
+        backup.close();
+      }
+      heartbeat();
+      await enforceBackupRetention(request.storageRoot, {
+        exemptPaths: [...exemptBackupPaths(), backupPath],
+      });
+      if (!(await pathExists(backupPath))) {
+        throw new Error(
+          `The enablement backup disappeared during retention: ${backupPath}`,
+        );
+      }
+      registerBackup({ backupPath, contract: "item-table", targetPath: databasePath });
     }
-    await enforceBackupRetention(request.storageRoot, { exemptPath: backupPath });
-    const retainedBackup = openDatabase(backupPath, { readOnly: true });
-    try {
-      retainedBackup.exec("PRAGMA query_only=ON");
-      assertItemTableSchema(retainedBackup);
-      assertIntegrity(retainedBackup);
-    } finally {
-      retainedBackup.close();
-    }
-    registerBackup({ backupPath, contract: "item-table", targetPath: databasePath });
     database.exec("BEGIN IMMEDIATE");
     transactionStarted = true;
     const row = database

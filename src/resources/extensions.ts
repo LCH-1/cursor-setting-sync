@@ -118,14 +118,25 @@ export class ExtensionsAdapter implements ResourceAdapter {
         const memo = this.scanMemo.get(profile.id);
         let installed: Array<{ id: string; version: string }>;
         let disabled: Set<string>;
+        // The database mtime invalidates only the disabled list it feeds - a
+        // one-row read. It must not invalidate the CLI listing: the default
+        // profile's database is the global chat store, whose WAL mtime moves
+        // on virtually every poll during active use, and keying the CLI spawn
+        // on it re-ran Electron-as-node every thirty seconds for the life of
+        // the session - the exact cost this memo exists to avoid.
         if (
           memo !== undefined &&
           memo.manifestMtimeMs === manifestMtimeMs &&
-          memo.databaseMtimeMs === databaseMtimeMs &&
           memo.registryMtimeMs === registryMtimeMs
         ) {
           installed = memo.installed;
-          disabled = memo.disabled;
+          if (memo.databaseMtimeMs === databaseMtimeMs) {
+            disabled = memo.disabled;
+          } else {
+            disabled = readDisabledExtensions(this.paths, profile.id);
+            memo.databaseMtimeMs = databaseMtimeMs;
+            memo.disabled = disabled;
+          }
         } else {
           installed = await this.listInstalledExtensions(
             profile.id === "default" ? null : profile.name,

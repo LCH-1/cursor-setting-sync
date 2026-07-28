@@ -123,6 +123,7 @@ export class HelperLauncher {
     syncOptions: HelperSyncOptions,
     restoreTarget?: { targetPath: string; contract: DatabaseContract },
     onQuitVetoed: () => Promise<void> = async () => {},
+    onQuitStalled: () => void = () => {},
   ): Promise<void> {
     await writeFileAtomic(
       this.cancelFinalizersPath,
@@ -145,7 +146,10 @@ export class HelperLauncher {
     }
     await this.launch(request, masterKey);
     await saveNamedEditors();
-    // Armed before the quit for the same reason as in `applyAndRestart`.
+    // Both timers armed before the quit for the same reason as in
+    // `applyAndRestart`: a quit whose promise never settles left the stall
+    // undetected and the veto check unarmed.
+    this.scheduleQuitStartedCheck(onQuitStalled);
     this.scheduleQuitVetoCheck(onQuitVetoed);
     await vscode.commands.executeCommand("workbench.action.quit");
   }

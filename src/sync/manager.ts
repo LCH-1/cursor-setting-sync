@@ -1,5 +1,5 @@
 import { basename, isAbsolute, join, relative } from "node:path";
-import { readFile, readdir, rm } from "node:fs/promises";
+import { readFile, readdir, rm, stat } from "node:fs/promises";
 import * as vscode from "vscode";
 import {
   AUTOMATIC_CHECKPOINT_COOLDOWN_MS,
@@ -420,10 +420,14 @@ export class SyncManager implements vscode.Disposable {
       }
     }
 
-    this.disposeRuntime();
-    this.masterKey?.fill(0);
+    // The replacement is opened before anything running is torn down. Setup
+    // used to dispose the runtime and zero the master key first, so a wrong
+    // passphrase on a re-run left sync silently stopped with a zeroed but
+    // non-null key still in place - which a later Restart to Apply would quit
+    // Cursor for and hand to the helper as an all-zero key.
+    let openedRepository: SyncRepository;
     try {
-      this.repository = await this.withProgress(
+      openedRepository = await this.withProgress(
         "Cursor Setting Sync: Setup",
         async (report) => {
           report(
@@ -450,7 +454,9 @@ export class SyncManager implements vscode.Disposable {
       );
     } catch (error) {
       // Leaving the git shell behind would make the folder non-empty, so a
-      // retry could never reach the storage-mode picker again.
+      // retry could never reach the storage-mode picker again. The running
+      // state was never touched, so the previous repository - if any - keeps
+      // synchronizing exactly as before this attempt.
       if (preparedGitRoot !== null) {
         await rm(join(preparedGitRoot, ".git"), {
           recursive: true,
@@ -459,6 +465,9 @@ export class SyncManager implements vscode.Disposable {
       }
       throw error;
     }
+    this.disposeRuntime();
+    this.masterKey?.fill(0);
+    this.repository = openedRepository;
     this.masterKey = Buffer.from(this.repository.masterKey);
     await this.configuration.setRepository(
       root,
@@ -709,6 +718,12 @@ export class SyncManager implements vscode.Disposable {
     this.masterKey = null;
     this.adapters = [];
     this.warnings.clear();
+    // Everything else that describes the departed repository goes with it: a
+    // helper failure, notices, and a declined offer all prescribe actions
+    // against a queue that no longer exists.
+    this.helperFailure = null;
+    this.notices.clear();
+    this.queuedApplyDeclined = false;
     await this.configuration.clearRepository();
     this.status.setStatus("unconfigured");
     this.status.log("Disconnected from the synchronization repository.");
@@ -732,16 +747,23 @@ export class SyncManager implements vscode.Disposable {
   }
 
   private async drainSyncQueue(): Promise<void> {
-    while (this.pendingSyncScopes.size > 0) {
-      const scope = mergeSyncScopes(this.pendingSyncScopes);
-      const manual = this.pendingManualSync;
-      this.pendingSyncScopes.clear();
-      this.pendingManualSync = false;
-      await this.performSync(manual, scope);
-    }
-    // Outside the cycle, because the maintenance phases take the same lock the
-    // cycle holds.
-    await this.runRequestedMaintenance();
+    // Maintenance runs inside the drain loop, not after it: a checkpoint of a
+    // multi-GiB repository holds the lock for minutes, and a "Sync Now" issued
+    // during that window queues a scope, sees the promise in flight, and
+    // awaits it - so returning without re-checking the queue resolved that
+    // caller's await without any sync having run.
+    do {
+      while (this.pendingSyncScopes.size > 0) {
+        const scope = mergeSyncScopes(this.pendingSyncScopes);
+        const manual = this.pendingManualSync;
+        this.pendingSyncScopes.clear();
+        this.pendingManualSync = false;
+        await this.performSync(manual, scope);
+      }
+      // Outside the cycle, because the maintenance phases take the same lock
+      // the cycle holds.
+      await this.runRequestedMaintenance();
+    } while (this.pendingSyncScopes.size > 0);
   }
 
   /**
@@ -833,6 +855,9 @@ export class SyncManager implements vscode.Disposable {
       const blocked = repository.state.pendingDatabaseChanges.filter(
         (change) => change.blockedReason !== undefined,
       );
+      // An empty queue means the work the failure described no longer exists;
+      // a red bar that survives it prescribes a retry that cannot clear it.
+      this.helperFailure = null;
       this.updateStatus(repository);
       if (blocked.length > 0) {
         void vscode.window.showWarningMessage(
@@ -1405,6 +1430,16 @@ export class SyncManager implements vscode.Disposable {
       async () => {
         await this.startFinalizer();
       },
+      () => {
+        this.status.log(QUIT_STALLED_MESSAGE);
+        void vscode.window.showWarningMessage(QUIT_STALLED_MESSAGE).then(
+          () => {},
+          () => {
+            // The window may be mid-teardown; the output-channel line above
+            // is the durable record either way.
+          },
+        );
+      },
     );
   }
 
@@ -1730,14 +1765,23 @@ export class SyncManager implements vscode.Disposable {
     await this.withProgress(
       "Cursor Setting Sync: Archive Repository",
       async (report) => {
-        report("Enumerating repository files...");
-        const sources = await listFilesRecursively(repository.root);
-        let copied = 0;
-        for (const source of sources) {
-          const relativePath = relative(repository.root, source);
-          await copyFileAtomic(source, join(destination, relativePath));
-          copied += 1;
-          report(`Copying ${copied}/${sources.length} files...`);
+        // Held for the whole copy: without it this window's own 30-second
+        // poll, automatic maintenance, or the offline helper deletes event
+        // files mid-enumeration and the archive dies on ENOENT halfway - or
+        // worse, completes while silently missing what was pruned under it.
+        const lock = await this.takeCommandLock(report);
+        try {
+          report("Enumerating repository files...");
+          const sources = await listFilesRecursively(repository.root);
+          let copied = 0;
+          for (const source of sources) {
+            const relativePath = relative(repository.root, source);
+            await copyFileAtomic(source, join(destination, relativePath));
+            copied += 1;
+            report(`Copying ${copied}/${sources.length} files...`);
+          }
+        } finally {
+          await lock.release();
         }
       },
     );
@@ -3101,15 +3145,40 @@ export class SyncManager implements vscode.Disposable {
     } catch {
       return;
     }
+    // A shutdown finalizer deliberately waits days for Cursor to exit, holding
+    // its lock with a once-a-minute heartbeat the whole time. Its request file
+    // is the helper's input, not litter; deleting it starved the export.
+    let finalizerAlive = false;
+    try {
+      const lockStat = await stat(
+        join(this.paths.extensionStorage, "shutdown-finalizer.lock"),
+      );
+      finalizerAlive = Date.now() - lockStat.mtimeMs < ABANDONED_HELPER_MIN_AGE_MS;
+    } catch {
+      // No lock: no live finalizer to protect.
+    }
     for (const name of names.filter((entry) => entry.endsWith(".json"))) {
       const requestPath = join(this.paths.extensionStorage, name);
       const logPath = `${requestPath}.stderr.log`;
       let scriptMissing = false;
+      let request: HelperRequest | null = null;
       try {
-        const request = await readJsonFile<HelperRequest>(requestPath);
+        request = await readJsonFile<HelperRequest>(requestPath);
         scriptMissing = !(await pathExists(request.paths.helperScript));
       } catch {
         // An unreadable request is itself worth reporting.
+      }
+      if (request !== null) {
+        if (request.mode === "final-export" && finalizerAlive) {
+          continue;
+        }
+        const ageMs = Date.now() - Date.parse(request.createdAt);
+        if (Number.isFinite(ageMs) && ageMs < ABANDONED_HELPER_MIN_AGE_MS) {
+          // Younger than the exit-wait plus lock-wait budget: a helper may
+          // still be legitimately waiting on it. "Never reported a result"
+          // must not describe a helper that has not had time to.
+          continue;
+        }
       }
       let stderr = "";
       try {
@@ -3414,6 +3483,14 @@ export function settledStatus(input: {
  * the user is trying to move. Closing windows is enough, because the helper
  * waits on the process list rather than on the command it issued.
  */
+/**
+ * How old a helper request must be before "never reported a result" can be
+ * true of it: the 3-minute exit wait, the 3-minute lock wait, and margin for
+ * the apply itself. The shutdown finalizer is recognized by its heartbeated
+ * lock instead - it waits for days by design.
+ */
+const ABANDONED_HELPER_MIN_AGE_MS = 15 * 60_000;
+
 export const QUIT_STALLED_MESSAGE =
   `Cursor Setting Sync asked Cursor to close ${Math.round(QUIT_START_GRACE_MS / 1000)} seconds ago and it is still open, so the queued changes have not been written. ` +
   "Closing Cursor yourself in the next couple of minutes still completes it - the offline helper is waiting for the windows to go away, not for the command it sent - " +

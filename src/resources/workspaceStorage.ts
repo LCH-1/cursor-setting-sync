@@ -15,7 +15,7 @@ import {
   pathExists,
 } from "../platform/files";
 import { sha256 } from "../protocol/canonical";
-import { discoverWorkspaces } from "../chat/workspace";
+import { discoverWorkspacesDetailed } from "../chat/workspace";
 import { EMPTY_IGNORE_MATCHER, type IgnoreMatcher } from "./ignorePatterns";
 import type { ResourceAdapter, ResourceApplyInput } from "./resource";
 import {
@@ -61,13 +61,17 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
     // unreadable workspaceStorage root reject here dropped the backup of every
     // workspace, which is exactly the failure this adapter must not have.
     let workspaceUris = new Map<string, string>();
+    // Directories whose workspace.json could not be read. Unknown is not
+    // folderless: a crash while VS Code writes the file leaves it empty, and
+    // classifying that as "a window with no folder open" silently dropped the
+    // workspace's databases from the shutdown backup.
+    let unreadableWorkspaceIds = new Set<string>();
     try {
+      const discovery = await discoverWorkspacesDetailed(this.paths);
       workspaceUris = new Map(
-        (await discoverWorkspaces(this.paths)).map((workspace) => [
-          workspace.id,
-          workspace.uri,
-        ]),
+        discovery.workspaces.map((workspace) => [workspace.id, workspace.uri]),
       );
+      unreadableWorkspaceIds = new Set(discovery.unreadableIds);
     } catch (error) {
       warnings.push(formatScanWarning(this.paths.workspaceStorageRoot, error));
     }
@@ -102,7 +106,11 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
           ...actualRelativePath.split("/").slice(1),
         ].join("/");
         const resourceId = workspaceStorageResourceId(canonicalRelativePath);
-        if (workspaceUris.size > 0 && !workspaceUris.has(actualWorkspaceId)) {
+        if (
+          workspaceUris.size > 0 &&
+          !workspaceUris.has(actualWorkspaceId) &&
+          !unreadableWorkspaceIds.has(actualWorkspaceId)
+        ) {
           // A directory with no folder URI belongs to a window that had nothing
           // open - `discoverWorkspaces` lists only those with a folder or a
           // .code-workspace file. VS Code names those after the millisecond the

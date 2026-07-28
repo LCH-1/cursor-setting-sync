@@ -299,6 +299,29 @@ export function mergeWorkspaceDatabaseSnapshots(
     if (localTable === undefined && remoteTable === undefined) {
       continue;
     }
+    if (localTable === undefined || remoteTable === undefined) {
+      // A snapshot that lacks the table entirely came from a Cursor whose
+      // schema does not have it. That is no opinion about its rows - not a
+      // deletion of every one of them, which is what the three-way walk below
+      // would infer: each row equal to base on the present side would take the
+      // absent side's "row", dropping the whole table from the merge.
+      const present = localTable ?? remoteTable;
+      const presentRows = rowsByKey(present);
+      const passthrough: WorkspaceDatabaseRow[] = [];
+      for (const key of [...presentRows.keys()].sort(compareText)) {
+        const row = presentRows.get(key);
+        if (row !== undefined) {
+          passthrough.push(cloneRow(row));
+        }
+      }
+      tables.push({
+        name: descriptor.name,
+        keyColumn: descriptor.keyColumn,
+        columns: [...descriptor.valueColumns],
+        rows: passthrough,
+      });
+      continue;
+    }
     const baseRows = rowsByKey(baseTable);
     const localRows = rowsByKey(localTable);
     const remoteRows = rowsByKey(remoteTable);

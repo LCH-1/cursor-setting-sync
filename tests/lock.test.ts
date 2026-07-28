@@ -126,15 +126,35 @@ describe("file lock", () => {
     }
   });
 
-  it("takes over a corrupt lock file", async () => {
+  it("leaves a fresh unreadable lock file alone", async () => {
+    // An unreadable lock is usually another process caught in the
+    // milliseconds between its open("wx") and its writeFile. Taking it over
+    // on unreadability alone stole locks mid-creation, and the post-rename
+    // isSameLock(null, null) check confirmed the theft - two windows then
+    // both believed they held the lock and ran full cycles concurrently.
     const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
     try {
       const path = join(root, "sync.lock");
       await writeFile(path, "not json", "utf8");
 
+      expect(await acquireFileLock(path)).toBeNull();
+      expect(await readFile(path, "utf8")).toBe("not json");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("takes over an unreadable lock file only after the TTL", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
+    try {
+      const path = join(root, "sync.lock");
+      await writeFile(path, "not json", "utf8");
+      const past = new Date(Date.now() - 16 * 60_000);
+      await utimes(path, past, past);
+
       const lock = await acquireFileLock(path);
       if (lock === null) {
-        throw new Error("Expected the corrupt lock to be taken over.");
+        throw new Error("Expected the stale corrupt lock to be taken over.");
       }
       const stored = JSON.parse(await readFile(path, "utf8")) as StoredLock;
       expect(stored.pid).toBe(process.pid);

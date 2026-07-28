@@ -96,10 +96,15 @@ export class EventReconciler {
 
     state.tips = nextTips;
     state.conflicts = mergeConflictHistory(state.conflicts, conflicts);
-    state.lamport = Math.max(
-      state.lamport,
-      ...accepted.map((event) => event.manifest.lamport),
-    );
+    // A loop, not Math.max(...spread): the spread passes one argument per
+    // accepted event, and the since-checkpoint backlog is unbounded while a
+    // conflict blocks checkpointing - past ~100k events it overflows the
+    // argument stack and every cycle dies with RangeError.
+    for (const event of accepted) {
+      if (event.manifest.lamport > state.lamport) {
+        state.lamport = event.manifest.lamport;
+      }
+    }
     const acceptedEventHashes = accepted.map((event) => event.eventHash);
     for (const event of accepted) {
       state.streams[event.stored.header.deviceId] = {
@@ -336,14 +341,19 @@ function markAncestors(
   graph: Map<string, VersionNode>,
   ancestors: Set<string>,
 ): void {
-  if (ancestors.has(versionId)) {
-    return;
-  }
-  ancestors.add(versionId);
-  const parent = graph.get(versionId);
-  if (parent !== undefined) {
-    for (const ancestor of parent.parents) {
-      markAncestors(ancestor, graph, ancestors);
+  // An explicit stack, not recursion: a version chain grows one link per
+  // publish of the resource, so a chatty resource that has not been folded
+  // into a checkpoint for weeks reaches depths that overflow the call stack.
+  const pending = [versionId];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (current === undefined || ancestors.has(current)) {
+      continue;
+    }
+    ancestors.add(current);
+    const parent = graph.get(current);
+    if (parent !== undefined) {
+      pending.push(...parent.parents);
     }
   }
 }

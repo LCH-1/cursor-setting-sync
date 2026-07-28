@@ -111,6 +111,7 @@ export class SettingsAdapter implements ResourceAdapter {
     const scannedProfiles = new Set<string>();
     const nativeIgnoredByProfile = new Map<string, IgnoreMatcher>();
     const observedKeys = new Set<string>();
+    let observedKeysComplete = true;
     const silencedByDefaults = new Set<string>();
 
     for (const profile of await discoverProfileResourcePaths(this.paths)) {
@@ -166,16 +167,22 @@ export class SettingsAdapter implements ResourceAdapter {
         }
       } catch (error) {
         warnings.push(toErrorMessage(error));
+        observedKeysComplete = false;
       }
     }
 
     // A configured entry that matched nothing is almost always a typo or an
     // unsupported pattern, and silence there means the user believes a key is
-    // excluded when it is not.
-    for (const pattern of this.ignoredSettings.unmatched(observedKeys)) {
-      warnings.push(
-        `cursorSettingSync.ignoredSettings entry "${pattern}" matched no settings key. Correct the typo or remove the entry; nothing is being excluded by it.`,
-      );
+    // excluded when it is not. Only claimable when every settings file was
+    // actually read: a profile that failed to parse leaves its keys out of
+    // observedKeys, and reporting each configured entry as "excluding
+    // nothing" on that basis told the user to delete entries that were fine.
+    if (observedKeysComplete) {
+      for (const pattern of this.ignoredSettings.unmatched(observedKeys)) {
+        warnings.push(
+          `cursorSettingSync.ignoredSettings entry "${pattern}" matched no settings key. Correct the typo or remove the entry; nothing is being excluded by it.`,
+        );
+      }
     }
 
     // A key the built-in defaults took over is otherwise completely silent:
