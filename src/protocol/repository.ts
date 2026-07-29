@@ -63,6 +63,7 @@ import {
 } from "../platform/files";
 import {
   canonicalBytes,
+  compareCodeUnits,
   hashesEqual,
   hasExactObjectKeys,
   hmacSha256,
@@ -433,7 +434,7 @@ export class SyncRepository {
       changes.push(change);
     }
 
-    changes.sort((left, right) => left.resourceId.localeCompare(right.resourceId));
+    changes.sort((left, right) => compareCodeUnits(left.resourceId, right.resourceId));
     const header: EventHeader = {
       protocolVersion:
         this.state.checkpoint === undefined
@@ -464,10 +465,31 @@ export class SyncRepository {
       throw new Error(`Event envelope exceeds ${MAX_EVENT_FILE_BYTES} bytes.`);
     }
     const eventHash = sha256(storedBytes);
-    const eventFileName = `${String(header.sequence).padStart(16, "0")}-${eventHash}${EVENT_EXTENSION}`;
+    const sequencePrefix = `${String(header.sequence).padStart(16, "0")}-`;
+    const eventFileName = `${sequencePrefix}${eventHash}${EVENT_EXTENSION}`;
     const eventPath = join(this.eventsRoot(header.deviceId), eventFileName);
-    if (await pathExists(eventPath)) {
-      throw new Error(`Event already exists: ${eventFileName}`);
+    // ANY file at this sequence refuses the publish, not just the exact
+    // hash-qualified name: a device whose state was restored from an OS
+    // backup can believe a sequence is free while its own older publication
+    // of that sequence is still hydrating from the cloud - writing a second
+    // file there forks the immutable stream and fail-stops every machine.
+    try {
+      const siblings = await readdir(this.eventsRoot(header.deviceId));
+      const occupied = siblings.find(
+        (name) => name.startsWith(sequencePrefix) && name.endsWith(EVENT_EXTENSION),
+      );
+      if (occupied !== undefined) {
+        throw new Error(
+          `Event sequence ${header.sequence} is already occupied by ${occupied}; ` +
+            "this device's local state appears older than its published stream (was it restored from a backup?). " +
+            "Waiting for the shared folder to finish delivering this device's own events.",
+        );
+      }
+    } catch (error) {
+      if (!isMissingPathError(error)) {
+        throw error;
+      }
+      // First publish for this device: the directory does not exist yet.
     }
     await writeFileAtomic(eventPath, storedBytes, false);
     this.noteSelfWrite(eventFileName);
@@ -929,6 +951,34 @@ export class SyncRepository {
     };
   }
 
+  /**
+   * Throws when the visible event log or the absorbed checkpoint carries a
+   * resource kind this build does not know. Folding or pruning around such a
+   * kind silently destroys a newer build's data; the remedy is updating the
+   * extension, and the message says so.
+   */
+  private async assertNoUnknownResourceKinds(action: string): Promise<void> {
+    const unknown = new Set<string>();
+    for (const event of await this.listEvents()) {
+      for (const change of event.manifest.changes) {
+        if (!isSupportedResourceKind(change.kind)) {
+          unknown.add(String(change.kind));
+        }
+      }
+    }
+    const manifest = await this.loadAbsorbedCheckpointManifest();
+    for (const resource of manifest?.resources ?? []) {
+      if (!isSupportedResourceKind(resource.kind)) {
+        unknown.add(String(resource.kind));
+      }
+    }
+    if (unknown.size > 0) {
+      throw new Error(
+        `Refused to ${action}: the repository contains resource kinds this extension version does not understand (${[...unknown].sort().join(", ")}). Update Cursor Setting Sync on this computer first - folding or pruning around them would silently destroy the newer computer's data.`,
+      );
+    }
+  }
+
   async createCheckpoint(
     reconciledWithoutWarnings: boolean,
   ): Promise<CheckpointCreateResult> {
@@ -947,6 +997,14 @@ export class SyncRepository {
         "Resolve all synchronization conflicts before creating a checkpoint.",
       );
     }
+    // Forward-compatibility fail-safe: a future release that adds a resource
+    // kind syncs fine through THIS build (kind is just a validated string),
+    // but folding history would silently OMIT every such resource from the
+    // checkpoint - reconciliation skips unknown kinds - and the prune that
+    // follows would then delete the only events carrying them. Refusing here
+    // is the one chance a fielded build has to protect data a newer build
+    // published.
+    await this.assertNoUnknownResourceKinds("create a checkpoint");
     const lamport = this.state.lamport + 1;
     const resources: CheckpointResource[] = [];
     for (const resourceId of Object.keys(this.state.tips).sort()) {
@@ -1043,6 +1101,14 @@ export class SyncRepository {
     if (options.reconciledWithoutWarnings !== true) {
       throw new Error(
         "Pruning requires a completed reconcile without stream warnings.",
+      );
+    }
+    try {
+      await this.assertNoUnknownResourceKinds("prune history");
+    } catch (error) {
+      return abortedPrune(
+        error instanceof Error ? error.message : String(error),
+        [],
       );
     }
     const previousHash = this.state.checkpoint?.hash ?? null;
@@ -1377,6 +1443,20 @@ export class SyncRepository {
         `stream ended before previously published event ${pinned.lastSequence}`,
       );
     }
+    // The pinned cursor is only what THIS state file remembers - and a state
+    // file restored from an OS backup remembers less than the device actually
+    // published. head.json in the shared folder records the real head; while
+    // the cloud is still hydrating the newer event files, publishing would
+    // mint a sequence that already exists out there with different bytes,
+    // forking the immutable own stream and fail-stopping every machine. Wait
+    // instead, exactly like the checkpoint branch already does.
+    const headSequence = await this.readOwnHeadSequence();
+    if (headSequence !== null && expectedSequence - 1 < headSequence) {
+      throw new OwnStreamPendingRecoveryError(
+        deviceId,
+        `this device's own head records event ${headSequence}, which has not finished arriving from the shared folder`,
+      );
+    }
     const cursor = this.state.streams[deviceId];
     // A device that has published nothing has no pinned cursor at all. The
     // (nextSequence, ownStreamHead, streams[own]) triple encodes "empty
@@ -1647,9 +1727,14 @@ export class SyncRepository {
         ),
       );
     } catch (error) {
-      // The shared copy vanishing mid-cycle is another device's prune; the
-      // absorbed manifest stays reachable through the manifest loader.
-      if (!isMissingPathError(error)) {
+      // The shared copy vanishing mid-cycle is another device's prune, and a
+      // torn read is the same file mid-propagation; the absorbed manifest
+      // stays reachable through the manifest loader, and the local copy is
+      // retried on a later cycle.
+      if (
+        !isMissingPathError(error) &&
+        !isTolerableTornCheckpointError(error)
+      ) {
         throw error;
       }
     }
@@ -1684,9 +1769,19 @@ export class SyncRepository {
         break;
       } catch (error) {
         // A listed shared file that vanished mid-scan was deleted by another
-        // device's prune; every other failure on a well-named shared
-        // checkpoint is a fail-stop.
-        if (isMissingPathError(error)) {
+        // device's prune, and one that reads torn - zero bytes, truncated
+        // JSON, a hash or auth check over half-transferred content - is
+        // mid-propagation from the other machine: checkpoints run tens of
+        // MiB, and the cloud client materializes the name before the bytes.
+        // Both mean "not arrived yet", not corruption; the next candidate (or
+        // the local copy of the previous winner) covers this cycle and the
+        // 30-second poll retries the file. Failing hard here took every cycle
+        // down for the whole hydration window - the exact shape 0.0.32
+        // declared a bug when EVENT files produced it.
+        if (
+          isMissingPathError(error) ||
+          isTolerableTornCheckpointError(error)
+        ) {
           continue;
         }
         throw error;
@@ -1951,7 +2046,7 @@ export class SyncRepository {
     return entries
       .filter((entry) => entry.isDirectory() && isSafeIdentifier(entry.name))
       .map((entry) => entry.name)
-      .sort((left, right) => left.localeCompare(right));
+      .sort(compareCodeUnits);
   }
 
   private async readEvent(
@@ -2022,7 +2117,7 @@ export class SyncRepository {
   private currentParents(resourceId: string): string[] {
     return (this.state.tips[resourceId] ?? [])
       .map((tip) => tip.versionId)
-      .sort((left, right) => left.localeCompare(right));
+      .sort(compareCodeUnits);
   }
 
   private deviceRoot(deviceId: string): string {
@@ -2051,7 +2146,8 @@ function compareDecryptedEvents(
   left: DecryptedEvent,
   right: DecryptedEvent,
 ): number {
-  const deviceOrder = left.stored.header.deviceId.localeCompare(
+  const deviceOrder = compareCodeUnits(
+    left.stored.header.deviceId,
     right.stored.header.deviceId,
   );
   if (deviceOrder !== 0) {
@@ -2142,6 +2238,24 @@ function isTolerablePrunedEventError(error: unknown): boolean {
   );
 }
 
+/**
+ * The checkpoint analog of {@link isTolerablePrunedEventError}: the failure
+ * shapes a well-named checkpoint file shows while the cloud client is still
+ * transferring its bytes. Only used where another candidate or the local copy
+ * of the previous winner can cover the cycle.
+ */
+function isTolerableTornCheckpointError(error: unknown): boolean {
+  if (error instanceof SyntaxError) {
+    return true;
+  }
+  return (
+    error instanceof Error &&
+    (error.message.startsWith("Checkpoint ") ||
+      error.message.startsWith("Unsupported state authentication") ||
+      error.message.includes("Unsupported state or unable to authenticate data"))
+  );
+}
+
 function abortedPrune(reason: string, laggingDevices: string[]): PruneResult {
   return {
     status: "aborted",
@@ -2176,7 +2290,7 @@ function compareCheckpointIdentity(
   if (left.lamport !== right.lamport) {
     return left.lamport - right.lamport;
   }
-  return left.hash.localeCompare(right.hash);
+  return compareCodeUnits(left.hash, right.hash);
 }
 
 function cloneStreams(
@@ -2207,11 +2321,12 @@ function compareCheckpointTips(left: ResourceTip, right: ResourceTip): number {
   if (left.lamport !== right.lamport) {
     return right.lamport - left.lamport;
   }
-  const deviceOrder = right.deviceId.localeCompare(left.deviceId);
+  // Code-unit order: replicated elections must sort identically everywhere.
+  const deviceOrder = compareCodeUnits(right.deviceId, left.deviceId);
   if (deviceOrder !== 0) {
     return deviceOrder;
   }
-  return right.eventHash.localeCompare(left.eventHash);
+  return compareCodeUnits(right.eventHash, left.eventHash);
 }
 
 function compareVersionSummaries(
@@ -2221,11 +2336,11 @@ function compareVersionSummaries(
   if (left.lamport !== right.lamport) {
     return right.lamport - left.lamport;
   }
-  const createdOrder = right.createdAt.localeCompare(left.createdAt);
+  const createdOrder = compareCodeUnits(right.createdAt, left.createdAt);
   if (createdOrder !== 0) {
     return createdOrder;
   }
-  return right.versionId.localeCompare(left.versionId);
+  return compareCodeUnits(right.versionId, left.versionId);
 }
 
 function parseCheckpointIdentity(value: unknown): CheckpointIdentity | null {

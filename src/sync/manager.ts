@@ -1,5 +1,5 @@
 import { basename, isAbsolute, join, relative } from "node:path";
-import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { readFile, readdir, rename, rm, stat, utimes } from "node:fs/promises";
 import * as vscode from "vscode";
 import {
   AUTOMATIC_CHECKPOINT_COOLDOWN_MS,
@@ -224,6 +224,8 @@ export class SyncManager implements vscode.Disposable {
   private readonly historyDocuments = new Map<string, string>();
   private readonly historyPreviewRegistration: vscode.Disposable;
   private readonly gitWarningsShown = new Set<GitErrorKind>();
+  /** The LAST git window's outcome; recovers on success, unlike the toast set. */
+  private lastGitWindowDegraded = false;
   private readonly warnings = new StandingWarningRegistry();
   /**
    * Deliberate exclusions, kept in their own registry.
@@ -483,6 +485,19 @@ export class SyncManager implements vscode.Disposable {
       this.repository.repository.repositoryId,
       this.masterKey,
     );
+    // The swap starts this repository's story fresh, the same trade
+    // Disconnect->Setup already makes: the old repository's latched failure
+    // must not paint the new one red, and a decline given to the OLD queue
+    // must not suppress the setup-time offer for the new one.
+    this.helperFailure = null;
+    this.notices.clear();
+    this.queuedApplyDeclined = false;
+    // Reconnecting also supersedes any standing disconnect marker for this
+    // repository, so sibling windows resume normally.
+    await rm(
+      this.disconnectMarkerPath(this.repository.repository.repositoryId),
+      { force: true },
+    ).catch(() => {});
     this.refreshAdapters();
     await this.withProgress("Cursor Setting Sync: Setup", async (report) => {
       if (await this.gitModeFor(root)) {
@@ -743,6 +758,18 @@ export class SyncManager implements vscode.Disposable {
       // block the disconnect the user asked for.
     }
     await this.helper.cancelFinalizers();
+    // Disconnect is a statement about THIS DEVICE, but every open window runs
+    // its own extension host and none of them observe globalState changes.
+    // Without a machine-wide signal, sibling windows kept publishing into the
+    // folder - green check mark and all - after the user was told the device
+    // had disconnected. The marker is checked at the top of every sync cycle
+    // and before every finalizer arm; Setup removes it on reconnect.
+    if (this.repository !== null) {
+      await writeJsonAtomic(
+        this.disconnectMarkerPath(this.repository.repository.repositoryId),
+        { disconnectedAt: new Date().toISOString(), pid: process.pid },
+      ).catch(() => {});
+    }
     this.repository = null;
     this.masterKey?.fill(0);
     this.masterKey = null;
@@ -859,7 +886,23 @@ export class SyncManager implements vscode.Disposable {
 
   async restartToApply(): Promise<void> {
     const repository = this.requireRepository();
-    const masterKey = this.requireMasterKey();
+    // A copy, not the live reference: Disconnect or a Setup re-run zeroes
+    // this.masterKey in place, and this command parks for tens of seconds in
+    // sync, lock waits and mapping prompts before the key is serialized to
+    // the helper - a zeroed shared Buffer there meant the helper opened the
+    // repository with an all-zero key and failed after quitting Cursor.
+    const masterKey = Buffer.from(this.requireMasterKey());
+    try {
+      await this.restartToApplyWithKey(repository, masterKey);
+    } finally {
+      masterKey.fill(0);
+    }
+  }
+
+  private async restartToApplyWithKey(
+    repository: SyncRepository,
+    masterKey: Buffer,
+  ): Promise<void> {
     assertCompatibleForDatabaseWrite(this.compatibility);
     if (await this.applyAlreadyInProgress()) {
       const message =
@@ -868,56 +911,89 @@ export class SyncManager implements vscode.Disposable {
       void vscode.window.showInformationMessage(message);
       return;
     }
-    await this.syncNow(true);
-    // The sync above releases the lock, so this races the background cycle for
-    // it a moment later - which is how the command the user asked for failed
-    // with "another Cursor window is synchronizing" about this window's own
-    // poll. Waiting is shown rather than silent, because it can take a cycle.
-    const lock = await this.withProgress(
-      RESTART_TO_APPLY_TITLE,
-      async (report) => this.takeCommandLock(report),
-    );
-    let batch: PendingHelperBatch;
-    try {
-      await this.openGitWindow(repository);
-      await repository.refreshState();
-      await this.applyPendingRunningResources(repository);
-      await this.ensureWorkspaceMappings(repository);
-      batch = pendingHelperBatch(repository);
-    } finally {
-      await lock.release();
-    }
-    const changes = batch.changes;
-    if (changes.length === 0) {
-      const blocked = repository.state.pendingDatabaseChanges.filter(
-        (change) => change.blockedReason !== undefined,
-      );
-      // An empty queue means the work the failure described no longer exists;
-      // a red bar that survives it prescribes a retry that cannot clear it.
-      this.helperFailure = null;
-      this.updateStatus(repository);
-      if (blocked.length > 0) {
-        void vscode.window.showWarningMessage(
-          `${blocked.length} database change(s) are deferred. ${blocked[0]?.blockedReason ?? "Update Cursor and try again."}`,
-        );
-      } else {
-        void vscode.window.showInformationMessage("There are no database changes to apply.");
-      }
-      return;
-    }
-    // The retry the failure asked for is under way, so the red bar has served
-    // its purpose; leaving it latched would outlive the thing it described.
-    // Cleared here rather than on entry because everything above can throw or
-    // return early, and a burnt latch would hide a failure still in force.
-    this.helperFailure = null;
-    if (batch.deferredForBatchLimit > 0) {
-      // Durable, because the toast below dies with the window this is about to
-      // quit. Without it the queue simply comes back smaller than promised.
-      this.status.log(
-        `Applying ${changes.length} change(s); ${batch.deferredForBatchLimit} more exceed the per-apply size limit, stay queued, and are offered again after this pass.`,
-      );
-    }
+    // Claimed BEFORE the multi-ten-second sync below, not after: the check
+    // above and a marker written only at the end left the whole preparation
+    // window open for a second window to commit to the same apply - two
+    // helpers then each counted the other as a live Cursor and both timed
+    // out having applied nothing.
     await this.markApplyInProgress();
+    let committed = false;
+    try {
+      await this.syncNow(true);
+      // The sync above releases the lock, so this races the background cycle
+      // for it a moment later - which is how the command the user asked for
+      // failed with "another Cursor window is synchronizing" about this
+      // window's own poll. Waiting is shown rather than silent.
+      const lock = await this.withProgress(
+        RESTART_TO_APPLY_TITLE,
+        async (report) => this.takeCommandLock(report),
+      );
+      let batch: PendingHelperBatch;
+      try {
+        await this.openGitWindow(repository);
+        await repository.refreshState();
+        await this.applyPendingRunningResources(repository);
+        await this.ensureWorkspaceMappings(repository);
+        batch = pendingHelperBatch(repository);
+      } finally {
+        await lock.release();
+      }
+      if (this.disposed || this.repository !== repository || this.masterKey === null) {
+        // Disconnect or Setup ran while this command was parked in prompts or
+        // waits; quitting every window to apply into a repository this device
+        // just left is not what anyone asked for.
+        this.status.log(
+          "Restart to Apply was abandoned: the synchronization configuration changed while it was being prepared. Nothing was applied.",
+        );
+        return;
+      }
+      const changes = batch.changes;
+      if (changes.length === 0) {
+        const blocked = repository.state.pendingDatabaseChanges.filter(
+          (change) => change.blockedReason !== undefined,
+        );
+        // An empty queue means the work the failure described no longer
+        // exists; a red bar surviving it prescribes a retry that cannot clear.
+        this.helperFailure = null;
+        this.updateStatus(repository);
+        if (blocked.length > 0) {
+          void vscode.window.showWarningMessage(
+            `${blocked.length} database change(s) are deferred. ${blocked[0]?.blockedReason ?? "Update Cursor and try again."}`,
+          );
+        } else {
+          void vscode.window.showInformationMessage("There are no database changes to apply.");
+        }
+        return;
+      }
+      // The retry the failure asked for is under way, so the red bar has
+      // served its purpose; leaving it latched would outlive the thing it
+      // described. Cleared here rather than on entry because everything above
+      // can throw or return early.
+      this.helperFailure = null;
+      if (batch.deferredForBatchLimit > 0) {
+        // Durable, because the toast below dies with the window this is about
+        // to quit. Without it the queue comes back smaller than promised.
+        this.status.log(
+          `Applying ${changes.length} change(s); ${batch.deferredForBatchLimit} more exceed the per-apply size limit, stay queued, and are offered again after this pass.`,
+        );
+      }
+      committed = true;
+      await this.launchApplyHelper(repository, masterKey, changes);
+    } finally {
+      if (!committed) {
+        // Every early return and throw above must release the claim, or a
+        // batch that turned out empty blocks the next window's offer for the
+        // marker's whole TTL.
+        await this.clearApplyInProgress();
+      }
+    }
+  }
+
+  private async launchApplyHelper(
+    repository: SyncRepository,
+    masterKey: Buffer,
+    changes: HelperChange[],
+  ): Promise<void> {
     try {
       await this.helper.applyAndRestart(
         this.configuration.repositoryPath ?? repository.root,
@@ -970,6 +1046,46 @@ export class SyncManager implements vscode.Disposable {
     return join(this.paths.extensionStorage, "apply-in-progress.json");
   }
 
+  private disconnectMarkerPath(repositoryId: string): string {
+    return join(this.paths.extensionStorage, `disconnected-${repositoryId}.json`);
+  }
+
+  /**
+   * Whether another window disconnected this device from the repository this
+   * window still holds open - and if so, the same teardown disconnect()
+   * performs locally. Extension hosts observe no globalState events, so
+   * without this check a sibling window kept publishing into the folder,
+   * green check mark and all, after the user was told the device had
+   * disconnected.
+   */
+  private async disconnectedElsewhere(): Promise<boolean> {
+    const repository = this.repository;
+    if (repository === null) {
+      return false;
+    }
+    if (
+      !(await pathExists(
+        this.disconnectMarkerPath(repository.repository.repositoryId),
+      ))
+    ) {
+      return false;
+    }
+    this.disposeRuntime();
+    this.repository = null;
+    this.masterKey?.fill(0);
+    this.masterKey = null;
+    this.adapters = [];
+    this.warnings.clear();
+    this.helperFailure = null;
+    this.notices.clear();
+    this.queuedApplyDeclined = false;
+    this.status.setStatus("unconfigured");
+    this.status.log(
+      "Another window disconnected this device from the synchronization repository; this window stopped synchronizing too.",
+    );
+    return true;
+  }
+
   /**
    * Whether a sibling window committed to an apply recently enough that it may
    * still be between its dialog and the quit. The budget is the helper's exit
@@ -1000,6 +1116,33 @@ export class SyncManager implements vscode.Disposable {
 
   private async clearApplyInProgress(): Promise<void> {
     await rm(this.applyInProgressPath(), { force: true });
+  }
+
+  /**
+   * Clears the marker unless it belongs to another window that is still
+   * alive - that window's apply may be mid-flight, and erasing its claim
+   * re-admits a concurrent apply against the same quit. A dead owner's
+   * marker and this window's own marker clear as usual; the TTL remains the
+   * backstop for anything left behind.
+   */
+  private async clearApplyInProgressUnlessForeign(): Promise<void> {
+    try {
+      const marker = await readJsonFile<{ pid?: number }>(
+        this.applyInProgressPath(),
+      );
+      const pid = marker.pid;
+      if (typeof pid === "number" && pid !== process.pid) {
+        try {
+          process.kill(pid, 0);
+          return;
+        } catch {
+          // Owner gone; fall through to the clear.
+        }
+      }
+    } catch {
+      // Unreadable or missing marker clears unconditionally.
+    }
+    await this.clearApplyInProgress();
   }
 
   async resolveConflicts(): Promise<void> {
@@ -1422,7 +1565,7 @@ export class SyncManager implements vscode.Disposable {
         (left, right) => left.localeCompare(right),
       ),
       gitMode:
-        this.gitWarningsShown.size > 0
+        this.lastGitWindowDegraded
           ? "degraded"
           : this.configuration.gitSync
             ? "enabled"
@@ -1457,7 +1600,20 @@ export class SyncManager implements vscode.Disposable {
 
   async restoreBackup(): Promise<void> {
     const repository = this.requireRepository();
-    const masterKey = this.requireMasterKey();
+    // Copied for the same reason as restartToApply: this command parks in
+    // pickers and a modal, and a Disconnect meanwhile zeroes the live Buffer.
+    const masterKey = Buffer.from(this.requireMasterKey());
+    try {
+      await this.restoreBackupWithKey(repository, masterKey);
+    } finally {
+      masterKey.fill(0);
+    }
+  }
+
+  private async restoreBackupWithKey(
+    repository: SyncRepository,
+    masterKey: Buffer,
+  ): Promise<void> {
     assertCompatibleForDatabaseWrite(this.compatibility);
     const backupRoot = join(this.paths.extensionStorage, BACKUP_DIRECTORY);
     const backups = (await listFilesRecursively(backupRoot)).filter((path) => {
@@ -1554,6 +1710,7 @@ export class SyncManager implements vscode.Disposable {
       label: string;
       description?: string;
       deviceId: string;
+      action: "forget" | "unforget";
     }>;
     try {
       await this.openGitWindow(repository);
@@ -1572,11 +1729,28 @@ export class SyncManager implements vscode.Disposable {
         .sort((left, right) => left.localeCompare(right))
         .map((deviceId) => ({
           label: deviceId,
+          // "(no published events)" is also what a computer that is STILL
+          // JOINING looks like under cloud-sync lag; the description says so
+          // rather than reading like an invitation to clean it up.
           ...(streamDevices.has(deviceId)
             ? {}
-            : { description: "(no published events)" }),
+            : {
+                description:
+                  "(no published events - may be a computer still joining)",
+              }),
           deviceId,
+          action: "forget" as const,
         }));
+      // Retiring used to be irreversible; a mistaken pick silently blinded
+      // this machine to a real peer forever. The same picker restores.
+      for (const deviceId of [...repository.state.retiredDevices].sort()) {
+        candidates.push({
+          label: `$(history) Restore forgotten device ${deviceId}`,
+          description: "start reading this device's events again",
+          deviceId,
+          action: "unforget",
+        });
+      }
     } finally {
       await firstLock.release();
     }
@@ -1587,24 +1761,46 @@ export class SyncManager implements vscode.Disposable {
     if (selected === undefined) {
       return;
     }
+    if (selected.action === "forget") {
+      const proceed = "Forget Device";
+      const confirmed = await vscode.window.showWarningMessage(
+        `Permanently stop reading events from device ${selected.deviceId} on this computer? ` +
+          "If that device is a real computer that is still joining or temporarily offline, its changes will silently never arrive here. " +
+          "You can restore it later from this same command.",
+        { modal: true },
+        proceed,
+      );
+      if (confirmed !== proceed) {
+        return;
+      }
+    }
     const secondLock = await this.takeCommandLock();
     try {
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
-      if (!repository.state.retiredDevices.includes(selected.deviceId)) {
-        repository.state.retiredDevices.push(selected.deviceId);
+      if (selected.action === "forget") {
+        if (!repository.state.retiredDevices.includes(selected.deviceId)) {
+          repository.state.retiredDevices.push(selected.deviceId);
+        }
+      } else {
+        repository.state.retiredDevices =
+          repository.state.retiredDevices.filter(
+            (deviceId) => deviceId !== selected.deviceId,
+          );
       }
       await repository.saveState();
       await this.commitGitWindow(
         gitActive,
         repository.root,
-        `forget-device ${selected.deviceId.slice(0, 8)}`,
+        `${selected.action}-device ${selected.deviceId.slice(0, 8)}`,
       );
     } finally {
       await secondLock.release();
     }
     void vscode.window.showInformationMessage(
-      `Device ${selected.deviceId} is now retired.`,
+      selected.action === "forget"
+        ? `Device ${selected.deviceId} is now retired.`
+        : `Device ${selected.deviceId} is readable again; its events are picked up on the next sync.`,
     );
   }
 
@@ -1920,6 +2116,9 @@ export class SyncManager implements vscode.Disposable {
       }
       return;
     }
+    if (await this.disconnectedElsewhere()) {
+      return;
+    }
     this.syncRepositoryLimit(repository);
     let lock: FileLock | null;
     try {
@@ -2035,7 +2234,32 @@ export class SyncManager implements vscode.Disposable {
             snapshot,
             repository.state.tips[snapshot.resourceId] ?? [],
           ),
-      ).map((snapshot) => ({
+      );
+      // A suppressed snapshot whose bytes match the projection is the steady
+      // state - but the mtime fast paths in the chat adapters compare against
+      // projection.sourceTimestamp, which after a helper APPLY still holds the
+      // sender's clock. Refreshing it to the local capture's timestamp turns
+      // "fully re-read and re-hash every store and transcript on every poll,
+      // forever" into one full re-read per apply.
+      const published = new Set(changedSnapshots.map((s) => s.resourceId));
+      for (const snapshot of scan.snapshots) {
+        if (published.has(snapshot.resourceId)) {
+          continue;
+        }
+        const projection = repository.state.projections[snapshot.resourceId];
+        const captured = snapshot.metadata?.lastUpdatedAt;
+        if (
+          projection !== undefined &&
+          typeof captured === "number" &&
+          Number.isFinite(captured) &&
+          projection.sourceTimestamp !== captured &&
+          (projection.semanticHash === snapshot.semanticHash ||
+            projection.retainedLocalHash === snapshot.semanticHash)
+        ) {
+          projection.sourceTimestamp = captured;
+        }
+      }
+      const publishableSnapshots = changedSnapshots.map((snapshot) => ({
         ...snapshot,
         parents: conflictedResources.has(snapshot.resourceId)
           ? parentsWithOwnConflictTips(
@@ -2054,7 +2278,7 @@ export class SyncManager implements vscode.Disposable {
       // its own tip. Volatile content turned that into one new event per poll
       // forever, so the republish is rate-limited per resource.
       const throttled = throttleConflictedRepublish(
-        changedSnapshots,
+        publishableSnapshots,
         conflictedResources,
         this.conflictedRepublishAt,
         Date.now(),
@@ -3077,6 +3301,9 @@ export class SyncManager implements vscode.Disposable {
       this.finalizerRetryTimer = null;
     }
     try {
+      if (await this.disconnectedElsewhere()) {
+        return;
+      }
       if (
         this.disposed ||
         !this.configuration.enabled ||
@@ -3095,6 +3322,16 @@ export class SyncManager implements vscode.Disposable {
         this.configuration.workspaceMappings,
         this.helperSyncOptions(),
       );
+      if (this.disposed || !this.configuration.enabled || this.repository === null) {
+        // The user disabled sync or disconnected while the arm was inside its
+        // up-to-30s replacement wait; the wait's own cancel-marker removal
+        // overrode that stand-down, so an exporter would now be armed for a
+        // sync the user just turned off. Cancel it - the fresh marker
+        // postdates the new request, so the finalizer honors it even without
+        // a live process handle.
+        await this.helper.cancelFinalizers();
+        return;
+      }
       if (outcome === "adopted") {
         // Another window installed a fresh finalizer after this window asked
         // for the replacement; it covers the shutdown export, so there is
@@ -3361,6 +3598,12 @@ export class SyncManager implements vscode.Disposable {
         }
         throw error;
       }
+      // Rename preserves mtime, so a result written hours ago (an overnight
+      // final-export consumed at the next startup) would read as an hour-old
+      // ORPHANED claim the instant it was claimed, and a sibling's sweep
+      // could destroy it between this rename and the read below. Stamping the
+      // claim time makes the sweep measure what it says it measures.
+      await utimes(claimedPath, new Date(), new Date()).catch(() => {});
       let result: HelperResult;
       try {
         result = await readJsonFile<HelperResult>(claimedPath);
@@ -3378,8 +3621,11 @@ export class SyncManager implements vscode.Disposable {
       consumed.push(result);
       if (result.mode !== "final-export") {
         // The apply this marker described has reported; a sibling window may
-        // offer again if anything is still queued.
-        await this.clearApplyInProgress();
+        // offer again if anything is still queued. But a STALE result - one
+        // orphaned by a partial quit and consumed much later - must not erase
+        // a marker a DIFFERENT window wrote for an apply still in flight, so
+        // the clear is skipped while the marker names another live process.
+        await this.clearApplyInProgressUnlessForeign();
       }
       await this.recordHelperBackups(result);
       if (result.success) {
@@ -3599,6 +3845,7 @@ export class SyncManager implements vscode.Disposable {
     }
     try {
       await pullLatest(repository.root);
+      this.lastGitWindowDegraded = false;
       return true;
     } catch (error) {
       if (error instanceof GitError && error.kind === "conflict") {
@@ -3631,6 +3878,10 @@ export class SyncManager implements vscode.Disposable {
     }
     try {
       await commitAndPush(root, message);
+      // Health is the LAST window's outcome, not history: one offline minute
+      // weeks ago must not keep diagnostics reporting "degraded" about a
+      // transport that has pushed cleanly ever since.
+      this.lastGitWindowDegraded = false;
       return true;
     } catch (error) {
       if (error instanceof GitError && error.kind === "conflict") {
@@ -3648,7 +3899,10 @@ export class SyncManager implements vscode.Disposable {
       error instanceof GitError ? error.kind : "command";
     const message = error instanceof Error ? error.message : String(error);
     this.status.log(`Git transport degraded (${kind}): ${message}`);
+    this.lastGitWindowDegraded = true;
     if (this.gitWarningsShown.has(kind)) {
+      // The toast dedupe set is deliberately never cleared; health reporting
+      // lives in lastGitWindowDegraded, which recovers with the next window.
       return;
     }
     this.gitWarningsShown.add(kind);

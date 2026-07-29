@@ -7,6 +7,7 @@ import type {
   SyncConflict,
 } from "../types";
 import { isSupportedResourceKind } from "../types";
+import { compareCodeUnits } from "./canonical";
 import type { DecryptedEvent } from "./repository";
 
 export interface ReconcileResult {
@@ -173,7 +174,7 @@ function acceptContiguousStreams(
     deviceEvents.sort(
       (left, right) =>
         left.stored.header.sequence - right.stored.header.sequence ||
-        left.eventHash.localeCompare(right.eventHash),
+        compareCodeUnits(left.eventHash, right.eventHash),
     );
     const pinned = state.streams[deviceId];
     const checkpointCursor = checkpoint?.streams[deviceId];
@@ -376,11 +377,13 @@ export function compareTips(left: ResourceTip, right: ResourceTip): number {
   if (left.lamport !== right.lamport) {
     return right.lamport - left.lamport;
   }
-  const deviceOrder = right.deviceId.localeCompare(left.deviceId);
+  // Code-unit order, never localeCompare: this comparator elects replicated
+  // winners, and both machines must sort identically whatever their locales.
+  const deviceOrder = compareCodeUnits(right.deviceId, left.deviceId);
   if (deviceOrder !== 0) {
     return deviceOrder;
   }
-  return right.eventHash.localeCompare(left.eventHash);
+  return compareCodeUnits(right.eventHash, left.eventHash);
 }
 
 function existingOrNewConflict(

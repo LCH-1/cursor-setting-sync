@@ -68,6 +68,7 @@ export class HelperLauncher {
     syncOptions: HelperSyncOptions,
   ): Promise<void> {
     await rm(this.cancelFinalizersPath, { force: true });
+    await rm(`${this.cancelFinalizersPath}-owner`, { force: true });
     const request = this.createRequest(
       "final-export",
       repositoryRoot,
@@ -101,13 +102,27 @@ export class HelperLauncher {
 
   /** Returns the marker timestamp, for comparing against a later holder. */
   async cancelFinalizers(): Promise<number> {
+    return this.writeCancelMarker("restart");
+  }
+
+  /**
+   * The marker file itself stays a bare ISO timestamp - the one format every
+   * fielded finalizer, 0.0.32 included, parses. The writer's identity and the
+   * KIND of handoff live in a sidecar: a "restart" writer promises to arm a
+   * replacement (so its death voids the cancel), a "quit" writer is expected
+   * to die (the window is closing) and its cancel survives it for a grace
+   * window. Folding either into the marker bytes made older finalizers read
+   * NaN and never stand down.
+   */
+  private async writeCancelMarker(kind: "restart" | "quit"): Promise<number> {
     const stamp = new Date().toISOString();
-    // The second line names the writer: a cancel whose writer died before
-    // arming a replacement must expire instead of standing down the only
-    // finalizer the session has.
+    await writeJsonAtomic(`${this.cancelFinalizersPath}-owner`, {
+      pid: process.pid,
+      kind,
+    });
     await writeFileAtomic(
       this.cancelFinalizersPath,
-      Buffer.from(`${stamp}\n${process.pid}`, "utf8"),
+      Buffer.from(stamp, "utf8"),
     );
     this.finalizer?.kill();
     this.finalizer = null;
@@ -123,12 +138,7 @@ export class HelperLauncher {
     onQuitVetoed: () => Promise<void> = async () => {},
     onQuitStalled: () => void = () => {},
   ): Promise<void> {
-    await writeFileAtomic(
-      this.cancelFinalizersPath,
-      Buffer.from(`${new Date().toISOString()}\n${process.pid}`, "utf8"),
-    );
-    this.finalizer?.kill();
-    this.finalizer = null;
+    await this.writeCancelMarker("quit");
     const request = this.createRequest(
       "apply-and-restart",
       repositoryRoot,
@@ -157,12 +167,7 @@ export class HelperLauncher {
     onQuitVetoed: () => Promise<void> = async () => {},
     onQuitStalled: () => void = () => {},
   ): Promise<void> {
-    await writeFileAtomic(
-      this.cancelFinalizersPath,
-      Buffer.from(`${new Date().toISOString()}\n${process.pid}`, "utf8"),
-    );
-    this.finalizer?.kill();
-    this.finalizer = null;
+    await this.writeCancelMarker("quit");
     const request = this.createRequest(
       "restore-backup",
       repositoryRoot,

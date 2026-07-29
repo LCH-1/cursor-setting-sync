@@ -2,6 +2,45 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.34] - 2026-07-29
+
+Convergence round one: a fresh-eyes audit of the last three releases' own fixes plus the subsystems no earlier audit had reached (protocol core, the file adapters, the manager command flows), 32 findings adversarially verified. Everything reachable is fixed.
+
+### Fixed - bugs in recent fixes
+
+- The cancel-finalizers marker is a bare ISO timestamp again - the 0.0.33 two-line format read as NaN to a still-running 0.0.32 finalizer, which then NEVER stood down: the session retried "stalled" every minute forever and quit exports ran against the pre-update session's request. The writer's pid and the KIND of handoff live in a sidecar now: a "restart" writer's death voids its cancel immediately (a crashed restart can never arm the replacement it promised), while a "quit" writer is expected to die and keeps its grace window - which also closes the headline 0.0.33 scenario the grace alone could not.
+- One transient process-listing failure no longer kills the session's only shutdown exporter: the wait treats it as "Cursor may still be running" and retries, matching the stated policy everywhere else.
+- Restart to Apply claims the apply-in-progress marker BEFORE its multi-ten-second pre-quit sync, not after - two windows could both commit to the same apply and each helper then counted the other as a live Cursor until both timed out having applied nothing. Every early exit releases the claim; a consumed stale result no longer erases a DIFFERENT live window's marker (the clear checks the owner pid); the claimed-result sweep stamps the claim time so an overnight export's result is not "an hour-old orphan" the instant it is claimed.
+- Disable or Disconnect landing while a finalizer arm is inside its 30-second replacement wait no longer gets overridden by that arm: the arm re-checks on completion and cancels what it just installed.
+
+### Fixed - protocol core
+
+- A device whose extension state was restored from an OS backup can no longer fork its own event stream: stream recovery consults the shared head.json and waits while the device's own newer events are still arriving, and publish refuses a sequence ANY existing file occupies - previously both machines fail-stopped permanently on "previously accepted event has a different hash".
+- A checkpoint file caught mid-propagation (zero-byte, truncated, torn ciphertext - checkpoints run tens of MiB over OneDrive) no longer kills every sync cycle and even repository open until it finishes hydrating; it is skipped like a pruned event and retried next poll.
+- Every replicated ordering - conflict-winner election, checkpoint tips, event ordering - now compares by UTF-16 code units instead of localeCompare: a Danish/Norwegian locale sorts "aa" after "ab", so a device pair split across locales could elect different winners for the same fork and re-fork forever.
+- Checkpoint creation refuses, and prune aborts, when the repository contains resource kinds this build does not know: a future release adding a kind would otherwise have today's build silently omit those resources from its checkpoint and then delete the only events carrying them.
+
+### Fixed - adapters
+
+- Deleting a profile on one machine no longer wipes that profile's keybindings, snippets, tasks and prompts on every other machine: the profile-files adapter gained the vanished-profile guard its sibling adapters always had.
+- A duplicated key in settings.json (VS Code tolerates them) no longer silently reverts every remote edit of that key: the apply verifies the edit landed and consumes duplicates until it does.
+- Chat stores and transcripts another machine wrote are no longer fully re-read and re-hashed on EVERY 30-second poll forever: the scan refreshes the projection timestamp when content matches, and applied transcripts get their source mtime restored.
+- The extension retained-hash records the OBSERVED post-install preRelease/pinned state instead of the peer's desired one, closing a version-skew ping-pong the 0.0.32 fix left open on channel fallbacks.
+- A clone killed mid-checkout now cleans up everything it created, not just .git - checked-out files used to block every retry with "must be an empty directory" and no stated cause. Sync commits never invoke GPG signing, so a commit.gpgsign user no longer gets a stray pinentry dialog (or a two-minute hang) from every sync cycle.
+
+### Fixed - command flows
+
+- Disconnect now disconnects the MACHINE, not just the window it ran in: a machine-wide marker makes every sibling window (which observe no globalState events) stop synchronizing and tear down at its next cycle - previously they kept publishing into the folder, green check mark and all.
+- Restart to Apply and Restore Backup capture a copy of the master key, so a Disconnect or Setup re-run mid-command can no longer hand the helper an all-zero key; Restart to Apply also aborts if the configuration changed while it was parked in prompts.
+- Forget Device requires a modal confirmation (a "(no published events)" entry may be a computer still joining) and the same picker can now RESTORE a forgotten device - retiring was irreversible and silently blinded the machine to a real peer.
+- A Setup re-run resets the previous repository's latched failure, notices and declined-offer memory instead of carrying them into the new repository; diagnostics' gitMode reports the LAST git window's outcome instead of latching "degraded" forever after one offline minute.
+
+### Added
+
+- A repeated-rounds two-device simulation (three rounds of concurrent workspace and chat edits converging to a single tip each round), and regression pins for the finalizer adoption-confirm window, the backward-parseable cancel marker, duplicated settings keys, the vanished-profile guard, and code-unit ordering.
+
+## [0.0.33] - 2026-07-29
+
 ## [0.0.33] - 2026-07-29
 
 A backup-and-restore audit under multi-window and multi-computer concurrency: six reviewers over backup creation, retention, the restore flow, the shutdown export, cross-machine semantics and user-facing truth; 70 interleavings traced (most came up clean), 32 findings adversarially verified, none refuted. The reachable ones are fixed.

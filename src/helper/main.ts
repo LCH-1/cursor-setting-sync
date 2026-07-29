@@ -932,8 +932,15 @@ async function waitForCursorExit(
     const hostGone = !isProcessAlive(request.extensionHostPid);
     if (hostGone || Date.now() - lastListingAt > 30_000) {
       lastListingAt = Date.now();
-      if (await noOtherCursorProcesses(request)) {
-        return false;
+      try {
+        if (await noOtherCursorProcesses(request)) {
+          return false;
+        }
+      } catch {
+        // A transient tasklist failure is not evidence about Cursor. Erring
+        // toward waiting matches inertCursorProcessIds' policy; letting the
+        // throw escape killed the session's ONLY shutdown exporter over one
+        // hiccup in a listing this loop reruns within 30 seconds anyway.
       }
     }
     await delay(500);
@@ -973,23 +980,59 @@ async function isFinalizerCancelled(request: HelperRequest): Promise<boolean> {
   if (!(await pathExists(path))) {
     return false;
   }
+  // The marker itself is a bare ISO timestamp - the format every fielded
+  // finalizer can parse. A 0.0.33 build briefly shipped "iso\npid" here, which
+  // a still-running 0.0.32 finalizer read as NaN and therefore NEVER stood
+  // down for; the writer identity lives in a sidecar now so the marker bytes
+  // stay backward-parseable forever.
   const lines = (await readFile(path, "utf8")).trim().split(/\r?\n/);
   const timestamp = Date.parse(lines[0] ?? "");
   if (!Number.isFinite(timestamp) || timestamp < Date.parse(request.createdAt)) {
     return false;
   }
-  // A cancel is a promise that its writer arms a replacement. A writer that
-  // died between the marker and the spawn left a marker nobody follows up on,
-  // and honoring it forever meant this session's quit export - the only
-  // workspaceStorage backup - silently never ran. The marker stays valid
-  // while its writer is alive (a slow quit is still a live handoff) or for a
-  // fresh grace window; beyond that, an orphaned cancel is ignored and this
-  // finalizer keeps the watch it already holds.
-  const writerPid = Number.parseInt(lines[1] ?? "", 10);
-  if (Number.isFinite(writerPid) && isProcessAlive(writerPid)) {
+  // A cancel is a promise that its writer follows through - with a quit, or
+  // with a replacement finalizer. What a dead writer means depends on which:
+  //  - a "quit" handoff's writer is EXPECTED to die (the window is closing),
+  //    so the marker stays valid for the grace window;
+  //  - a "restart" handoff's writer dying means no replacement will ever be
+  //    armed, so honoring its marker would strip the session of its only
+  //    exporter - the marker is void the moment the writer is gone.
+  const owner = await readCancelOwner(request);
+  if (owner !== null && Number.isFinite(owner.pid)) {
+    if (isProcessAlive(owner.pid)) {
+      return true;
+    }
+    if (owner.kind === "restart") {
+      return false;
+    }
+    return Date.now() - timestamp < CANCEL_MARKER_GRACE_MS;
+  }
+  // Legacy two-line marker or no sidecar (a 0.0.32 writer): pid from line 2
+  // when present, otherwise the grace window alone.
+  const legacyPid = Number.parseInt(lines[1] ?? "", 10);
+  if (Number.isFinite(legacyPid) && isProcessAlive(legacyPid)) {
     return true;
   }
   return Date.now() - timestamp < CANCEL_MARKER_GRACE_MS;
+}
+
+async function readCancelOwner(
+  request: HelperRequest,
+): Promise<{ pid: number; kind: "restart" | "quit" } | null> {
+  try {
+    const raw = JSON.parse(
+      await readFile(join(request.storageRoot, "cancel-finalizers-owner"), "utf8"),
+    ) as { pid?: unknown; kind?: unknown };
+    if (
+      typeof raw.pid !== "number" ||
+      (raw.kind !== "restart" && raw.kind !== "quit")
+    ) {
+      return null;
+    }
+    return { pid: raw.pid, kind: raw.kind };
+  } catch {
+    return null;
+  }
 }
 
 /** How long an unowned cancel marker is still trusted; a live handoff takes seconds. */

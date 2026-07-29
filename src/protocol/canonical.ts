@@ -109,6 +109,17 @@ function sortValue(value: unknown): unknown {
 }
 
 function compareCanonicalKeys(left: string, right: string): number {
+  return compareCodeUnits(left, right);
+}
+
+/**
+ * Plain UTF-16 code-unit comparison, the one string order that is identical
+ * on every machine. `localeCompare` is NOT: with a Danish/Norwegian default
+ * locale "aa" sorts after "ab", so two devices tie-breaking a replicated
+ * election on device IDs or hashes could elect DIFFERENT winners and publish
+ * diverging resolutions forever. Every replicated ordering must use this.
+ */
+export function compareCodeUnits(left: string, right: string): number {
   if (left < right) {
     return -1;
   }

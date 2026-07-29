@@ -132,9 +132,26 @@ export async function cloneRepository(
   try {
     await runGit(root, args);
   } catch (error) {
-    // A killed clone leaves a partial .git behind on Windows, which would make
-    // the folder non-empty and block every retry.
-    await rm(join(root, ".git"), { recursive: true, force: true });
+    // A killed clone leaves debris behind - and not just .git: a clone
+    // force-killed mid-checkout (the timeout SIGKILLs git, so its own atexit
+    // junk cleanup never runs) leaves checked-out work-tree files that made
+    // every retry throw "must be an empty directory" with no path that ever
+    // clears them. The precheck above proved the directory was empty, so
+    // everything in it is clone debris. Cleanup failures must not replace
+    // the real clone error.
+    try {
+      for (const entry of await readdir(root)) {
+        await rm(join(root, entry), {
+          recursive: true,
+          force: true,
+          maxRetries: 3,
+          retryDelay: 200,
+        });
+      }
+    } catch {
+      // The folder may need emptying by hand; the rethrown clone error is
+      // still the story that matters.
+    }
     throw error;
   }
   await disableLineEndingConversion(root);
@@ -634,6 +651,15 @@ async function execGitRaw(
           GIT_TERMINAL_PROMPT: "0",
           GIT_ASKPASS: "echo",
           GCM_INTERACTIVE: "never",
+          // A user who signs their commits globally (commit.gpgsign=true with
+          // a passphrase-protected key) would get a stray pinentry dialog -
+          // or a 120s hang - from EVERY sync commit, squash commit and merge
+          // commit, in the extension and the helper alike. Sync commits are
+          // plumbing, not authored history; signing them serves nobody.
+          // GIT_CONFIG_* overrides all config files (git >= 2.31).
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "commit.gpgsign",
+          GIT_CONFIG_VALUE_0: "false",
         },
         maxBuffer: GIT_MAX_BUFFER_BYTES,
         timeout: timeoutMs,

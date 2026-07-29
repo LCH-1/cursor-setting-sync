@@ -49,9 +49,11 @@ export class ProfileFilesAdapter implements ResourceAdapter {
     const warnings: string[] = [];
     const current = new Set<string>();
     const unscannedScopes = new Set<string>();
+    const scannedProfiles = new Set<string>();
     for (const candidate of await this.discoverCandidates(
       warnings,
       unscannedScopes,
+      scannedProfiles,
     )) {
       const resourceId = resourceIdFor(candidate);
       current.add(resourceId);
@@ -81,7 +83,12 @@ export class ProfileFilesAdapter implements ResourceAdapter {
     }
     return {
       snapshots,
-      deletions: this.findDeletions(known, current, unscannedScopes),
+      deletions: this.findDeletions(
+        known,
+        current,
+        unscannedScopes,
+        scannedProfiles,
+      ),
       warnings,
     };
   }
@@ -116,9 +123,13 @@ export class ProfileFilesAdapter implements ResourceAdapter {
   private async discoverCandidates(
     warnings: string[],
     unscannedScopes: Set<string>,
+    scannedProfiles: Set<string> = new Set(),
   ): Promise<ProfileFileCandidate[]> {
     const candidates: ProfileFileCandidate[] = [];
     for (const profile of await discoverProfileResourcePaths(this.paths)) {
+      // Recorded even when the profile has no files: absence from discovery
+      // is what must NOT read as deletion.
+      scannedProfiles.add(profile.profileId);
       const singleFiles: Array<{
         kind: ResourceKind;
         path: string;
@@ -179,6 +190,7 @@ export class ProfileFilesAdapter implements ResourceAdapter {
     known: Record<string, LocalProjection>,
     current: Set<string>,
     unscannedScopes: ReadonlySet<string>,
+    scannedProfiles: ReadonlySet<string>,
   ): ResourceDeletion[] {
     return Object.values(known)
       .filter(
@@ -187,6 +199,13 @@ export class ProfileFilesAdapter implements ResourceAdapter {
             projection.kind as (typeof this.kinds)[number],
           ) &&
           !current.has(projection.resourceId) &&
+          // The guard settings.ts and extensions.ts always had: a profile
+          // absent from discovery - deleted here, or a junction discovery
+          // skips - must not tombstone every keybinding, snippet, task and
+          // prompt it ever had, unlinking them live on every other machine.
+          scannedProfiles.has(
+            parseResourceId(projection.resourceId).profileId,
+          ) &&
           !unscannedScopes.has(
             scanScope(
               projection.kind,

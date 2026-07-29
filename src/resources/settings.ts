@@ -257,7 +257,30 @@ export class SettingsAdapter implements ResourceAdapter {
     const value = isDeletion(input)
       ? undefined
       : parseJsonc(input.content.toString("utf8"), input.resourceId);
-    const updated = setJsoncProperty(source, [key], value);
+    let updated = setJsoncProperty(source, [key], value);
+    // VS Code tolerates a DUPLICATED top-level key with only an editor
+    // squiggle, and jsonc-parser's parse() reads the LAST occurrence while
+    // modify() edits the FIRST - so one edit can leave the file re-parsing to
+    // the old value, silently reverting the remote change and republishing
+    // the reversion. Each extra pass consumes one more occurrence; the loop
+    // converges because occurrences are finite, and the bound is a fail-safe.
+    for (let pass = 0; pass < 8; pass += 1) {
+      const parsed = parseJsoncObject(updated, target);
+      const landed = isDeletion(input)
+        ? parsed[key] === undefined
+        : JSON.stringify(parsed[key]) === JSON.stringify(value);
+      if (landed) {
+        break;
+      }
+      // A delete edit removes the first occurrence - for a put that did not
+      // land, that first occurrence is the copy just written, so the delete
+      // consumes one DUPLICATE per round and the re-put lands one step closer
+      // to being the only occurrence.
+      updated = setJsoncProperty(updated, [key], undefined);
+      if (!isDeletion(input)) {
+        updated = setJsoncProperty(updated, [key], value);
+      }
+    }
     parseJsoncObject(updated, target);
     await writeFileAtomicWithinRoot(
       this.paths.userDataRoot,

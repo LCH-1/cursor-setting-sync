@@ -130,6 +130,54 @@ describe("replacing the shutdown finalizer", () => {
     launcher.dispose();
   });
 
+  it("does not adopt a holder that releases within the confirmation window", async () => {
+    // The doomed finalizer: its lock postdates the cancel, but only because
+    // its boot spanned the marker write - it reads the marker milliseconds
+    // after acquiring and self-cancels. Adopt-on-first-sight would return
+    // "adopted" here and leave the session with NO exporter at all; the
+    // 1-second survival requirement must see the release and arm instead.
+    const { launcher, root } = await createLauncher();
+    await writeLock(root, process.pid, new Date(Date.now() + 5_000).toISOString());
+    setTimeout(() => {
+      void rm(lockFile(root), { force: true });
+    }, 300);
+
+    const outcome = await launcher.restartFinalizer(
+      "C:/nonexistent-repository",
+      Buffer.alloc(32, 1),
+      {},
+      syncOptions,
+    );
+
+    expect(outcome).toBe("armed");
+    expect(await requestFiles(root)).toHaveLength(1);
+    launcher.dispose();
+  });
+
+  it("writes a backward-parseable cancel marker with the owner in a sidecar", async () => {
+    // A 0.0.32 finalizer parses the marker with Date.parse(content.trim());
+    // the two-line format read as NaN there, so it NEVER stood down and the
+    // session retried "stalled" every minute forever. The marker bytes must
+    // stay a bare ISO timestamp for as long as old finalizers can be running.
+    const { launcher, root } = await createLauncher(300);
+    await writeLock(root, process.pid, new Date(Date.now() - 60_000).toISOString());
+    await launcher.restartFinalizer(
+      "C:/nonexistent-repository",
+      Buffer.alloc(32, 1),
+      {},
+      syncOptions,
+    );
+
+    const marker = (await readFile(join(root, "cancel-finalizers"), "utf8")).trim();
+    expect(Number.isFinite(Date.parse(marker))).toBe(true);
+    const owner = JSON.parse(
+      await readFile(join(root, "cancel-finalizers-owner"), "utf8"),
+    ) as { pid?: number; kind?: string };
+    expect(owner.pid).toBe(process.pid);
+    expect(owner.kind).toBe("restart");
+    launcher.dispose();
+  });
+
   it("reports a live but unresponsive older finalizer as stalled instead of throwing", async () => {
     const { launcher, root } = await createLauncher(600);
     // Alive (this test's own pid), created BEFORE the cancel marker, and never

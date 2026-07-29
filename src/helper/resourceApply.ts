@@ -8,7 +8,7 @@ import {
   sqliteStorageText,
 } from "../platform/sqlite";
 import { dirname, join, relative } from "node:path";
-import { utimes } from "node:fs/promises";
+import { readFile, utimes } from "node:fs/promises";
 import type { JsonValue } from "../types";
 import type { HelperBackup, HelperRequest } from "./types";
 import type { PreparedHelperChange } from "./database";
@@ -238,6 +238,18 @@ export async function applyNonGlobalChanges(
           normalizeResourcePath(relative(request.paths.cursorHome, target)),
           content,
         );
+        // Same as the workspace-storage plain-file branch: restoring the
+        // source mtime lets the scan's fast path recognize the file as
+        // already-applied instead of re-reading it on every poll.
+        const transcriptUpdatedAt = change.metadata?.lastUpdatedAt;
+        if (
+          typeof transcriptUpdatedAt === "number" &&
+          Number.isFinite(transcriptUpdatedAt) &&
+          transcriptUpdatedAt >= 0
+        ) {
+          const stamp = new Date(transcriptUpdatedAt);
+          await utimes(target, stamp, stamp).catch(() => {});
+        }
         applied.push(change.resourceId);
         continue;
       }
@@ -639,14 +651,25 @@ async function applyExtensionChanges(
           extensionId,
         );
         if (actualVersion !== null && actualVersion !== version) {
+          // The recorded hash must equal what the NEXT SCAN will produce, and
+          // the scan folds preRelease/pinned from the manifest, not from the
+          // peer's desired state. When the resolver fell back (a pre-release
+          // the local Cursor cannot take resolves to a stable build), the
+          // observed channel differs from the desired one - hashing the
+          // desired channel here made the suppression never match and revived
+          // the one-event-per-apply ping-pong this exists to stop.
+          const observed = await observedExtensionManifestState(
+            request,
+            extensionId,
+          );
           retainedLocal.push(change.resourceId);
           retainedLocalHashes[change.resourceId] = semanticHash({
             id: extensionId,
             version: actualVersion,
             installed: true,
             enabled: desired.enabled,
-            preRelease: desired.preRelease,
-            pinned: desired.pinned,
+            preRelease: observed?.preRelease ?? desired.preRelease,
+            pinned: observed?.pinned ?? desired.pinned,
           });
         }
       }
@@ -693,6 +716,52 @@ async function installedExtensionVersion(
       if (trimmed.toLowerCase().startsWith(prefix)) {
         return trimmed.slice(prefix.length);
       }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * preRelease/pinned as the extensions manifest records them post-install,
+ * folded exactly the way the scan's readExtensionMetadata folds them. Null
+ * when the manifest cannot be read or lacks the extension - the caller falls
+ * back to the desired state, the pre-existing behavior.
+ */
+async function observedExtensionManifestState(
+  request: HelperRequest,
+  extensionId: string,
+): Promise<{ preRelease: boolean; pinned: boolean } | null> {
+  try {
+    const parsed = JSON.parse(
+      (await readFile(request.paths.cursorExtensionsManifest, "utf8")),
+    ) as unknown;
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+    for (const item of parsed) {
+      if (item === null || typeof item !== "object") {
+        continue;
+      }
+      const record = item as Record<string, unknown>;
+      const identifier = record.identifier;
+      const id =
+        identifier !== null && typeof identifier === "object"
+          ? (identifier as Record<string, unknown>).id
+          : undefined;
+      if (typeof id !== "string" || id.toLowerCase() !== extensionId.toLowerCase()) {
+        continue;
+      }
+      const metadata =
+        record.metadata !== null && typeof record.metadata === "object"
+          ? (record.metadata as Record<string, unknown>)
+          : {};
+      return {
+        preRelease:
+          metadata.isPreReleaseVersion === true || record.preRelease === true,
+        pinned: metadata.pinned === true || record.pinned === true,
+      };
     }
     return null;
   } catch {

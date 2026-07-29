@@ -414,6 +414,128 @@ describeBuilt("a second computer joining and merging", () => {
       expect(sha256(recaptured)).toBe(mergedHash);
     }
   }, 300_000);
+
+  it("stays convergent across repeated rounds of concurrent editing", async () => {
+    // Day-in, day-out simulation: round after round, both computers fork the
+    // same workspace database and update their own chats concurrently, and
+    // after every round the pair must land on ONE tip per resource with zero
+    // unresolved conflicts - because a pair that needs a human once a day is
+    // the failure mode, not a pathological interleaving.
+    const root = await mkdtemp(join(tmpdir(), "cursor-sync-rounds-"));
+    temporaryRoots.push(root);
+    const repositoryRoot = join(root, "repository");
+    const deviceA = await SyncRepository.create(
+      repositoryRoot,
+      join(root, "storage-a"),
+      PASSPHRASE,
+      128 * 1024 * 1024,
+      PRODUCER,
+    );
+    const deviceB = await SyncRepository.openWithMasterKey(
+      repositoryRoot,
+      join(root, "storage-b"),
+      deviceA.repository,
+      Buffer.from(deviceA.masterKey),
+      128 * 1024 * 1024,
+      PRODUCER,
+    );
+    const CHAT_X = "33333333-cccc-4ccc-8ccc-333333333333";
+    const CHAT_Y = "44444444-dddd-4ddd-8ddd-444444444444";
+    const wsResourceId = workspaceStorageResourceId(
+      `${WORKSPACE_B}/state.vscdb`,
+    );
+    const reconcileFor = async (device: SyncRepository) =>
+      new EventReconciler().reconcile(
+        await device.listEvents(),
+        device.state,
+        await device.loadAbsorbedCheckpointManifest(),
+      );
+
+    // Each side's snapshot is what a real SCAN would capture: the whole
+    // portable table as it stands on that machine - the previous round's
+    // merged rows plus this round's own edit. Publishing only the edited row
+    // would model a deletion of everything else, which is not what a scan
+    // ever produces.
+    const mergedRows = new Map<string, string>([["notepadData", "round-0"]]);
+    const rowsWith = (key: string, value: string): Array<[string, string]> => {
+      const rows = new Map(mergedRows);
+      rows.set(key, value);
+      return [...rows.entries()];
+    };
+    const base = portableWorkspaceSnapshot(root, "round-base", [
+      ...mergedRows.entries(),
+    ]);
+    await deviceA.publish([base], []);
+
+    for (let round = 1; round <= 3; round += 1) {
+      // Both sides fork the CURRENT single workspace tip concurrently.
+      await deviceA.refreshState();
+      await reconcileFor(deviceA);
+      const tip = (deviceA.state.tips[wsResourceId] ?? [])[0];
+      expect(tip).toBeDefined();
+      const parents = [tip?.versionId ?? ""];
+      await deviceA.publish(
+        [
+          {
+            ...portableWorkspaceSnapshot(
+              root,
+              `r${round}-a`,
+              rowsWith("notepadData", `a-${round}`),
+            ),
+            parents,
+          },
+          chatSnapshot(CHAT_X, WORKSPACE_B),
+        ],
+        [],
+      );
+      await deviceB.refreshState();
+      await deviceB.publish(
+        [
+          {
+            ...portableWorkspaceSnapshot(
+              root,
+              `r${round}-b`,
+              rowsWith("interactive.sessions", `b-${round}`),
+            ),
+            parents,
+          },
+          chatSnapshot(CHAT_Y, WORKSPACE_B),
+        ],
+        [],
+      );
+      mergedRows.set("notepadData", `a-${round}`);
+      mergedRows.set("interactive.sessions", `b-${round}`);
+
+      // Whichever device looks first resolves; the other adopts. After the
+      // round, one tip, no open conflicts, on BOTH devices.
+      for (const device of [deviceA, deviceB]) {
+        await device.refreshState();
+        const open = (await reconcileFor(device)).conflicts.filter(
+          (conflict) => conflict.resolvedAt === undefined,
+        );
+        if (open.length > 0) {
+          expect(await autoMergeConflicts(device, open)).toBe(true);
+          await device.saveState();
+        }
+      }
+      await deviceA.refreshState();
+      await deviceB.refreshState();
+      expect(
+        (await reconcileFor(deviceA)).conflicts.filter(
+          (c) => c.resolvedAt === undefined,
+        ),
+      ).toHaveLength(0);
+      expect(
+        (await reconcileFor(deviceB)).conflicts.filter(
+          (c) => c.resolvedAt === undefined,
+        ),
+      ).toHaveLength(0);
+      const tipsA = deviceA.state.tips[wsResourceId] ?? [];
+      const tipsB = deviceB.state.tips[wsResourceId] ?? [];
+      expect(tipsA).toHaveLength(1);
+      expect(tipsA[0]?.versionId).toBe(tipsB[0]?.versionId);
+    }
+  }, 300_000);
 });
 
 async function buildDevicePaths(root: string): Promise<CursorPaths> {
