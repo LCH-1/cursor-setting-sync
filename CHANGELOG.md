@@ -2,6 +2,14 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.41] - 2026-07-30
+
+Found on the real two-computer pair the moment the second machine joined.
+
+### Fixed
+
+- A second computer joining no longer raises one unresolvable conflict per shared workspace. Both machines already had their own `state.vscdb` for every Remote-SSH project they both keep open, so neither snapshot descended from the other and the three-way merge had nothing to compare against - the live pair produced 198 of these, and the manual resolver could only offer whole-snapshot either/or, discarding the losing machine's notepads and sessions wholesale. Base-free workspace databases are now unioned the way base-free chats already were: with no ancestor there are no deletions to honour, so every row either machine has is kept, and only a key both hold with differing values is decided - by the replicated-newest tip, so both computers compute byte-identical results and the reconciler collapses them into one version.
+
 ## [0.0.40] - 2026-07-29
 
 The final full-scope pass after the convergence series: three reviewers re-read every source file of v0.0.39 whole (58 areas explicitly cleared), raising five findings - one medium, four low - all outside the audited fix chain and all fixed here.

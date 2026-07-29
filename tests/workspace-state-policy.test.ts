@@ -118,6 +118,55 @@ describe("workspace-storage auto-merge under the policy", () => {
     });
   });
 
+  it("unions a base-free fork instead of asking once per shared workspace", async () => {
+    // Two computers meeting for the first time: each already has its own
+    // state.vscdb for a workspace both keep open, so neither snapshot
+    // descends from the other. This used to raise one manual conflict PER
+    // SHARED WORKSPACE - 198 of them on the real pair - and the manual
+    // resolver's whole-snapshot either/or would have discarded the losing
+    // machine's notepads outright.
+    await withRepository(async (repository) => {
+      const conflicts = await forkBaseFree(
+        repository,
+        workspaceSnapshot({
+          item: [
+            ["notepadData", "from-a"],
+            ["debug.breakpoint", "a-only"],
+          ],
+        }),
+        workspaceSnapshot({
+          item: [
+            ["notepadData", "from-b"],
+            ["interactive.sessions", "b-only"],
+          ],
+        }),
+      );
+      expect(conflicts).toHaveLength(1);
+      expect(conflicts[0]?.baseVersionId).toBeNull();
+
+      expect(await autoMergeConflicts(repository, conflicts)).toBe(true);
+      expect(await reconcileConflicts(repository)).toHaveLength(0);
+
+      const tips = repository.state.tips[RESOURCE_ID] ?? [];
+      expect(tips).toHaveLength(1);
+      const merged = parseWorkspaceDatabaseSnapshot(
+        (await repository.readVersion(tips[0]?.versionId ?? "")).content ??
+          Buffer.alloc(0),
+      );
+      const rows = merged.tables.find((table) => table.name === "ItemTable")?.rows;
+      const value = (key: string): unknown =>
+        rows?.find((row) => row.key === key)?.values[0];
+      // Every row either machine had survives; the key both hold takes the
+      // replicated-newest side, deterministically on both computers.
+      expect(value("debug.breakpoint")).toEqual({ type: "text", value: "a-only" });
+      expect(value("interactive.sessions")).toEqual({
+        type: "text",
+        value: "b-only",
+      });
+      expect(value("notepadData")).toBeDefined();
+    });
+  });
+
   it("does not read a filtered side as having deleted an old snapshot's chrome", async () => {
     // Transition: the base and the remote tip were published by a build that
     // still shipped chrome, and the remote side even changed it. The filtered
@@ -207,6 +256,22 @@ function resourceSnapshot(content: Buffer): ResourceSnapshot {
       workspaceId: "workspace-a",
     },
   };
+}
+
+/**
+ * Two independent first publications of one resource - no shared ancestor,
+ * exactly what two computers that each had the workspace before they ever
+ * met produce.
+ */
+async function forkBaseFree(
+  repository: SyncRepository,
+  first: WorkspaceDatabaseSnapshot,
+  second: WorkspaceDatabaseSnapshot,
+): ReturnType<typeof reconcileConflicts> {
+  for (const side of [first, second]) {
+    await repository.publish([resourceSnapshot(serialized(side))], []);
+  }
+  return reconcileConflicts(repository);
 }
 
 /** Publishes a base version plus two children of it, then reconciles. */

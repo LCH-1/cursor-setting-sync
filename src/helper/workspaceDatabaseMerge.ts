@@ -387,6 +387,75 @@ export function mergeWorkspaceDatabaseSnapshots(
 }
 
 /**
+ * Unions two snapshots of one workspace that share NO common ancestor.
+ *
+ * This is what two computers meeting for the first time produce: each has its
+ * own state.vscdb for a workspace both of them have open (every Remote-SSH
+ * project the user works from both machines), and neither snapshot descends
+ * from the other, so the three-way walk above has nothing to compare against
+ * and reports every differing row as a conflict. Left there, the first sync
+ * between two machines raised one unresolvable manual conflict PER SHARED
+ * WORKSPACE - and the manual resolver can only offer whole-snapshot
+ * either/or, which discards the losing machine's rows wholesale.
+ *
+ * A union is strictly better than that choice: with no base there are no
+ * deletions to honour, so every row either machine has is a row someone
+ * wrote and nobody deleted. Only a key BOTH sides hold with different values
+ * has to be decided, and it is decided by `preferred` - the caller passes the
+ * replicated-newest tip, so both machines compute byte-identical output.
+ */
+export function unionWorkspaceDatabaseSnapshots(
+  preferred: WorkspaceDatabaseSnapshot,
+  other: WorkspaceDatabaseSnapshot,
+  limits?: Partial<WorkspaceDatabaseLimits>,
+): WorkspaceDatabaseSnapshot {
+  const normalized = normalizedLimits(limits);
+  const canonicalPreferred = canonicalSnapshot(preferred, normalized);
+  const canonicalOther = canonicalSnapshot(other, normalized);
+  if (canonicalPreferred.workspaceId !== canonicalOther.workspaceId) {
+    throw new Error("Workspace database snapshots belong to different workspaces.");
+  }
+  const tables: WorkspaceDatabaseTable[] = [];
+  for (const descriptor of TABLE_DESCRIPTORS) {
+    const preferredTable = tableByName(canonicalPreferred, descriptor.name);
+    const otherTable = tableByName(canonicalOther, descriptor.name);
+    if (preferredTable === undefined && otherTable === undefined) {
+      continue;
+    }
+    const merged = rowsByKey(otherTable);
+    for (const [key, row] of rowsByKey(preferredTable)) {
+      merged.set(key, row);
+    }
+    const rows: WorkspaceDatabaseRow[] = [];
+    for (const key of [...merged.keys()].sort(compareText)) {
+      const row = merged.get(key);
+      if (row !== undefined) {
+        rows.push(cloneRow(row));
+      }
+    }
+    tables.push({
+      name: descriptor.name,
+      keyColumn: descriptor.keyColumn,
+      columns: [...descriptor.valueColumns],
+      rows,
+    });
+  }
+  return canonicalSnapshot(
+    {
+      format: WORKSPACE_DATABASE_SNAPSHOT_FORMAT,
+      version: WORKSPACE_DATABASE_SNAPSHOT_VERSION,
+      workspaceId: canonicalPreferred.workspaceId,
+      sqliteUserVersion: Math.max(
+        canonicalPreferred.sqliteUserVersion,
+        canonicalOther.sqliteUserVersion,
+      ),
+      tables,
+    },
+    normalized,
+  );
+}
+
+/**
  * Applies a portable snapshot without replacing, renaming, or copying the live
  * database file. With no base this is an upsert-only overlay. With a base,
  * deletes and updates use a conservative three-way policy. The verified backup

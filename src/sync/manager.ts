@@ -143,6 +143,7 @@ import {
   mergeWorkspaceDatabaseSnapshots,
   parseWorkspaceDatabaseSnapshot,
   serializeWorkspaceDatabaseSnapshot,
+  unionWorkspaceDatabaseSnapshots,
 } from "../helper/workspaceDatabaseMerge";
 import type { StatusController, SyncStatus } from "../ui/status";
 import type {
@@ -5483,6 +5484,71 @@ async function resolveBaseFreeChatConflict(
 }
 
 /**
+ * Resolves a base-free workspace-database fork by unioning the two snapshots.
+ *
+ * The union is computed with the replicated-newest tip preferred, so both
+ * machines produce byte-identical bytes and the reconciler collapses their
+ * two merge events into one. Returns false - never throws - when either
+ * payload is unreadable or is not a snapshot this build can parse, leaving
+ * the conflict for the manual resolver rather than inventing a result.
+ */
+async function resolveBaseFreeWorkspaceDatabaseConflict(
+  repository: SyncRepository,
+  conflict: SyncConflict,
+  orderedPuts: readonly ResourceTip[],
+  onWarning: (warning: string) => void,
+): Promise<boolean> {
+  const [newest, older] = orderedPuts;
+  if (newest === undefined || older === undefined) {
+    return false;
+  }
+  const [newestData, olderData] = await Promise.all([
+    repository.tryReadVersion(newest.versionId),
+    repository.tryReadVersion(older.versionId),
+  ]);
+  if (
+    newestData === null ||
+    olderData === null ||
+    newestData.content === null ||
+    olderData.content === null
+  ) {
+    return false;
+  }
+  let content: Buffer;
+  try {
+    content = serializeWorkspaceDatabaseSnapshot(
+      unionWorkspaceDatabaseSnapshots(
+        parseWorkspaceDatabaseSnapshot(newestData.content),
+        parseWorkspaceDatabaseSnapshot(olderData.content),
+      ),
+    );
+  } catch {
+    // A payload this build cannot read - a future schema, a snapshot for a
+    // different workspace - stays a conflict instead of losing a side.
+    return false;
+  }
+  return publishAutoMerge(
+    repository,
+    conflict,
+    [
+      {
+        resourceId: conflict.resourceId,
+        kind: conflict.kind,
+        content,
+        semanticHash: sha256(content),
+        metadata: {
+          ...(newest.metadata ?? {}),
+          plainBytes: content.byteLength,
+          syncOrigin: "auto-merge",
+        },
+      },
+    ],
+    [],
+    onWarning,
+  );
+}
+
+/**
  * Resolves a fork with no common ancestor by republishing the winning tip
  * verbatim.
  *
@@ -5521,6 +5587,27 @@ async function resolveBaseFreeConflict(
       puts.length === 2 &&
       puts.length === tips.length &&
       (await resolveBaseFreeChatConflict(
+        repository,
+        conflict,
+        [...puts].sort(compareTips),
+        onWarning,
+      ))
+    );
+  }
+  // A workspace database is combined for the same reason a chat is: its rows
+  // are keyed, so two machines meeting for the first time can keep every row
+  // either of them has. Without this, the first sync between two computers
+  // raised one manual conflict for EVERY workspace both had open, and the
+  // only answer the manual resolver could offer - one whole snapshot or the
+  // other - discarded the losing machine's notepads and sessions outright.
+  if (
+    conflict.kind === "workspace-storage" &&
+    isWorkspaceDatabaseTipMetadata(tips[0]?.metadata)
+  ) {
+    return (
+      puts.length === 2 &&
+      puts.length === tips.length &&
+      (await resolveBaseFreeWorkspaceDatabaseConflict(
         repository,
         conflict,
         [...puts].sort(compareTips),
