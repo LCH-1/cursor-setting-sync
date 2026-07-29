@@ -17,7 +17,11 @@ import { SyncRepository } from "../src/protocol/repository";
 import { EventReconciler } from "../src/protocol/reconciler";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import { readJsonFile, writeJsonAtomic } from "../src/platform/files";
-import { isUnscannableIncomingResource } from "../src/sync/manager";
+import {
+  autoMergeConflicts,
+  isUnscannableIncomingResource,
+} from "../src/sync/manager";
+import { filterPortableWorkspaceRows } from "../src/resources/workspaceStatePolicy";
 import { resolveTargetWorkspace, discoverWorkspaces } from "../src/chat/workspace";
 import { workspaceStorageResourceId } from "../src/resources/workspaceStorage";
 import {
@@ -234,6 +238,182 @@ describeBuilt("a second computer joining and merging", () => {
     );
     expect(stillDropped).toHaveLength(2);
   }, 180_000);
+
+  it("two computers working the same workspace converge and then go quiet", async () => {
+    // The scenario the whole extension exists for, end to end through the real
+    // helper bundle on both sides: each computer writes a different chat in
+    // the same remote workspace and touches the same workspace database, both
+    // "quit" (publish their exports as concurrent forks of a shared base),
+    // both auto-resolve, both apply the other's work - and then NOTHING
+    // republishes, because a pair that converges loudly once and then keeps
+    // echoing is the failure mode 0.0.31 and 0.0.32 were about.
+    const root = await mkdtemp(join(tmpdir(), "cursor-sync-pair-"));
+    temporaryRoots.push(root);
+    const repositoryRoot = join(root, "repository");
+    const deviceA = await SyncRepository.create(
+      repositoryRoot,
+      join(root, "storage-a"),
+      PASSPHRASE,
+      128 * 1024 * 1024,
+      PRODUCER,
+    );
+    const deviceB = await SyncRepository.openWithMasterKey(
+      repositoryRoot,
+      join(root, "storage-b"),
+      deviceA.repository,
+      Buffer.from(deviceA.masterKey),
+      128 * 1024 * 1024,
+      PRODUCER,
+    );
+    await mkdir(join(root, "pc-a"), { recursive: true });
+    await mkdir(join(root, "pc-b"), { recursive: true });
+    const pathsA = await buildDevicePaths(join(root, "pc-a"));
+    const pathsB = await buildDevicePaths(join(root, "pc-b"));
+    const CHAT_X = "11111111-aaaa-4aaa-8aaa-111111111111";
+    const CHAT_Y = "22222222-bbbb-4bbb-8bbb-222222222222";
+
+    // A shared base version of the workspace database, then a concurrent fork:
+    // each side changes a different portable row and adds its own chat.
+    const base = portableWorkspaceSnapshot(root, "base", [
+      ["notepadData", "shared-note"],
+    ]);
+    const published = await deviceA.publish([base], []);
+    const parents = [`${published.eventHash}#0`];
+    await deviceA.publish(
+      [
+        {
+          ...portableWorkspaceSnapshot(root, "side-a", [
+            ["notepadData", "from-a"],
+          ]),
+          parents,
+        },
+        chatSnapshot(CHAT_X, WORKSPACE_B),
+      ],
+      [],
+    );
+    await deviceB.refreshState();
+    await deviceB.publish(
+      [
+        {
+          ...portableWorkspaceSnapshot(root, "side-b", [
+            ["notepadData", "shared-note"],
+            ["interactive.sessions", "from-b"],
+          ]),
+          parents,
+        },
+        chatSnapshot(CHAT_Y, WORKSPACE_B),
+      ],
+      [],
+    );
+
+    // The first device to look sees the fork and resolves it; the second sees
+    // the published resolution and has nothing left to resolve - the order two
+    // real machines actually converge in. Neither may be left with an open
+    // conflict.
+    let resolvedBy = 0;
+    for (const device of [deviceA, deviceB]) {
+      await device.refreshState();
+      const conflicts = new EventReconciler()
+        .reconcile(
+          await device.listEvents(),
+          device.state,
+          await device.loadAbsorbedCheckpointManifest(),
+        )
+        .conflicts.filter((conflict) => conflict.resolvedAt === undefined);
+      if (conflicts.length > 0) {
+        expect(conflicts).toHaveLength(1);
+        expect(await autoMergeConflicts(device, conflicts)).toBe(true);
+        await device.saveState();
+        resolvedBy += 1;
+      }
+    }
+    expect(resolvedBy).toBeGreaterThanOrEqual(1);
+    await deviceA.refreshState();
+    await deviceB.refreshState();
+    const wsResourceId = workspaceStorageResourceId(
+      `${WORKSPACE_B}/state.vscdb`,
+    );
+    const reconcileFor = async (device: SyncRepository) =>
+      new EventReconciler().reconcile(
+        await device.listEvents(),
+        device.state,
+        await device.loadAbsorbedCheckpointManifest(),
+      );
+    expect((await reconcileFor(deviceA)).conflicts).toHaveLength(0);
+    expect((await reconcileFor(deviceB)).conflicts).toHaveLength(0);
+    const tipA = deviceA.state.tips[wsResourceId] ?? [];
+    const tipB = deviceB.state.tips[wsResourceId] ?? [];
+    expect(tipA).toHaveLength(1);
+    // Byte-identical merges collapse to the same version on both devices.
+    expect(tipA[0]?.versionId).toBe(tipB[0]?.versionId);
+
+    // Each side applies the other's chat and the merged workspace through the
+    // real helper bundle.
+    for (const [paths, device, deviceRoot] of [
+      [pathsA, deviceA, join(root, "pc-a")],
+      [pathsB, deviceB, join(root, "pc-b")],
+    ] as const) {
+      const projections = (await reconcileFor(device)).projections.filter(
+        (projection) =>
+          projection.resourceId.startsWith("chat/") ||
+          projection.resourceId === wsResourceId,
+      );
+      const changes: HelperChange[] = projections.map((projection) => ({
+        eventHash: projection.tip.eventHash,
+        changeIndex: projection.tip.changeIndex,
+        resourceId: projection.resourceId,
+        kind: projection.tip.kind,
+        operation: projection.tip.operation,
+        semanticHash: projection.tip.semanticHash,
+        ...(projection.tip.payload === undefined
+          ? {}
+          : { payload: projection.tip.payload }),
+        ...(projection.tip.metadata === undefined
+          ? {}
+          : { metadata: projection.tip.metadata }),
+      }));
+      const result = await runHelper(
+        deviceRoot,
+        repositoryRoot,
+        paths,
+        device,
+        changes,
+      );
+      expect(result.error).toBeNull();
+      expect(result.success).toBe(true);
+    }
+
+    // Convergence: both conversations exist on both computers, the workspace
+    // database carries both sides' portable rows plus the local-only row, and
+    // no chrome travelled.
+    for (const paths of [pathsA, pathsB]) {
+      const composers = readComposerIds(paths.globalDatabase);
+      expect(composers).toContain(CHAT_X);
+      expect(composers).toContain(CHAT_Y);
+      const merged = readItemTable(
+        join(paths.workspaceStorageRoot, WORKSPACE_B, "state.vscdb"),
+      );
+      expect(merged["notepadData"]).toBe("from-a");
+      expect(merged["interactive.sessions"]).toBe("from-b");
+      expect(merged["only-on-this-computer"]).toBe("kept");
+      expect(merged["only-on-the-other-computer"]).toBeUndefined();
+    }
+
+    // Quiet: re-capturing each side's workspace database exactly as the scan
+    // does hashes to the merged tip, so neither computer would publish again.
+    const mergedHash = tipA[0]?.semanticHash;
+    for (const paths of [pathsA, pathsB]) {
+      const recaptured = serializeWorkspaceDatabaseSnapshot(
+        filterPortableWorkspaceRows(
+          captureWorkspaceDatabaseSnapshot(
+            join(paths.workspaceStorageRoot, WORKSPACE_B, "state.vscdb"),
+            { workspaceId: WORKSPACE_B, includeComposerHeaders: true },
+          ).snapshot,
+        ),
+      );
+      expect(sha256(recaptured)).toBe(mergedHash);
+    }
+  }, 300_000);
 });
 
 async function buildDevicePaths(root: string): Promise<CursorPaths> {
@@ -439,6 +619,56 @@ function workspaceStorageSnapshot(
       relativePath,
       workspaceId,
       workspaceUri,
+      plainBytes: content.length,
+      lastUpdatedAt: 1_785_165_284_786,
+    },
+  };
+}
+
+/**
+ * A workspace-database snapshot the 0.0.32 scan would publish: captured from a
+ * real fixture database and restricted to portable rows, with one chrome row
+ * present pre-filter to prove the filter ran.
+ */
+function portableWorkspaceSnapshot(
+  root: string,
+  marker: string,
+  rows: Array<[string, string]>,
+): ResourceSnapshot {
+  const relativePath = `${WORKSPACE_B}/state.vscdb`;
+  const path = join(root, `fixture-portable-${marker}.vscdb`);
+  const database = new DatabaseSync(path);
+  database.exec(
+    "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
+  );
+  database.exec(
+    "CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
+  );
+  const insert = database.prepare(
+    "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+  );
+  for (const [key, value] of rows) {
+    insert.run(key, value);
+  }
+  insert.run("only-on-the-other-computer", marker);
+  database.close();
+  const content = serializeWorkspaceDatabaseSnapshot(
+    filterPortableWorkspaceRows(
+      captureWorkspaceDatabaseSnapshot(path, {
+        workspaceId: WORKSPACE_B,
+        includeComposerHeaders: true,
+      }).snapshot,
+    ),
+  );
+  return {
+    resourceId: workspaceStorageResourceId(relativePath),
+    kind: "workspace-storage",
+    content,
+    semanticHash: sha256(content),
+    metadata: {
+      relativePath,
+      workspaceId: WORKSPACE_B,
+      workspaceUri: URI_B,
       plainBytes: content.length,
       lastUpdatedAt: 1_785_165_284_786,
     },
