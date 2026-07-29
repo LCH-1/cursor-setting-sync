@@ -2,6 +2,17 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.40] - 2026-07-29
+
+The final full-scope pass after the convergence series: three reviewers re-read every source file of v0.0.39 whole (58 areas explicitly cleared), raising five findings - one medium, four low - all outside the audited fix chain and all fixed here.
+
+### Fixed
+
+- Auto-merge can no longer destroy a non-UTF-8 user file: concurrently edited binary files whose extension escaped the denylist (.ico, .woff2, .mp3, ...) were diff3-merged as UTF-8, converging both machines on replacement-character soup with no prompt. Merge inputs are now round-trip checked; anything non-textual goes to the manual resolver, which handles binary either/or.
+- A displaced lock holder aborts instead of writing blind: refresh() throws when the lock file provably carries another process's token (the stale-takeover race's rarest interleaving), so the helper's error paths roll the write back rather than running a destructive section on a mutex someone else owns.
+- The Restore Backup picker resolves each pre-restore snapshot's contract from its record instead of assuming global: a workspace or store snapshot offered as a global restore quit Cursor only to fail (or could import wrong content wholesale); snapshots whose origin record has rotated out are skipped with a log line instead of being mislabeled.
+- A repository switch through Setup clears the previous repository's standing helper warnings - they had no re-observation path on the new repository and painted it "Partial" for the rest of the session. Notices from adapters that were turned off (chat sync disabled) are pruned with the adapters instead of standing in diagnostics until reload.
+
 ## [0.0.39] - 2026-07-29
 
 Convergence round six: one finding, low severity, confined to the one-release upgrade window.

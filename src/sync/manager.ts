@@ -501,10 +501,14 @@ export class SyncManager implements vscode.Disposable {
     );
     // The swap starts this repository's story fresh, the same trade
     // Disconnect->Setup already makes: the old repository's latched failure
-    // must not paint the new one red, and a decline given to the OLD queue
-    // must not suppress the setup-time offer for the new one.
+    // must not paint the new one red, a decline given to the OLD queue must
+    // not suppress the setup-time offer for the new one, and the old
+    // repository's standing helper warnings must not report the NEW one as
+    // "Partial" for the rest of the session (no cycle on the new repository
+    // ever re-observes that bucket; the sync below re-derives live ones).
     this.helperFailure = null;
     this.notices.clear();
+    this.warnings.clear();
     this.queuedApplyDeclined = false;
     // Reconnecting also supersedes any standing disconnect marker for this
     // repository, so sibling windows resume normally.
@@ -1761,20 +1765,64 @@ export class SyncManager implements vscode.Disposable {
         name.endsWith(".vscdb")
       );
     });
+    const recorded = this.context.globalState.get<StoredHelperBackup[]>(
+      LAST_HELPER_BACKUPS_KEY,
+      [],
+    );
+    const recordedByPath = new Map(
+      recorded.map((entry) => [entry.backupPath.toLowerCase(), entry]),
+    );
     const items: Array<{
       label: string;
       description: string;
       path: string;
       restoreTarget?: { targetPath: string; contract: DatabaseContract };
-    }> = backups
-      .sort((left, right) => right.localeCompare(left))
-      .map((path) => ({ label: basename(path), description: path, path }));
-    const recorded = this.context.globalState.get<StoredHelperBackup[]>(
-      LAST_HELPER_BACKUPS_KEY,
-      [],
-    );
+    }> = [];
+    for (const path of backups.sort((left, right) => right.localeCompare(left))) {
+      const name = basename(path);
+      const record = recordedByPath.get(path.toLowerCase());
+      if (name.toLowerCase().startsWith("pre-restore-")) {
+        // A pre-restore snapshot is named identically for EVERY contract, but
+        // the picker's bare entries restore as GLOBAL. Offering a workspace
+        // or store snapshot that way quit Cursor only to fail (or, for a
+        // workspace database that happens to carry composerHeaders, import
+        // the wrong content wholesale). Only a snapshot whose recorded entry
+        // names its contract is offered; the record IS the label.
+        if (record === undefined) {
+          this.status.log(
+            `Restore Backup: skipped ${name} - its origin record has rotated out, so its target database cannot be determined.`,
+          );
+          continue;
+        }
+        items.push({
+          label: `${record.contract} ${basename(record.targetPath)}`,
+          description: path,
+          path,
+          ...(record.contract === "global"
+            ? {}
+            : {
+                restoreTarget: {
+                  targetPath: record.targetPath,
+                  contract: record.contract,
+                },
+              }),
+        });
+        continue;
+      }
+      // state-* files are always the helper's pre-apply GLOBAL snapshots.
+      items.push({ label: name, description: path, path });
+    }
     for (const entry of recorded) {
-      if (entry.contract === "global" || !(await pathExists(entry.backupPath))) {
+      if (
+        entry.contract === "global" ||
+        backups.some(
+          (path) => path.toLowerCase() === entry.backupPath.toLowerCase(),
+        ) ||
+        !(await pathExists(entry.backupPath))
+      ) {
+        // Non-global backups living OUTSIDE the scanned tree (workspace and
+        // store snapshots in other directories) still come from the records;
+        // ones inside it were already listed above with their contract.
         continue;
       }
       items.push({
@@ -3273,6 +3321,13 @@ export class SyncManager implements vscode.Disposable {
           publishWarningSource(adapter.id),
         ]),
       ]),
+    );
+    // Notices are keyed by adapter id alone; without this, a notice raised by
+    // an adapter that was then turned off (the bodyless-chats note after
+    // syncChat goes false) stood in diagnostics and re-logged on every manual
+    // sync until the window reloaded.
+    this.notices.retainSources(
+      new Set(this.adapters.map((adapter) => adapter.id)),
     );
   }
 

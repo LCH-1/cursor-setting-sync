@@ -206,7 +206,10 @@ describe("file lock", () => {
     }
   });
 
-  it("refresh leaves a lock owned by another holder untouched", async () => {
+  it("refresh reports the loss of a lock another holder took over", async () => {
+    // A displaced holder must ABORT, not write blind: silently returning on
+    // a foreign token let a stale-takeover race leave two processes each
+    // convinced they held the mutex. The foreign lock's bytes stay untouched.
     const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
     try {
       const path = join(root, "sync.lock");
@@ -217,7 +220,7 @@ describe("file lock", () => {
       await writeFile(path, lockJson("other"), "utf8");
       await ageFile(path, 10 * 60_000);
 
-      lock.refresh();
+      expect(() => lock.refresh()).toThrow(/taken over by another process/);
 
       const untouched = await stat(path);
       expect(Date.now() - untouched.mtimeMs).toBeGreaterThan(9 * 60_000);

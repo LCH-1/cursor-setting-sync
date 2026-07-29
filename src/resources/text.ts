@@ -42,6 +42,22 @@ export function mergeTextBuffers(
     };
   }
 
+  // diff3 works on decoded strings, and decoding is only faithful for UTF-8:
+  // any invalid byte becomes U+FFFD, so a genuinely binary "user file" (an
+  // .ico, a .woff2, an .mp3 the extension denylist did not anticipate) would
+  // be MERGED into replacement-character soup that both machines then
+  // converge on with no prompt - authored content silently destroyed. A
+  // round-trip check is exact where an extension denylist can never be:
+  // if any side's bytes do not survive decode+encode, this is not text and
+  // the manual resolver (which handles binary either/or) must decide.
+  if (
+    !utf8RoundTrips(base) ||
+    !utf8RoundTrips(local) ||
+    !utf8RoundTrips(remote)
+  ) {
+    return { status: "conflict" };
+  }
+
   const result = diff3.mergeDiff3(
     splitLines(local),
     splitLines(base),
@@ -75,6 +91,10 @@ export function mergeTextBuffers(
     content,
     semanticHash: sha256(content),
   };
+}
+
+function utf8RoundTrips(content: Buffer): boolean {
+  return Buffer.from(content.toString("utf8"), "utf8").equals(content);
 }
 
 function splitLines(content: Buffer): string[] {

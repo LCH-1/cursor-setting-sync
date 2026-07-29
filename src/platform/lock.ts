@@ -21,8 +21,28 @@ interface LockContent {
 
 export interface FileLock {
   path: string;
+  /**
+   * Re-stamps the lock's mtime before a long synchronous phase.
+   *
+   * Throws {@link LockLostError} when the path is PROVABLY held by someone
+   * else (readable content with a foreign token): a stale-takeover race can
+   * displace a live holder, and continuing a destructive critical section on
+   * a lock another process now owns is strictly worse than aborting - the
+   * helper's error paths roll the write back. Every other failure (a
+   * transient read error, a vanished file) stays silent as before.
+   */
   refresh(): void;
   release(): Promise<void>;
+}
+
+/** The lock's path is now owned by another process; abort the critical section. */
+export class LockLostError extends Error {
+  constructor(path: string) {
+    super(
+      `The synchronization lock was taken over by another process (${path}); aborting to avoid concurrent writes.`,
+    );
+    this.name = "LockLostError";
+  }
 }
 
 /**
@@ -300,16 +320,25 @@ function createLock(path: string, content: LockContent): FileLock {
       // Long synchronous phases stall the event loop and with it the
       // heartbeat, so holders call this right before entering one. It must
       // stay synchronous to run while the loop still can.
+      let foreign = false;
       try {
         const existing = JSON.parse(readFileSync(path, "utf8")) as LockContent;
         if (existing.token !== content.token) {
-          return;
+          // Displaced by a stale-takeover race: another process now owns the
+          // path and believes it holds the mutex. Silently returning here
+          // let the displaced holder keep writing blind.
+          foreign = true;
+        } else {
+          const now = new Date();
+          utimesSync(path, now, now);
         }
-        const now = new Date();
-        utimesSync(path, now, now);
       } catch {
-        // Same contract as the heartbeat: a failed refresh never interrupts
-        // the holder.
+        // Same contract as the heartbeat: a failed READ never interrupts the
+        // holder - only a proven foreign occupant does.
+      }
+      if (foreign) {
+        clearInterval(heartbeat);
+        throw new LockLostError(path);
       }
     },
     async release(): Promise<void> {
