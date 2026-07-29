@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readdir, rm, stat } from "node:fs/promises";
+import { readdir, rename, rm, stat } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { directorySize, ensureDirectory, pathExists } from "./files";
 
@@ -124,36 +124,52 @@ export async function cloneRepository(
       `Clone target must be an empty directory: ${root}`,
     );
   }
+  // Clone into a staging subdirectory, never into the target itself. A clone
+  // force-killed mid-checkout (the timeout SIGKILLs git before its atexit
+  // cleanup) leaves debris, and cleaning the TARGET on failure deleted files
+  // that arrived AFTER the emptiness precheck - in a cloud-synced folder,
+  // potentially another machine's repository content, with the deletions
+  // propagating. Scoping everything to the staging directory makes deleting
+  // a file the clone did not create structurally impossible.
+  const stagingName = `.cursor-sync-clone-${randomUUID().slice(0, 8)}`;
+  const staging = join(root, stagingName);
   const args = ["-c", "core.autocrlf=false", "clone"];
   if (branch !== undefined) {
     args.push("--branch", branch);
   }
-  args.push("--", remoteUrl, ".");
+  args.push("--", remoteUrl, stagingName);
   try {
     await runGit(root, args);
   } catch (error) {
-    // A killed clone leaves debris behind - and not just .git: a clone
-    // force-killed mid-checkout (the timeout SIGKILLs git, so its own atexit
-    // junk cleanup never runs) leaves checked-out work-tree files that made
-    // every retry throw "must be an empty directory" with no path that ever
-    // clears them. The precheck above proved the directory was empty, so
-    // everything in it is clone debris. Cleanup failures must not replace
-    // the real clone error.
     try {
-      for (const entry of await readdir(root)) {
-        await rm(join(root, entry), {
-          recursive: true,
-          force: true,
-          maxRetries: 3,
-          retryDelay: 200,
-        });
-      }
+      await rm(staging, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 200,
+      });
     } catch {
-      // The folder may need emptying by hand; the rethrown clone error is
-      // still the story that matters.
+      // The staging folder may need emptying by hand; the rethrown clone
+      // error is still the story that matters, and the visible dot-directory
+      // names itself as this extension's debris.
     }
     throw error;
   }
+  // Success: the target must still contain nothing but the staging directory
+  // before its contents move up. Foreign files that appeared meanwhile are
+  // NOT deleted - the user is told to empty the folder instead.
+  const afterClone = (await readdir(root)).filter((name) => name !== stagingName);
+  if (afterClone.length > 0) {
+    await rm(staging, { recursive: true, force: true }).catch(() => {});
+    throw new GitError(
+      "command",
+      `Files appeared in the clone target while cloning (${afterClone[0] ?? ""}); empty the folder and try again.`,
+    );
+  }
+  for (const entry of await readdir(staging)) {
+    await rename(join(staging, entry), join(root, entry));
+  }
+  await rm(staging, { recursive: true, force: true });
   await disableLineEndingConversion(root);
 }
 

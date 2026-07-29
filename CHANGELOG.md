@@ -2,6 +2,28 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.35] - 2026-07-29
+
+Convergence round two: adversarial verification of the 0.0.34 diff itself - 18 findings raised against it, 2 refuted, the rest fixed here. Each is a refinement of a round-one fix, not a regression of older behavior.
+
+### Fixed
+
+- The finalizer arm's completion re-check now distinguishes scopes: a CLOSING window leaves the just-armed (or adopted) exporter running - cancelling it silently cost the machine its shutdown export - while Disable and Disconnect (own window's or a sibling's, via the machine-wide marker) still stand it down; an adopted sibling finalizer is never cancelled by another window's teardown. The arm also passes a copy of the master key, so a Setup re-run during the 30-second replacement wait can no longer hand the finalizer 32 zero bytes.
+- A window torn down by a sibling's disconnect marker cancels any in-flight arm's exporter (closing the one-final-export leak) and probes for reconnection - after a Setup elsewhere removes the marker, the window reopens and resumes instead of sitting dark at "unconfigured" until a manual reload.
+- The apply/restore claim carries a nonce for its whole life: a leftover veto timer or a stale consumed result can no longer erase a successor attempt's live claim (pid alone cannot tell two attempts from one window apart); the claim is re-stamped and re-verified after the unbounded preparation phase, so a TTL-expired claim taken over by another window makes this attempt stand down instead of double-committing; Restore Backup gained the same config-change abort Restart to Apply has.
+- The cancel-marker owner sidecar is bound to its marker by stamp: a crash between the two writes strands a sidecar that would otherwise veto every LATER writer's legitimate cancel forever.
+- The claimed-result name embeds the claim instant, closing the rename-to-utimes gap in which a sibling's orphan sweep could still destroy a freshly claimed overnight result.
+- The exit-wait listing tolerance gained a budget: an environment where the process listing has NEVER worked fails loudly after ten consecutive failures (surfaced through the stderr log and the red bar) instead of waiting thirty days in silence; transient hiccups after a first success still wait indefinitely, as intended.
+- A failed clone can no longer delete files it did not create: cloning goes through a staging subdirectory, failure cleanup is scoped to it, and foreign files that appear in the target mid-clone abort with instructions instead of being removed - in a cloud-synced folder those could be another machine's repository content.
+- Torn-checkpoint tolerance is enumerated instead of prefix-matched, so a checkpoint that authenticates and then fails validation (complete and genuinely invalid) fail-stops instead of being skipped forever as "still arriving".
+- A device now detects its own forked stream: two event files at one sequence in the device's own directory (the OS-restore fork, if it ever lands despite the 0.0.34 guards) fail-stop with recovery instructions on the one machine that can see both branches, instead of silently extending one of them while every peer wedges.
+
+### Known limits, accepted deliberately
+
+- The OS-restore fork guards read the local replica of the shared folder; a whole-disk restore where the first publish beats cloud rehydration can still fork - the new owner-side detection turns that from a silent permanent wedge into a named, recoverable state.
+
+## [0.0.34] - 2026-07-29
+
 ## [0.0.34] - 2026-07-29
 
 Convergence round one: a fresh-eyes audit of the last three releases' own fixes plus the subsystems no earlier audit had reached (protocol core, the file adapters, the manager command flows), 32 findings adversarially verified. Everything reachable is fixed.

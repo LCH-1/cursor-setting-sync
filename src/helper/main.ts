@@ -922,6 +922,8 @@ async function waitForCursorExit(
   // wait for its whole timeout - thirty days for a finalizer. The listing is
   // authoritative, so it runs regardless on a slower cadence.
   let lastListingAt = 0;
+  let listingEverSucceeded = false;
+  let consecutiveListingFailures = 0;
   while (Date.now() - startedAt < timeoutMs) {
     if (
       request.mode === "final-export" &&
@@ -933,14 +935,30 @@ async function waitForCursorExit(
     if (hostGone || Date.now() - lastListingAt > 30_000) {
       lastListingAt = Date.now();
       try {
-        if (await noOtherCursorProcesses(request)) {
+        const noOthers = await noOtherCursorProcesses(request);
+        listingEverSucceeded = true;
+        consecutiveListingFailures = 0;
+        if (noOthers) {
           return false;
         }
-      } catch {
-        // A transient tasklist failure is not evidence about Cursor. Erring
-        // toward waiting matches inertCursorProcessIds' policy; letting the
-        // throw escape killed the session's ONLY shutdown exporter over one
-        // hiccup in a listing this loop reruns within 30 seconds anyway.
+      } catch (error) {
+        // A transient tasklist failure is not evidence about Cursor: erring
+        // toward waiting matches inertCursorProcessIds' policy, and letting
+        // the throw escape killed the session's only shutdown exporter over
+        // one hiccup. But an environment where the listing has NEVER worked
+        // would otherwise wait out the full timeout - thirty days for a
+        // finalizer - in perfect silence, losing every quit's export with
+        // green status. A listing that never succeeded fails loudly instead,
+        // which the launcher's stderr log and the consume path surface.
+        consecutiveListingFailures += 1;
+        process.stderr.write(
+          `Cursor process listing failed (${consecutiveListingFailures}): ${
+            error instanceof Error ? error.message : String(error)
+          }\n`,
+        );
+        if (!listingEverSucceeded && consecutiveListingFailures >= 10) {
+          throw error;
+        }
       }
     }
     await delay(500);
@@ -998,7 +1016,15 @@ async function isFinalizerCancelled(request: HelperRequest): Promise<boolean> {
   //    armed, so honoring its marker would strip the session of its only
   //    exporter - the marker is void the moment the writer is gone.
   const owner = await readCancelOwner(request);
-  if (owner !== null && Number.isFinite(owner.pid)) {
+  if (
+    owner !== null &&
+    Number.isFinite(owner.pid) &&
+    (owner.stamp === undefined || owner.stamp === lines[0])
+  ) {
+    // A sidecar bound to a DIFFERENT marker is a stranded leftover (its
+    // writer crashed between the sidecar and marker writes) and must not
+    // speak for the marker actually present - fall through to the legacy
+    // reading instead.
     if (isProcessAlive(owner.pid)) {
       return true;
     }
@@ -1018,18 +1044,22 @@ async function isFinalizerCancelled(request: HelperRequest): Promise<boolean> {
 
 async function readCancelOwner(
   request: HelperRequest,
-): Promise<{ pid: number; kind: "restart" | "quit" } | null> {
+): Promise<{ pid: number; kind: "restart" | "quit"; stamp?: string } | null> {
   try {
     const raw = JSON.parse(
       await readFile(join(request.storageRoot, "cancel-finalizers-owner"), "utf8"),
-    ) as { pid?: unknown; kind?: unknown };
+    ) as { pid?: unknown; kind?: unknown; stamp?: unknown };
     if (
       typeof raw.pid !== "number" ||
       (raw.kind !== "restart" && raw.kind !== "quit")
     ) {
       return null;
     }
-    return { pid: raw.pid, kind: raw.kind };
+    return {
+      pid: raw.pid,
+      kind: raw.kind,
+      ...(typeof raw.stamp === "string" ? { stamp: raw.stamp } : {}),
+    };
   } catch {
     return null;
   }

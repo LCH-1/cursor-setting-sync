@@ -1,5 +1,6 @@
 import { basename, isAbsolute, join, relative } from "node:path";
-import { readFile, readdir, rename, rm, stat, utimes } from "node:fs/promises";
+import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import {
   AUTOMATIC_CHECKPOINT_COOLDOWN_MS,
@@ -130,7 +131,10 @@ import {
   resolveTargetWorkspace,
 } from "../chat/workspace";
 import { HelperLauncher } from "../helper/launcher";
-import type { HelperSyncOptions } from "../helper/launcher";
+import type {
+  FinalizerReplaceOutcome,
+  HelperSyncOptions,
+} from "../helper/launcher";
 import type { HelperRequest } from "../helper/types";
 import type { DatabaseContract } from "../helper/database";
 import type { HelperChange, HelperResult } from "../helper/types";
@@ -212,6 +216,9 @@ export class SyncManager implements vscode.Disposable {
   private chatPollTimer: NodeJS.Timeout | null = null;
   private watcherDebounce: NodeJS.Timeout | null = null;
   private finalizerRetryTimer: NodeJS.Timeout | null = null;
+  private reconnectProbeTimer: NodeJS.Timeout | null = null;
+  /** The nonce of the apply/restore claim this window currently holds. */
+  private activeApplyClaim: string | null = null;
   private finalizerStartInFlight: Promise<void> | null = null;
   private finalizerRestartRequested = false;
   /** Resources whose payload has not crossed the shared folder yet, to log once. */
@@ -916,7 +923,7 @@ export class SyncManager implements vscode.Disposable {
     // window open for a second window to commit to the same apply - two
     // helpers then each counted the other as a live Cursor and both timed
     // out having applied nothing.
-    await this.markApplyInProgress();
+    const claim = await this.markApplyInProgress();
     let committed = false;
     try {
       await this.syncNow(true);
@@ -947,6 +954,25 @@ export class SyncManager implements vscode.Disposable {
         );
         return;
       }
+      // The preparation above is unbounded (a maintenance checkpoint inside
+      // the sync, mapping prompts held open) while the claim's TTL is not.
+      // Re-stamp so a live preparer's marker never ages out mid-flight, and
+      // verify no other window took the claim over in the meantime - if one
+      // did, IT is committing this apply and this attempt must stand down.
+      try {
+        const marker = await readJsonFile<{ nonce?: string }>(
+          this.applyInProgressPath(),
+        );
+        if (typeof marker.nonce === "string" && marker.nonce !== claim) {
+          this.status.log(
+            "Another window took over this apply while it was being prepared; standing down.",
+          );
+          return;
+        }
+      } catch {
+        // Marker expired or was swept; re-claim below.
+      }
+      await this.markApplyInProgress(claim);
       const changes = batch.changes;
       if (changes.length === 0) {
         const blocked = repository.state.pendingDatabaseChanges.filter(
@@ -978,13 +1004,13 @@ export class SyncManager implements vscode.Disposable {
         );
       }
       committed = true;
-      await this.launchApplyHelper(repository, masterKey, changes);
+      await this.launchApplyHelper(repository, masterKey, changes, claim);
     } finally {
       if (!committed) {
         // Every early return and throw above must release the claim, or a
         // batch that turned out empty blocks the next window's offer for the
-        // marker's whole TTL.
-        await this.clearApplyInProgress();
+        // marker's whole TTL. Nonce-scoped: a successor's claim survives.
+        await this.clearApplyInProgress(claim);
       }
     }
   }
@@ -993,6 +1019,7 @@ export class SyncManager implements vscode.Disposable {
     repository: SyncRepository,
     masterKey: Buffer,
     changes: HelperChange[],
+    claim: string,
   ): Promise<void> {
     try {
       await this.helper.applyAndRestart(
@@ -1002,7 +1029,7 @@ export class SyncManager implements vscode.Disposable {
         this.configuration.workspaceMappings,
         this.helperSyncOptions(),
         async () => {
-          await this.clearApplyInProgress();
+          await this.clearApplyInProgress(claim);
           // The quit was vetoed, so the helper is about to give up and write a
           // failure nobody would otherwise read until the next launch. The
           // consume is best-effort because `scheduleQuitVetoCheck` invokes this
@@ -1036,7 +1063,7 @@ export class SyncManager implements vscode.Disposable {
       // apply helper, so a launch that throws - the helper bundle mid-update,
       // a spawn failure - would otherwise leave the session with no shutdown
       // export at all and nothing scheduled to notice.
-      await this.clearApplyInProgress();
+      await this.clearApplyInProgress(claim);
       await this.startFinalizer();
       throw error;
     }
@@ -1071,6 +1098,11 @@ export class SyncManager implements vscode.Disposable {
       return false;
     }
     this.disposeRuntime();
+    // The disconnecting window cancelled the finalizer it knew about, but an
+    // arm in flight in THIS window at that moment survives it; without a
+    // second cancel from whoever observes the marker, that exporter performs
+    // one final export into a repository the device just left.
+    await this.helper.cancelFinalizers();
     this.repository = null;
     this.masterKey?.fill(0);
     this.masterKey = null;
@@ -1083,7 +1115,56 @@ export class SyncManager implements vscode.Disposable {
     this.status.log(
       "Another window disconnected this device from the synchronization repository; this window stopped synchronizing too.",
     );
+    // A later Setup in some window removes the marker; this window must come
+    // back on its own rather than sitting dark until a manual reload while
+    // the device is in fact configured and syncing.
+    this.scheduleReconnectProbe(repository.repository.repositoryId);
     return true;
+  }
+
+  private scheduleReconnectProbe(repositoryId: string): void {
+    if (this.reconnectProbeTimer !== null || this.disposed) {
+      return;
+    }
+    this.reconnectProbeTimer = setTimeout(() => {
+      this.reconnectProbeTimer = null;
+      void (async () => {
+        if (this.disposed || this.repository !== null) {
+          return;
+        }
+        if (await pathExists(this.disconnectMarkerPath(repositoryId))) {
+          this.scheduleReconnectProbe(repositoryId);
+          return;
+        }
+        // Marker gone: a Setup reconnected the device. Reopen from the
+        // stored configuration; failing that (stale memento, different
+        // repository), tell the user what to do instead of showing a wrong
+        // "unconfigured".
+        try {
+          const root = this.configuration.repositoryPath;
+          const masterKey = await this.configuration.getMasterKey();
+          if (root !== null && masterKey !== null) {
+            await this.openConfiguredRepository(masterKey);
+            await this.startFinalizer();
+            this.startWatching();
+            this.status.log(
+              "Reconnected after another window's Setup; synchronization resumed in this window.",
+            );
+            return;
+          }
+        } catch (error) {
+          this.status.log(
+            `This window could not rejoin the reconnected repository: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+        this.status.setStatus(
+          "error",
+          "This device reconnected in another window; reload this window to resume synchronizing here.",
+        );
+      })();
+    }, RECONNECT_PROBE_INTERVAL_MS);
   }
 
   /**
@@ -1107,27 +1188,54 @@ export class SyncManager implements vscode.Disposable {
     }
   }
 
-  private async markApplyInProgress(): Promise<void> {
+  /**
+   * Writes (or re-stamps) the claim and returns its nonce. Every clear is
+   * nonce-scoped: a leftover veto timer from a superseded attempt, or a stale
+   * consumed result, must never erase a SUCCESSOR's live claim - pid alone
+   * cannot tell two attempts from the same window apart.
+   */
+  private async markApplyInProgress(nonce?: string): Promise<string> {
+    const claim = nonce ?? randomUUID();
+    this.activeApplyClaim = claim;
     await writeJsonAtomic(this.applyInProgressPath(), {
       createdAt: new Date().toISOString(),
       pid: process.pid,
+      nonce: claim,
     });
+    return claim;
   }
 
-  private async clearApplyInProgress(): Promise<void> {
+  /** Removes the marker only while it still carries the given claim. */
+  private async clearApplyInProgress(nonce?: string): Promise<void> {
+    if (nonce !== undefined) {
+      try {
+        const marker = await readJsonFile<{ nonce?: string }>(
+          this.applyInProgressPath(),
+        );
+        if (typeof marker.nonce === "string" && marker.nonce !== nonce) {
+          // A successor attempt owns the marker now; leave it standing.
+          return;
+        }
+      } catch {
+        // Missing or unreadable: nothing to protect.
+      }
+    }
+    if (this.activeApplyClaim === nonce || nonce === undefined) {
+      this.activeApplyClaim = null;
+    }
     await rm(this.applyInProgressPath(), { force: true });
   }
 
   /**
    * Clears the marker unless it belongs to another window that is still
-   * alive - that window's apply may be mid-flight, and erasing its claim
-   * re-admits a concurrent apply against the same quit. A dead owner's
-   * marker and this window's own marker clear as usual; the TTL remains the
-   * backstop for anything left behind.
+   * alive, or to THIS window's currently held claim - either way that apply
+   * may be mid-flight, and erasing its claim re-admits a concurrent apply
+   * against the same quit. A dead owner's marker and an unowned own-pid
+   * marker clear as usual; the TTL remains the backstop.
    */
   private async clearApplyInProgressUnlessForeign(): Promise<void> {
     try {
-      const marker = await readJsonFile<{ pid?: number }>(
+      const marker = await readJsonFile<{ pid?: number; nonce?: string }>(
         this.applyInProgressPath(),
       );
       const pid = marker.pid;
@@ -1138,6 +1246,14 @@ export class SyncManager implements vscode.Disposable {
         } catch {
           // Owner gone; fall through to the clear.
         }
+      }
+      if (
+        typeof marker.nonce === "string" &&
+        this.activeApplyClaim === marker.nonce
+      ) {
+        // This window's own LIVE claim - a stale result consumed during the
+        // claim-holder's pre-quit sync must not strip it mid-preparation.
+        return;
       }
     } catch {
       // Unreadable or missing marker clears unconditionally.
@@ -1664,6 +1780,16 @@ export class SyncManager implements vscode.Disposable {
     if (confirmed !== "Import and Restart") {
       return;
     }
+    if (this.disposed || this.repository !== repository || this.masterKey === null) {
+      // Same guard restartToApply has: the picker and the modal park for as
+      // long as the user thinks, and a Disconnect or Setup re-run meanwhile
+      // makes "quit every window and restore" the wrong thing to do - and
+      // the modal's propagation sentence stale.
+      this.status.log(
+        "Restore Backup was abandoned: the synchronization configuration changed while the backup was being chosen. Nothing was restored.",
+      );
+      return;
+    }
     if (await this.applyAlreadyInProgress()) {
       const message =
         "Another window already started an apply or restore; wait for Cursor to quit, then try again.";
@@ -1671,7 +1797,7 @@ export class SyncManager implements vscode.Disposable {
       void vscode.window.showInformationMessage(message);
       return;
     }
-    await this.markApplyInProgress();
+    const claim = await this.markApplyInProgress();
     try {
       await this.helper.restoreAndRestart(
         repository.root,
@@ -1680,7 +1806,7 @@ export class SyncManager implements vscode.Disposable {
         this.helperSyncOptions(),
         selected.restoreTarget,
         async () => {
-          await this.clearApplyInProgress();
+          await this.clearApplyInProgress(claim);
           await this.startFinalizer();
         },
         () => {
@@ -1697,7 +1823,7 @@ export class SyncManager implements vscode.Disposable {
     } catch (error) {
       // Same as restartToApply: the restore flow cancelled the standing
       // finalizer before launching, so a failed launch must re-arm it.
-      await this.clearApplyInProgress();
+      await this.clearApplyInProgress(claim);
       await this.startFinalizer();
       throw error;
     }
@@ -2093,6 +2219,10 @@ export class SyncManager implements vscode.Disposable {
     if (this.finalizerRetryTimer !== null) {
       clearTimeout(this.finalizerRetryTimer);
       this.finalizerRetryTimer = null;
+    }
+    if (this.reconnectProbeTimer !== null) {
+      clearTimeout(this.reconnectProbeTimer);
+      this.reconnectProbeTimer = null;
     }
     this.disposeRuntime();
     this.warnings.clear();
@@ -3316,29 +3446,52 @@ export class SyncManager implements vscode.Disposable {
         // must not quietly re-install an exporter the user just turned off.
         return;
       }
-      const outcome = await this.helper.restartFinalizer(
-        this.repository.root,
-        this.masterKey,
-        this.configuration.workspaceMappings,
-        this.helperSyncOptions(),
-      );
-      if (this.disposed || !this.configuration.enabled || this.repository === null) {
-        // The user disabled sync or disconnected while the arm was inside its
-        // up-to-30s replacement wait; the wait's own cancel-marker removal
-        // overrode that stand-down, so an exporter would now be armed for a
-        // sync the user just turned off. Cancel it - the fresh marker
-        // postdates the new request, so the finalizer honors it even without
-        // a live process handle.
-        await this.helper.cancelFinalizers();
-        return;
+      // A copy, and the repository captured: a Setup re-run during the arm's
+      // up-to-30s replacement wait zeroes this.masterKey IN PLACE, and the
+      // launcher serializes the key only at spawn time - after the wait - so
+      // the finalizer received 32 zero bytes and failed at its first decrypt.
+      const repository = this.repository;
+      const masterKey = Buffer.from(this.masterKey);
+      let outcome: FinalizerReplaceOutcome;
+      try {
+        outcome = await this.helper.restartFinalizer(
+          repository.root,
+          masterKey,
+          this.configuration.workspaceMappings,
+          this.helperSyncOptions(),
+        );
+      } finally {
+        masterKey.fill(0);
       }
       if (outcome === "adopted") {
         // Another window installed a fresh finalizer after this window asked
-        // for the replacement; it covers the shutdown export, so there is
-        // nothing to arm here and nothing to warn about.
+        // for the replacement. It covers the shutdown export - and it belongs
+        // to that window, so no re-check below may cancel it: this window
+        // being disposed or disconnected says nothing about the sibling's.
         this.status.log(
           "Another window installed the shutdown finalizer; this window uses it.",
         );
+        return;
+      }
+      if (this.disposed) {
+        // Window teardown mid-arm. The exporter just armed IS the machine's
+        // shutdown coverage; cancelling it here silently cost the session its
+        // final export. Leave it running - the same policy
+        // HelperLauncher.dispose() follows by not killing the child.
+        return;
+      }
+      if (
+        !this.configuration.enabled ||
+        this.repository === null ||
+        (await this.disconnectedElsewhere())
+      ) {
+        // Disable or Disconnect (this window's or a sibling's, via the
+        // machine-wide marker) landed while the arm was inside its wait; the
+        // wait's own cancel-marker removal overrode that stand-down, so an
+        // exporter would now be armed for a sync the user just turned off.
+        // The fresh marker postdates the new request, so the finalizer honors
+        // it even without a live process handle.
+        await this.helper.cancelFinalizers();
         return;
       }
       if (outcome === "stalled") {
@@ -3564,15 +3717,26 @@ export class SyncManager implements vscode.Disposable {
     // A window that claimed a result and died before deleting it left a
     // .claimed file no listing ever matched again - the result's warnings and
     // backups were lost to every surviving window. An hour is far beyond any
-    // consume, so age alone is proof of orphanhood.
+    // consume, so CLAIM age alone is proof of orphanhood - and the claim age
+    // is embedded in the name at rename time, because mtime is the RESULT's
+    // age (rename preserves it) and a post-rename utimes left a gap in which
+    // a sibling's sweep destroyed a freshly claimed overnight result.
     try {
       for (const entry of await readdir(this.paths.extensionStorage)) {
         if (!/\.claimed$/.test(entry) || !entry.includes("helper-result-")) {
           continue;
         }
         const orphanPath = join(this.paths.extensionStorage, entry);
-        const info = await stat(orphanPath).catch(() => null);
-        if (info !== null && Date.now() - info.mtimeMs > 60 * 60_000) {
+        const embedded = /\.(\d{10,16})\.claimed$/.exec(entry);
+        const claimedAtMs =
+          embedded === null ? null : Number.parseInt(embedded[1] ?? "", 10);
+        let ageBasisMs = claimedAtMs;
+        if (ageBasisMs === null || !Number.isFinite(ageBasisMs)) {
+          // Old-format leftover from a prior version: mtime is all there is.
+          const info = await stat(orphanPath).catch(() => null);
+          ageBasisMs = info?.mtimeMs ?? null;
+        }
+        if (ageBasisMs !== null && Date.now() - ageBasisMs > 60 * 60_000) {
           this.status.log(
             `Discarded a helper result another window claimed but never processed (${entry}).`,
           );
@@ -3587,8 +3751,9 @@ export class SyncManager implements vscode.Disposable {
       // Claim before reading: startup runs this in EVERY restoring window at
       // once, and two windows that both read a result before either deleted
       // it reported it twice and raced the backup-record update. The rename
-      // is atomic, so exactly one window owns each result.
-      const claimedPath = `${path}.${process.pid}.claimed`;
+      // is atomic, so exactly one window owns each result - and the claim
+      // instant rides in the name, atomically with the claim itself.
+      const claimedPath = `${path}.${process.pid}.${Date.now()}.claimed`;
       try {
         await rename(path, claimedPath);
       } catch (error) {
@@ -3598,12 +3763,6 @@ export class SyncManager implements vscode.Disposable {
         }
         throw error;
       }
-      // Rename preserves mtime, so a result written hours ago (an overnight
-      // final-export consumed at the next startup) would read as an hour-old
-      // ORPHANED claim the instant it was claimed, and a sibling's sweep
-      // could destroy it between this rename and the read below. Stamping the
-      // claim time makes the sweep measure what it says it measures.
-      await utimes(claimedPath, new Date(), new Date()).catch(() => {});
       let result: HelperResult;
       try {
         result = await readJsonFile<HelperResult>(claimedPath);
@@ -4127,6 +4286,9 @@ const FINALIZER_RETRY_DELAY_MS = 60_000;
  * a run that ended without cleanup and is ignored.
  */
 const APPLY_IN_PROGRESS_TTL_MS = 210_000;
+
+/** How often a window torn down by a sibling's disconnect probes for a reconnect. */
+const RECONNECT_PROBE_INTERVAL_MS = 60_000;
 
 export const QUIT_STALLED_MESSAGE =
   `Cursor Setting Sync asked Cursor to close ${Math.round(QUIT_START_GRACE_MS / 1000)} seconds ago and it is still open, so the queued changes have not been written. ` +

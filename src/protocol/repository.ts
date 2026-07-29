@@ -1350,6 +1350,26 @@ export class SyncRepository {
           entry.match !== null,
       )
       .sort((left, right) => Number(left.match[1]) - Number(right.match[1]));
+    // Two files at one sequence in the device's OWN stream is a fork this
+    // device minted - the OS-restore scenario where local state and the local
+    // cloud replica rolled back together and a publish beat rehydration. The
+    // walk below filters to sequences above the verified head and would
+    // silently keep extending one branch; every peer meanwhile fail-stops.
+    // The owner is the one device that can see and name the problem.
+    for (let index = 1; index < allFiles.length; index += 1) {
+      const current = allFiles[index];
+      const previous = allFiles[index - 1];
+      if (
+        current !== undefined &&
+        previous !== undefined &&
+        current.match[1] === previous.match[1]
+      ) {
+        throw ownStreamRollbackError(
+          deviceId,
+          `two events exist at sequence ${Number(current.match[1])} (${previous.file} and ${current.file}) - this device's stream has forked, most likely after restoring this computer from a backup. Keep the file every OTHER computer already accepted (check their warnings for the expected hash) and move the other one out of the folder`,
+        );
+      }
+    }
     if (
       checkpointCursor !== undefined &&
       pinned.lastSequence < checkpointCursor.lastSequence
@@ -2243,6 +2263,13 @@ function isTolerablePrunedEventError(error: unknown): boolean {
  * shapes a well-named checkpoint file shows while the cloud client is still
  * transferring its bytes. Only used where another candidate or the local copy
  * of the previous winner can cover the cycle.
+ *
+ * Deliberately ENUMERATED rather than prefix-matched: half-transferred bytes
+ * fail the JSON parse, the file hash, the filename cross-checks, or the AEAD
+ * authentication - all BEFORE the content is trusted. A checkpoint that
+ * authenticates and then fails validation is complete and genuinely invalid
+ * (another build wrote something this one cannot fold), which must fail
+ * loudly, not be skipped forever as "still arriving".
  */
 function isTolerableTornCheckpointError(error: unknown): boolean {
   if (error instanceof SyntaxError) {
@@ -2250,7 +2277,9 @@ function isTolerableTornCheckpointError(error: unknown): boolean {
   }
   return (
     error instanceof Error &&
-    (error.message.startsWith("Checkpoint ") ||
+    (error.message.startsWith("Checkpoint file hash mismatch") ||
+      error.message.startsWith("Checkpoint lamport does not match") ||
+      error.message.startsWith("Checkpoint envelope") ||
       error.message.startsWith("Unsupported state authentication") ||
       error.message.includes("Unsupported state or unable to authenticate data"))
   );

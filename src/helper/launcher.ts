@@ -116,9 +116,15 @@ export class HelperLauncher {
    */
   private async writeCancelMarker(kind: "restart" | "quit"): Promise<number> {
     const stamp = new Date().toISOString();
+    // The sidecar names the marker it belongs to (its exact stamp): a crash
+    // between the two writes strands a sidecar describing a marker that never
+    // landed, and an unbound sidecar would then veto a LATER writer's
+    // legitimate cancel forever. Readers ignore a sidecar whose stamp does
+    // not match the marker's first line.
     await writeJsonAtomic(`${this.cancelFinalizersPath}-owner`, {
       pid: process.pid,
       kind,
+      stamp,
     });
     await writeFileAtomic(
       this.cancelFinalizersPath,
