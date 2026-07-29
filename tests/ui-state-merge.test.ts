@@ -294,34 +294,46 @@ describe("UI state merge", () => {
 });
 
 describe("UI state key policy", () => {
-  it("denies the unbounded per-panel key families", () => {
-    expect(
-      isDeniedUiStateKey(
-        "workbench.panel.composerChatViewPane.fe374843-0376-48d0-bbc4-948b7a99c55b.hidden",
-      ),
-    ).toBe(true);
-    expect(isDeniedUiStateKey("workbench.auxiliarybar.pinnedPanels")).toBe(true);
-    expect(isDeniedUiStateKey("workbench.panel.pinnedPanels")).toBe(false);
-    expect(isDeniedUiStateKey("workbench.activity.pinnedViewlets2")).toBe(false);
+  it("excludes every ui-state key, not a hand-maintained family list", () => {
+    // 0.0.4 through 0.0.41 excluded one churning key family at a time and the
+    // field kept producing the next one - thirteen of the sixteen conflicts the
+    // second computer raised on joining were ui-state keys nobody had edited.
+    // The whole kind is window chrome, so the whole kind stays local.
+    for (const key of [
+      "workbench.panel.composerChatViewPane.fe374843-0376-48d0-bbc4-948b7a99c55b.hidden",
+      "workbench.auxiliarybar.pinnedPanels",
+      "src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser",
+      // Never excluded before this release; excluded now for the same reason.
+      "workbench.panel.pinnedPanels",
+      "workbench.activity.pinnedViewlets2",
+      "workbench.panel.chatSidebar",
+      "some.key.no.release.has.ever.seen",
+    ]) {
+      expect(isPolicyExcludedUiStateKey(key)).toBe(true);
+      expect(isDeniedUiStateKey(key)).toBe(true);
+    }
   });
 
   it("separates a policy exclusion from a security denial", () => {
-    // Policy: excluded from the scan, but harmless to receive. Treating one of
-    // these as a security violation aborted the whole shutdown apply on any
-    // device whose repository still held an event published by 0.0.1-0.0.3.
+    // The distinction survives the blanket exclusion and still decides what an
+    // inbound change does: a policy exclusion is skipped and accounted for, a
+    // security denial aborts the transaction. Conflating them aborted the whole
+    // shutdown apply on any device whose repository still held an event an
+    // older release of this extension published.
     for (const key of [
       "workbench.auxiliarybar.pinnedPanels",
       "workbench.panel.composerChatViewPane.fe374843-0376-48d0-bbc4-948b7a99c55b.hidden",
-      // Rewritten by Cursor every 15-30 seconds while it runs; syncing it
-      // published an event on virtually every poll.
       "src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser",
+      "workbench.activity.pinnedViewlets2",
     ]) {
       expect(isPolicyExcludedUiStateKey(key)).toBe(true);
       expect(isSecurityDeniedUiStateKey(key)).toBe(false);
       expect(isDeniedUiStateKey(key)).toBe(true);
     }
 
-    // Security: receiving one of these is a protocol violation.
+    // Security: receiving one of these is a protocol violation, and it must
+    // still read as one now that every key is policy-excluded as well. The
+    // apply side checks this first, so the answer here decides fatal vs skipped.
     for (const key of [
       "secret://github",
       "mcpOAuth.server",
@@ -332,16 +344,7 @@ describe("UI state key policy", () => {
       "lch.cursor-setting-sync.state",
     ]) {
       expect(isSecurityDeniedUiStateKey(key)).toBe(true);
-      expect(isPolicyExcludedUiStateKey(key)).toBe(false);
       expect(isDeniedUiStateKey(key)).toBe(true);
-    }
-
-    for (const key of [
-      "workbench.activity.pinnedViewlets2",
-      "workbench.panel.chatSidebar",
-    ]) {
-      expect(isSecurityDeniedUiStateKey(key)).toBe(false);
-      expect(isPolicyExcludedUiStateKey(key)).toBe(false);
     }
   });
 

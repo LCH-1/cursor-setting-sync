@@ -9,7 +9,7 @@ Cursor Setting Sync securely synchronizes Cursor configuration, allowlisted work
 - Settings for the default profile and named profiles
 - Keybindings, snippets, user tasks, prompts, and MCP configuration
 - Installed extension lists, versions, enablement, pre-release, and pinning state
-- Profile definitions and selected user-scoped UI state
+- Profile definitions
 - Cursor User Rules
 - `~/.cursor` MCP and CLI configuration, commands, skills, and rules
 - Portable, query-level synchronization of allowlisted `%APPDATA%\Cursor\User\workspaceStorage` state plus notepads and images
@@ -114,11 +114,11 @@ Git transport requires the `git` CLI on `PATH`. Authentication uses your system 
 
 - **Setup** — First-time configuration. Pick the repository folder and transport (plain / clone / new git), then enter the encryption passphrase (12+ characters, the same on every PC, never stored in the folder).
 - **Sync Now** — Run one synchronization immediately. Synchronization is otherwise automatic (30-second polling plus file watching); this publishes local changes and pulls remote ones on demand.
-- **Restart to Apply** — Applies pending database changes. The command hands the queue to the offline helper, quits Cursor, waits for every process to exit, writes the rows, and relaunches. Quitting and reopening Cursor yourself does **not** apply them: the shutdown helper only exports this device's changes, so the queue is still there afterwards. Files apply while Cursor runs, but `state.vscdb` (chat, UI state, workspace databases) is written safely with SQL only after Cursor exits.
+- **Restart to Apply** — Applies pending database changes. The command hands the queue to the offline helper, quits Cursor, waits for every process to exit, writes the rows, and relaunches. Quitting and reopening Cursor yourself does **not** apply them: the shutdown helper only exports this device's changes, so the queue is still there afterwards. Files apply while Cursor runs, but `state.vscdb` (chat, user rules, workspace databases) is written safely with SQL only after Cursor exits.
 
 **Conflicts and recovery**
 
-- **Resolve Conflicts** — Manually resolve edits made on two PCs that could not auto-merge. Every conflict is listed on one screen under its own name with both sides' values beside it — `Setting: editor.fontSize · This PC: 14 vs Other PC: 16` — plus which PC wrote each side and when. One answer can settle the whole list (*keep the newest everywhere*, *keep this PC's everywhere*, *keep the other PC's everywhere*), or you can open a single entry's diff and decide it alone; a diff is only opened for an entry you ask to review. Deferring costs nothing — both versions stay in the repository, and **Restore Version History** can recover a side that lost. UI state and chat never appear here: UI state is machine-local chrome resolved by last-writer-wins, and a chat fork is merged into the union of both sides' messages. Only resources that carry something you wrote and cannot be combined — settings, `.cursor` rules and user files, extensions — ever ask. While a conflict is open, that resource keeps publishing this PC's version at most once an hour so the other side can still see it; resolving the conflict restores normal syncing immediately.
+- **Resolve Conflicts** — Manually resolve edits made on two PCs that could not auto-merge. Every conflict is listed on one screen under its own name with both sides' values beside it — `Setting: editor.fontSize · This PC: 14 vs Other PC: 16` — plus which PC wrote each side and when. One answer can settle the whole list (*keep the newest everywhere*, *keep this PC's everywhere*, *keep the other PC's everywhere*), or you can open a single entry's diff and decide it alone; a diff is only opened for an entry you ask to review. Deferring costs nothing — both versions stay in the repository, and **Restore Version History** can recover a side that lost. UI state, chat, and workspace storage never appear here: UI state does not travel at all, a chat fork is merged into the union of both sides' messages, and workspace databases and `notepads.json` are combined row by row and notepad by notepad, so no computer's notes are dropped to settle a fork. Only resources that carry something you wrote and cannot be combined — settings, `.cursor` rules and user files, extensions — ever ask. While a conflict is open, that resource keeps publishing this PC's version at most once an hour so the other side can still see it; resolving the conflict restores normal syncing immediately.
 - **Restore Version History** — Roll one resource back to an earlier version (like a git revert). Pick a resource, browse its versions with a diff preview, and publish the chosen one as a new version; history is preserved.
 - **Restore Backup** — Restore a database to an earlier backup snapshot. A SQLite backup is taken before every database write; pick one to restore. A "pre-restore" backup is also listed so a mistaken restore can be undone.
 
@@ -170,7 +170,7 @@ Git transport requires the `git` CLI on `PATH`. Authentication uses your system 
 | `useDefaultIgnoredSettings` | `true` | Also exclude the built-in machine-specific key list below. Turn it off to synchronize those keys anyway. |
 | `ignoredExtensions` | `[]` | Extension IDs excluded from synchronization. Exact (`ms-python.python`) or wildcard (`ms-python.*`); matching ignores case. |
 | `ignoredUserFiles` | `[]` | Files under `~/.cursor` excluded from synchronization, by relative path. Use this — **not** `ignoredSettings` — to keep `mcp.json` or `cli-config.json` off the shared folder. An entry naming a directory (`rules` or `rules/`) excludes everything under it, and wildcards work: `rules/*.md`, `skills/**/secret.md`. |
-| `ignoredUiStateKeys` | `[]` | UI state keys excluded from synchronization. Each entry is an exact key such as `workbench.activity.pinnedViewlets2` or a wildcard such as `workbench.panel.*`. Ignoring a key only stops it from syncing; the value already on other devices is never deleted. |
+| `ignoredUiStateKeys` | `[]` | **No effect since 0.0.42.** No UI state key is synchronized at all any more, so there is nothing left for this list to exclude. See [UI state is not synchronized](#ui-state-is-not-synchronized). |
 | `maxPayloadMiB` | `128` | Maximum uncompressed size of one payload (MiB, 1–512). A larger resource is skipped with a warning naming it; everything else in the cycle still synchronizes. |
 
 Every ignore list accepts the same patterns: an exact entry, `*` for any characters (stopping at `/` in the path-shaped `ignoredUserFiles`), and `**` to cross directory separators. For `ignoredSettings` and `ignoredUserFiles`, an entry that matches nothing is reported in the output channel, so a typo is visible.
@@ -199,18 +199,15 @@ Settings that an installed extension declares as `machine` or `machine-overridab
 
 If a key on this list had already synchronized from this PC before the list started covering it, the output channel names it, and `Show Diagnostics` keeps the same notice under the standing warnings — so a key that stops travelling after an upgrade is never silent.
 
-### UI state keys excluded by default
+### UI state is not synchronized
 
-Two UI state families are never synchronized, on top of anything in `cursorSettingSync.ignoredUiStateKeys`:
+Since 0.0.42, **no** UI state key travels between computers. Window layout — pinned panels and view containers, hidden views, per-panel state, dismissed-notification counters — stays on the machine that produced it.
 
-```
-workbench.panel.composerChatViewPane.<uuid>.hidden
-workbench.auxiliarybar.pinnedPanels
-```
+Each Cursor window rewrites these keys on its own schedule from what you do on that screen, so they have no shared meaning across two computers and nothing to converge on. Carrying them produced conflicts with no authored change behind them at all: when a second computer first joined the real repository this was built for, thirteen of its sixteen conflicts were UI state keys whose only crime was existing on both machines. Releases 0.0.4 through 0.0.41 excluded one churning key family at a time — dead chat-panel GUIDs, the pinned-panel union, Cursor's reactive-storage blob — and the field kept producing the next one.
 
-Cursor mints a GUID for every AI chat panel and never prunes either one, so both grow without bound and every GUID is meaningless on another machine. `workbench.auxiliarybar.pinnedPanels` collects one `workbench.panel.aichat.<uuid>` entry per panel either machine ever opened; merging it converges, but the merged array is the union of both machines' dead panels and nothing ever shrinks it again — a PC with two entries would permanently inherit the peer's hundreds. Panel *sizes* and the rest of the workbench layout still travel; only these two GUID-keyed families are held back.
+Your **Cursor User Rules** are stored in the same database table but are a separate resource, and they still synchronize. So do settings, keybindings, snippets, tasks, prompts, MCP configuration, extensions, profiles, chats, and workspace storage.
 
-This is a policy, not a safety rule. A value published by an earlier version is skipped on arrival, is named in the output channel, and never fails the rest of the apply. The value already on other devices is never deleted.
+This is a policy, not a safety rule. A UI state value published by an earlier version is skipped on arrival, is named in the output channel, and never fails the rest of the apply. The value already on other devices is never deleted. `cursorSettingSync.ignoredUiStateKeys` is consequently a no-op and can be removed from your settings.
 
 ## Security and privacy
 

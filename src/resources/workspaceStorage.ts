@@ -427,6 +427,12 @@ export function isWorkspaceStateDatabasePath(relativePath: string): boolean {
   );
 }
 
+/** `<workspaceId>/notepads.json` — the one workspace file that is a JSON list. */
+export function isWorkspaceNotepadsPath(relativePath: string): boolean {
+  const segments = relativePath.split("/");
+  return segments.length === 2 && segments[1]?.toLowerCase() === "notepads.json";
+}
+
 async function snapshotWorkspaceDatabase(
   path: string,
   canonicalWorkspaceId: string,

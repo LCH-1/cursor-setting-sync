@@ -48,7 +48,7 @@ const REMOTE_PANELS = panels([
 ]);
 
 describe("ui-state auto-merge", () => {
-  it("resolves a pinnedPanels conflict without asking the user", async () => {
+  it("resolves a layout fork by last writer without asking the user", async () => {
     await withRepository(async (repository) => {
       const conflicts = await forkResource(
         repository,
@@ -59,6 +59,10 @@ describe("ui-state auto-merge", () => {
         REMOTE_PANELS,
       );
       expect(conflicts).toHaveLength(1);
+      const winner = [...(repository.state.tips[PINNED_PANELS] ?? [])].sort(
+        compareTips,
+      )[0];
+      const winnerContent = await repository.readVersion(winner?.versionId ?? "");
 
       expect(await autoMergeConflicts(repository, conflicts)).toBe(true);
       expect(conflicts[0]?.resolvedAt).toBeDefined();
@@ -66,65 +70,50 @@ describe("ui-state auto-merge", () => {
 
       const tips = repository.state.tips[PINNED_PANELS] ?? [];
       expect(tips).toHaveLength(1);
-      const expected = mergeUiStateBuffers(
-        BASE_PANELS,
-        LOCAL_PANELS,
-        REMOTE_PANELS,
-      ).content;
-      expect(tips[0]?.semanticHash).toBe(sha256(expected ?? Buffer.alloc(0)));
       expect(tips[0]?.metadata?.syncOrigin).toBe("auto-merge");
       expect(tips[0]?.metadata?.valueType).toBe("text");
       const merged = await repository.readVersion(tips[0]?.versionId ?? "");
-      expect(merged.content?.equals(expected ?? Buffer.alloc(0))).toBe(true);
-      // Both dead AI-chat panel GUIDs survive, and the concurrently hidden
-      // chat sidebar keeps the remote's value.
-      expect(JSON.parse((merged.content ?? Buffer.alloc(0)).toString("utf8"))).toEqual([
-        { id: "workbench.panel.chatSidebar", order: 0, pinned: true, visible: false },
-        {
-          id: "workbench.panel.aichat.fe374843-0376-48d0-bbc4-948b7a99c55b",
-          order: 1,
-          pinned: true,
-          visible: false,
-        },
-        {
-          id: "workbench.panel.aichat.11111111-1111-4111-8111-111111111111",
-          order: 2,
-          pinned: true,
-          visible: false,
-        },
-        {
-          id: "workbench.panel.aichat.22222222-2222-4222-8222-222222222222",
-          order: 3,
-          pinned: true,
-          visible: false,
-        },
-      ]);
+      expect(
+        merged.content?.equals(winnerContent.content ?? Buffer.alloc(0)),
+      ).toBe(true);
     });
   });
 
-  it("publishes the same bytes whichever side the device calls local", async () => {
-    const forward = await withRepository((repository) =>
-      autoMergedContent(
+  it("takes one side whole rather than the union the structural merge would build", async () => {
+    // The structural ui-state merge still exists and is still tested directly,
+    // but no conflict reaches it any more: every ui-state key is excluded from
+    // synchronization, so a fork is settled by the replicated comparator and
+    // the value stays whatever one machine had. If this ever starts matching
+    // the union again, the kind has quietly begun travelling once more.
+    await withRepository(async (repository) => {
+      const conflicts = await forkResource(
         repository,
         PINNED_PANELS,
         "ui-state",
         BASE_PANELS,
         LOCAL_PANELS,
         REMOTE_PANELS,
-      ),
-    );
-    const reversed = await withRepository((repository) =>
-      autoMergedContent(
-        repository,
-        PINNED_PANELS,
-        "ui-state",
-        BASE_PANELS,
-        REMOTE_PANELS,
-        LOCAL_PANELS,
-      ),
-    );
+      );
+      expect(await autoMergeConflicts(repository, conflicts)).toBe(true);
 
-    expect(forward.equals(reversed)).toBe(true);
+      const tips = repository.state.tips[PINNED_PANELS] ?? [];
+      const resolved =
+        (await repository.readVersion(tips[0]?.versionId ?? "")).content ??
+        Buffer.alloc(0);
+      const structural =
+        mergeUiStateBuffers(BASE_PANELS, LOCAL_PANELS, REMOTE_PANELS).content ??
+        Buffer.alloc(0);
+
+      expect(resolved.equals(structural)).toBe(false);
+      expect(
+        resolved.equals(LOCAL_PANELS) || resolved.equals(REMOTE_PANELS),
+      ).toBe(true);
+      // The union would have carried all four panels; one side carries three.
+      expect(
+        JSON.parse(structural.toString("utf8")) as unknown[],
+      ).toHaveLength(4);
+      expect(JSON.parse(resolved.toString("utf8")) as unknown[]).toHaveLength(3);
+    });
   });
 
   it("falls back to the deterministic newest tip for an unmergeable value", async () => {
@@ -508,29 +497,6 @@ async function reconcileConflicts(repository: SyncRepository) {
     repository.state,
     null,
   ).conflicts;
-}
-
-async function autoMergedContent(
-  repository: SyncRepository,
-  resourceId: string,
-  kind: ResourceKind,
-  base: Buffer,
-  local: Buffer,
-  remote: Buffer,
-): Promise<Buffer> {
-  const conflicts = await forkResource(
-    repository,
-    resourceId,
-    kind,
-    base,
-    local,
-    remote,
-  );
-  expect(await autoMergeConflicts(repository, conflicts)).toBe(true);
-  await reconcileConflicts(repository);
-  const tips = repository.state.tips[resourceId] ?? [];
-  const merged = await repository.readVersion(tips[0]?.versionId ?? "");
-  return merged.content ?? Buffer.alloc(0);
 }
 
 async function withRepository<T>(

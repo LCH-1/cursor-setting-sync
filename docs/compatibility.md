@@ -51,7 +51,7 @@ If these checks fail, file synchronization remains active while profile, UI-stat
 
 File resources include settings, keybindings, snippets, tasks, prompts, MCP files, Cursor commands, skills, rules, and agent transcripts. Machine-scoped settings and configured ignore lists are excluded.
 
-Database-backed resources include profiles, selected UI state, Cursor User Rules, extension state, allowlisted workspace storage, Composer/chat records, and supported `store.db` sessions.
+Database-backed resources include profiles, Cursor User Rules, extension state, allowlisted workspace storage, Composer/chat records, and supported `store.db` sessions. UI state is read from the same database but is not synchronized.
 
 A lower extension version can retain events containing a well-formed resource kind introduced by a newer extension. It continues applying supported changes from the same event without reindexing them, and a later extension update replays the immutable log to discover the previously unknown kind.
 

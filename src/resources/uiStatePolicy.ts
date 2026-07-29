@@ -4,8 +4,6 @@ import { sqliteStorageText } from "../platform/sqlite";
 import type { IgnoreMatcher } from "./ignorePatterns";
 import { createIgnoreMatcher } from "./ignorePatterns";
 
-const UUID = "[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}";
-
 /**
  * Keys that must never cross the repository boundary because carrying them
  * would leak a secret or let a peer rewrite this extension's own bookkeeping.
@@ -25,50 +23,43 @@ const SECURITY_DENIED_KEY_PATTERNS = [
   new RegExp(`^${escapeRegExp(EXTENSION_ID)}`, "i"),
 ];
 
-/**
- * Keys this build declines to synchronize because they are machine-local churn,
- * not because they are dangerous.
- *
- * These are a *policy*, and policies change between releases. Every release up
- * to 0.0.3 published these keys, so real repositories already contain events
- * for them and this build must still be able to read those events without
- * failing. An inbound change for one of these keys is therefore skipped and
- * accounted for — never fatal. Conflating the two lists made the apply side
- * throw {@link FatalApplyError} on an event a previous version of this very
- * extension wrote, which aborted the entire shutdown apply — ui-state,
- * profiles, chat, extensions, user files and the workspaceStorage restore all
- * of it — on every single shutdown, permanently, because the event is immutable
- * and the pending entry is never superseded.
- */
-const POLICY_EXCLUDED_KEY_PATTERNS = [
-  // Cursor mints one of these per AI chat panel and never prunes them, so the
-  // family grows without bound and every GUID is meaningless on another
-  // machine. Syncing them only ferries dead layout entries between devices.
-  new RegExp(`^workbench\\.panel\\.composerChatViewPane\\.${UUID}\\.hidden$`),
-  // The same GUIDs, accumulated inside one value: this array collects a
-  // `workbench.panel.aichat.<uuid>` entry per chat panel either machine ever
-  // opened. Merging it converges, but the merged array is the union of both
-  // machines' dead panels and nothing ever shrinks it again.
-  /^workbench\.auxiliarybar\.pinnedPanels$/,
-  // Cursor's reactive-storage service persists its application state as one
-  // ~360 KiB JSON blob that the app rewrites continuously while it runs -
-  // measured at a new version every 15-30 seconds for six hours straight on an
-  // otherwise idle machine, which as a synced key meant an event published on
-  // virtually every poll, ~185 an hour, around the clock. Cursor registers the
-  // key as USER-target, but a value both machines rewrite nonstop can never
-  // converge between them; it only churns the repository and elects arbitrary
-  // last writers.
-  /^src\.vs\.platform\.reactivestorage\./,
-];
-
 /** A key whose arrival is a protocol violation; see the pattern list. */
 export function isSecurityDeniedUiStateKey(key: string): boolean {
   return SECURITY_DENIED_KEY_PATTERNS.some((pattern) => pattern.test(key));
 }
 
-/** A key this build declines to synchronize; see the pattern list. */
-export function isPolicyExcludedUiStateKey(key: string): boolean {
-  return POLICY_EXCLUDED_KEY_PATTERNS.some((pattern) => pattern.test(key));
+/**
+ * True for every `ui-state` key: this build synchronizes none of them.
+ *
+ * The kind is window chrome — pinned viewlets, hidden panels, per-panel layout,
+ * dismissed notification counters — that each Cursor window rewrites on its own
+ * schedule from what the user does on *that* screen. It has no shared meaning
+ * between two computers, and carrying it produced conflicts that had no
+ * authored change behind them at all: on the real pair, thirteen of the sixteen
+ * conflicts a second computer raised on joining were ui-state keys whose only
+ * crime was existing on both machines before the machines ever met. Releases
+ * 0.0.4 through 0.0.41 narrowed the exclusion pattern by pattern — dead chat
+ * panel GUIDs, the pinned-panel union, the reactive-storage blob — and each
+ * narrowing left the next churning key to be found in the field. The honest
+ * conclusion of that sequence is the whole kind.
+ *
+ * `cursor-user-rules` (`aicontext.personalContext`) lives in the same table but
+ * is a *different kind* precisely so this exclusion cannot reach it: user rules
+ * are authored prose and still travel.
+ *
+ * This is a *policy*, not a safety boundary, and the distinction is load
+ * bearing. Every release up to 0.0.41 published some of these keys, so real
+ * repositories already contain immutable events for them and this build must
+ * still read those events without failing. An inbound ui-state change is
+ * therefore skipped and accounted for — never fatal. Conflating the two lists
+ * made the apply side throw {@link FatalApplyError} on an event a previous
+ * version of this very extension wrote, which aborted the entire shutdown apply
+ * — profiles, chat, extensions, user files and the workspaceStorage restore,
+ * all of it — on every single shutdown, permanently, because the event is
+ * immutable and the pending entry is never superseded.
+ */
+export function isPolicyExcludedUiStateKey(_key: string): boolean {
+  return true;
 }
 
 /**

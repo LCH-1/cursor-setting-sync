@@ -2,6 +2,20 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.42] - 2026-07-30
+
+Two answers to the same question — what belongs on one computer, and what has to reach all of them.
+
+### Changed
+
+- **UI state is no longer synchronized at all.** Window layout — pinned panels and view containers, hidden views, per-panel state, dismissed-notification counters — now stays on the machine that produced it. Each Cursor window rewrites these keys on its own schedule from what you do on that screen, so they have no shared meaning between computers and nothing to converge on; carrying them raised conflicts with no authored change behind them, thirteen of the sixteen the second machine reported on joining. Releases 0.0.4 through 0.0.41 excluded one churning family at a time — dead chat-panel GUIDs, the pinned-panel union, the reactive-storage blob — and the field kept producing the next one, so the whole kind is now local. Your Cursor User Rules live in the same database table but are a separate resource and still travel, as do settings, keybindings, snippets, tasks, prompts, MCP configuration, extensions, profiles, chats, and workspace storage. Values earlier versions published are still skipped on arrival rather than failing the apply, and nothing is deleted on any device. `cursorSettingSync.ignoredUiStateKeys` consequently has no effect and can be removed from your settings.
+
+### Fixed
+
+- A notepad edited on one computer now reaches the others instead of forcing a choice between two whole files. `notepads.json` is a JSON array keyed by notepad id, so it is merged notepad by notepad: an id only one machine has is kept, an id whose text one side never touched takes the other side's version — the ordinary case where one computer edited and the other simply still holds the old copy — and an edit that raced a deletion survives, because a resurrected notepad can be deleted again while a discarded edit cannot be retyped. First contact between two computers, where there is no common ancestor to read intent from, unions the two lists the same way. The two conflicts left standing on the live pair after 0.0.41 were exactly this, one per workspace, and the manual resolver's whole-file either/or would have thrown away every notepad on the losing side to carry one change.
+- Where two versions of the same notepad genuinely differ, the merge only claims a winner when it can prove one, and otherwise asks. A notepad carries no timestamp — its id records when it was created, not when it was last written — so if one text strictly contains the other, that side is the same note with material added and is taken. Anything else is two people's writing with nothing in the file to separate them, so the fork goes to `Resolve Conflicts` with both versions intact rather than being settled by discarding one; there is no warning channel out of a merge, so an election there would have deleted the losing text from both computers with nothing in the output channel to say it happened. The tip's Lamport clock is deliberately not used as a recency signal either: a computer joining an existing repository publishes at the highest clock in it, and on the pair this was built against the joining machine held the higher clock and the *smaller* file for both shared workspaces, so electing by clock would have destroyed the very content this change exists to carry.
+- An auto-merged workspace-storage version now advertises its own size. A merge is routinely larger than either side, so inheriting the winning tip's byte count described a payload nobody published.
+
 ## [0.0.41] - 2026-07-30
 
 Found on the real two-computer pair the moment the second machine joined.

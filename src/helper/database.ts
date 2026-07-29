@@ -937,18 +937,18 @@ function applyPreparedChange(
     if (!isSafeUiStateKey(key, change.kind)) {
       throw new FatalApplyError(`Refused unsafe UI state key: ${key}`);
     }
-    // A key this build declines to synchronize as a matter of policy, not
-    // safety. Every release up to 0.0.3 published these, so repositories in the
-    // field carry immutable events for them; failing the request would abort
-    // the whole apply — including chat, profiles, extensions, user files and
-    // the workspaceStorage restore — on every shutdown forever, because the
+    // A kind this build declines to synchronize as a matter of policy, not
+    // safety. Every release up to 0.0.41 published these, so repositories in
+    // the field carry immutable events for them; failing the request would
+    // abort the whole apply — including chat, profiles, extensions, user files
+    // and the workspaceStorage restore — on every shutdown forever, because the
     // event can never be superseded. Skipped and accounted for instead, exactly
     // like an ignored key.
     if (change.kind === "ui-state" && isPolicyExcludedUiStateKey(key)) {
       return {
         status: "retained-local",
         reason:
-          "UI state key is excluded from synchronization by this version; the local value is kept and nothing is deleted on other devices",
+          "window layout is kept local to each computer; the local value is kept and nothing is deleted on other devices",
       };
     }
     // "cursorSettingSync.ignoredUiStateKeys" is honored on both sides, exactly

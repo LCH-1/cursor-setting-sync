@@ -113,8 +113,13 @@ import {
 import {
   WorkspaceStorageAdapter,
   isIgnoredWorkspaceUri,
+  isWorkspaceNotepadsPath,
   isWorkspaceStateDatabasePath,
 } from "../resources/workspaceStorage";
+import {
+  mergeNotepadBuffers,
+  unionNotepadBuffers,
+} from "../resources/notepadMerge";
 import { filterPortableWorkspaceRows } from "../resources/workspaceStatePolicy";
 import {
   createIgnoreMatcher,
@@ -2800,13 +2805,13 @@ export class SyncManager implements vscode.Disposable {
         continue;
       }
       if (isPolicyExcludedUiStateResource(projection.resourceId, tip.kind)) {
-        // A peer running 0.0.1-0.0.3 published this key before it was excluded.
-        // Accept the version without writing it: the helper would skip it
-        // anyway, and queueing it only makes the user restart for a change that
-        // will never be applied.
+        // A peer running an older build published this key before the kind was
+        // excluded. Accept the version without writing it: the helper would
+        // skip it anyway, and queueing it only makes the user restart for a
+        // change that will never be applied.
         this.status.log(
-          `Skipped ${projection.resourceId}: this key is excluded from ` +
-            "synchronization because it accumulates one dead entry per AI chat panel.",
+          `Skipped ${projection.resourceId}: window layout is kept local to ` +
+            "each computer and is no longer synchronized.",
         );
         markProjection(repository, projection, local);
         continue;
@@ -4977,11 +4982,13 @@ export function isUnscannableIncomingResource(
 }
 
 /**
- * True for an inbound ui-state resource this build declines to synchronize.
+ * True for an inbound ui-state resource this build declines to synchronize —
+ * since 0.0.42, every one of them.
  *
  * Read from the resource ID rather than the tip metadata: the ID is what the
- * helper validates the metadata against, and events written by 0.0.1-0.0.3
- * are the ones this has to recognize.
+ * helper validates the metadata against, and events written by older builds are
+ * the ones this has to recognize. `cursor-user-rules` is a separate kind and
+ * never matches here.
  */
 function isPolicyExcludedUiStateResource(
   resourceId: string,
@@ -4995,7 +5002,9 @@ function isPolicyExcludedUiStateResource(
   try {
     key = decodeURIComponent(resourceId.slice(prefix.length));
   } catch {
-    return false;
+    // Undecodable, so the helper would reject the metadata match anyway. The
+    // kind is excluded either way; there is nothing to queue.
+    return true;
   }
   return isPolicyExcludedUiStateKey(key);
 }
@@ -5256,9 +5265,16 @@ export async function autoMergeConflicts(
       const workspaceDatabase =
         conflict.kind === "workspace-storage" &&
         isWorkspaceDatabaseTipMetadata(tips[0]?.metadata);
+      const notepads =
+        conflict.kind === "workspace-storage" &&
+        isNotepadsTipMetadata(tips[0]?.metadata);
       if (
         tips.some((tip) => tip.operation !== "put") ||
-        !(workspaceDatabase || isAutoMergeKind(conflict.kind, tips[0]?.metadata))
+        !(
+          workspaceDatabase ||
+          notepads ||
+          isAutoMergeKind(conflict.kind, tips[0]?.metadata)
+        )
       ) {
         continue;
       }
@@ -5302,19 +5318,33 @@ export async function autoMergeConflicts(
       // can never reach the diff3 fallback: a line-based merge of two chat
       // snapshots can produce syntactically valid JSON that describes a
       // conversation neither device has.
+      // notepads takes the newest/older ordering rather than local/remote for
+      // the same reason chat does: the merge has a preferred side, and reading
+      // it off `localTip` would make the two computers prefer each other and
+      // publish two different "resolutions" of one fork.
+      const notepadOutcome =
+        notepads && newestTip !== undefined && olderTip !== undefined
+          ? mergeNotepadBuffers(
+              base.content,
+              contentOf(newestTip),
+              contentOf(olderTip),
+            )
+          : undefined;
       const outcome: MergeOutcome =
         conflict.kind === "chat"
           ? chatOutcome ?? { status: "conflict" }
-          : workspaceDatabase
-            ? mergeWorkspaceDatabaseBuffers(base.content, local.content, remote.content)
-            : conflict.kind === "ui-state"
-              ? mergeUiStateBuffers(base.content, local.content, remote.content)
-              : isJsonMergeKind(conflict.kind, localTip.metadata)
-                ? mergeJsoncBuffers(base.content, local.content, remote.content)
-                : validatedTextMergeOutcome(
-                    conflict.kind,
-                    mergeTextBuffers(base.content, local.content, remote.content),
-                  );
+          : notepads
+            ? notepadOutcome ?? { status: "conflict" }
+            : workspaceDatabase
+              ? mergeWorkspaceDatabaseBuffers(base.content, local.content, remote.content)
+              : conflict.kind === "ui-state"
+                ? mergeUiStateBuffers(base.content, local.content, remote.content)
+                : isJsonMergeKind(conflict.kind, localTip.metadata)
+                  ? mergeJsoncBuffers(base.content, local.content, remote.content)
+                  : validatedTextMergeOutcome(
+                      conflict.kind,
+                      mergeTextBuffers(base.content, local.content, remote.content),
+                    );
       // A ui-state value with no structural merge still resolves without asking:
       // both devices sort the same two tips with the same replicated comparator,
       // so both republish the same side's bytes and the reconciler collapses the
@@ -5368,6 +5398,13 @@ export async function autoMergeConflicts(
           ...(chatOutcome?.bubbleCount === undefined
             ? {}
             : { bubbleCount: chatOutcome.bubbleCount }),
+          // Same reasoning for the size workspace-storage carries: a merge is
+          // routinely larger than either side, so inheriting the winner's byte
+          // count would describe a payload nobody published. Only overridden
+          // where the scan sets it, so no other kind gains a field.
+          ...(typeof metadataTip.metadata?.["plainBytes"] === "number"
+            ? { plainBytes: resolved.content.byteLength }
+            : {}),
           syncOrigin: "auto-merge",
         },
       };
@@ -5549,6 +5586,62 @@ async function resolveBaseFreeWorkspaceDatabaseConflict(
 }
 
 /**
+ * Resolves a base-free `notepads.json` fork by unioning the two lists by
+ * notepad id. See {@link unionNotepadBuffers} for the per-notepad rules.
+ *
+ * Returns false — never throws — when either payload is unreadable or is not a
+ * list this build can key. The conflict then stays unresolved rather than
+ * electing one whole file and discarding the other's notepads.
+ */
+async function resolveBaseFreeNotepadsConflict(
+  repository: SyncRepository,
+  conflict: SyncConflict,
+  orderedPuts: readonly ResourceTip[],
+  onWarning: (warning: string) => void,
+): Promise<boolean> {
+  const [newest, older] = orderedPuts;
+  if (newest === undefined || older === undefined) {
+    return false;
+  }
+  const [newestData, olderData] = await Promise.all([
+    repository.tryReadVersion(newest.versionId),
+    repository.tryReadVersion(older.versionId),
+  ]);
+  if (
+    newestData === null ||
+    olderData === null ||
+    newestData.content === null ||
+    olderData.content === null
+  ) {
+    return false;
+  }
+  const outcome = unionNotepadBuffers(newestData.content, olderData.content);
+  if (outcome.status !== "merged" || outcome.content === undefined) {
+    return false;
+  }
+  const content = outcome.content;
+  return publishAutoMerge(
+    repository,
+    conflict,
+    [
+      {
+        resourceId: conflict.resourceId,
+        kind: conflict.kind,
+        content,
+        semanticHash: outcome.semanticHash ?? sha256(content),
+        metadata: {
+          ...(newest.metadata ?? {}),
+          plainBytes: content.byteLength,
+          syncOrigin: "auto-merge",
+        },
+      },
+    ],
+    [],
+    onWarning,
+  );
+}
+
+/**
  * Resolves a fork with no common ancestor by republishing the winning tip
  * verbatim.
  *
@@ -5608,6 +5701,25 @@ async function resolveBaseFreeConflict(
       puts.length === 2 &&
       puts.length === tips.length &&
       (await resolveBaseFreeWorkspaceDatabaseConflict(
+        repository,
+        conflict,
+        [...puts].sort(compareTips),
+        onWarning,
+      ))
+    );
+  }
+  // notepads.json is the same shape of problem one level up: a JSON array keyed
+  // by notepad id, so first contact between two computers keeps every notepad
+  // either of them wrote instead of asking a person to pick one file and lose
+  // the other's notes wholesale.
+  if (
+    conflict.kind === "workspace-storage" &&
+    isNotepadsTipMetadata(tips[0]?.metadata)
+  ) {
+    return (
+      puts.length === 2 &&
+      puts.length === tips.length &&
+      (await resolveBaseFreeNotepadsConflict(
         repository,
         conflict,
         [...puts].sort(compareTips),
@@ -5780,6 +5892,13 @@ function isWorkspaceDatabaseTipMetadata(
   return (
     typeof relativePath === "string" &&
     isWorkspaceStateDatabasePath(relativePath)
+  );
+}
+
+function isNotepadsTipMetadata(metadata: ResourceTip["metadata"]): boolean {
+  const relativePath = metadata?.relativePath;
+  return (
+    typeof relativePath === "string" && isWorkspaceNotepadsPath(relativePath)
   );
 }
 

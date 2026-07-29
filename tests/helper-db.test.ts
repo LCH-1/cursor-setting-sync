@@ -25,6 +25,8 @@ const describeWithBackup = hasBackup ? describe : describe.skip;
 // offline apply path — the one that decides whether a shutdown writes anything
 // at all — goes unexercised. Local runs on a Node without `backup` stay green,
 // but a release or CI run has to opt in and then cannot miss the gap.
+const USER_RULES_KEY = "aicontext.personalContext";
+
 describe("offline database helper prerequisites", () => {
   it("exercises the offline helper suite on a runtime that supports it", () => {
     if (hasBackup) {
@@ -175,8 +177,12 @@ describeWithBackup("offline database helper", () => {
   it.each([
     "workbench.auxiliarybar.pinnedPanels",
     "workbench.panel.composerChatViewPane.1b4e28ba-2fa1-11d2-883f-b9a761bde3fb.hidden",
+    // Keys earlier releases DID synchronize. The repository still holds their
+    // immutable events, and receiving one must skip rather than fail.
+    "workbench.activity.pinnedViewlets2",
+    "workbench.panel.chatSidebar",
   ])(
-    "skips the policy-excluded key %s and still applies the rest of the request",
+    "skips the excluded ui-state key %s and still applies the rest of the request",
     async (excludedKey) => {
       const fixture = await createFixture();
       const result = await applyGlobalDatabaseChanges(fixture.request, [
@@ -192,11 +198,6 @@ describeWithBackup("offline database helper", () => {
           },
           content: Buffer.from("[]", "utf8"),
         },
-        uiStateChange(
-          "workbench.panel.chatSidebar",
-          "text",
-          Buffer.from("peer layout", "utf8"),
-        ),
         {
           change: {
             eventHash: "7".repeat(64),
@@ -216,10 +217,8 @@ describeWithBackup("offline database helper", () => {
 
       // Nothing was written for the excluded key...
       expect(readItem(fixture.databasePath, excludedKey)).toBe(null);
-      // ...but every other change in the same request landed.
-      expect(readItem(fixture.databasePath, "workbench.panel.chatSidebar")).toBe(
-        "peer layout",
-      );
+      // ...but the user rules in the same request landed. They share the
+      // adapter and the table with ui-state and must not be caught by it.
       expect(
         readItem(fixture.databasePath, "aicontext.personalContext"),
       ).toBe("Always respond safely.");
@@ -232,7 +231,7 @@ describeWithBackup("offline database helper", () => {
         result.skipped.some(
           (entry) =>
             entry.startsWith(`ui-state/${encodeURIComponent(excludedKey)}:`) &&
-            entry.includes("excluded from synchronization"),
+            entry.includes("kept local to each computer"),
         ),
       ).toBe(true);
     },
@@ -264,10 +263,8 @@ describeWithBackup("offline database helper", () => {
     expect(readItem(fixture.databasePath, key)).toBe("local panels");
   });
 
-  it("retains the local value for an ignored UI state key", async () => {
-    const fixture = await createFixture({
-      ignoredUiStateKeys: ["workbench.activity.pinnedViewlets2"],
-    });
+  it("retains the local value for an inbound UI state key", async () => {
+    const fixture = await createFixture();
     const database = new DatabaseSync(fixture.databasePath);
     database
       .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
@@ -287,7 +284,7 @@ describeWithBackup("offline database helper", () => {
       "ui-state/workbench.activity.pinnedViewlets2",
     );
     expect(result.skipped).toContain(
-      "ui-state/workbench.activity.pinnedViewlets2: UI state key is ignored on this device; remove it from cursorSettingSync.ignoredUiStateKeys to accept changes for it",
+      "ui-state/workbench.activity.pinnedViewlets2: window layout is kept local to each computer; the local value is kept and nothing is deleted on other devices",
     );
   });
 
@@ -325,7 +322,10 @@ describeWithBackup("offline database helper", () => {
     ).toEqual({ "workbench.activity.pinnedViewlets2": 0 });
   });
 
-  it("still applies an ignored key's namesake when the list does not match", async () => {
+  it("retains a UI state key the ignore list does not name either", async () => {
+    // The exclusion is the kind, not the user's list: a key nobody ignored is
+    // still not written. Reading it off the list would have left every key the
+    // user had not thought to name travelling between computers.
     const fixture = await createFixture({
       ignoredUiStateKeys: ["workbench.activity.pinnedViewlets2"],
     });
@@ -339,7 +339,7 @@ describeWithBackup("offline database helper", () => {
     ]);
 
     expect(readItem(fixture.databasePath, "workbench.panel.chatSidebar")).toBe(
-      "peer layout",
+      null,
     );
   });
 
@@ -635,39 +635,60 @@ describeWithBackup("offline database helper", () => {
     ).toBe(false);
   });
 
-  it("preserves the SQLite storage class of applied UI state values", async () => {
-    const fixture = await createFixture();
+  it("preserves the SQLite storage class of applied ItemTable values", async () => {
+    // One key per fixture rather than four keys in one request: ui-state no
+    // longer travels, so `aicontext.personalContext` is the only key that
+    // reaches this code, and each storage class has to be applied on its own.
     const legacyBlobBytes = Buffer.from([0xff, 0x00, 0x01]);
-    await applyGlobalDatabaseChanges(fixture.request, [
-      uiStateChange("workbench.textKey", "text", Buffer.from("true", "utf8")),
-      uiStateChange("workbench.blobKey", "blob", Buffer.from([1, 2, 3])),
-      uiStateChange(
-        "workbench.legacyKey",
-        undefined,
-        Buffer.from("legacy", "utf8"),
-      ),
-      uiStateChange(
-        "workbench.legacyBlobKey",
-        undefined,
-        Buffer.from(legacyBlobBytes),
-      ),
-    ]);
-
-    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
-    try {
-      expect(readItemType(database, "workbench.textKey")).toBe("text");
-      expect(readItemType(database, "workbench.blobKey")).toBe("blob");
-      expect(readItemType(database, "workbench.legacyKey")).toBe("text");
+    const cases: Array<{
+      valueType: "text" | "blob" | undefined;
+      content: Buffer;
+      storageClass: string;
+    }> = [
+      {
+        valueType: "text",
+        content: Buffer.from("true", "utf8"),
+        storageClass: "text",
+      },
+      {
+        valueType: "blob",
+        content: Buffer.from([1, 2, 3]),
+        storageClass: "blob",
+      },
+      {
+        valueType: undefined,
+        content: Buffer.from("legacy", "utf8"),
+        storageClass: "text",
+      },
       // A legacy payload that is not valid UTF-8 must keep its exact bytes
       // instead of being decoded through U+FFFD replacement characters.
-      expect(readItemType(database, "workbench.legacyBlobKey")).toBe("blob");
-      const raw = database
-        .prepare("SELECT value FROM ItemTable WHERE key = ?")
-        .get("workbench.legacyBlobKey") as { value?: Uint8Array } | undefined;
-      expect(Buffer.from(raw?.value ?? [])).toEqual(legacyBlobBytes);
-      expect(readItemFromConnection(database, "workbench.textKey")).toBe("true");
-    } finally {
-      database.close();
+      {
+        valueType: undefined,
+        content: legacyBlobBytes,
+        storageClass: "blob",
+      },
+    ];
+
+    for (const testCase of cases) {
+      const fixture = await createFixture();
+      await applyGlobalDatabaseChanges(fixture.request, [
+        userRulesChange(testCase.valueType, testCase.content),
+      ]);
+
+      const database = new DatabaseSync(fixture.databasePath, {
+        readOnly: true,
+      });
+      try {
+        expect(readItemType(database, USER_RULES_KEY)).toBe(
+          testCase.storageClass,
+        );
+        const raw = database
+          .prepare("SELECT value FROM ItemTable WHERE key = ?")
+          .get(USER_RULES_KEY) as { value?: Uint8Array | string } | undefined;
+        expect(Buffer.from(raw?.value ?? [])).toEqual(testCase.content);
+      } finally {
+        database.close();
+      }
     }
   });
 
@@ -1007,26 +1028,26 @@ describeWithBackup("offline database helper", () => {
         },
         content: Buffer.from("{ not a snapshot", "utf8"),
       },
-      uiStateChange("workbench.survivor", "text", Buffer.from("kept", "utf8")),
+      userRulesChange("text", Buffer.from("kept", "utf8"), 1),
     ]);
 
-    expect(result.applied).toEqual(["ui-state/workbench.survivor"]);
+    expect(result.applied).toEqual([`cursor-user-rules/${USER_RULES_KEY}`]);
     expect(result.skipped.join("\n")).toContain(`chat/${composerId}:`);
-    expect(readItem(fixture.databasePath, "workbench.survivor")).toBe("kept");
+    expect(readItem(fixture.databasePath, USER_RULES_KEY)).toBe("kept");
   });
 
-  it("rejects an unrecognised UI state storage class instead of writing a decoded value", async () => {
+  it("rejects an unrecognised ItemTable storage class instead of writing a decoded value", async () => {
     const fixture = await createFixture();
 
     const result = await applyGlobalDatabaseChanges(fixture.request, [
-      uiStateChange("workbench.futureKey", "null", Buffer.alloc(0)),
+      userRulesChange("null", Buffer.alloc(0)),
     ]);
 
     expect(result.applied).toEqual([]);
     expect(result.skipped.join("\n")).toContain(
       "Unsupported UI state storage class: null",
     );
-    expect(readItem(fixture.databasePath, "workbench.futureKey")).toBeNull();
+    expect(readItem(fixture.databasePath, USER_RULES_KEY)).toBeNull();
   });
 
   it("does not restore a stale backup when recovering an applying journal", async () => {
@@ -1345,6 +1366,34 @@ function uiStateChange(
       semanticHash: "hash",
       metadata: {
         key,
+        registeredUserTarget: true,
+        ...(valueType === undefined ? {} : { valueType }),
+      },
+    },
+    content,
+  };
+}
+
+/**
+ * The one ItemTable key this build still writes from the repository. ui-state
+ * is excluded wholesale, so anything testing the *shared* write path — storage
+ * classes, batch isolation, metadata validation — has to ride on this kind.
+ */
+function userRulesChange(
+  valueType: "text" | "blob" | "null" | undefined,
+  content: Buffer,
+  changeIndex = 0,
+): PreparedHelperChange {
+  return {
+    change: {
+      eventHash: "6".repeat(64),
+      changeIndex,
+      resourceId: `cursor-user-rules/${USER_RULES_KEY}`,
+      kind: "cursor-user-rules",
+      operation: "put",
+      semanticHash: "hash",
+      metadata: {
+        key: USER_RULES_KEY,
         registeredUserTarget: true,
         ...(valueType === undefined ? {} : { valueType }),
       },

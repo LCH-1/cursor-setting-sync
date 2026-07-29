@@ -2,7 +2,7 @@
   "name": "cursor-setting-sync",
   "displayName": "Cursor Setting Sync",
   "description": "Securely synchronize Cursor settings, workspace state, profiles, extensions, user files, and chat data across devices.",
-  "version": "0.0.41",
+  "version": "0.0.42",
   "publisher": "lch",
   "icon": "icon.png",
   "license": "MIT",
@@ -186,7 +186,7 @@
           "items": {
             "type": "string"
           },
-          "description": "UI state keys excluded from synchronization. Each entry is an exact key such as workbench.activity.pinnedViewlets2 or a wildcard such as workbench.panel.* . Use this for per-machine layout you want to keep local; an ignored key is never deleted on other devices."
+          "description": "No longer has any effect: since 0.0.42 no UI state key is synchronized at all. Window layout — pinned panels, hidden views, per-panel state — is kept local to each computer, so there is nothing left for this list to exclude. Your Cursor user rules are not UI state and still travel."
         },
         "cursorSettingSync.ignoredUserFiles": {
           "type": "array",
