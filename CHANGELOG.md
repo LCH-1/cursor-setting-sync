@@ -2,6 +2,32 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.33] - 2026-07-29
+
+A backup-and-restore audit under multi-window and multi-computer concurrency: six reviewers over backup creation, retention, the restore flow, the shutdown export, cross-machine semantics and user-facing truth; 70 interleavings traced (most came up clean), 32 findings adversarially verified, none refuted. The reachable ones are fixed.
+
+### Fixed - backup and restore integrity
+
+- The global database apply re-checks that Cursor is still closed immediately before its write transaction - the backup/validate/retention pipeline ahead of it takes minutes on a multi-GiB database, long enough to relaunch Cursor, whose write-back at its next quit silently reverted a commit that was already marked applied. The logical restore re-checks the same way immediately before its DELETE+INSERT, inside the path that first integrity-checks the multi-GiB source.
+- The fresh pre-restore backup that an interrupted-restore replay takes is registered with the run, so the same run's retention can no longer evict the only capture of the pre-replay state; the global apply's retention pass also exempts every backup earlier steps of the same run took.
+- A queued restore's source backup is exempt from retention until the restore runs - an apply interleaving between the user's confirmation and the helper could previously delete the file the restore was about to read.
+- An interrupted restore found more than a day after it started is NOT replayed - days later a destructive rewind to a stale backup is data loss wearing a recovery costume; the journal closes with instructions to re-run Restore Backup deliberately. A replay that does run within the window is disclosed in the result (what was rewound, where the pre-replay copy is) instead of happening silently.
+
+### Fixed - the shutdown export
+
+- A cancel marker whose writer died before arming a replacement expires after a minute instead of standing down the session's only exporter forever; markers now name their writer, and a live writer (a slow quit) keeps its marker valid indefinitely.
+- The exit wait no longer trusts a recycled extension-host pid: the authoritative process listing runs on its own cadence, so a stray pid can no longer hold a finalizer for its full thirty-day timeout.
+- A helper that vanished without a result is announced out loud - a hard-crashed shutdown export or a restore that never ran used to leave green status everywhere and one Output line; a queued restore cleared by an extension update is named too.
+- Arming respects disable (an in-flight arm resolving after the user turns sync off no longer re-installs the exporter), and a failing first sync during Setup no longer costs the session its exporter and polling.
+
+### Fixed - what the user is told
+
+- Final-export warnings consumed mid-session (a vetoed quit) are no longer destroyed unseen: they merge into the standing warnings instead of being skipped past on a path that had already deleted the result file.
+- Real per-resource apply failures are promoted to standing warnings; folded into the routine skip list inside a green result, a resource failing identically on every apply was invisible.
+- The restore confirmation says that the restored state propagates to other computers through synchronization; Restore Backup participates in the apply-in-progress protocol, so it cannot race a Restart to Apply from another window; helper results another window claimed and never processed are swept after an hour.
+
+## [0.0.32] - 2026-07-29
+
 ## [0.0.32] - 2026-07-29
 
 A concurrency-focused inspection of the whole extension - seven reviewers over multi-window races, extension-helper lifecycle, lock protocols, failure blast radius, republish loops, shared-folder semantics and cross-device convergence, every finding adversarially verified: 34 raised, 33 confirmed or downgraded-but-real. The reachable ones are fixed.

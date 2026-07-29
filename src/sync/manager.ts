@@ -490,7 +490,18 @@ export class SyncManager implements vscode.Disposable {
         await this.commitGitWindow(true, root, "initial sync repository");
       }
       report("Scanning local resources and synchronizing...");
-      await this.syncNow(true);
+      try {
+        await this.syncNow(true);
+      } catch (error) {
+        // The first sync failing (a OneDrive hiccup, one unreadable file)
+        // must not leave the freshly configured session with no shutdown
+        // exporter and no polling until the next launch: arm and watch, then
+        // surface the sync error as what it is.
+        report("Preparing the offline helper...");
+        await this.startFinalizer();
+        this.startWatching();
+        throw error;
+      }
       report("Preparing the offline helper...");
       await this.startFinalizer();
     });
@@ -1489,13 +1500,22 @@ export class SyncManager implements vscode.Disposable {
       return;
     }
     const confirmed = await vscode.window.showWarningMessage(
-      "Cursor will quit and import the selected backup's managed tables with a SQLite transaction. The live database file is not replaced; rows absent from those backed-up tables are removed.",
+      "Cursor will quit and import the selected backup's managed tables with a SQLite transaction. The live database file is not replaced; rows absent from those backed-up tables are removed. " +
+        "After the restart, synchronization publishes the restored state as the newest version, so other computers converge on it too - this restore is not local-only.",
       { modal: true },
       "Import and Restart",
     );
     if (confirmed !== "Import and Restart") {
       return;
     }
+    if (await this.applyAlreadyInProgress()) {
+      const message =
+        "Another window already started an apply or restore; wait for Cursor to quit, then try again.";
+      this.status.log(message);
+      void vscode.window.showInformationMessage(message);
+      return;
+    }
+    await this.markApplyInProgress();
     try {
       await this.helper.restoreAndRestart(
         repository.root,
@@ -1504,6 +1524,7 @@ export class SyncManager implements vscode.Disposable {
         this.helperSyncOptions(),
         selected.restoreTarget,
         async () => {
+          await this.clearApplyInProgress();
           await this.startFinalizer();
         },
         () => {
@@ -1520,6 +1541,7 @@ export class SyncManager implements vscode.Disposable {
     } catch (error) {
       // Same as restartToApply: the restore flow cancelled the standing
       // finalizer before launching, so a failed launch must re-arm it.
+      await this.clearApplyInProgress();
       await this.startFinalizer();
       throw error;
     }
@@ -3056,11 +3078,15 @@ export class SyncManager implements vscode.Disposable {
     }
     try {
       if (
+        this.disposed ||
+        !this.configuration.enabled ||
         this.repository === null ||
         this.masterKey === null ||
         !this.compatibility.compatible ||
         !(await pathExists(this.paths.helperScript))
       ) {
+        // Disable cancels finalizers; an in-flight arm resolving after it
+        // must not quietly re-install an exporter the user just turned off.
         return;
       }
       const outcome = await this.helper.restartFinalizer(
@@ -3298,6 +3324,27 @@ export class SyncManager implements vscode.Disposable {
       }
       throw error;
     }
+    // A window that claimed a result and died before deleting it left a
+    // .claimed file no listing ever matched again - the result's warnings and
+    // backups were lost to every surviving window. An hour is far beyond any
+    // consume, so age alone is proof of orphanhood.
+    try {
+      for (const entry of await readdir(this.paths.extensionStorage)) {
+        if (!/\.claimed$/.test(entry) || !entry.includes("helper-result-")) {
+          continue;
+        }
+        const orphanPath = join(this.paths.extensionStorage, entry);
+        const info = await stat(orphanPath).catch(() => null);
+        if (info !== null && Date.now() - info.mtimeMs > 60 * 60_000) {
+          this.status.log(
+            `Discarded a helper result another window claimed but never processed (${entry}).`,
+          );
+          await rm(orphanPath, { force: true });
+        }
+      }
+    } catch {
+      // Listing is best-effort; the next consume retries.
+    }
     for (const name of names) {
       const path = join(this.paths.extensionStorage, name);
       // Claim before reading: startup runs this in EVERY restoring window at
@@ -3362,18 +3409,36 @@ export class SyncManager implements vscode.Disposable {
         this.helperFailure = helperFailureDetail(result.error);
         this.status.setStatus("error", this.helperFailure);
         this.announceHelperFailure(this.helperFailure);
-        if (result.mode !== undefined && result.mode !== "final-export") {
-          // The apply flow cancelled the standing finalizer before it quit
-          // Cursor, and its own veto recovery lives in whichever window
-          // launched it - a window that may be gone. Whoever consumes the
-          // failure is alive, so it re-arms; restartFinalizer's outcomes make
-          // this safe when several windows race to do the same.
-          void this.startFinalizer();
-        }
+        // Any consumed failure re-arms the finalizer: the flow that failed
+        // cancelled the standing one first, and its own recovery lives in
+        // whichever window launched it - a window that may be gone. Whoever
+        // consumes the failure is alive; restartFinalizer's outcomes make
+        // this safe when several windows race to do the same.
+        void this.startFinalizer();
       }
       await rm(claimedPath, { force: true });
     }
     if (!options.atStartup) {
+      // The result file is already deleted, so skipping observation here
+      // DESTROYED any warnings it carried - a quit-vetoed final-export's
+      // "these resources were not exported" landed in no window at all. Only
+      // results actually carrying warnings observe mid-session, merged with
+      // what already stands so a bare mid-cycle observe cannot clear a
+      // bucket a startup consume raised.
+      const carrying = consumed.filter(
+        (result) => (result.warnings?.length ?? 0) > 0,
+      );
+      if (carrying.length > 0) {
+        const standing = this.warnings
+          .standingFor(HELPER_WARNING_SOURCE)
+          .map((entry) => entry.warning);
+        for (const entry of this.warnings.observe({
+          sources: helperWarningObservation(carrying, standing),
+          now: Date.now(),
+        })) {
+          this.status.log(formatWarningLine(entry));
+        }
+      }
       return;
     }
     await this.reportAbandonedHelpers();
@@ -3469,11 +3534,31 @@ export class SyncManager implements vscode.Disposable {
         // No log: this predates the change that captures one.
       }
       if (!scriptMissing) {
-        this.status.log(
-          `The offline helper for ${name} never reported a result.${
-            stderr.length === 0 ? "" : ` It wrote: ${stderr.slice(0, 2000)}`
-          }`,
-        );
+        const detail = `The offline helper for ${name} never reported a result.${
+          stderr.length === 0 ? "" : ` It wrote: ${stderr.slice(0, 2000)}`
+        }`;
+        this.status.log(detail);
+        // A helper that died without a result is exactly how a hard-crashed
+        // shutdown export looks: nothing red anywhere, one Output line the
+        // user never opens. For a final-export or restore that silence is a
+        // missed backup or a restore that did not happen - say so out loud.
+        if (request?.mode === "final-export") {
+          void vscode.window.showWarningMessage(
+            "The previous session's shutdown export never completed, so its final workspaceStorage backup was skipped. The next quit exports everything current.",
+          );
+        } else if (request?.mode === "restore-backup") {
+          void vscode.window.showWarningMessage(
+            "The requested restore never reported a result and may not have run. Check the data and run \"Cursor Setting Sync: Restore Backup\" again if needed.",
+          );
+        }
+      } else {
+        // The upgrade case is routine, but a silent delete of a RESTORE the
+        // user explicitly confirmed is not: name it even then.
+        if (request?.mode === "restore-backup") {
+          this.status.log(
+            `Cleared a queued restore (${name}) whose helper was removed by an extension update; run "Cursor Setting Sync: Restore Backup" again.`,
+          );
+        }
       }
       await rm(requestPath, { force: true });
       await rm(logPath, { force: true });
@@ -4004,6 +4089,12 @@ export function lockSkipResumedLine(
  */
 export function helperWarningObservation(
   results: readonly HelperResult[],
+  /**
+   * Warning texts already standing, merged in when a mid-session result must
+   * ADD to the bucket without being entitled to clear it - the startup path
+   * omits this so a clean run still clears.
+   */
+  alsoStanding: readonly string[] = [],
 ): Map<string, readonly string[]> {
   const reported = results.filter((result) => result.warnings !== undefined);
   if (reported.length === 0) {
@@ -4014,7 +4105,12 @@ export function helperWarningObservation(
   return new Map([
     [
       HELPER_WARNING_SOURCE,
-      [...new Set(reported.flatMap((result) => result.warnings ?? []))],
+      [
+        ...new Set([
+          ...alsoStanding,
+          ...reported.flatMap((result) => result.warnings ?? []),
+        ]),
+      ],
     ],
   ]);
 }

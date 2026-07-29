@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, rm, stat } from "node:fs/promises";
+import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { inspectSqliteCapabilities, openDatabase } from "../platform/sqlite";
 import {
@@ -159,14 +159,23 @@ async function run(): Promise<void> {
           );
         }
       };
+      const recoveryNotices: string[] = [];
       await recoverInterruptedApplyJournals(
         request.storageRoot,
         request.paths.globalDatabase,
         ensureCursorStillClosed,
+        (backup) => collected.backups.push(backup),
+        (message) => recoveryNotices.push(message),
       );
-      const result = await executeRequest(request, masterKey, collected, () => {
-        lock.refresh();
-      });
+      const result = await executeRequest(
+        request,
+        masterKey,
+        collected,
+        () => {
+          lock.refresh();
+        },
+        recoveryNotices,
+      );
       await writeResult(request, result);
       if (request.restart && result.success) {
         restartCursor(request.cursorExecutable);
@@ -228,8 +237,14 @@ async function executeRequest(
    * mid-write.
    */
   heartbeat: () => void = () => {},
+  /**
+   * What journal recovery did before this request ran - a replayed or
+   * refused interrupted restore. Folded into the result's warnings so a
+   * destructive replay the user never watched is impossible to miss.
+   */
+  recoveryNotices: readonly string[] = [],
 ): Promise<HelperResult> {
-  const gitWarnings: string[] = [];
+  const gitWarnings: string[] = [...recoveryNotices];
   // A restore reads no events and publishes none, so the network pull is pure
   // window: up to ten minutes during which Cursor is visibly closed and the
   // user has every reason to reopen it before the destructive write begins.
@@ -259,6 +274,17 @@ async function executeRequest(
       );
     }
   };
+  // A restore the user confirmed but whose helper has not run yet names a
+  // backup file as its source; an apply interleaving before it must not let
+  // retention evict that file, or the restore fails on a source this
+  // extension deleted seconds earlier.
+  const pendingRestoreSources = await pendingRestoreSourceBackups(
+    request.storageRoot,
+  );
+  const priorBackupPaths = (): string[] => [
+    ...collected.backups.map((backup) => backup.backupPath),
+    ...pendingRestoreSources,
+  ];
 
   if (request.mode === "restore-backup") {
     if (request.backupToRestore === undefined) {
@@ -353,6 +379,8 @@ async function executeRequest(
       request,
       globalPrepared,
       heartbeat,
+      ensureExclusiveAccess,
+      priorBackupPaths,
     );
     backupPath = globalResult.backupPath;
     collected.backupPath = backupPath;
@@ -376,12 +404,17 @@ async function executeRequest(
     (backup) => collected.backups.push(backup),
     heartbeat,
     // The pre-apply global snapshot above must survive every retention pass
-    // the non-global applies run; it is the request's only pre-apply recovery
-    // point for the global database.
-    () => collected.backups.map((backup) => backup.backupPath),
+    // the non-global applies run - it is the request's only pre-apply
+    // recovery point for the global database - and so must any queued
+    // restore's source.
+    priorBackupPaths,
   );
   applied.push(...nonGlobalResult.applied);
   skipped.push(...nonGlobalResult.skipped);
+  // Real per-resource failures ride the warnings channel: warnings become
+  // standing in the extension host, so a resource that fails every apply is
+  // visible instead of buried between routine skip lines in a green result.
+  warnings.push(...nonGlobalResult.failures);
   for (const resourceId of nonGlobalResult.retainedLocal) {
     retainedLocal.add(resourceId);
   }
@@ -844,11 +877,51 @@ async function assertRuntimeVersion(request: HelperRequest): Promise<void> {
   }
 }
 
+/**
+ * Backups that queued restore-backup requests still intend to read. The scan
+ * is over the storage root only, never the backups tree, and tolerates any
+ * unreadable request - a missing exemption falls back to the old behavior.
+ */
+async function pendingRestoreSourceBackups(
+  storageRoot: string,
+): Promise<string[]> {
+  const sources: string[] = [];
+  let names: string[];
+  try {
+    names = await readdir(storageRoot);
+  } catch {
+    return sources;
+  }
+  for (const name of names) {
+    if (!name.startsWith("helper-request-") || !name.endsWith(".json")) {
+      continue;
+    }
+    try {
+      const pending = await readJsonFile<HelperRequest>(join(storageRoot, name));
+      if (
+        pending.mode === "restore-backup" &&
+        typeof pending.backupToRestore === "string"
+      ) {
+        sources.push(pending.backupToRestore);
+      }
+    } catch {
+      // Unreadable or mid-write; the next run sees it settled.
+    }
+  }
+  return sources;
+}
+
 async function waitForCursorExit(
   request: HelperRequest,
   timeoutMs: number,
 ): Promise<boolean> {
   const startedAt = Date.now();
+  // The extension-host pid check is only a cheap gate in front of the process
+  // listing, and Windows recycles pids: a recycled pid belonging to some
+  // unrelated long-lived process read as "Cursor still open" and held this
+  // wait for its whole timeout - thirty days for a finalizer. The listing is
+  // authoritative, so it runs regardless on a slower cadence.
+  let lastListingAt = 0;
   while (Date.now() - startedAt < timeoutMs) {
     if (
       request.mode === "final-export" &&
@@ -856,11 +929,12 @@ async function waitForCursorExit(
     ) {
       return true;
     }
-    if (
-      !isProcessAlive(request.extensionHostPid) &&
-      (await noOtherCursorProcesses(request))
-    ) {
-      return false;
+    const hostGone = !isProcessAlive(request.extensionHostPid);
+    if (hostGone || Date.now() - lastListingAt > 30_000) {
+      lastListingAt = Date.now();
+      if (await noOtherCursorProcesses(request)) {
+        return false;
+      }
     }
     await delay(500);
   }
@@ -899,9 +973,27 @@ async function isFinalizerCancelled(request: HelperRequest): Promise<boolean> {
   if (!(await pathExists(path))) {
     return false;
   }
-  const timestamp = Date.parse((await readFile(path, "utf8")).trim());
-  return Number.isFinite(timestamp) && timestamp >= Date.parse(request.createdAt);
+  const lines = (await readFile(path, "utf8")).trim().split(/\r?\n/);
+  const timestamp = Date.parse(lines[0] ?? "");
+  if (!Number.isFinite(timestamp) || timestamp < Date.parse(request.createdAt)) {
+    return false;
+  }
+  // A cancel is a promise that its writer arms a replacement. A writer that
+  // died between the marker and the spawn left a marker nobody follows up on,
+  // and honoring it forever meant this session's quit export - the only
+  // workspaceStorage backup - silently never ran. The marker stays valid
+  // while its writer is alive (a slow quit is still a live handoff) or for a
+  // fresh grace window; beyond that, an orphaned cancel is ignored and this
+  // finalizer keeps the watch it already holds.
+  const writerPid = Number.parseInt(lines[1] ?? "", 10);
+  if (Number.isFinite(writerPid) && isProcessAlive(writerPid)) {
+    return true;
+  }
+  return Date.now() - timestamp < CANCEL_MARKER_GRACE_MS;
 }
+
+/** How long an unowned cancel marker is still trusted; a live handoff takes seconds. */
+const CANCEL_MARKER_GRACE_MS = 60_000;
 
 async function acquireSyncLock(
   storageRoot: string,

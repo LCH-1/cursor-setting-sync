@@ -102,9 +102,12 @@ export class HelperLauncher {
   /** Returns the marker timestamp, for comparing against a later holder. */
   async cancelFinalizers(): Promise<number> {
     const stamp = new Date().toISOString();
+    // The second line names the writer: a cancel whose writer died before
+    // arming a replacement must expire instead of standing down the only
+    // finalizer the session has.
     await writeFileAtomic(
       this.cancelFinalizersPath,
-      Buffer.from(stamp, "utf8"),
+      Buffer.from(`${stamp}\n${process.pid}`, "utf8"),
     );
     this.finalizer?.kill();
     this.finalizer = null;
@@ -122,7 +125,7 @@ export class HelperLauncher {
   ): Promise<void> {
     await writeFileAtomic(
       this.cancelFinalizersPath,
-      Buffer.from(new Date().toISOString(), "utf8"),
+      Buffer.from(`${new Date().toISOString()}\n${process.pid}`, "utf8"),
     );
     this.finalizer?.kill();
     this.finalizer = null;
@@ -156,7 +159,7 @@ export class HelperLauncher {
   ): Promise<void> {
     await writeFileAtomic(
       this.cancelFinalizersPath,
-      Buffer.from(new Date().toISOString(), "utf8"),
+      Buffer.from(`${new Date().toISOString()}\n${process.pid}`, "utf8"),
     );
     this.finalizer?.kill();
     this.finalizer = null;

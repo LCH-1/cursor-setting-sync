@@ -86,6 +86,13 @@ export type DatabaseContract =
 
 const COMPLETED_JOURNAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
+/**
+ * How long after its start an interrupted restore is still replayed. Beyond
+ * this the replay would rewind days of use to a stale backup - the user
+ * re-runs Restore Backup deliberately instead.
+ */
+const RESTORE_REPLAY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 export async function recoverInterruptedApplyJournals(
   storageRoot: string,
   databasePath: string,
@@ -97,6 +104,12 @@ export async function recoverInterruptedApplyJournals(
    * take down every later apply and every shutdown export forever.
    */
   ensureCursorStillClosed: () => Promise<void> = async () => {},
+  registerBackup: (backup: {
+    backupPath: string;
+    contract: DatabaseContract;
+    targetPath: string;
+  }) => void = () => {},
+  notice: (message: string) => void = () => {},
 ): Promise<void> {
   const journalPaths = await listJournalFiles(storageRoot);
   for (const path of journalPaths) {
@@ -112,7 +125,13 @@ export async function recoverInterruptedApplyJournals(
       await removeExpiredJournal(path, journal.completedAt);
       continue;
     }
-    await recoverRestoreJournal(path, journal, ensureCursorStillClosed);
+    await recoverRestoreJournal(
+      path,
+      journal,
+      ensureCursorStillClosed,
+      registerBackup,
+      notice,
+    );
   }
   for (const path of journalPaths) {
     const name = basename(path);
@@ -234,6 +253,17 @@ export async function applyGlobalDatabaseChanges(
    * synchronous for exactly this reason.
    */
   heartbeat: () => void = () => {},
+  /**
+   * Awaited immediately before the write transaction opens. The backup, seal,
+   * validation and retention above it take minutes on a multi-GiB database -
+   * long enough for the user to relaunch Cursor, whose in-memory write-back
+   * at its next quit would silently revert a commit made under it while the
+   * changes were already marked applied and de-queued. A throw here aborts
+   * with the live database untouched and the changes still pending.
+   */
+  beforeDestructiveWrite: () => Promise<void> = async () => {},
+  /** Backups earlier steps of the same run took; retention must spare them. */
+  priorBackups: () => readonly string[] = () => [],
 ): Promise<DatabaseApplyResult> {
   const localWorkspaces = await preflightGlobalChanges(request, prepared);
   const databasePath = request.paths.globalDatabase;
@@ -272,7 +302,10 @@ export async function applyGlobalDatabaseChanges(
     }
     await sealBackupFile(backupPath);
     validateDatabaseFile(backupPath, "global");
-    await enforceBackupRetention(request.storageRoot, { exemptPath: backupPath });
+    await enforceBackupRetention(request.storageRoot, {
+      exemptPath: backupPath,
+      exemptPaths: priorBackups(),
+    });
     // Retention is contractually unable to touch the exempt backup, so a
     // second full integrity pass over a possibly multi-GiB file bought
     // nothing; existence is the only thing left to confirm.
@@ -285,6 +318,7 @@ export async function applyGlobalDatabaseChanges(
 
     journal.status = "applying";
     await writeJsonAtomic(journalPath, journal);
+    await beforeDestructiveWrite();
     database.exec("BEGIN IMMEDIATE");
     const result = applyPreparedChanges(
       database,
@@ -407,7 +441,15 @@ export async function restoreDatabaseBackup(
     await beforeDestructiveWrite();
     journal.status = "applying";
     await writeJsonAtomic(journalPath, journal);
-    restoreKnownTablesWithQueries(databasePath, backupPath, contract);
+    // The re-check runs again INSIDE, immediately before the transaction: the
+    // source integrity_check between here and the DELETE+INSERT takes minutes
+    // on a multi-GiB backup, which is its own reopen window.
+    await restoreKnownTablesWithQueries(
+      databasePath,
+      backupPath,
+      contract,
+      beforeDestructiveWrite,
+    );
     validateDatabaseFile(databasePath, contract);
     journal.status = "verified";
     journal.completedAt = new Date().toISOString();
@@ -452,11 +494,20 @@ async function createPreRestoreBackup(
  * read source; the live database file and its WAL/SHM sidecars are never
  * copied, renamed, or replaced.
  */
-function restoreKnownTablesWithQueries(
+async function restoreKnownTablesWithQueries(
   databasePath: string,
   backupPath: string,
   contract: DatabaseContract,
-): void {
+  /**
+   * Awaited immediately before the DELETE+INSERT transaction. The
+   * integrity_check of a multi-GiB restore source above it takes minutes -
+   * long enough for Cursor to be relaunched, whose in-memory write-back
+   * would undo the restore while it was reported successful. Checking here,
+   * after every read-only preparation, shrinks the unguarded window to the
+   * transaction itself.
+   */
+  beforeDestructiveWrite: () => Promise<void> = async () => {},
+): Promise<void> {
   const tables = restoreTablesForContract(contract);
   const database = openDatabase(databasePath);
   let attached = false;
@@ -487,6 +538,7 @@ function restoreKnownTablesWithQueries(
       return { table, columns: targetColumns };
     });
 
+    await beforeDestructiveWrite();
     database.exec("BEGIN IMMEDIATE");
     transactionStarted = true;
     for (const { table, columns } of plans) {
@@ -581,12 +633,31 @@ async function recoverRestoreJournal(
   journalPath: string,
   journal: RestoreJournal,
   ensureCursorStillClosed: () => Promise<void> = async () => {},
+  registerBackup: (backup: {
+    backupPath: string;
+    contract: DatabaseContract;
+    targetPath: string;
+  }) => void = () => {},
+  notice: (message: string) => void = () => {},
 ): Promise<void> {
   const contract = journal.contract ?? "global";
   if (!(await pathExists(journal.backupPath))) {
     validateDatabaseFile(journal.databasePath, contract);
     journal.status = "failed";
     journal.error = "Interrupted restore source is missing; the live database was left untouched.";
+  } else if (
+    Date.now() - Date.parse(journal.startedAt) > RESTORE_REPLAY_WINDOW_MS
+  ) {
+    // A destructive replay is only what the user still wants while the
+    // interruption is fresh. Days later the machine has been used, other
+    // machines have synced, and silently rewinding the database to a
+    // days-old backup is a data-loss surprise, not a recovery. The journal
+    // closes with instructions instead.
+    validateDatabaseFile(journal.databasePath, contract);
+    journal.status = "failed";
+    journal.error =
+      "An interrupted restore was found more than a day after it started and was NOT replayed; run \"Cursor Setting Sync: Restore Backup\" again if you still want it. The live database was left untouched.";
+    notice(journal.error);
   } else {
     try {
       validateDatabaseFile(journal.backupPath, contract);
@@ -623,15 +694,25 @@ async function recoverRestoreJournal(
     }
     journal.preRestoreBackupPath = preRestoreBackupPath;
     await writeJsonAtomic(journalPath, journal);
+    // Registered with the run so every later retention pass exempts it - the
+    // recovery backup used to be the one backup of the run that retention
+    // could evict minutes after it was taken, while it was the only capture
+    // of the pre-replay state.
+    registerBackup({
+      backupPath: preRestoreBackupPath,
+      contract,
+      targetPath: journal.databasePath,
+    });
     // Deliberately outside the catch below: Cursor having reopened is not a
     // fact about this journal, so it aborts the run and leaves the journal
     // pending for the next closed-Cursor helper.
     await ensureCursorStillClosed();
     try {
-      restoreKnownTablesWithQueries(
+      await restoreKnownTablesWithQueries(
         journal.databasePath,
         journal.backupPath,
         contract,
+        ensureCursorStillClosed,
       );
       validateDatabaseFile(journal.databasePath, contract);
     } catch (error) {
@@ -647,6 +728,12 @@ async function recoverRestoreJournal(
     }
     journal.status = "verified";
     journal.error = "Recovered an interrupted logical restore with a SQL transaction.";
+    // A destructive replay the user never watched must not be invisible: the
+    // notice rides the helper result into the output channel and the standing
+    // warnings, naming the state it rewound and where the pre-replay copy is.
+    notice(
+      `Completed an interrupted restore from ${journal.startedAt} (source ${journal.backupPath}); the pre-replay state was saved to ${preRestoreBackupPath}.`,
+    );
   }
   journal.completedAt = new Date().toISOString();
   await writeJsonAtomic(journalPath, journal);

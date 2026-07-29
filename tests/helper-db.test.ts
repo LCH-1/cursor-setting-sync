@@ -74,6 +74,47 @@ describeWithBackup("offline database helper", () => {
     );
   });
 
+  it("aborts before the write transaction when Cursor reopened during the backup", async () => {
+    // The backup/validate/retention pipeline ahead of the transaction takes
+    // minutes on a real database - plenty of time to relaunch Cursor, whose
+    // write-back at its next quit silently reverts a commit made under it.
+    const fixture = await createFixture();
+    let checked = 0;
+    const operation = applyGlobalDatabaseChanges(
+      fixture.request,
+      [
+        {
+          change: {
+            eventHash: "9".repeat(64),
+            changeIndex: 0,
+            resourceId: "cursor-user-rules/aicontext.personalContext",
+            kind: "cursor-user-rules",
+            operation: "put",
+            semanticHash: "hash",
+            metadata: {
+              key: "aicontext.personalContext",
+              registeredUserTarget: false,
+            },
+          },
+          content: Buffer.from("never lands", "utf8"),
+        },
+      ],
+      () => {},
+      async () => {
+        checked += 1;
+        throw new Error("Cursor was reopened before offline changes could be applied.");
+      },
+    );
+
+    await expect(operation).rejects.toThrow("Cursor was reopened");
+    expect(checked).toBe(1);
+    // The live database is untouched and the pre-apply backup exists.
+    expect(readItem(fixture.databasePath, "existing")).toBe("preserved");
+    expect(
+      readItem(fixture.databasePath, "aicontext.personalContext"),
+    ).toBeNull();
+  });
+
   it("rolls back the SQL transaction when an unsafe key is requested", async () => {
     const fixture = await createFixture();
     const operation = applyGlobalDatabaseChanges(fixture.request, [
@@ -518,7 +559,7 @@ describeWithBackup("offline database helper", () => {
         status: "applying",
         databasePath: fixture.databasePath,
         backupPath,
-        startedAt: "2026-07-14T00:00:00.000Z",
+        startedAt: new Date().toISOString(),
         completedAt: null,
         error: null,
         contract: "global",
@@ -570,7 +611,7 @@ describeWithBackup("offline database helper", () => {
         status: "applying",
         databasePath: join(storageRoot, "missing.vscdb"),
         backupPath,
-        startedAt: "2026-07-14T00:00:00.000Z",
+        startedAt: new Date().toISOString(),
         completedAt: null,
         error: null,
         contract: "global",
@@ -1018,7 +1059,7 @@ describeWithBackup("offline database helper", () => {
         status: "applying",
         databasePath: fixture.databasePath,
         backupPath,
-        startedAt: "2026-07-14T00:00:00.000Z",
+        startedAt: new Date().toISOString(),
         completedAt: null,
         error: null,
       }),
@@ -1071,7 +1112,7 @@ describeWithBackup("offline database helper", () => {
         status: "committed",
         databasePath: fixture.databasePath,
         backupPath: null,
-        startedAt: "2026-07-14T00:00:00.000Z",
+        startedAt: new Date().toISOString(),
         completedAt: null,
         error: null,
       }),

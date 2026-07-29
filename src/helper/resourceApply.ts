@@ -60,6 +60,8 @@ export class CursorReopenedError extends Error {
 export interface NonGlobalApplyResult {
   applied: string[];
   skipped: string[];
+  /** The subset of skipped that is a real failure, promoted to warnings. */
+  failures: string[];
   backupPaths: string[];
   backups: HelperBackup[];
   retainedLocal: string[];
@@ -96,6 +98,7 @@ export async function applyNonGlobalChanges(
   ];
   const retainedLocal: string[] = [];
   const retainedLocalHashes: Record<string, string> = {};
+  const failures: string[] = [];
   const localWorkspaces =
     request.syncOptions.syncWorkspaceStorage &&
     prepared.some((item) => item.change.kind === "workspace-storage")
@@ -299,10 +302,15 @@ export async function applyNonGlobalChanges(
         throw error;
       }
       // Each database merge is transactional, so one corrupt or drifted
-      // resource is skipped and stays pending without aborting the batch.
-      skipped.push(
-        `${change.resourceId}: ${error instanceof Error ? error.message : String(error)}`,
-      );
+      // resource is skipped and stays pending without aborting the batch. It
+      // is ALSO a failure: folded into skipped alone it sat between routine
+      // "tombstone retained" lines inside a green success result, and a
+      // resource that failed the same way on every apply was never surfaced.
+      const line = `${change.resourceId}: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      skipped.push(line);
+      failures.push(`Applying ${line}`);
     }
   }
 
@@ -321,6 +329,7 @@ export async function applyNonGlobalChanges(
   return {
     applied,
     skipped,
+    failures,
     backupPaths: backups.map((backup) => backup.backupPath),
     backups,
     retainedLocal,

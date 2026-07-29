@@ -249,6 +249,55 @@ describeWithBackup("interrupted restore journal recovery", () => {
     expect(journal.error).toMatch(/was not retried/i);
   });
 
+  it("refuses to replay a journal older than a day and says so", async () => {
+    const fixture = await journalFixture();
+    const stale = JSON.parse(await readFile(fixture.journalPath, "utf8")) as {
+      startedAt: string;
+    };
+    stale.startedAt = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    await writeFile(fixture.journalPath, JSON.stringify(stale), "utf8");
+    const notices: string[] = [];
+
+    await recoverInterruptedApplyJournals(
+      fixture.root,
+      fixture.live,
+      async () => {},
+      () => {},
+      (message) => notices.push(message),
+    );
+
+    const journal = JSON.parse(await readFile(fixture.journalPath, "utf8")) as {
+      status: string;
+      error: string | null;
+    };
+    // Days later the machine has been used; silently rewinding it to a stale
+    // backup is data loss wearing a recovery costume.
+    expect(journal.status).toBe("failed");
+    expect(journal.error).toMatch(/NOT replayed/);
+    expect(notices.join(" ")).toMatch(/NOT replayed/);
+    expect(readCell(fixture.live, "ItemTable", "key", "layout", "value")).toBe("original");
+  });
+
+  it("registers the recovery backup and discloses a completed replay", async () => {
+    const fixture = await journalFixture();
+    const registered: Array<{ backupPath: string }> = [];
+    const notices: string[] = [];
+
+    await recoverInterruptedApplyJournals(
+      fixture.root,
+      fixture.live,
+      async () => {},
+      (backup) => registered.push(backup),
+      (message) => notices.push(message),
+    );
+
+    // The replay ran: its fresh pre-replay backup is registered with the run
+    // (so retention exempts it) and the destructive replay is disclosed.
+    expect(registered).toHaveLength(1);
+    expect(registered[0]?.backupPath).toContain("-recovery");
+    expect(notices.join(" ")).toMatch(/Completed an interrupted restore/);
+  });
+
   it("leaves the journal pending when Cursor reopened before the replay", async () => {
     const fixture = await journalFixture();
     const reopened = new Error("Cursor was reopened");
