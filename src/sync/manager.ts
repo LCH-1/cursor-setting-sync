@@ -1132,6 +1132,15 @@ export class SyncManager implements vscode.Disposable {
         if (this.disposed || this.repository !== null) {
           return;
         }
+        if (!this.configuration.enabled) {
+          // The user turned sync off while this window waited to reconnect;
+          // resuming the watcher and publish cycles under a "disabled" status
+          // bar is exactly what the setting says must not happen. The probe
+          // ends here - re-enabling goes through configurationChanged, which
+          // restarts everything itself.
+          this.status.setStatus("disabled");
+          return;
+        }
         if (await pathExists(this.disconnectMarkerPath(repositoryId))) {
           this.scheduleReconnectProbe(repositoryId);
           return;
@@ -3622,6 +3631,13 @@ export class SyncManager implements vscode.Disposable {
     if (this.watcherDebounce !== null) {
       clearTimeout(this.watcherDebounce);
       this.watcherDebounce = null;
+    }
+    if (this.reconnectProbeTimer !== null) {
+      // An explicit stand-down (disable, disconnect, a fresh startWatching)
+      // also ends any pending reconnect probe; disconnectedElsewhere arms its
+      // probe AFTER calling this, so the one probe that should survive does.
+      clearTimeout(this.reconnectProbeTimer);
+      this.reconnectProbeTimer = null;
     }
     this.clearSyncIndicator();
   }

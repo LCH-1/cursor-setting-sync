@@ -2,6 +2,17 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.36] - 2026-07-29
+
+Convergence round three: verification of the 0.0.35 diff raised six findings - four distinct, all small, all fixed here. The finding count across rounds (32, then 18, then 6, all progressively narrower in scope) is the convergence the audit series was run for.
+
+### Fixed
+
+- The staged clone's promotion step tolerates transient Windows locks (OneDrive, antivirus) with retries; on unrecoverable failure it moves the promoted entries back and fails with instructions instead of leaving the target half-assembled behind a raw EPERM. Leftover staging directories from an earlier failed clone are cleared automatically, so a retry reaches the clone path again. The mid-clone foreign-file abort now says to WAIT and re-run Setup when the folder syncs from another computer - the previous wording told the user to delete what may be the other machine's repository.
+- The reconnect probe respects the enabled setting: a window torn down by a sibling's disconnect and then disabled no longer resumes watching and publishing under a "disabled" status bar after a later Setup; disable, disconnect and a fresh start of watching also cancel any pending probe.
+
+## [0.0.35] - 2026-07-29
+
 ## [0.0.35] - 2026-07-29
 
 Convergence round two: adversarial verification of the 0.0.34 diff itself - 18 findings raised against it, 2 refuted, the rest fixed here. Each is a refinement of a round-one fix, not a regression of older behavior.
@@ -21,8 +32,6 @@ Convergence round two: adversarial verification of the 0.0.34 diff itself - 18 f
 ### Known limits, accepted deliberately
 
 - The OS-restore fork guards read the local replica of the shared folder; a whole-disk restore where the first publish beats cloud rehydration can still fork - the new owner-side detection turns that from a silent permanent wedge into a named, recoverable state.
-
-## [0.0.34] - 2026-07-29
 
 ## [0.0.34] - 2026-07-29
 

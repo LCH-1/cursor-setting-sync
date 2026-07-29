@@ -117,6 +117,19 @@ export async function cloneRepository(
     assertSafeGitArgument(branch, "branch name");
   }
   await ensureDirectory(root);
+  // Leftover staging directories from an earlier failed clone are this
+  // extension's own debris; clearing them lets a retry reach the clone path
+  // instead of wedging on "must be an empty directory" forever.
+  for (const entry of await readdir(root)) {
+    if (entry.startsWith(".cursor-sync-clone-")) {
+      await rm(join(root, entry), {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 200,
+      }).catch(() => {});
+    }
+  }
   const entries = await readdir(root);
   if (entries.length > 0) {
     throw new GitError(
@@ -157,20 +170,71 @@ export async function cloneRepository(
   }
   // Success: the target must still contain nothing but the staging directory
   // before its contents move up. Foreign files that appeared meanwhile are
-  // NOT deleted - the user is told to empty the folder instead.
+  // NOT deleted - in a cloud-synced folder they are most likely another
+  // machine's repository arriving, and the right move is to JOIN it, never
+  // to hand-delete it.
   const afterClone = (await readdir(root)).filter((name) => name !== stagingName);
   if (afterClone.length > 0) {
     await rm(staging, { recursive: true, force: true }).catch(() => {});
     throw new GitError(
       "command",
-      `Files appeared in the clone target while cloning (${afterClone[0] ?? ""}); empty the folder and try again.`,
+      `Files appeared in the clone target while cloning (${afterClone[0] ?? ""}). ` +
+        "If this folder synchronizes from another computer, wait for that synchronization to finish and run Setup again - it will join the repository that arrived. " +
+        "Only empty the folder if you are certain the files are not another computer's sync data.",
     );
   }
-  for (const entry of await readdir(staging)) {
-    await rename(join(staging, entry), join(root, entry));
+  // The promotion gets the same transient-lock tolerance as every other
+  // mutation of this directory - OneDrive or an antivirus holding one fresh
+  // checkout file made a single bare rename throw a raw EPERM out of Setup
+  // over a fully successful clone. On unrecoverable failure the moved
+  // entries go back so the target again holds only the staging directory,
+  // which the precheck above clears on the next attempt.
+  const promoted: string[] = [];
+  try {
+    for (const entry of await readdir(staging)) {
+      await renameWithRetries(join(staging, entry), join(root, entry));
+      promoted.push(entry);
+    }
+  } catch (error) {
+    for (const entry of promoted) {
+      await renameWithRetries(join(root, entry), join(staging, entry)).catch(
+        () => {},
+      );
+    }
+    throw new GitError(
+      "command",
+      `The clone finished but its files could not be moved into place (${
+        error instanceof Error ? error.message : String(error)
+      }). Close programs that may hold the folder open and run Setup again.`,
+    );
   }
-  await rm(staging, { recursive: true, force: true });
+  // Staging is empty and the clone has fully materialized; a locked leftover
+  // directory is cosmetic and the precheck clears it next time.
+  await rm(staging, {
+    recursive: true,
+    force: true,
+    maxRetries: 3,
+    retryDelay: 200,
+  }).catch(() => {});
   await disableLineEndingConversion(root);
+}
+
+async function renameWithRetries(from: string, to: string): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (
+        attempt >= 4 ||
+        (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY")
+      ) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200 * attempt));
+    }
+  }
 }
 
 async function disableLineEndingConversion(root: string): Promise<void> {
