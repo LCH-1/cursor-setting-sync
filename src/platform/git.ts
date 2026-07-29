@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import { readdir, rename, rm, stat } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { directorySize, ensureDirectory, pathExists } from "./files";
@@ -117,19 +118,7 @@ export async function cloneRepository(
     assertSafeGitArgument(branch, "branch name");
   }
   await ensureDirectory(root);
-  // Leftover staging directories from an earlier failed clone are this
-  // extension's own debris; clearing them lets a retry reach the clone path
-  // instead of wedging on "must be an empty directory" forever.
-  for (const entry of await readdir(root)) {
-    if (entry.startsWith(".cursor-sync-clone-")) {
-      await rm(join(root, entry), {
-        recursive: true,
-        force: true,
-        maxRetries: 3,
-        retryDelay: 200,
-      }).catch(() => {});
-    }
-  }
+  await clearCloneStaging(root);
   const entries = await readdir(root);
   if (entries.length > 0) {
     throw new GitError(
@@ -144,7 +133,7 @@ export async function cloneRepository(
   // potentially another machine's repository content, with the deletions
   // propagating. Scoping everything to the staging directory makes deleting
   // a file the clone did not create structurally impossible.
-  const stagingName = `.cursor-sync-clone-${randomUUID().slice(0, 8)}`;
+  const stagingName = `${cloneStagingPrefix()}${randomUUID().slice(0, 8)}`;
   const staging = join(root, stagingName);
   const args = ["-c", "core.autocrlf=false", "clone"];
   if (branch !== undefined) {
@@ -201,6 +190,16 @@ export async function cloneRepository(
         () => {},
       );
     }
+    // Best-effort: with everything rolled back, removing the staging
+    // directory returns the folder to empty so "run Setup again" actually
+    // reaches the clone path; a lock that persists leaves the directory for
+    // the pre-clone sweep to clear next time.
+    await rm(staging, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 200,
+    }).catch(() => {});
     throw new GitError(
       "command",
       `The clone finished but its files could not be moved into place (${
@@ -218,6 +217,61 @@ export async function cloneRepository(
   }).catch(() => {});
   await disableLineEndingConversion(root);
 }
+
+/**
+ * The staging-directory prefix carries a token derived from this machine's
+ * hostname: in a cloud-synced folder, a bare shared prefix let one machine's
+ * pre-clone sweep delete the replica of ANOTHER machine's clone still in
+ * flight, with the deletion propagating.
+ */
+function cloneStagingPrefix(): string {
+  const token = createHash("sha256").update(hostname()).digest("hex").slice(0, 8);
+  return `.cursor-sync-clone-${token}-`;
+}
+
+/**
+ * Removes leftover clone-staging directories so a retry can reach the clone
+ * path again instead of wedging on "must be an empty directory" forever.
+ * Exposed for Setup, which gates the clone flow on folder emptiness BEFORE
+ * cloneRepository runs - a sweep only inside cloneRepository was unreachable
+ * exactly when it was needed.
+ *
+ * This machine's own staging directories (hostname token match) are removed
+ * on sight; another machine's are removed only when old enough that no
+ * legitimate clone can still be running behind them.
+ */
+export async function clearCloneStaging(root: string): Promise<void> {
+  const ownPrefix = cloneStagingPrefix();
+  let entries: string[];
+  try {
+    entries = await readdir(root);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith(".cursor-sync-clone-")) {
+      continue;
+    }
+    if (!entry.startsWith(ownPrefix)) {
+      const info = await stat(join(root, entry)).catch(() => null);
+      if (
+        info === null ||
+        Date.now() - info.mtimeMs < FOREIGN_STAGING_MIN_AGE_MS
+      ) {
+        continue;
+      }
+    }
+    await rm(join(root, entry), {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 200,
+    }).catch(() => {});
+  }
+}
+
+/** A clone takes at most GIT_NETWORK_TIMEOUT_MS; a day is decisively stale. */
+const FOREIGN_STAGING_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 
 async function renameWithRetries(from: string, to: string): Promise<void> {
   for (let attempt = 1; ; attempt += 1) {

@@ -55,6 +55,7 @@ import {
 import type { FileLock, LockHolderReport } from "../platform/lock";
 import {
   GitError,
+  clearCloneStaging,
   cloneRepository,
   commitAndPush,
   detectGit,
@@ -379,6 +380,12 @@ export class SyncManager implements vscode.Disposable {
     let exists = await pathExists(repositoryPath);
     let action: "join" | "create" | "cancel";
     let preparedGitRoot: string | null = null;
+    if (!exists) {
+      // A folder holding only debris from this machine's earlier failed
+      // clone must count as empty, or the clone path is unreachable forever
+      // and the picker below offers only creating a DIVERGENT repository.
+      await clearCloneStaging(root);
+    }
     if (exists) {
       action = "join";
     } else if ((await readdir(root)).length === 0) {
@@ -758,6 +765,10 @@ export class SyncManager implements vscode.Disposable {
     // repository is dropped. Tearing down underneath it would publish into the
     // shared folder after the user was told this device had disconnected.
     this.disposeRuntime();
+    if (this.reconnectProbeTimer !== null) {
+      clearTimeout(this.reconnectProbeTimer);
+      this.reconnectProbeTimer = null;
+    }
     try {
       await this.syncPromise;
     } catch {
@@ -1136,9 +1147,11 @@ export class SyncManager implements vscode.Disposable {
           // The user turned sync off while this window waited to reconnect;
           // resuming the watcher and publish cycles under a "disabled" status
           // bar is exactly what the setting says must not happen. The probe
-          // ends here - re-enabling goes through configurationChanged, which
-          // restarts everything itself.
+          // chain stays ALIVE though - configurationChanged cannot restart a
+          // window whose repository is null, so ending the chain here left
+          // disable-then-re-enable stranded until a manual reload.
           this.status.setStatus("disabled");
+          this.scheduleReconnectProbe(repositoryId);
           return;
         }
         if (await pathExists(this.disconnectMarkerPath(repositoryId))) {
@@ -3632,13 +3645,12 @@ export class SyncManager implements vscode.Disposable {
       clearTimeout(this.watcherDebounce);
       this.watcherDebounce = null;
     }
-    if (this.reconnectProbeTimer !== null) {
-      // An explicit stand-down (disable, disconnect, a fresh startWatching)
-      // also ends any pending reconnect probe; disconnectedElsewhere arms its
-      // probe AFTER calling this, so the one probe that should survive does.
-      clearTimeout(this.reconnectProbeTimer);
-      this.reconnectProbeTimer = null;
-    }
+    // The reconnect probe deliberately survives this: disposeRuntime also
+    // runs on every startWatching and on ANY configuration change (which
+    // reaches every window through the shared settings.json), and killing
+    // the probe there permanently stranded a disconnected-elsewhere window
+    // at "locked". The probe dies only with dispose() and disconnect() - the
+    // explicit ends of this window's participation.
     this.clearSyncIndicator();
   }
 

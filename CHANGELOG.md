@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.37] - 2026-07-29
+
+Convergence round four: five findings against the 0.0.36 diff, all narrow lifecycle refinements of that release's own additions.
+
+### Fixed
+
+- The reconnect probe survives configuration changes and disable/re-enable: clearing it inside disposeRuntime meant ANY settings change (which reaches every window) permanently stranded a disconnected-elsewhere window at "locked", and the disabled gate ended the probe chain a re-enable could never restart. The probe now keeps watching while disabled (without resuming sync) and dies only with dispose() and disconnect().
+- The leftover-staging sweep is reachable where it matters: Setup clears this machine's clone-staging debris BEFORE its emptiness check, so a failed clone's retry reaches the clone path instead of a picker that only offers creating a divergent repository; the promotion-failure path also removes its staging directory after rolling back. Staging names now carry a hostname-derived token, and another machine's staging directory is only swept when a day old - a bare prefix match could delete the replica of a clone still running on the other computer.
+- The changelog's duplicate-heading class is retired: the 0.0.35 duplicate this round introduced and the older 0.0.33/0.0.32 pairs are all deduplicated.
+
 ## [0.0.36] - 2026-07-29
 
 Convergence round three: verification of the 0.0.35 diff raised six findings - four distinct, all small, all fixed here. The finding count across rounds (32, then 18, then 6, all progressively narrower in scope) is the convergence the audit series was run for.
@@ -10,8 +20,6 @@ Convergence round three: verification of the 0.0.35 diff raised six findings - f
 
 - The staged clone's promotion step tolerates transient Windows locks (OneDrive, antivirus) with retries; on unrecoverable failure it moves the promoted entries back and fails with instructions instead of leaving the target half-assembled behind a raw EPERM. Leftover staging directories from an earlier failed clone are cleared automatically, so a retry reaches the clone path again. The mid-clone foreign-file abort now says to WAIT and re-run Setup when the folder syncs from another computer - the previous wording told the user to delete what may be the other machine's repository.
 - The reconnect probe respects the enabled setting: a window torn down by a sibling's disconnect and then disabled no longer resumes watching and publishing under a "disabled" status bar after a later Setup; disable, disconnect and a fresh start of watching also cancel any pending probe.
-
-## [0.0.35] - 2026-07-29
 
 ## [0.0.35] - 2026-07-29
 
@@ -72,8 +80,6 @@ Convergence round one: a fresh-eyes audit of the last three releases' own fixes 
 
 ## [0.0.33] - 2026-07-29
 
-## [0.0.33] - 2026-07-29
-
 A backup-and-restore audit under multi-window and multi-computer concurrency: six reviewers over backup creation, retention, the restore flow, the shutdown export, cross-machine semantics and user-facing truth; 70 interleavings traced (most came up clean), 32 findings adversarially verified, none refuted. The reachable ones are fixed.
 
 ### Fixed - backup and restore integrity
@@ -95,8 +101,6 @@ A backup-and-restore audit under multi-window and multi-computer concurrency: si
 - Final-export warnings consumed mid-session (a vetoed quit) are no longer destroyed unseen: they merge into the standing warnings instead of being skipped past on a path that had already deleted the result file.
 - Real per-resource apply failures are promoted to standing warnings; folded into the routine skip list inside a green result, a resource failing identically on every apply was invisible.
 - The restore confirmation says that the restored state propagates to other computers through synchronization; Restore Backup participates in the apply-in-progress protocol, so it cannot race a Restart to Apply from another window; helper results another window claimed and never processed are swept after an hour.
-
-## [0.0.32] - 2026-07-29
 
 ## [0.0.32] - 2026-07-29
 
