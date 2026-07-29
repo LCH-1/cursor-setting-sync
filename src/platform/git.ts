@@ -218,15 +218,19 @@ export async function cloneRepository(
   await disableLineEndingConversion(root);
 }
 
+function hostToken(): string {
+  return createHash("sha256").update(hostname()).digest("hex").slice(0, 8);
+}
+
 /**
- * The staging-directory prefix carries a token derived from this machine's
- * hostname: in a cloud-synced folder, a bare shared prefix let one machine's
- * pre-clone sweep delete the replica of ANOTHER machine's clone still in
- * flight, with the deletion propagating.
+ * The staging-directory prefix carries a hostname token AND this process's
+ * pid. The hostname token keeps one MACHINE's sweep from deleting another
+ * machine's in-flight clone through the cloud replica; the pid keeps one
+ * WINDOW's Setup from deleting a sibling window's clone on the same machine
+ * - merely opening Setup used to sweep on sight by machine token alone.
  */
 function cloneStagingPrefix(): string {
-  const token = createHash("sha256").update(hostname()).digest("hex").slice(0, 8);
-  return `.cursor-sync-clone-${token}-`;
+  return `.cursor-sync-clone-${hostToken()}-${process.pid}-`;
 }
 
 /**
@@ -236,12 +240,17 @@ function cloneStagingPrefix(): string {
  * cloneRepository runs - a sweep only inside cloneRepository was unreachable
  * exactly when it was needed.
  *
- * This machine's own staging directories (hostname token match) are removed
- * on sight; another machine's are removed only when old enough that no
- * legitimate clone can still be running behind them.
+ * Removal rules, most to least certain:
+ * - this process's own directories: on sight;
+ * - same machine, other process: only when that pid is provably dead, or the
+ *   entry is older than any clone can run (the pid may be unparseable in
+ *   old-format names);
+ * - another machine's: only when a day old - its clone may be in flight and
+ *   deletions propagate through the cloud replica.
  */
 export async function clearCloneStaging(root: string): Promise<void> {
   const ownPrefix = cloneStagingPrefix();
+  const machinePrefix = `.cursor-sync-clone-${hostToken()}-`;
   let entries: string[];
   try {
     entries = await readdir(root);
@@ -253,12 +262,23 @@ export async function clearCloneStaging(root: string): Promise<void> {
       continue;
     }
     if (!entry.startsWith(ownPrefix)) {
-      const info = await stat(join(root, entry)).catch(() => null);
-      if (
-        info === null ||
-        Date.now() - info.mtimeMs < FOREIGN_STAGING_MIN_AGE_MS
-      ) {
-        continue;
+      let minAgeMs = FOREIGN_STAGING_MIN_AGE_MS;
+      if (entry.startsWith(machinePrefix)) {
+        const pid = Number.parseInt(
+          entry.slice(machinePrefix.length).split("-")[0] ?? "",
+          10,
+        );
+        if (Number.isFinite(pid) && !processIsAlive(pid)) {
+          minAgeMs = 0;
+        } else {
+          minAgeMs = SIBLING_STAGING_MIN_AGE_MS;
+        }
+      }
+      if (minAgeMs > 0) {
+        const info = await stat(join(root, entry)).catch(() => null);
+        if (info === null || Date.now() - info.mtimeMs < minAgeMs) {
+          continue;
+        }
       }
     }
     await rm(join(root, entry), {
@@ -270,8 +290,20 @@ export async function clearCloneStaging(root: string): Promise<void> {
   }
 }
 
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
 /** A clone takes at most GIT_NETWORK_TIMEOUT_MS; a day is decisively stale. */
 const FOREIGN_STAGING_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** Same machine, live-or-unknown pid: just over the clone's own timeout. */
+const SIBLING_STAGING_MIN_AGE_MS = 15 * 60 * 1000;
 
 async function renameWithRetries(from: string, to: string): Promise<void> {
   for (let attempt = 1; ; attempt += 1) {

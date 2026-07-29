@@ -2,6 +2,14 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.38] - 2026-07-29
+
+Convergence round five: one finding, low severity, fixed.
+
+### Fixed
+
+- Clone-staging names carry the process id as well as the hostname token, and the sweep removes a same-machine entry only when its process is provably dead (or the entry outlives any possible clone): opening Setup in a second window could previously delete a sibling window's clone mid-flight, since the hostname token distinguishes machines but not windows.
+
 ## [0.0.37] - 2026-07-29
 
 Convergence round four: five findings against the 0.0.36 diff, all narrow lifecycle refinements of that release's own additions.
