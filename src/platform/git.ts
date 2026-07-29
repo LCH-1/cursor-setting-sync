@@ -264,11 +264,15 @@ export async function clearCloneStaging(root: string): Promise<void> {
     if (!entry.startsWith(ownPrefix)) {
       let minAgeMs = FOREIGN_STAGING_MIN_AGE_MS;
       if (entry.startsWith(machinePrefix)) {
-        const pid = Number.parseInt(
-          entry.slice(machinePrefix.length).split("-")[0] ?? "",
-          10,
-        );
-        if (Number.isFinite(pid) && !processIsAlive(pid)) {
+        // The segment is a pid only when it is STRUCTURALLY one: all-decimal
+        // AND followed by another hyphen-delimited segment (the uuid). A
+        // legacy 0.0.37 name is 8 bare hex chars, which parseInt would
+        // partial-parse into a garbage never-alive pid and delete on sight -
+        // exactly the sibling-clone deletion this function must not do.
+        const segments = entry.slice(machinePrefix.length).split("-");
+        const pidSegment = segments[0] ?? "";
+        const structuallyPid = segments.length > 1 && /^\d+$/.test(pidSegment);
+        if (structuallyPid && !processIsAlive(Number.parseInt(pidSegment, 10))) {
           minAgeMs = 0;
         } else {
           minAgeMs = SIBLING_STAGING_MIN_AGE_MS;

@@ -2,6 +2,14 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.39] - 2026-07-29
+
+Convergence round six: one finding, low severity, confined to the one-release upgrade window.
+
+### Fixed
+
+- The staging-sweep pid check requires the segment to be structurally a pid (all-decimal, followed by the uuid segment): parseInt partial-parsed a pre-0.0.38 name's bare hex suffix into a garbage never-alive pid, deleting on sight the very sibling-window clone the age gate was promised for during the one-release mixed-version window.
+
 ## [0.0.38] - 2026-07-29
 
 Convergence round five: one finding, low severity, fixed.
