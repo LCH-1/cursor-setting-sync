@@ -72,6 +72,12 @@ export interface HelperBackup {
 
 export interface HelperResult {
   requestId: string;
+  /**
+   * Which request produced this result; absent on results written before
+   * 0.0.32. A final-export success says nothing about a failed apply, so the
+   * consumer must not let one clear the apply-failure bar.
+   */
+  mode?: HelperRequest["mode"];
   success: boolean;
   completedAt: string;
   applied: string[];

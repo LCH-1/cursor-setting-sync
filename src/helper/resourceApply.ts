@@ -30,6 +30,7 @@ import {
 } from "../chat/storeDb";
 import { EXTENSION_ID } from "../constants";
 import { createExtensionIgnoreMatcher } from "../resources/extensions";
+import { semanticHash } from "../resources/jsonc";
 import { assertValidProfileId } from "../resources/profilePaths";
 import {
   discoverWorkspaces,
@@ -316,6 +317,7 @@ export async function applyNonGlobalChanges(
   applied.push(...extensionResult.applied);
   skipped.push(...extensionResult.skipped);
   retainedLocal.push(...extensionResult.retainedLocal);
+  Object.assign(retainedLocalHashes, extensionResult.retainedLocalHashes);
   return {
     applied,
     skipped,
@@ -472,10 +474,16 @@ async function applyExtensionChanges(
   registerBackup: (backup: HelperBackup) => void,
   heartbeat: () => void = () => {},
   exemptBackupPaths: () => readonly string[] = () => [],
-): Promise<{ applied: string[]; skipped: string[]; retainedLocal: string[] }> {
+): Promise<{
+  applied: string[];
+  skipped: string[];
+  retainedLocal: string[];
+  retainedLocalHashes: Record<string, string>;
+}> {
   const applied: string[] = [];
   const skipped: string[] = [];
   const retainedLocal: string[] = [];
+  const retainedLocalHashes: Record<string, string> = {};
   const ignoredExtensions = createExtensionIgnoreMatcher(
     request.syncOptions.ignoredExtensions,
   );
@@ -607,6 +615,32 @@ async function applyExtensionChanges(
         skipped.push(`${change.resourceId}: ${cliFailureText(error)}`);
         continue;
       }
+      if (installTarget === extensionId) {
+        // A non-pinned install asks this machine's resolver for its own
+        // engine-compatible "latest", which on a Cursor version skew is NOT
+        // the version the other machine published. The next scan would then
+        // republish this machine's version as a fresh change, the peer would
+        // install ITS latest and republish, and the pair ping-ponged one
+        // event per cycle indefinitely. Recording the hash of what was
+        // actually installed lets the scan recognize it as the applied state.
+        const actualVersion = await installedExtensionVersion(
+          request,
+          cli,
+          profileArgs,
+          extensionId,
+        );
+        if (actualVersion !== null && actualVersion !== version) {
+          retainedLocal.push(change.resourceId);
+          retainedLocalHashes[change.resourceId] = semanticHash({
+            id: extensionId,
+            version: actualVersion,
+            installed: true,
+            enabled: desired.enabled,
+            preRelease: desired.preRelease,
+            pinned: desired.pinned,
+          });
+        }
+      }
       applied.push(change.resourceId);
     } catch (error) {
       if (error instanceof CursorReopenedError) {
@@ -619,7 +653,42 @@ async function applyExtensionChanges(
       );
     }
   }
-  return { applied, skipped, retainedLocal };
+  return { applied, skipped, retainedLocal, retainedLocalHashes };
+}
+
+/**
+ * The version the CLI actually installed for this profile, or null when the
+ * listing cannot be read - in which case no retained hash is recorded and the
+ * next scan simply republishes, the pre-existing behavior.
+ */
+async function installedExtensionVersion(
+  request: HelperRequest,
+  cli: string,
+  profileArgs: readonly string[],
+  extensionId: string,
+): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      request.cursorExecutable,
+      [cli, "--list-extensions", "--show-versions", ...profileArgs],
+      {
+        windowsHide: true,
+        timeout: 120_000,
+        maxBuffer: 10 * 1024 * 1024,
+        env: cliEnvironment(),
+      },
+    );
+    const prefix = `${extensionId.toLowerCase()}@`;
+    for (const line of stdout.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed.toLowerCase().startsWith(prefix)) {
+        return trimmed.slice(prefix.length);
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function cliFailureText(error: unknown): string {

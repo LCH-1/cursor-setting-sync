@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { open } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
@@ -20,6 +20,26 @@ import type { HelperChange, HelperRequest } from "./types";
 export type HelperSyncOptions = HelperRequest["syncOptions"];
 
 /**
+ * How a request to install this window's shutdown finalizer ended.
+ *
+ * - `armed`: the previous finalizer exited and this window's replacement holds
+ *   the lock.
+ * - `adopted`: another window installed a finalizer AFTER this window asked the
+ *   old one to stand down. That one never reads this window's cancel marker as
+ *   addressed to it (the marker predates it), so waiting out the 30 seconds and
+ *   failing was guaranteed - and pointless, because a live finalizer with
+ *   current state already covers the shutdown export. Seven windows restoring
+ *   at once made this the COMMON activation path, and the guaranteed failure
+ *   took the whole activation down with it.
+ * - `stalled`: the standing finalizer neither exited nor qualified for
+ *   adoption within the wait - typically one mid-export from the previous
+ *   quit, which only polls its cancel marker while waiting for Cursor to
+ *   exit. It finishes and releases on its own; the caller retries later
+ *   instead of dying.
+ */
+export type FinalizerReplaceOutcome = "armed" | "adopted" | "stalled";
+
+/**
  * The apply helper waits up to 180 seconds for every Cursor process to exit.
  * A re-armed finalizer is itself a Cursor.exe process, so re-arming before the
  * helper gives up would keep it from ever seeing zero other Cursor processes.
@@ -35,6 +55,8 @@ export class HelperLauncher {
   constructor(
     private readonly paths: CursorPaths,
     private readonly compatibility: CompatibilityReport,
+    /** Test seam: how long a finalizer replacement waits for the old holder. */
+    private readonly replaceWaitMs = 30_000,
   ) {
     this.cancelFinalizersPath = join(paths.extensionStorage, "cancel-finalizers");
   }
@@ -62,24 +84,31 @@ export class HelperLauncher {
     masterKey: Buffer,
     workspaceMappings: Record<string, string>,
     syncOptions: HelperSyncOptions,
-  ): Promise<void> {
-    await this.cancelFinalizers();
-    await this.waitForFinalizersToExit();
+  ): Promise<FinalizerReplaceOutcome> {
+    const cancelledAt = await this.cancelFinalizers();
+    const wait = await this.waitForFinalizersToExit(cancelledAt);
+    if (wait !== "free") {
+      return wait;
+    }
     await this.startFinalizer(
       repositoryRoot,
       masterKey,
       workspaceMappings,
       syncOptions,
     );
+    return "armed";
   }
 
-  async cancelFinalizers(): Promise<void> {
+  /** Returns the marker timestamp, for comparing against a later holder. */
+  async cancelFinalizers(): Promise<number> {
+    const stamp = new Date().toISOString();
     await writeFileAtomic(
       this.cancelFinalizersPath,
-      Buffer.from(new Date().toISOString(), "utf8"),
+      Buffer.from(stamp, "utf8"),
     );
     this.finalizer?.kill();
     this.finalizer = null;
+    return Date.parse(stamp);
   }
 
   async applyAndRestart(
@@ -283,18 +312,95 @@ export class HelperLauncher {
     return child;
   }
 
-  private async waitForFinalizersToExit(): Promise<void> {
+  private async waitForFinalizersToExit(
+    cancelledAt: number,
+  ): Promise<"free" | FinalizerReplaceOutcome> {
     const lockPath = join(this.paths.extensionStorage, "shutdown-finalizer.lock");
     const startedAt = Date.now();
-    while (Date.now() - startedAt < 30_000) {
+    // A crashed finalizer's lock needs no handling here: its pid is dead, so
+    // isLockStale reads it as stale immediately (no TTL wait) and the acquire
+    // below breaks it through the atomic rename-verify takeover. An explicit
+    // rm() was tried and is strictly worse - between reading the holder and
+    // removing the file, a successor can create a LIVE lock at the same path.
+    let candidate: { pid: number; createdAt: number; seenAt: number } | null =
+      null;
+    while (Date.now() - startedAt < this.replaceWaitMs) {
       const lock = await acquireFileLock(lockPath);
       if (lock !== null) {
         await lock.release();
-        return;
+        return "free";
+      }
+      const holder = await readFinalizerLockHolder(lockPath);
+      if (
+        holder !== null &&
+        processAlive(holder.pid) &&
+        holder.createdAt > cancelledAt
+      ) {
+        // A lock stamped after this window's cancel marker is not proof the
+        // holder will stay: the marker is compared against the REQUEST's
+        // createdAt (stamped before spawn), so a finalizer whose boot spanned
+        // the marker write acquires the lock and then cancels itself
+        // milliseconds later. Adopting it would leave the session with no
+        // finalizer at all while every window logs success. A holder is only
+        // adopted once the SAME lock has survived a full second - a doomed
+        // one releases within tens of milliseconds of acquiring.
+        if (
+          candidate !== null &&
+          candidate.pid === holder.pid &&
+          candidate.createdAt === holder.createdAt
+        ) {
+          if (Date.now() - candidate.seenAt >= ADOPTION_CONFIRM_MS) {
+            return "adopted";
+          }
+        } else {
+          candidate = {
+            pid: holder.pid,
+            createdAt: holder.createdAt,
+            seenAt: Date.now(),
+          };
+        }
+      } else {
+        candidate = null;
       }
       await delay(100);
     }
-    throw new Error("Timed out replacing the shutdown finalizer.");
+    return "stalled";
+  }
+}
+
+const ADOPTION_CONFIRM_MS = 1_000;
+
+/**
+ * The holder a finalizer lock names, or null while the file is unreadable -
+ * including the milliseconds mid-creation, which must read as "someone is
+ * there", not as breakable.
+ */
+async function readFinalizerLockHolder(
+  lockPath: string,
+): Promise<{ pid: number; createdAt: number } | null> {
+  try {
+    const parsed = JSON.parse(await readFile(lockPath, "utf8")) as {
+      pid?: unknown;
+      createdAt?: unknown;
+    };
+    const createdAt =
+      typeof parsed.createdAt === "string" ? Date.parse(parsed.createdAt) : NaN;
+    if (typeof parsed.pid !== "number" || !Number.isFinite(createdAt)) {
+      return null;
+    }
+    return { pid: parsed.pid, createdAt };
+  } catch {
+    return null;
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM is a live process this user may not signal; only ESRCH is absence.
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 

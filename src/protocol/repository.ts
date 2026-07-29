@@ -500,13 +500,20 @@ export class SyncRepository {
       lastEventHash: eventHash,
     };
     await this.stateStore.save(this.state);
-    await writeJsonAtomic(join(this.deviceRoot(header.deviceId), "head.json"), {
-      deviceId: header.deviceId,
-      sequence: header.sequence,
-      eventHash,
-      lamport: manifest.lamport,
-      updatedAt: new Date().toISOString(),
-    });
+    try {
+      await writeJsonAtomic(join(this.deviceRoot(header.deviceId), "head.json"), {
+        deviceId: header.deviceId,
+        sequence: header.sequence,
+        eventHash,
+        lamport: manifest.lamport,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch {
+      // head.json is advisory - its reader already tolerates absence and
+      // damage. The event and state writes above ARE the publish; reporting
+      // it failed over a hint file made a durably committed publish retry
+      // and duplicate.
+    }
     return { eventHash, eventPath, changeCount: changes.length };
   }
 
@@ -2111,10 +2118,27 @@ function checkpointStreamRollbackError(deviceId: string, sequence: number): Erro
   );
 }
 
+/**
+ * Whether a failure to read an event file is tolerable for a file the absorbed
+ * checkpoint already covers. Only such files ever reach this test - the caller
+ * gates on `fileSequence <= checkpointCursor.lastSequence` - so skipping loses
+ * no content; the question is only which failure SHAPES a mid-prune or
+ * mid-propagation file can produce. A cloud-synced folder produces more than
+ * ENOENT: a zero-byte or truncated placeholder parses as a SyntaxError, a
+ * partially propagated envelope fails validation ("Event ..." messages), and a
+ * torn ciphertext fails authentication. All of them once threw out of
+ * listEvents and killed every cycle on the reading machine until the file
+ * finished hydrating - for content the checkpoint already carried.
+ */
 function isTolerablePrunedEventError(error: unknown): boolean {
+  if (isMissingPathError(error) || error instanceof SyntaxError) {
+    return true;
+  }
   return (
-    isMissingPathError(error) ||
-    (error instanceof Error && error.message.startsWith("Event file hash mismatch"))
+    error instanceof Error &&
+    (error.message.startsWith("Event ") ||
+      error.message.startsWith("Unsupported state authentication") ||
+      error.message.includes("Unsupported state or unable to authenticate data"))
   );
 }
 
@@ -2429,7 +2453,9 @@ function validateEventHeader(header: EventHeader, repositoryId: string): void {
     throw new Error("Unsupported event envelope version.");
   }
   if (header.repositoryId !== repositoryId) {
-    throw new Error("Event belongs to a different repository.");
+    throw new Error(
+      "Event belongs to a different repository. This usually means Setup ran on two computers against the same folder before the cloud sync had copied either one's repository files: each created its own repository, and the folder now holds both. Keep one computer's setup, run \"Cursor Setting Sync: Disconnect\" on the other, delete the other device's folder under devices/ (its repo.json conflict copy too, if the cloud client made one), and run Setup there again pointing at this folder.",
+    );
   }
   assertSafeIdentifier(header.deviceId, "event device ID");
   if (

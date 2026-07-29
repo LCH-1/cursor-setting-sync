@@ -129,6 +129,14 @@ export async function acquireFileLock(path: string): Promise<FileLock | null> {
     await undoTakeover(path, takeoverPath);
     return null;
   }
+  if (moved !== null && !(await isLockStale(takeoverPath, moved))) {
+    // The staleness verdict predates the rename. A holder whose heartbeat
+    // landed in between is alive - the rename preserved the fresh mtime, so
+    // re-judging the moved file sees it. isSameLock alone cannot: the bytes
+    // (pid, token) are identical whether the holder is dead or mid-beat.
+    await undoTakeover(path, takeoverPath);
+    return null;
+  }
   await rm(takeoverPath, { force: true });
   return tryCreateLock(path, content);
 }

@@ -2,6 +2,36 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.32] - 2026-07-29
+
+A concurrency-focused inspection of the whole extension - seven reviewers over multi-window races, extension-helper lifecycle, lock protocols, failure blast radius, republish loops, shared-folder semantics and cross-device convergence, every finding adversarially verified: 34 raised, 33 confirmed or downgraded-but-real. The reachable ones are fixed.
+
+### Fixed - activation and multi-window
+
+- Seven windows restoring at once no longer race to replace the shutdown finalizer with a 30-second timeout that killed the losing window's WHOLE activation ("Timed out replacing the shutdown finalizer"). Replacement now ends three ways, none fatal: armed (the old one exited), adopted (another window installed a newer finalizer - confirmed only after it holds the lock a full second, because one whose boot spanned this window's cancel marker self-cancels milliseconds after acquiring), or stalled (one is mid-export; a retry lands this session's finalizer a minute later). Arming is serialized per window, never throws, and reschedules itself on failure.
+- Opening the repository now holds the sync lock, like the helper always has. An opening window's state save raced a sibling's live cycle and could revert projections and pending queues the cycle had just persisted - resurrecting resources another machine deleted.
+- Helper results are claimed by atomic rename before being read, so restoring windows report each result exactly once; an apply failure consumed in ANY window re-arms the shutdown finalizer (the recovery used to live only in the window that launched the apply, which may be closed); a final-export success no longer clears the red bar a failed apply latched; and a failed applyAndRestart launch re-arms the finalizer it had just cancelled.
+- A second window can no longer start a second Restart to Apply over the same queue while the first one's quit is in flight: committing to an apply leaves a marker other windows honor for three and a half minutes.
+- A transient EPERM probing the sync lock (antivirus, cloud-sync tooling) skips the cycle instead of killing activation; the takeover of a stale readable lock re-checks the holder's liveness after the rename, closing a window where a heartbeat between the verdict and the rename lost its lock.
+
+### Fixed - loops and cross-device convergence
+
+- Four more republish loops of the 0.0.31 flood class: a non-pinned extension apply installs this machine's own "latest", and on a Cursor version skew the two machines re-published their versions at each other indefinitely - the helper now records the hash of what it actually installed, and the scan recognizes it as applied. A chat whose workspaceId was remapped (and whose header carries no timestamp) republished one event per restart on each machine - the written form's hash is recorded the same way. A profile manifest merged with local-only profiles echoed between machines forever - likewise. All three ride the retained-local mechanism workspace databases already used.
+- A ui-state fork with three or more tips - several windows or machines each merging a different pair - had no two-tip shape, sat unresolved forever, and refused every checkpoint. It now resolves last-writer-wins, as does any fork on a policy-excluded key (the reactive-storage blob), which a 0.0.30 peer could otherwise re-derive against 0.0.31 every cycle.
+
+### Fixed - shared-folder resilience
+
+- One event whose payload had not crossed OneDrive yet no longer aborts every inbound apply cycle after cycle (extension side) or fails the whole shutdown batch (helper side): the resource defers itself, everything else applies, and it retries when the file arrives.
+- An event file the checkpoint already covers that reads as zero-byte, truncated, torn or unauthenticated mid-propagation is skipped like the already-tolerated deleted one, instead of killing every cycle until it hydrates.
+- Atomic writes retry the commit rename through transient cloud-sync locks the way reads always did, and a durably committed publish can no longer be reported failed over the advisory head.json.
+- The two-repositories-in-one-folder wedge (Setup run on both computers before the cloud copied either) is explained with recovery steps instead of "Event belongs to a different repository."
+
+### Known limits, accepted deliberately
+
+- Restart to Apply still holds the sync lock while its workspace-mapping prompts are open; other windows skip cycles until the dialog is answered.
+- Profile deletions still resurrect through the union merge (by design); only the infinite echo is gone.
+- Two windows consuming two DIFFERENT helper results in the same instant can still lose one backup-list entry (the files themselves are untouched).
+
 ## [0.0.31] - 2026-07-29
 
 ### Changed

@@ -33,9 +33,12 @@ import {
   resolveTargetWorkspace,
 } from "../chat/workspace";
 import {
+  normalizeProfile,
   parsePortableProfiles,
   type PortableProfile,
 } from "../resources/profiles";
+import { semanticHash } from "../resources/jsonc";
+import { canonicalBytes, sha256 } from "../protocol/canonical";
 import {
   isIgnoredUiStateKey,
   isPolicyExcludedUiStateKey,
@@ -54,6 +57,10 @@ export interface DatabaseApplyResult {
   backupPath: string;
   applied: string[];
   skipped: string[];
+  /** Resources whose bytes on disk differ from the published version. */
+  retainedLocal: string[];
+  /** What the next scan of those resources will hash to. */
+  retainedLocalHashes: Record<string, string>;
 }
 
 interface RestoreJournal {
@@ -683,7 +690,18 @@ async function preflightGlobalChanges(
 class FatalApplyError extends Error {}
 
 type ChangeOutcome =
-  | { status: "applied" }
+  | {
+      status: "applied";
+      /**
+       * Present when what was WRITTEN differs from what was published - a
+       * chat whose workspaceId was remapped to this machine's id, a profile
+       * manifest merged with local-only profiles. The next scan hashes the
+       * written form; without recording it here the mismatch republished the
+       * resource every cycle, and on a two-machine pair each apply fed the
+       * other's next publish forever.
+       */
+      retainedLocalHash?: string;
+    }
   | { status: "ignored" }
   /**
    * The local value wins and nothing was written, but the change is still
@@ -699,9 +717,16 @@ function applyPreparedChanges(
   prepared: PreparedHelperChange[],
   localWorkspaces: Awaited<ReturnType<typeof discoverWorkspaces>>,
   heartbeat: () => void = () => {},
-): { applied: string[]; skipped: string[] } {
+): {
+  applied: string[];
+  skipped: string[];
+  retainedLocal: string[];
+  retainedLocalHashes: Record<string, string>;
+} {
   const applied: string[] = [];
   const skipped: string[] = [];
+  const retainedLocal: string[] = [];
+  const retainedLocalHashes: Record<string, string> = {};
   const marker: MarkerState = {
     entries: readTargetMarker(database),
     dirty: false,
@@ -739,6 +764,10 @@ function applyPreparedChanges(
     }
     if (outcome.status === "applied") {
       applied.push(item.change.resourceId);
+      if (outcome.retainedLocalHash !== undefined) {
+        retainedLocal.push(item.change.resourceId);
+        retainedLocalHashes[item.change.resourceId] = outcome.retainedLocalHash;
+      }
     } else if (outcome.status === "retained-local") {
       skipped.push(`${item.change.resourceId}: ${outcome.reason}`);
       applied.push(item.change.resourceId);
@@ -757,7 +786,7 @@ function applyPreparedChanges(
       )
       .run(TARGET_STORAGE_MARKER, JSON.stringify(marker.entries));
   }
-  return { applied, skipped };
+  return { applied, skipped, retainedLocal, retainedLocalHashes };
 }
 
 function applyPreparedChange(
@@ -785,7 +814,7 @@ function applyPreparedChange(
       // A workspace-less composer round-trips as workspace-less; there is
       // nothing to map and no local workspace it belongs to.
       upsertChat(database, snapshot, null);
-      return { status: "applied" };
+      return chatAppliedOutcome(change.semanticHash, snapshot, null);
     }
     const sourceWorkspaceUri = metadataStringOrNull(
       change.metadata,
@@ -807,10 +836,10 @@ function applyPreparedChange(
       // Writing a workspace ID that names nothing local is a state Cursor
       // already handles: it is what a deleted workspace folder leaves behind.
       upsertChat(database, snapshot, sourceWorkspaceId);
-      return { status: "applied" };
+      return chatAppliedOutcome(change.semanticHash, snapshot, sourceWorkspaceId);
     }
     upsertChat(database, snapshot, targetWorkspaceId);
-    return { status: "applied" };
+    return chatAppliedOutcome(change.semanticHash, snapshot, targetWorkspaceId);
   }
 
   if (change.kind === "ui-state" || change.kind === "cursor-user-rules") {
@@ -900,10 +929,46 @@ function applyPreparedChange(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       )
       .run("userDataProfiles", JSON.stringify(stored));
-    return { status: "applied" };
+    // The merge is union-only, so a manifest with local-only profiles hashes
+    // differently from the published one. The next scan reads exactly what
+    // was written: recording that hash keeps the union from being republished
+    // as a fresh change - which the peer merged and republished in turn, one
+    // echo per apply, resurrecting every deletion forever.
+    const written = stored
+      .map(normalizeProfile)
+      .sort((left, right) => left.id.localeCompare(right.id));
+    const writtenHash = semanticHash(written as unknown as JsonValue);
+    return {
+      status: "applied",
+      ...(writtenHash === change.semanticHash
+        ? {}
+        : { retainedLocalHash: writtenHash }),
+    };
   }
 
   return { status: "ignored" };
+}
+
+/**
+ * The applied outcome for a chat, carrying the written form's hash when the
+ * remapped workspaceId (or any other normalization) made it differ from the
+ * published bytes. The scan serializes with `canonicalBytes` and hashes those
+ * bytes, so this must mirror it exactly.
+ */
+function chatAppliedOutcome(
+  publishedHash: string,
+  snapshot: ReturnType<typeof parsePortableChatSnapshot>,
+  writtenWorkspaceId: string | null,
+): ChangeOutcome {
+  const written = canonicalBytes({
+    ...snapshot,
+    header: { ...snapshot.header, workspaceId: writtenWorkspaceId },
+  });
+  const writtenHash = sha256(written);
+  return {
+    status: "applied",
+    ...(writtenHash === publishedHash ? {} : { retainedLocalHash: writtenHash }),
+  };
 }
 
 /**

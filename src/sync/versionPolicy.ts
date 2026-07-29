@@ -18,9 +18,18 @@ export function shouldPublishSnapshot(
 ): boolean {
   if (
     projection !== undefined &&
-    ["chat", "chat-transcript", "chat-store", "workspace-storage"].includes(
-      projection.kind,
-    ) &&
+    [
+      "chat",
+      "chat-transcript",
+      "chat-store",
+      "workspace-storage",
+      // profile and extension applies write a form that deliberately differs
+      // from the published bytes (a union-merged manifest, the version this
+      // machine's resolver actually installed); the recorded hash is that
+      // written form, and republishing it echoed between machines forever.
+      "profile",
+      "extension",
+    ].includes(projection.kind) &&
     projection.retainedLocalHash === snapshot.semanticHash
   ) {
     return false;

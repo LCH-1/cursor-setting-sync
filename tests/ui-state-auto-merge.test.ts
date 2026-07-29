@@ -28,7 +28,9 @@ const PRODUCER: EventProducer = {
   vscodeVersion: "1.125.0",
 };
 
-const PINNED_PANELS = "ui-state/workbench.auxiliarybar.pinnedPanels";
+// A key NOT on the policy-exclusion list: excluded keys now short-circuit to
+// last-writer-wins before the structural merge these tests exercise.
+const PINNED_PANELS = "ui-state/workbench.activity.pinnedViewlets2";
 
 const BASE_PANELS = panels([
   ["workbench.panel.chatSidebar", 0, true],
@@ -266,6 +268,54 @@ describe("ui-state auto-merge", () => {
       expect(warnings[0]).toContain("cursorSettingSync.maxPayloadMiB");
       expect(warnings[0]).toContain("Cursor Setting Sync: Resolve Conflicts");
     }, limit);
+  });
+
+  it("resolves a policy-excluded key by last writer instead of merging churn", async () => {
+    await withRepository(async (repository) => {
+      const resourceId =
+        "ui-state/src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser";
+      const conflicts = await forkResource(
+        repository,
+        resourceId,
+        "ui-state",
+        Buffer.from('{"tick":1}', "utf8"),
+        Buffer.from('{"tick":2}', "utf8"),
+        Buffer.from('{"tick":3}', "utf8"),
+      );
+      expect(conflicts).toHaveLength(1);
+
+      // One LWW resolution ends the chain; the scan never republishes the
+      // key, so this is the last event the resource ever produces.
+      expect(await autoMergeConflicts(repository, conflicts)).toBe(true);
+      expect(await reconcileConflicts(repository)).toHaveLength(0);
+      expect(repository.state.tips[resourceId]).toHaveLength(1);
+    });
+  });
+
+  it("resolves a three-tip ui-state fork that blocked checkpoints forever", async () => {
+    await withRepository(async (repository) => {
+      const resourceId = "ui-state/workbench.activityBar.location";
+      const published = await repository.publish(
+        [snapshot(resourceId, "ui-state", Buffer.from("base", "utf8"))],
+        [],
+      );
+      const parents = [`${published.eventHash}#0`];
+      // Three concurrent children of one base: the two-tip machinery had no
+      // shape for this, so the fork sat unresolved and refused every
+      // checkpoint from then on.
+      for (const value of ["left", "middle", "right"]) {
+        await repository.publish(
+          [{ ...snapshot(resourceId, "ui-state", Buffer.from(value, "utf8")), parents }],
+          [],
+        );
+      }
+      const conflicts = await reconcileConflicts(repository);
+      expect(conflicts).toHaveLength(1);
+
+      expect(await autoMergeConflicts(repository, conflicts)).toBe(true);
+      expect(await reconcileConflicts(repository)).toHaveLength(0);
+      expect(repository.state.tips[resourceId]).toHaveLength(1);
+    });
   });
 
   it("still asks for a cursor-user-rules conflict", async () => {

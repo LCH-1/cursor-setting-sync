@@ -1,5 +1,5 @@
 import { basename, isAbsolute, join, relative } from "node:path";
-import { readFile, readdir, rm, stat } from "node:fs/promises";
+import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import * as vscode from "vscode";
 import {
   AUTOMATIC_CHECKPOINT_COOLDOWN_MS,
@@ -44,6 +44,7 @@ import {
   listFilesRecursively,
   pathExists,
   readJsonFile,
+  writeJsonAtomic,
 } from "../platform/files";
 import {
   acquireFileLock,
@@ -210,6 +211,11 @@ export class SyncManager implements vscode.Disposable {
   private pollTimer: NodeJS.Timeout | null = null;
   private chatPollTimer: NodeJS.Timeout | null = null;
   private watcherDebounce: NodeJS.Timeout | null = null;
+  private finalizerRetryTimer: NodeJS.Timeout | null = null;
+  private finalizerStartInFlight: Promise<void> | null = null;
+  private finalizerRestartRequested = false;
+  /** Resources whose payload has not crossed the shared folder yet, to log once. */
+  private readonly deferredApplyNoted = new Set<string>();
   private syncPromise: Promise<void> | null = null;
   private readonly pendingSyncScopes = new Set<SyncScope>();
   private pendingManualSync = false;
@@ -436,21 +442,23 @@ export class SyncManager implements vscode.Disposable {
               ? "Unlocking the repository (deriving the encryption key)..."
               : "Creating the repository (deriving the encryption key)...",
           );
-          return exists
-            ? SyncRepository.open(
-                root,
-                this.paths.extensionStorage,
-                passphrase,
-                this.configuration.maxPayloadBytes,
-                this.producer,
-              )
-            : SyncRepository.create(
-                root,
-                this.paths.extensionStorage,
-                passphrase,
-                this.configuration.maxPayloadBytes,
-                this.producer,
-              );
+          return this.withOpenLock(() =>
+            exists
+              ? SyncRepository.open(
+                  root,
+                  this.paths.extensionStorage,
+                  passphrase,
+                  this.configuration.maxPayloadBytes,
+                  this.producer,
+                )
+              : SyncRepository.create(
+                  root,
+                  this.paths.extensionStorage,
+                  passphrase,
+                  this.configuration.maxPayloadBytes,
+                  this.producer,
+                ),
+          );
         },
       );
     } catch (error) {
@@ -521,6 +529,16 @@ export class SyncManager implements vscode.Disposable {
   private async offerQueuedApply(occasion: "setup" | "launch"): Promise<void> {
     const repository = this.repository;
     if (repository === null || this.queuedApplyDeclined) {
+      return;
+    }
+    if (await this.applyAlreadyInProgress()) {
+      // A sibling window committed to an apply and the offer lock is free
+      // again because its dialog was answered - but its syncNow, git pull and
+      // quit can take tens of seconds. A second modal over the same queue in
+      // that window started a SECOND helper against the same batch.
+      this.status.log(
+        "Skipped the apply offer: another window already started this apply.",
+      );
       return;
     }
     // Counted the way the command counts it, rather than off the raw queue.
@@ -832,6 +850,13 @@ export class SyncManager implements vscode.Disposable {
     const repository = this.requireRepository();
     const masterKey = this.requireMasterKey();
     assertCompatibleForDatabaseWrite(this.compatibility);
+    if (await this.applyAlreadyInProgress()) {
+      const message =
+        "Another window already started this apply; Cursor will quit when it is ready.";
+      this.status.log(message);
+      void vscode.window.showInformationMessage(message);
+      return;
+    }
     await this.syncNow(true);
     // The sync above releases the lock, so this races the background cycle for
     // it a moment later - which is how the command the user asked for failed
@@ -881,40 +906,89 @@ export class SyncManager implements vscode.Disposable {
         `Applying ${changes.length} change(s); ${batch.deferredForBatchLimit} more exceed the per-apply size limit, stay queued, and are offered again after this pass.`,
       );
     }
-    await this.helper.applyAndRestart(
-      this.configuration.repositoryPath ?? repository.root,
-      masterKey,
-      changes,
-      this.configuration.workspaceMappings,
-      this.helperSyncOptions(),
-      async () => {
-        // The quit was vetoed, so the helper is about to give up and write a
-        // failure nobody would otherwise read until the next launch. The
-        // consume is best-effort because `scheduleQuitVetoCheck` invokes this
-        // with `void`: a throw here would go unhandled AND cost the session its
-        // shutdown export, which is the only workspaceStorage backup there is.
-        try {
-          await this.consumeHelperResults({ atStartup: false });
-        } catch (error) {
-          this.status.log(
-            `Could not read the offline helper's result: ${
-              error instanceof Error ? error.message : String(error)
-            }`,
+    await this.markApplyInProgress();
+    try {
+      await this.helper.applyAndRestart(
+        this.configuration.repositoryPath ?? repository.root,
+        masterKey,
+        changes,
+        this.configuration.workspaceMappings,
+        this.helperSyncOptions(),
+        async () => {
+          await this.clearApplyInProgress();
+          // The quit was vetoed, so the helper is about to give up and write a
+          // failure nobody would otherwise read until the next launch. The
+          // consume is best-effort because `scheduleQuitVetoCheck` invokes this
+          // with `void`: a throw here would go unhandled AND cost the session
+          // its shutdown export, which is the only workspaceStorage backup
+          // there is.
+          try {
+            await this.consumeHelperResults({ atStartup: false });
+          } catch (error) {
+            this.status.log(
+              `Could not read the offline helper's result: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+          await this.startFinalizer();
+        },
+        () => {
+          this.status.log(QUIT_STALLED_MESSAGE);
+          void vscode.window.showWarningMessage(QUIT_STALLED_MESSAGE).then(
+            () => {},
+            () => {
+              // The window may be mid-teardown; the output-channel line above
+              // is the durable record either way.
+            },
           );
-        }
-        await this.startFinalizer();
-      },
-      () => {
-        this.status.log(QUIT_STALLED_MESSAGE);
-        void vscode.window.showWarningMessage(QUIT_STALLED_MESSAGE).then(
-          () => {},
-          () => {
-            // The window may be mid-teardown; the output-channel line above is
-            // the durable record either way.
-          },
-        );
-      },
-    );
+        },
+      );
+    } catch (error) {
+      // applyAndRestart cancels the standing finalizer BEFORE it spawns the
+      // apply helper, so a launch that throws - the helper bundle mid-update,
+      // a spawn failure - would otherwise leave the session with no shutdown
+      // export at all and nothing scheduled to notice.
+      await this.clearApplyInProgress();
+      await this.startFinalizer();
+      throw error;
+    }
+  }
+
+  private applyInProgressPath(): string {
+    return join(this.paths.extensionStorage, "apply-in-progress.json");
+  }
+
+  /**
+   * Whether a sibling window committed to an apply recently enough that it may
+   * still be between its dialog and the quit. The budget is the helper's exit
+   * wait plus its lock wait plus margin; a marker older than that is a vetoed
+   * or crashed run whose cleanup never happened, and must not block the user.
+   */
+  private async applyAlreadyInProgress(): Promise<boolean> {
+    try {
+      const marker = await readJsonFile<{ createdAt?: string }>(
+        this.applyInProgressPath(),
+      );
+      const createdAt = Date.parse(marker.createdAt ?? "");
+      return (
+        Number.isFinite(createdAt) &&
+        Date.now() - createdAt < APPLY_IN_PROGRESS_TTL_MS
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private async markApplyInProgress(): Promise<void> {
+    await writeJsonAtomic(this.applyInProgressPath(), {
+      createdAt: new Date().toISOString(),
+      pid: process.pid,
+    });
+  }
+
+  private async clearApplyInProgress(): Promise<void> {
+    await rm(this.applyInProgressPath(), { force: true });
   }
 
   async resolveConflicts(): Promise<void> {
@@ -1422,26 +1496,33 @@ export class SyncManager implements vscode.Disposable {
     if (confirmed !== "Import and Restart") {
       return;
     }
-    await this.helper.restoreAndRestart(
-      repository.root,
-      masterKey,
-      selected.path,
-      this.helperSyncOptions(),
-      selected.restoreTarget,
-      async () => {
-        await this.startFinalizer();
-      },
-      () => {
-        this.status.log(QUIT_STALLED_MESSAGE);
-        void vscode.window.showWarningMessage(QUIT_STALLED_MESSAGE).then(
-          () => {},
-          () => {
-            // The window may be mid-teardown; the output-channel line above
-            // is the durable record either way.
-          },
-        );
-      },
-    );
+    try {
+      await this.helper.restoreAndRestart(
+        repository.root,
+        masterKey,
+        selected.path,
+        this.helperSyncOptions(),
+        selected.restoreTarget,
+        async () => {
+          await this.startFinalizer();
+        },
+        () => {
+          this.status.log(QUIT_STALLED_MESSAGE);
+          void vscode.window.showWarningMessage(QUIT_STALLED_MESSAGE).then(
+            () => {},
+            () => {
+              // The window may be mid-teardown; the output-channel line above
+              // is the durable record either way.
+            },
+          );
+        },
+      );
+    } catch (error) {
+      // Same as restartToApply: the restore flow cancelled the standing
+      // finalizer before launching, so a failed launch must re-arm it.
+      await this.startFinalizer();
+      throw error;
+    }
   }
 
   async forgetDevice(): Promise<void> {
@@ -1791,6 +1872,10 @@ export class SyncManager implements vscode.Disposable {
 
   dispose(): void {
     this.disposed = true;
+    if (this.finalizerRetryTimer !== null) {
+      clearTimeout(this.finalizerRetryTimer);
+      this.finalizerRetryTimer = null;
+    }
     this.disposeRuntime();
     this.warnings.clear();
     this.historyPreviewRegistration.dispose();
@@ -1814,7 +1899,22 @@ export class SyncManager implements vscode.Disposable {
       return;
     }
     this.syncRepositoryLimit(repository);
-    const lock = await acquireFileLock(this.syncLockPath());
+    let lock: FileLock | null;
+    try {
+      lock = await acquireFileLock(this.syncLockPath());
+    } catch (error) {
+      // Antivirus or cloud-sync tooling touching the lock file can turn the
+      // open("wx")/read into a transient EPERM. That is "the lock is busy
+      // this instant", not a broken configuration - and on the activation
+      // path an escape here used to kill the whole window. The next poll
+      // retries; a persistent cause keeps logging and stays visible.
+      this.status.log(
+        `Skipped this cycle: the sync lock could not be probed (${
+          error instanceof Error ? error.message : String(error)
+        }).`,
+      );
+      lock = null;
+    }
     if (lock === null) {
       await this.noteLockSkipped(manual);
       // The other holder may own the lock continuously, so this window would
@@ -2294,13 +2394,53 @@ export class SyncManager implements vscode.Disposable {
             continue;
           }
         }
-        const applyResult = await adapter.apply(
-          await projectionInput(repository, projection),
-        );
-        markProjection(repository, projection, undefined, applyResult);
+        await this.applyProjectionGuarded(repository, adapter, projection);
       } else {
         queuePending(repository, projection);
       }
+    }
+  }
+
+  /**
+   * Applies one projection so that its failure defers only itself.
+   *
+   * An unguarded apply used to poison the whole batch: one blob whose event
+   * had crossed the shared folder ahead of its payload threw out of the loop,
+   * discarding every sibling apply, the ack and the publish - cycle after
+   * cycle until the file finished hydrating. The projection is left unmarked
+   * on failure, so the reconciler re-derives it and the apply retries every
+   * cycle until it lands; the missing-payload case logs once per resource,
+   * anything else logs every cycle, which is what keeps a genuine failure
+   * visible.
+   */
+  private async applyProjectionGuarded(
+    repository: SyncRepository,
+    adapter: ResourceAdapter,
+    projection: Parameters<typeof projectionInput>[1],
+  ): Promise<boolean> {
+    try {
+      const applyResult = await adapter.apply(
+        await projectionInput(repository, projection),
+      );
+      markProjection(repository, projection, undefined, applyResult);
+      this.deferredApplyNoted.delete(projection.resourceId);
+      return true;
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        if (!this.deferredApplyNoted.has(projection.resourceId)) {
+          this.deferredApplyNoted.add(projection.resourceId);
+          this.status.log(
+            `Deferred ${projection.resourceId}: its data has not reached this computer through the shared folder yet; retrying every cycle.`,
+          );
+        }
+        return false;
+      }
+      this.status.log(
+        `Applying ${projection.resourceId} failed and will be retried next cycle: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return false;
     }
   }
 
@@ -2352,10 +2492,7 @@ export class SyncManager implements vscode.Disposable {
         markProjection(repository, projection, decision.live);
         continue;
       }
-      const applyResult = await adapter.apply(
-        await projectionInput(repository, projection),
-      );
-      markProjection(repository, projection, undefined, applyResult);
+      await this.applyProjectionGuarded(repository, adapter, projection);
     }
     await repository.saveState();
     return driftSkipped;
@@ -2435,10 +2572,14 @@ export class SyncManager implements vscode.Disposable {
           continue;
         }
       }
-      const applyResult = await adapter.apply(
-        await projectionInput(repository, projection),
+      const applied = await this.applyProjectionGuarded(
+        repository,
+        adapter,
+        projection,
       );
-      markProjection(repository, projection, undefined, applyResult);
+      if (!applied) {
+        continue;
+      }
       repository.state.pendingDatabaseChanges =
         repository.state.pendingDatabaseChanges.filter(
           (candidate) =>
@@ -2825,15 +2966,53 @@ export class SyncManager implements vscode.Disposable {
     }
     this.masterKey?.fill(0);
     this.masterKey = Buffer.from(masterKey);
-    this.repository = await SyncRepository.openWithMasterKey(
-      root,
-      this.paths.extensionStorage,
-      repositoryFile,
-      this.masterKey,
-      this.configuration.maxPayloadBytes,
-      this.producer,
+    this.repository = await this.withOpenLock(() =>
+      SyncRepository.openWithMasterKey(
+        root,
+        this.paths.extensionStorage,
+        repositoryFile,
+        this.masterKey ?? Buffer.alloc(0),
+        this.configuration.maxPayloadBytes,
+        this.producer,
+      ),
     );
     this.refreshAdapters();
+  }
+
+  /**
+   * Runs a repository open/create under sync.lock.
+   *
+   * Opening is not read-only: absorbing a newer checkpoint and recovering the
+   * device's own stream both SAVE the state file, and in a multi-window
+   * restore that save raced a sibling window's locked cycle - the opener's
+   * pre-cycle snapshot landed last and reverted projections and pending
+   * queues the cycle had just persisted, resurrecting deletions the
+   * retained-hash chain exists to prevent. The helper already opens under
+   * this lock; the extension host now does the same. If the lock cannot be
+   * had in a minute, the open proceeds unlocked with a log line - the
+   * previous behavior, but no longer the silent default.
+   */
+  private async withOpenLock<T>(run: () => Promise<T>): Promise<T> {
+    let lock: FileLock | null = null;
+    try {
+      lock = await acquireFileLockWithin(this.syncLockPath(), 60_000);
+    } catch (error) {
+      this.status.log(
+        `The sync lock could not be probed before opening the repository: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    if (lock === null) {
+      this.status.log(
+        "Opening the repository without the sync lock; another window held it for over a minute.",
+      );
+    }
+    try {
+      return await run();
+    } finally {
+      await lock?.release();
+    }
   }
 
   private synchronizedSourceRoots(): Array<{ label: string; path: string }> {
@@ -2844,21 +3023,94 @@ export class SyncManager implements vscode.Disposable {
     ];
   }
 
+  /**
+   * Arms this window's shutdown finalizer. Never throws: activation and the
+   * quit-vetoed callbacks call this bare, and a window whose activation died
+   * over a redundant finalizer does nothing at all - the 0.0.31 seven-window
+   * restore produced exactly that. Failures and stalls schedule a retry.
+   *
+   * Serialized per window: the configuration-change handler is registered
+   * before initialize() is awaited, so two invocations can overlap. The
+   * follow-up flag ensures the LAST request's configuration wins.
+   */
   private async startFinalizer(): Promise<void> {
-    if (
-      this.repository === null ||
-      this.masterKey === null ||
-      !this.compatibility.compatible ||
-      !(await pathExists(this.paths.helperScript))
-    ) {
+    if (this.finalizerStartInFlight !== null) {
+      this.finalizerRestartRequested = true;
+      return this.finalizerStartInFlight;
+    }
+    const run = this.startFinalizerOnce().finally(() => {
+      this.finalizerStartInFlight = null;
+      if (this.finalizerRestartRequested && !this.disposed) {
+        this.finalizerRestartRequested = false;
+        void this.startFinalizer();
+      }
+    });
+    this.finalizerStartInFlight = run;
+    return run;
+  }
+
+  private async startFinalizerOnce(): Promise<void> {
+    if (this.finalizerRetryTimer !== null) {
+      clearTimeout(this.finalizerRetryTimer);
+      this.finalizerRetryTimer = null;
+    }
+    try {
+      if (
+        this.repository === null ||
+        this.masterKey === null ||
+        !this.compatibility.compatible ||
+        !(await pathExists(this.paths.helperScript))
+      ) {
+        return;
+      }
+      const outcome = await this.helper.restartFinalizer(
+        this.repository.root,
+        this.masterKey,
+        this.configuration.workspaceMappings,
+        this.helperSyncOptions(),
+      );
+      if (outcome === "adopted") {
+        // Another window installed a fresh finalizer after this window asked
+        // for the replacement; it covers the shutdown export, so there is
+        // nothing to arm here and nothing to warn about.
+        this.status.log(
+          "Another window installed the shutdown finalizer; this window uses it.",
+        );
+        return;
+      }
+      if (outcome === "stalled") {
+        // Typically a finalizer mid-export from the previous quit, which
+        // cannot read its cancel marker until it finishes. It exits on its
+        // own; retry until this session's finalizer lands.
+        this.status.log(
+          "The previous shutdown finalizer is still busy, likely finishing an export; retrying in a minute.",
+        );
+        this.scheduleFinalizerRetry();
+      }
+    } catch (error) {
+      // A spawn that failed (helper bundle mid-update, a transient EPERM on
+      // the lock file) leaves the session without a shutdown export unless it
+      // is retried - and must never take the caller down with it.
+      this.status.log(
+        `Arming the shutdown finalizer failed (retrying in a minute): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      this.scheduleFinalizerRetry();
+    }
+  }
+
+  private scheduleFinalizerRetry(): void {
+    if (this.finalizerRetryTimer !== null || this.disposed) {
       return;
     }
-    await this.helper.restartFinalizer(
-      this.repository.root,
-      this.masterKey,
-      this.configuration.workspaceMappings,
-      this.helperSyncOptions(),
-    );
+    this.finalizerRetryTimer = setTimeout(() => {
+      this.finalizerRetryTimer = null;
+      if (this.disposed || !this.configuration.enabled) {
+        return;
+      }
+      void this.startFinalizer();
+    }, FINALIZER_RETRY_DELAY_MS);
   }
 
   private startWatching(): void {
@@ -3048,14 +3300,24 @@ export class SyncManager implements vscode.Disposable {
     }
     for (const name of names) {
       const path = join(this.paths.extensionStorage, name);
-      let result: HelperResult;
+      // Claim before reading: startup runs this in EVERY restoring window at
+      // once, and two windows that both read a result before either deleted
+      // it reported it twice and raced the backup-record update. The rename
+      // is atomic, so exactly one window owns each result.
+      const claimedPath = `${path}.${process.pid}.claimed`;
       try {
-        result = await readJsonFile<HelperResult>(path);
+        await rename(path, claimedPath);
       } catch (error) {
         if (isMissingPathError(error)) {
-          // Another window consumed it between the listing and the read.
+          // Another window claimed it between the listing and the rename.
           continue;
         }
+        throw error;
+      }
+      let result: HelperResult;
+      try {
+        result = await readJsonFile<HelperResult>(claimedPath);
+      } catch (error) {
         // A truncated result never becomes readable, so leaving it would
         // rethrow on every cycle from here on.
         this.status.log(
@@ -3063,10 +3325,15 @@ export class SyncManager implements vscode.Disposable {
             error instanceof Error ? error.message : String(error)
           }`,
         );
-        await rm(path, { force: true });
+        await rm(claimedPath, { force: true });
         continue;
       }
       consumed.push(result);
+      if (result.mode !== "final-export") {
+        // The apply this marker described has reported; a sibling window may
+        // offer again if anything is still queued.
+        await this.clearApplyInProgress();
+      }
       await this.recordHelperBackups(result);
       if (result.success) {
         this.status.log(
@@ -3082,15 +3349,29 @@ export class SyncManager implements vscode.Disposable {
           );
         }
         // A later success is the only evidence that whatever failed before has
-        // been dealt with; without this the bar stays red until a reload.
-        this.helperFailure = null;
+        // been dealt with; without this the bar stays red until a reload. A
+        // final-export success is NOT that evidence - the routine shutdown
+        // exporter succeeding says nothing about the apply that failed, and
+        // letting it clear the bar hid real apply failures behind a green
+        // status every time the session quit cleanly.
+        if (result.mode !== "final-export") {
+          this.helperFailure = null;
+        }
       } else {
         this.status.log(`Helper ${result.requestId} failed: ${result.error ?? "unknown"}`);
         this.helperFailure = helperFailureDetail(result.error);
         this.status.setStatus("error", this.helperFailure);
         this.announceHelperFailure(this.helperFailure);
+        if (result.mode !== undefined && result.mode !== "final-export") {
+          // The apply flow cancelled the standing finalizer before it quit
+          // Cursor, and its own veto recovery lives in whichever window
+          // launched it - a window that may be gone. Whoever consumes the
+          // failure is alive, so it re-arms; restartFinalizer's outcomes make
+          // this safe when several windows race to do the same.
+          void this.startFinalizer();
+        }
       }
-      await rm(path, { force: true });
+      await rm(claimedPath, { force: true });
     }
     if (!options.atStartup) {
       return;
@@ -3491,6 +3772,22 @@ export function settledStatus(input: {
  * lock instead - it waits for days by design.
  */
 const ABANDONED_HELPER_MIN_AGE_MS = 15 * 60_000;
+
+/**
+ * How long a window waits before trying again to install its shutdown
+ * finalizer after finding the previous one busy - typically mid-export from
+ * the prior quit. Exports usually take seconds; a minute keeps the retry from
+ * hammering the lock while still landing this session's finalizer promptly.
+ */
+const FINALIZER_RETRY_DELAY_MS = 60_000;
+
+/**
+ * How long an apply-in-progress marker blocks other windows from starting a
+ * second apply over the same queue: the helper's 3-minute exit wait, its lock
+ * wait, and margin for the pre-quit sync. A marker older than this belongs to
+ * a run that ended without cleanup and is ignored.
+ */
+const APPLY_IN_PROGRESS_TTL_MS = 210_000;
 
 export const QUIT_STALLED_MESSAGE =
   `Cursor Setting Sync asked Cursor to close ${Math.round(QUIT_START_GRACE_MS / 1000)} seconds ago and it is still open, so the queued changes have not been written. ` +
@@ -4295,14 +4592,37 @@ export async function autoMergeConflicts(
     // were not, and 0.0.6 shipped exactly such a case (a RangeError out of the
     // base64 validator on a multi-megabyte chat payload).
     try {
-      if (
-        conflict.resolvedAt !== undefined ||
-        conflict.tipVersionIds.length !== 2
-      ) {
+      if (conflict.resolvedAt !== undefined) {
         continue;
       }
       const tips = repository.state.tips[conflict.resourceId] ?? [];
-      if (tips.length !== 2 || !canMerge(tips)) {
+      if (tips.length < 2 || !canMerge(tips)) {
+        continue;
+      }
+      if (
+        conflict.kind === "ui-state" &&
+        (tips.length > 2 ||
+          isPolicyExcludedUiStateResource(conflict.resourceId, conflict.kind))
+      ) {
+        // Two escapes that share one answer, last-writer-wins:
+        // - A fork with THREE or more tips (several windows or machines each
+        //   published a merge of a different pair) has no three-way shape, so
+        //   the two-tip machinery below skipped it forever - and an
+        //   unresolved conflict refuses every checkpoint, so the repository
+        //   could never prune again.
+        // - A policy-excluded key (the reactive-storage blob) is churn no
+        //   side should win on merit; re-merging it against a peer still
+        //   publishing it re-derived the fork every cycle. One LWW
+        //   resolution ends the chain: the scan never publishes the key
+        //   again, and the apply side accepts the resolution without
+        //   writing it.
+        if (await resolveBaseFreeConflict(repository, conflict, tips, onWarning)) {
+          conflict.resolvedAt = new Date().toISOString();
+          mergedAny = true;
+        }
+        continue;
+      }
+      if (tips.length !== 2 || conflict.tipVersionIds.length !== 2) {
         continue;
       }
       if (conflict.baseVersionId === null) {

@@ -141,11 +141,20 @@ export async function writeFileAtomic(
   }
 
   try {
+    // The commit gets the same transient tolerance as reads: a cloud-sync
+    // client or antivirus holding the destination for a moment turns rename
+    // into EPERM/EBUSY, and without a retry a durably written payload was
+    // reported as a failed publish. EEXIST from link is not transient and
+    // still fails fast.
+    await retryTransientRead(async () => {
+      if (!overwrite) {
+        await link(temporaryPath, path);
+      } else {
+        await rename(temporaryPath, path);
+      }
+    });
     if (!overwrite) {
-      await link(temporaryPath, path);
       await rm(temporaryPath, { force: true });
-    } else {
-      await rename(temporaryPath, path);
     }
   } catch (error) {
     await rm(temporaryPath, { force: true });
@@ -185,7 +194,8 @@ export async function copyFileAtomic(source: string, destination: string): Promi
     await handle.close();
   }
   try {
-    await rename(temporaryPath, destination);
+    // Same transient tolerance as writeFileAtomic's commit.
+    await retryTransientRead(() => rename(temporaryPath, destination));
   } catch (error) {
     await rm(temporaryPath, { force: true });
     throw error;

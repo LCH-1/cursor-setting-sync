@@ -138,7 +138,7 @@ export function parsePortableProfiles(content: Buffer): PortableProfile[] {
   return profiles;
 }
 
-function normalizeProfile(value: unknown): PortableProfile {
+export function normalizeProfile(value: unknown): PortableProfile {
   if (value === null || typeof value !== "object") {
     throw new Error("Invalid stored profile entry.");
   }

@@ -23,7 +23,12 @@ import type {
   ResourceSnapshot,
   ResourceTip,
 } from "../types";
-import { pathExists, readJsonFile, writeJsonAtomic } from "../platform/files";
+import {
+  isMissingPathError,
+  pathExists,
+  readJsonFile,
+  writeJsonAtomic,
+} from "../platform/files";
 import { commitAndPush, isGitRepository, pullLatest } from "../platform/git";
 import { acquireFileLock, type FileLock } from "../platform/lock";
 import { SyncRepository } from "../protocol/repository";
@@ -173,6 +178,7 @@ async function run(): Promise<void> {
     if (request !== null) {
       const result: HelperResult = {
         requestId: request.requestId,
+        mode: request.mode,
         success: false,
         completedAt: new Date().toISOString(),
         applied: [],
@@ -328,7 +334,9 @@ async function executeRequest(
     .filter((change) => !eligible.includes(change))
     .map((change) => `${change.resourceId}: superseded or conflicted`),
   ];
-  const prepared = await prepareChanges(repository, eligible);
+  const preparation = await prepareChanges(repository, eligible);
+  skipped.push(...preparation.skipped);
+  const prepared = preparation.prepared;
 
   const globalPrepared = prepared.filter((item) =>
     ["chat", "ui-state", "cursor-user-rules", "profile"].includes(
@@ -338,6 +346,7 @@ async function executeRequest(
   let backupPath: string | null = null;
   const applied: string[] = [];
   const retainedLocal = new Set<string>();
+  const globalRetainedHashes: Record<string, string> = {};
   if (globalPrepared.length > 0) {
     await ensureExclusiveAccess();
     const globalResult = await applyGlobalDatabaseChanges(
@@ -354,6 +363,10 @@ async function executeRequest(
     });
     applied.push(...globalResult.applied);
     skipped.push(...globalResult.skipped);
+    for (const resourceId of globalResult.retainedLocal) {
+      retainedLocal.add(resourceId);
+    }
+    Object.assign(globalRetainedHashes, globalResult.retainedLocalHashes);
   }
 
   const nonGlobalResult = await applyNonGlobalChanges(
@@ -377,7 +390,7 @@ async function executeRequest(
     eligible,
     applied,
     retainedLocal,
-    nonGlobalResult.retainedLocalHashes,
+    { ...globalRetainedHashes, ...nonGlobalResult.retainedLocalHashes },
   );
   await repository.saveState();
   await finishGitTransport(
@@ -540,6 +553,8 @@ async function exportFinalChanges(
               "chat-transcript",
               "chat-store",
               "workspace-storage",
+              "profile",
+              "extension",
             ].includes(projection.kind) &&
             projection.retainedLocalHash === snapshot.semanticHash
           ) {
@@ -669,8 +684,9 @@ async function resolveWorkspaceStorageMappings(
 async function prepareChanges(
   repository: SyncRepository,
   changes: HelperChange[],
-): Promise<PreparedHelperChange[]> {
+): Promise<{ prepared: PreparedHelperChange[]; skipped: string[] }> {
   const prepared: PreparedHelperChange[] = [];
+  const skipped: string[] = [];
   let totalBytes = 0;
   const batchLimit = MAX_APPLY_BATCH_BYTES;
   for (const change of changes) {
@@ -678,7 +694,23 @@ async function prepareChanges(
       if (change.payload === undefined) {
         throw new Error(`Payload reference is missing: ${change.resourceId}`);
       }
-      const content = await repository.readObject(change.payload);
+      let content: Buffer;
+      try {
+        content = await repository.readObject(change.payload);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          // The event arrived through the shared folder before its payload
+          // did. That is one change not yet appliable, not a failed batch:
+          // failing here used to write a failure result and drop every
+          // sibling change on the floor for a file OneDrive delivers a
+          // minute later. The change stays queued and rides the next apply.
+          skipped.push(
+            `${change.resourceId}: payload not yet synced to this computer; it stays queued`,
+          );
+          continue;
+        }
+        throw error;
+      }
       totalBytes += content.byteLength;
       if (totalBytes > batchLimit) {
         throw new Error(
@@ -693,7 +725,7 @@ async function prepareChanges(
       prepared.push({ change });
     }
   }
-  return prepared;
+  return { prepared, skipped };
 }
 
 function isEligible(
@@ -1071,6 +1103,7 @@ function successResult(
 ): HelperResult {
   return {
     requestId: request.requestId,
+    mode: request.mode,
     success: true,
     completedAt: new Date().toISOString(),
     applied,
