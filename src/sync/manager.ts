@@ -968,6 +968,13 @@ export class SyncManager implements vscode.Disposable {
         // retry, and it re-blocks anything that fails again.
         this.clearApplyFailureBlocks(repository);
         await this.ensureWorkspaceMappings(repository);
+        // Both of the above only touched memory. Everything else that blocks a
+        // queued change is derived from the synchronous
+        // `resourceApplyBlockReason` and reaches disk through the poll's own
+        // save - but workspace mappings are exactly what that function cannot
+        // see, so without this the answer the user just gave a mapping prompt
+        // died with the process it was given to. The quit is seconds away.
+        await repository.saveState();
         batch = pendingHelperBatch(repository);
       } finally {
         await lock.release();

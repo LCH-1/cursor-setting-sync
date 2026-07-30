@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.45] - 2026-07-30
+
+The rest of the class 0.0.44 found: an apply that cannot succeed must never be the reason Cursor quits. Five reviewers traced every route by which a queued change survives an apply, and each finding was put to a refutation pass before it was fixed.
+
+### Fixed
+
+- **The answer to a workspace mapping prompt no longer dies with the process it was given to.** `Restart to Apply` asks which local folder an incoming workspace belongs to, and blocks the change when there is no answer — but nothing wrote that decision to disk before quitting, and the reload on the next launch read the old row back unblocked. Every block the mapping pass set was lost, including the one 0.0.43 added machinery to preserve. Blocks derived from the per-cycle check reached disk through the poll's own save; workspace mappings are precisely what that check cannot see.
+- **One damaged payload object no longer costs the entire apply, repeatedly.** A payload that is present but unreadable — a cloud placeholder materialized as zero bytes, a truncated write, a size or authentication mismatch — was rethrown out of the preparation step, before anything was applied, dequeued or blocked. The whole request died with the queue exactly as it found it, and since those bytes do not heal, every later apply died the same way while the modal kept quitting Cursor to retry. Such a change is now deferred on its own, reported per resource, and blocked from being offered again, exactly like the per-resource failures its siblings already get. A change whose event carries no payload reference at all is treated the same way instead of throwing.
+- A payload that simply has not arrived yet is still told apart from one that is damaged: it stays queued and unblocked, because a shared folder delivering a file a minute late heals on its own and blocking it would make the user run the command by hand for nothing.
+
 ## [0.0.44] - 2026-07-30
 
 0.0.43 fixed a way the apply prompt could repeat. It was not the way that was actually happening.

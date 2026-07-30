@@ -364,6 +364,16 @@ async function executeRequest(
   ];
   const preparation = await prepareChanges(repository, eligible);
   skipped.push(...preparation.skipped);
+  // A payload this computer cannot read is a real failure, not a routine skip:
+  // it never heals on its own, so it has to be visible and it has to stop
+  // being offered. "Not yet synced" is deliberately not in this map - that one
+  // does heal, and blocking it would make the user run the command by hand for
+  // a file the shared folder is about to deliver.
+  for (const [resourceId, message] of Object.entries(
+    preparation.failureByResourceId,
+  )) {
+    warnings.push(`Preparing ${resourceId}: ${message}`);
+  }
   const prepared = preparation.prepared;
 
   const globalPrepared = prepared.filter((item) =>
@@ -426,7 +436,10 @@ async function executeRequest(
     applied,
     retainedLocal,
     { ...globalRetainedHashes, ...nonGlobalResult.retainedLocalHashes },
-    nonGlobalResult.failureByResourceId,
+    {
+      ...preparation.failureByResourceId,
+      ...nonGlobalResult.failureByResourceId,
+    },
   );
   await repository.saveState();
   await finishGitTransport(
@@ -717,18 +730,28 @@ async function resolveWorkspaceStorageMappings(
   return mappings;
 }
 
-async function prepareChanges(
+export async function prepareChanges(
   repository: SyncRepository,
   changes: HelperChange[],
-): Promise<{ prepared: PreparedHelperChange[]; skipped: string[] }> {
+): Promise<{
+  prepared: PreparedHelperChange[];
+  skipped: string[];
+  failureByResourceId: Record<string, string>;
+}> {
   const prepared: PreparedHelperChange[] = [];
   const skipped: string[] = [];
+  const failureByResourceId: Record<string, string> = {};
   let totalBytes = 0;
   const batchLimit = MAX_APPLY_BATCH_BYTES;
   for (const change of changes) {
     if (change.operation === "put") {
       if (change.payload === undefined) {
-        throw new Error(`Payload reference is missing: ${change.resourceId}`);
+        // Not fatal for the same reason a damaged object is not: one malformed
+        // change must not cost every sibling in the request.
+        const message = "the event carries no payload reference";
+        skipped.push(`${change.resourceId}: ${message}`);
+        failureByResourceId[change.resourceId] = message;
+        continue;
       }
       let content: Buffer;
       try {
@@ -745,7 +768,18 @@ async function prepareChanges(
           );
           continue;
         }
-        throw error;
+        // Present but unreadable: a cloud placeholder that materialized as
+        // zero bytes, a truncated write, bit rot, a size or HMAC mismatch.
+        // Rethrowing killed the WHOLE request - nothing applied, nothing
+        // dequeued, nothing blocked - and since the bytes never heal on their
+        // own, every later apply died the same way while the modal kept
+        // offering the queue and quitting Cursor to retry it. Deferring the
+        // one change is the same treatment its siblings get for every other
+        // per-resource failure.
+        const message = error instanceof Error ? error.message : String(error);
+        skipped.push(`${change.resourceId}: ${message}`);
+        failureByResourceId[change.resourceId] = message;
+        continue;
       }
       totalBytes += content.byteLength;
       if (totalBytes > batchLimit) {
@@ -761,7 +795,7 @@ async function prepareChanges(
       prepared.push({ change });
     }
   }
-  return { prepared, skipped };
+  return { prepared, skipped, failureByResourceId };
 }
 
 function isEligible(
