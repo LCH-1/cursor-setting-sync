@@ -2,6 +2,15 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.46] - 2026-07-30
+
+Both of these are about the one screen where the extension asks a person to decide something.
+
+### Changed
+
+- **The conflict review says which pane is which.** The diff opens two versions side by side and the picker beside it named them only by the computer that wrote each one, so the question the screen actually raises — *which of these two panes am I choosing* — had no answer anywhere on it. The picker entries now lead with `LEFT` and `RIGHT`, the diff title spells out `LEFT This PC ↔ RIGHT Other PC (…)`, and the labels are in each pane's own path so the panes identify themselves even after the title scrolls out of a narrow tab.
+- **A notepad conflict is shown as the notes, not as JSON.** `notepads.json` keeps every note's whole text inside one JSON string with its line breaks escaped, so the diff rendered each note as a single enormous line with `\r\n` written out in the middle of it — you could see that something differed without being able to read either version. The preview now renders each note under its own heading with its real line breaks, and normalizes CRLF against LF so a difference in line endings alone no longer reports every line as changed. The preview is only what is displayed: whichever side is chosen still publishes its original bytes exactly.
+
 ## [0.0.45] - 2026-07-30
 
 The rest of the class 0.0.44 found: an apply that cannot succeed must never be the reason Cursor quits. Five reviewers traced every route by which a queued change survives an apply, and each finding was put to a refutation pass before it was fixed.

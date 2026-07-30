@@ -11,6 +11,10 @@ import { sha256 } from "../protocol/canonical";
 import { MAX_EVENT_CHANGES } from "../constants";
 import type { ConflictSideView, ConflictView } from "./conflictSummary";
 import { PREVIEW_BYTE_LIMIT, describeConflict } from "./conflictSummary";
+import {
+  isNotepadsResourceId,
+  renderNotepadsPreview,
+} from "./notepadPreview";
 
 export interface ConflictResolutionResult {
   resolved: number;
@@ -275,12 +279,7 @@ export class ConflictController
       kind: ResourceKind,
     ) => Promise<ResourceSnapshot | undefined>,
   ): Promise<ConflictSelection | null> {
-    await this.showDiff(
-      repository,
-      view.conflict.resourceId,
-      view.tips[0],
-      view.tips[1],
-    );
+    await this.showDiff(repository, view);
     const live = await liveSnapshot(view.conflict.resourceId, view.conflict.kind);
     const keepLocal =
       live !== undefined &&
@@ -288,10 +287,19 @@ export class ConflictController
         ? live
         : null;
     const items: Array<vscode.QuickPickItem & { tip: ResourceTip | null }> =
-      view.sides.map((side) => ({
+      view.sides.map((side, index) => ({
         // The badge names why this side is elected, so it can never read as a
         // claim about time on a conflict where no time was compared.
-        label: `${side.origin === "local" ? "$(device-desktop)" : "$(cloud)"} ${side.deviceLabel}${
+        //
+        // LEFT/RIGHT ties the entry to the pane the user is looking at. The
+        // diff opens beside this list, and the list used to identify its two
+        // options only by which computer wrote them - so the one question the
+        // screen actually raises, "which of these panes am I picking", had no
+        // answer anywhere on it. `view.sides` and `view.tips` share an order,
+        // and showDiff hands tips[0] to the left pane.
+        label: `${index === 0 ? "LEFT" : "RIGHT"} · ${
+          side.origin === "local" ? "$(device-desktop)" : "$(cloud)"
+        } ${side.deviceLabel}${
           side.newest
             ? view.electedByClock
               ? " · written later"
@@ -351,27 +359,59 @@ export class ConflictController
 
   private async showDiff(
     repository: SyncRepository,
-    resourceId: string,
-    leftTip: ResourceTip | undefined,
-    rightTip: ResourceTip | undefined,
+    view: ConflictView,
   ): Promise<void> {
-    if (leftTip === undefined || rightTip === undefined) {
+    const [leftSide, rightSide] = view.sides;
+    const leftTip = view.tips[0];
+    const rightTip = view.tips[1];
+    if (
+      leftTip === undefined ||
+      rightTip === undefined ||
+      leftSide === undefined ||
+      rightSide === undefined
+    ) {
       return;
     }
-    const left = await tipContent(repository, leftTip);
-    const right = await tipContent(repository, rightTip);
+    const resourceId = view.conflict.resourceId;
+    const [left, right] = await Promise.all([
+      this.previewText(repository, resourceId, leftTip),
+      this.previewText(repository, resourceId, rightTip),
+    ]);
     const token = encodeURIComponent(resourceId);
-    const leftUri = vscode.Uri.parse(`cursor-sync-conflict:${token}/left`);
-    const rightUri = vscode.Uri.parse(`cursor-sync-conflict:${token}/right`);
+    // The side labels live in the URI path, not only in the title: the diff
+    // editor prints the path in each pane's own header and in the tab, so
+    // "which of these two is mine" is answerable from the panes themselves.
+    // With `left`/`right` alone it was not answerable anywhere on screen.
+    const leftUri = vscode.Uri.parse(
+      `cursor-sync-conflict:${token}/LEFT ${encodeURIComponent(leftSide.deviceLabel)}`,
+    );
+    const rightUri = vscode.Uri.parse(
+      `cursor-sync-conflict:${token}/RIGHT ${encodeURIComponent(rightSide.deviceLabel)}`,
+    );
     this.documents.set(leftUri.toString(), left);
     this.documents.set(rightUri.toString(), right);
     await vscode.commands.executeCommand(
       "vscode.diff",
       leftUri,
       rightUri,
-      `Cursor Setting Sync Conflict: ${resourceId}`,
+      `${view.category}: ${view.name} — LEFT ${leftSide.deviceLabel} ↔ RIGHT ${rightSide.deviceLabel}`,
       { preview: true },
     );
+  }
+
+  /**
+   * The bytes a person can actually read, falling back to the bytes themselves.
+   */
+  private async previewText(
+    repository: SyncRepository,
+    resourceId: string,
+    tip: ResourceTip,
+  ): Promise<string> {
+    const raw = await tipContent(repository, tip);
+    if (!isNotepadsResourceId(resourceId)) {
+      return raw;
+    }
+    return renderNotepadsPreview(raw) ?? raw;
   }
 }
 
