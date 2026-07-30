@@ -192,7 +192,9 @@ import {
   standingWarningDiagnostics,
 } from "./warningLog";
 import {
+  PERMANENT_EXCLUSION_REASONS,
   isChatResourceKind,
+  isPermanentExclusionReason,
   resourceConfigurationBlockReason,
 } from "./resourcePolicy";
 
@@ -3174,7 +3176,7 @@ export class SyncManager implements vscode.Disposable {
         // with a message about workspace storage - 69 conversations held back
         // by a rule that was never about them, reported under a reason that
         // could not be acted on.
-        pending.blockedReason = FOLDERLESS_WORKSPACE_BLOCK_REASON;
+        pending.blockedReason = PERMANENT_EXCLUSION_REASONS[3];
         continue;
       }
       if (pending.kind === "chat") {
@@ -3307,7 +3309,7 @@ export class SyncManager implements vscode.Disposable {
         this.ignoredWorkspaceMatcher(),
       )
     ) {
-      return "This workspace is excluded by cursorSettingSync.ignoredWorkspaces on this computer.";
+      return PERMANENT_EXCLUSION_REASONS[2];
     }
     return databaseApplyBlockReason(
       tip.kind,
@@ -3787,7 +3789,15 @@ export class SyncManager implements vscode.Disposable {
       // this failure is about, so resolving it comes first - but the queue on
       // its own must never repaint over the news that writing it just failed.
       this.status.setStatus("error", this.helperFailure);
-    } else if (repository.state.pendingDatabaseChanges.length > 0) {
+    } else if (
+      // Counted on what is actually outstanding. A queue made entirely of
+      // changes this computer has decided not to write is not "Queued": it
+      // needs no restart and no decision, and painting the badge for it told
+      // a correctly configured machine it had 234 things left to do.
+      repository.state.pendingDatabaseChanges.some(
+        (change) => !isPermanentExclusionReason(change.blockedReason),
+      )
+    ) {
       this.status.setStatus(
         "pending-restart",
         pendingRestartDetail(repository.state.pendingDatabaseChanges),
@@ -4487,7 +4497,20 @@ export function pendingRestartDetail(
   pending: readonly PendingDatabaseChange[],
 ): string {
   const ready = pending.filter((change) => change.blockedReason === undefined);
-  const deferred = pending.filter((change) => change.blockedReason !== undefined);
+  // Split three ways, not two. A change held by a standing decision of this
+  // computer is not waiting for anything and nobody needs to act on it, so
+  // counting it beside a compatibility hold turned a correctly configured
+  // machine into an alarming "234 change(s) are deferred" - which is what the
+  // other computer's local-only folders look like when the policy that is
+  // meant to exclude them is working exactly as intended.
+  const excluded = pending.filter((change) =>
+    isPermanentExclusionReason(change.blockedReason),
+  );
+  const deferred = pending.filter(
+    (change) =>
+      change.blockedReason !== undefined &&
+      !isPermanentExclusionReason(change.blockedReason),
+  );
   return [
     ready.length === 0
       ? ""
@@ -4496,6 +4519,9 @@ export function pendingRestartDetail(
     deferred.length === 0
       ? ""
       : `${deferred.length} change(s) are deferred: ${commonestBlockedReason(deferred)}`,
+    excluded.length === 0
+      ? ""
+      : `${excluded.length} change(s) are excluded by this computer's settings and are not waiting for anything: ${commonestBlockedReason(excluded)}`,
   ]
     .filter((message) => message.length > 0)
     .join(" ");
@@ -5084,8 +5110,7 @@ export const WORKSPACE_MAPPING_BLOCK_REASON =
   `${WORKSPACE_MAPPING_BLOCK_PREFIX} workspace storage. ` +
   'Run "Cursor Setting Sync: Restart to Apply" to be asked again, after opening the folder on this computer.';
 
-const FOLDERLESS_WORKSPACE_BLOCK_REASON =
-  "This workspace storage belongs to a window with no folder open, so it has no counterpart on this computer.";
+const FOLDERLESS_WORKSPACE_BLOCK_REASON = PERMANENT_EXCLUSION_REASONS[3];
 
 /**
  * True for a block the workspace-mapping pass set, which the per-cycle queueing

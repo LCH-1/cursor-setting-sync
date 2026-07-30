@@ -16,10 +16,16 @@ import {
   RESTART_TO_APPLY_COMMAND,
   RESTART_TO_APPLY_TITLE,
 } from "../src/constants";
+import {
+  PERMANENT_EXCLUSION_REASONS,
+  isPermanentExclusionReason,
+} from "../src/sync/resourcePolicy";
 import type { LockHolderReport } from "../src/platform/lock";
 import type { PendingDatabaseChange } from "../src/types";
 import manifest from "../package.json";
 
+const EXCLUDED_WORKSPACE_REASON =
+  "This workspace is excluded by cursorSettingSync.ignoredWorkspaces on this computer.";
 const T0 = Date.parse("2026-07-27T00:00:00.000Z");
 const POLL_MS = 30_000;
 
@@ -156,18 +162,52 @@ describe("the queued-changes status detail", () => {
     expect(detail).toContain("1 change(s) are deferred: Created by a newer Cursor.");
   });
 
-  it("names the reason the entries actually carry, not the only one there used to be", () => {
-    // An excluded workspace is a deferral too, and reporting it as a
-    // newer-Cursor problem would send the user looking for an upgrade.
+  it("counts a standing exclusion apart from something that is waiting", () => {
+    // A workspace this computer excludes is not deferred - nothing is going to
+    // lift it and nobody has to act. Counted together, a correctly configured
+    // machine reported "234 change(s) are deferred", which reads as a backlog:
+    // on the real pair those were the other computer's 193 local-only folders,
+    // held back by exactly the policy meant to hold them back.
     const excluded = pending("workspace-storage", 3, true).map((change) => ({
       ...change,
-      blockedReason:
-        "This workspace is excluded by cursorSettingSync.ignoredWorkspaces on this computer.",
+      blockedReason: EXCLUDED_WORKSPACE_REASON,
     }));
     const detail = pendingRestartDetail([...excluded, ...pending("chat", 1, true)]);
-    expect(detail).toContain("4 change(s) are deferred:");
+
+    expect(detail).toContain("1 change(s) are deferred: Created by a newer Cursor.");
+    expect(detail).toContain("3 change(s) are excluded by this computer's settings");
     expect(detail).toContain("cursorSettingSync.ignoredWorkspaces");
-    expect(detail).not.toContain("newer Cursor");
+    expect(detail).not.toContain("4 change(s)");
+  });
+
+  it("says nothing about a restart when every change is a standing exclusion", () => {
+    const detail = pendingRestartDetail(
+      pending("workspace-storage", 234, true).map((change) => ({
+        ...change,
+        blockedReason: EXCLUDED_WORKSPACE_REASON,
+      })),
+    );
+
+    expect(detail).toContain("234 change(s) are excluded");
+    expect(detail).toContain("not waiting for anything");
+    expect(detail).not.toContain(RESTART_TO_APPLY_TITLE);
+    expect(detail).not.toContain("deferred");
+  });
+
+  it("classifies every reason the block sites can produce", () => {
+    // The classification is by exact string, so a reworded reason silently
+    // changes which bucket it lands in. These are the constants themselves.
+    for (const reason of PERMANENT_EXCLUSION_REASONS) {
+      expect(isPermanentExclusionReason(reason)).toBe(true);
+    }
+    for (const reason of [
+      "Created by a newer Cursor.",
+      "Workspace mapping is required for incoming workspace storage.",
+      "The last apply could not write this resource: disk full",
+      undefined,
+    ]) {
+      expect(isPermanentExclusionReason(reason)).toBe(false);
+    }
   });
 });
 

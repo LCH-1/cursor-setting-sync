@@ -2,6 +2,13 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.47] - 2026-07-30
+
+### Changed
+
+- **A change this computer has decided not to write is no longer counted as a backlog.** Queued changes were reported two ways — waiting, or deferred — and "deferred" covered both a temporary hold, like a version that needs an upgrade, and a standing decision, like a workspace excluded by `cursorSettingSync.ignoredWorkspaces`. The second is never going to lift on its own and needs nobody to act, so counting them together told a **correctly configured** computer it had "234 change(s) are deferred". On the real pair those were the other machine's 193 local-only folders, held back by exactly the policy that is meant to hold them back. Standing exclusions are now counted and described separately, as excluded and "not waiting for anything".
+- **The status bar no longer says "Queued" for a queue that holds nothing to do.** A machine whose entire queue is standing exclusions needs no restart and no decision; it now reports its normal state instead of a badge implying outstanding work.
+
 ## [0.0.46] - 2026-07-30
 
 Both of these are about the one screen where the extension asks a person to decide something.
