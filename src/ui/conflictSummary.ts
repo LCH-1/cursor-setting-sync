@@ -169,6 +169,8 @@ export function categoryLabel(kind: ResourceKind): string {
       return "Cursor file";
     case "cursor-user-rules":
       return "Cursor rules";
+    case "remote-targets":
+      return "SSH targets";
     case "chat":
       return "Chat";
     case "chat-transcript":

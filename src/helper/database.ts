@@ -47,6 +47,7 @@ import {
   parseTargetStorageMarker,
 } from "../resources/uiStatePolicy";
 import type { IgnoreMatcher } from "../resources/ignorePatterns";
+import { isRemoteTargetsKey } from "../resources/remoteTargets";
 
 export interface PreparedHelperChange {
   change: HelperChange;
@@ -929,7 +930,11 @@ function applyPreparedChange(
     return chatAppliedOutcome(change.semanticHash, snapshot, targetWorkspaceId);
   }
 
-  if (change.kind === "ui-state" || change.kind === "cursor-user-rules") {
+  if (
+    change.kind === "ui-state" ||
+    change.kind === "cursor-user-rules" ||
+    change.kind === "remote-targets"
+  ) {
     const key = metadataString(change.metadata, "key");
     if (change.resourceId !== `${change.kind}/${encodeURIComponent(key)}`) {
       throw new Error(`UI state metadata does not match ${change.resourceId}.`);
@@ -1402,10 +1407,16 @@ function formatUnknownError(error: unknown): string {
  */
 function isSafeUiStateKey(
   key: string,
-  kind: "ui-state" | "cursor-user-rules",
+  kind: "ui-state" | "cursor-user-rules" | "remote-targets",
 ): boolean {
   if (kind === "cursor-user-rules") {
     return key === CURSOR_USER_RULES_KEY;
+  }
+  if (kind === "remote-targets") {
+    // Pinned to the allowlist, not merely "not denied": this kind exists to
+    // carry two known keys, and a peer naming a third under it is claiming a
+    // write this build never intended to grant.
+    return isRemoteTargetsKey(key);
   }
   return !isSecurityDeniedUiStateKey(key);
 }

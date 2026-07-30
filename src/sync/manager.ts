@@ -121,6 +121,7 @@ import {
   mergeNotepadBuffers,
   unionNotepadBuffers,
 } from "../resources/notepadMerge";
+import { mergeRemoteTargetsBuffers } from "../resources/remoteTargets";
 import { filterPortableWorkspaceRows } from "../resources/workspaceStatePolicy";
 import {
   createIgnoreMatcher,
@@ -5472,10 +5473,24 @@ export async function autoMergeConflicts(
               contentOf(olderTip),
             )
           : undefined;
+      // Union, not election: a folder one computer has opened on a host and
+      // the other has not is a fact about the server, not a disagreement. The
+      // newest tip only decides the order the tree shows.
+      const remoteTargetsOutcome =
+        conflict.kind === "remote-targets" &&
+        newestTip !== undefined &&
+        olderTip !== undefined
+          ? mergeRemoteTargetsBuffers(
+              contentOf(newestTip),
+              contentOf(olderTip),
+            )
+          : undefined;
       const outcome: MergeOutcome =
         conflict.kind === "chat"
           ? chatOutcome ?? { status: "conflict" }
-          : notepads
+          : conflict.kind === "remote-targets"
+            ? remoteTargetsOutcome ?? { status: "conflict" }
+            : notepads
             ? notepadOutcome ?? { status: "conflict" }
             : workspaceDatabase
               ? mergeWorkspaceDatabaseBuffers(base.content, local.content, remote.content)
@@ -5728,6 +5743,57 @@ async function resolveBaseFreeWorkspaceDatabaseConflict(
 }
 
 /**
+ * Resolves a base-free SSH-targets fork by unioning both computers' host and
+ * folder lists. See {@link mergeRemoteTargetsBuffers}.
+ */
+async function resolveBaseFreeRemoteTargetsConflict(
+  repository: SyncRepository,
+  conflict: SyncConflict,
+  orderedPuts: readonly ResourceTip[],
+  onWarning: (warning: string) => void,
+): Promise<boolean> {
+  const [newest, older] = orderedPuts;
+  if (newest === undefined || older === undefined) {
+    return false;
+  }
+  const [newestData, olderData] = await Promise.all([
+    repository.tryReadVersion(newest.versionId),
+    repository.tryReadVersion(older.versionId),
+  ]);
+  if (
+    newestData === null ||
+    olderData === null ||
+    newestData.content === null ||
+    olderData.content === null
+  ) {
+    return false;
+  }
+  const outcome = mergeRemoteTargetsBuffers(
+    newestData.content,
+    olderData.content,
+  );
+  if (outcome.status !== "merged" || outcome.content === undefined) {
+    return false;
+  }
+  const content = outcome.content;
+  return publishAutoMerge(
+    repository,
+    conflict,
+    [
+      {
+        resourceId: conflict.resourceId,
+        kind: conflict.kind,
+        content,
+        semanticHash: outcome.semanticHash ?? sha256(content),
+        metadata: { ...(newest.metadata ?? {}), syncOrigin: "auto-merge" },
+      },
+    ],
+    [],
+    onWarning,
+  );
+}
+
+/**
  * Resolves a base-free `notepads.json` fork by unioning the two lists by
  * notepad id. See {@link unionNotepadBuffers} for the per-notepad rules.
  *
@@ -5862,6 +5928,21 @@ async function resolveBaseFreeConflict(
       puts.length === 2 &&
       puts.length === tips.length &&
       (await resolveBaseFreeNotepadsConflict(
+        repository,
+        conflict,
+        [...puts].sort(compareTips),
+        onWarning,
+      ))
+    );
+  }
+  // First contact between two computers that already reach the same servers:
+  // each has its own folder history and neither descends from the other, so
+  // the union is the whole answer and nothing has to be discarded.
+  if (conflict.kind === "remote-targets") {
+    return (
+      puts.length === 2 &&
+      puts.length === tips.length &&
+      (await resolveBaseFreeRemoteTargetsConflict(
         repository,
         conflict,
         [...puts].sort(compareTips),
@@ -6101,6 +6182,8 @@ function isAutoMergeKind(
       "chat-transcript",
       "keybindings",
       "ui-state",
+      // Unioned rather than merged textually; see mergeRemoteTargetsBuffers.
+      "remote-targets",
     ].includes(kind)
   ) {
     return true;

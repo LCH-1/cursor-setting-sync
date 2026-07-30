@@ -22,10 +22,11 @@ import {
 } from "./uiStatePolicy";
 import type { IgnoreMatcher } from "./ignorePatterns";
 import { createIgnoreMatcher } from "./ignorePatterns";
+import { isRemoteTargetsKey, remoteTargetsKeys } from "./remoteTargets";
 
 export class UiStateAdapter implements ResourceAdapter {
   readonly id = "ui-state";
-  readonly kinds = ["ui-state", "cursor-user-rules"] as const;
+  readonly kinds = ["ui-state", "cursor-user-rules", "remote-targets"] as const;
   readonly appliesWhileRunning = false;
 
   constructor(
@@ -77,6 +78,15 @@ export class UiStateAdapter implements ResourceAdapter {
       if (!keys.includes(CURSOR_USER_RULES_KEY)) {
         keys.push(CURSOR_USER_RULES_KEY);
       }
+      // Appended unconditionally, exactly like the user rules: these are
+      // MACHINE-target, so they never appear in the marker this loop reads and
+      // would otherwise be invisible to the scan. See remoteTargets.ts for why
+      // a machine-target key is nonetheless the same on both computers.
+      for (const key of remoteTargetsKeys()) {
+        if (!keys.includes(key)) {
+          keys.push(key);
+        }
+      }
 
       const snapshots: ResourceSnapshot[] = [];
       const warnings: string[] = [...scanWarnings];
@@ -89,7 +99,11 @@ export class UiStateAdapter implements ResourceAdapter {
           continue;
         }
         const kind: ResourceKind =
-          key === CURSOR_USER_RULES_KEY ? "cursor-user-rules" : "ui-state";
+          key === CURSOR_USER_RULES_KEY
+            ? "cursor-user-rules"
+            : isRemoteTargetsKey(key)
+              ? "remote-targets"
+              : "ui-state";
         const resourceId = uiStateResourceId(kind, key);
         if (typeof raw !== "string" && !(raw instanceof Uint8Array)) {
           // The wire format has no NULL storage class, and publishing empty
@@ -149,7 +163,8 @@ function findDeletions(
     .filter((projection) => {
       if (
         (projection.kind !== "ui-state" &&
-          projection.kind !== "cursor-user-rules") ||
+          projection.kind !== "cursor-user-rules" &&
+          projection.kind !== "remote-targets") ||
         current.has(projection.resourceId)
       ) {
         return false;
@@ -163,7 +178,12 @@ function findDeletions(
       if (encodedKey === undefined) {
         return false;
       }
-      if (projection.kind === "cursor-user-rules") {
+      if (
+        projection.kind === "cursor-user-rules" ||
+        projection.kind === "remote-targets"
+      ) {
+        // Read by their own fixed keys rather than through the marker, so an
+        // absence here is trustworthy in a way a marker-driven one is not.
         return true;
       }
       const key = decodeURIComponent(encodedKey);

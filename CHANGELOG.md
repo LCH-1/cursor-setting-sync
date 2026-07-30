@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.48] - 2026-07-30
+
+### Added
+
+- **The Remote Explorer's SSH folder history now travels.** The tree under "SSH TARGETS" remembers which folders you have opened on each host, and that memory never left the computer that built it — not because a later release excluded it, but because Cursor registers it MACHINE-target, and the only keys this extension ever read out of the global table were USER-target ones. VS Code's own Settings Sync skips it for the same reason. Machine-target is the right call for a path on *this* computer and the wrong one for a path on a server both computers reach, which is exactly what this list holds.
+
+  Two hosts→folders keys are carried, by allowlist: `anysphere.remote-ssh` (the one that fills the tree in Cursor) and `ms-vscode-remote.remote-ssh` (the upstream extension, when installed). A fork between two computers is **unioned, never elected**: every host either machine knows is kept, folders union within each host, and the replicated-newest side only decides the order the tree shows — because a folder one machine has opened and the other has not is a fact about the server, not a disagreement. First contact between two computers unions the same way, so neither side's history is discarded to settle it.
+
+  **Nothing reads or writes `~/.ssh/config`.** The hosts themselves — their addresses, users, ports and key files — stay entirely on each computer; only the folder history for hosts you already have is synchronized. A payload whose shape this build does not recognize is left for the manual resolver rather than replaced by a guess, and a peer naming any key outside the allowlist under this kind is refused.
+
 ## [0.0.47] - 2026-07-30
 
 ### Changed

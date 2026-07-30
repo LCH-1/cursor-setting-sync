@@ -427,7 +427,8 @@ function databaseCapabilityForKind(kind: ResourceKind): DatabaseCapability | nul
     kind === "extension" ||
     kind === "profile" ||
     kind === "ui-state" ||
-    kind === "cursor-user-rules"
+    kind === "cursor-user-rules" ||
+    kind === "remote-targets"
   ) {
     return "global-item-table";
   }
