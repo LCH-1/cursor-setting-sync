@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.43] - 2026-07-30
+
+Two dead ends found by using the thing: a button that did nothing, and a restart prompt that could never be satisfied.
+
+### Fixed
+
+- **The apply prompt no longer returns after every restart.** A workspaceStorage change for a workspace with no counterpart on this computer sat in a loop with no exit: the mapping pass blocked it, which correctly took it out of the batch and silenced the offer — and then the next poll re-queued the same entry, found nothing wrong with it (the per-cycle check is synchronous and cannot see workspace mappings or discover folders), and deleted the block. The change was ready again, the modal quit Cursor again, and the helper skipped it again with "workspace mapping required" — which does not mark it applied, so it stayed queued. Thirty seconds later the modal was back. The second computer in the pair this was built against sat in exactly that cycle: one change, re-offered after every single restart, that no restart could ever write. A block the mapping pass owns is now left alone by the queueing pass; only the mapping pass clears it, and it does so the moment the workspace resolves. Blocks the queueing pass does own — a disabled kind, an excluded workspace, an incompatible producer — are still recomputed every cycle, so a Cursor upgrade that lifts one still takes effect on its own.
+- The blocked reason now says what to do about it: open the folder on this computer, then run `Restart to Apply` to be asked again.
+- **Clicking the conflict warning in the status bar does something.** It runs `Resolve Conflicts`, whose first act is to take the synchronization lock — routinely held by this window's own poll for a good part of a minute, with a 60-second wait before it gives up. Taken bare, that produced no notification, no spinner, and no dialog for up to a minute, so the item that had just asked for attention read as a dead button. The wait is now shown. `takeCommandLock` has always accepted a reporter for exactly this reason; `Resolve Conflicts`, `Restore Version History` and `Forget Device` never passed one.
+
 ## [0.0.42] - 2026-07-30
 
 Two answers to the same question — what belongs on one computer, and what has to reach all of them.

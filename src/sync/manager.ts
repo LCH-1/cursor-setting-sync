@@ -1295,7 +1295,20 @@ export class SyncManager implements vscode.Disposable {
 
   async resolveConflicts(): Promise<void> {
     const repository = this.requireRepository();
-    const refreshLock = await this.takeCommandLock();
+    // Wrapped in progress because this is the one command reached by CLICKING a
+    // warning in the status bar, and the lock it needs is routinely held by this
+    // window's own poll for a good part of a minute. Taking it bare meant the
+    // click produced nothing at all - no notification, no spinner - for up to
+    // COMMAND_LOCK_WAIT_MS, which reads as a dead button on the very item that
+    // just asked for attention. `takeCommandLock` has always accepted a
+    // reporter for exactly this reason; this call site never passed one.
+    const refreshLock = await this.withProgress(
+      "Cursor Setting Sync",
+      async (report) => {
+        report("Opening the conflict resolver...");
+        return this.takeCommandLock(report);
+      },
+    );
     try {
       await this.openGitWindow(repository);
       await repository.refreshState();
@@ -1395,7 +1408,13 @@ export class SyncManager implements vscode.Disposable {
 
   async restoreVersion(): Promise<void> {
     const repository = this.requireRepository();
-    const refreshLock = await this.takeCommandLock();
+    const refreshLock = await this.withProgress(
+      "Cursor Setting Sync",
+      async (report) => {
+        report("Reading version history...");
+        return this.takeCommandLock(report);
+      },
+    );
     try {
       await this.openGitWindow(repository);
       await repository.refreshState();
@@ -1907,7 +1926,13 @@ export class SyncManager implements vscode.Disposable {
 
   async forgetDevice(): Promise<void> {
     const repository = this.requireRepository();
-    const firstLock = await this.takeCommandLock();
+    const firstLock = await this.withProgress(
+      "Cursor Setting Sync",
+      async (report) => {
+        report("Reading the device list...");
+        return this.takeCommandLock(report);
+      },
+    );
     let candidates: Array<{
       label: string;
       description?: string;
@@ -3120,8 +3145,7 @@ export class SyncManager implements vscode.Disposable {
         // with a message about workspace storage - 69 conversations held back
         // by a rule that was never about them, reported under a reason that
         // could not be acted on.
-        pending.blockedReason =
-          "This workspace storage belongs to a window with no folder open, so it has no counterpart on this computer.";
+        pending.blockedReason = FOLDERLESS_WORKSPACE_BLOCK_REASON;
         continue;
       }
       if (pending.kind === "chat") {
@@ -3173,7 +3197,7 @@ export class SyncManager implements vscode.Disposable {
         this.updateWorkspaceMappingBlocks(
           repository,
           sourceWorkspaceId,
-          `Workspace mapping is required for incoming ${resourceLabel}.`,
+          WORKSPACE_MAPPING_BLOCK_REASON,
         );
         continue;
       }
@@ -5009,7 +5033,47 @@ function isPolicyExcludedUiStateResource(
   return isPolicyExcludedUiStateKey(key);
 }
 
-function queuePending(
+/**
+ * The two reasons owned by {@link SyncManager.ensureWorkspaceMappings} rather
+ * than by `resourceApplyBlockReason`.
+ *
+ * Whether an incoming workspaceStorage change has a local counterpart is an
+ * answer only workspace discovery and the user's mapping list can give, and both
+ * are asynchronous. `resourceApplyBlockReason` is synchronous and consulted once
+ * per changed projection per cycle, so it deliberately does not know — which
+ * makes these blocks something it must not overrule. See
+ * {@link isWorkspaceMappingBlockReason}.
+ */
+export const WORKSPACE_MAPPING_BLOCK_REASON =
+  "Workspace mapping is required for incoming workspace storage. " +
+  'Run "Cursor Setting Sync: Restart to Apply" to be asked again, after opening the folder on this computer.';
+
+const FOLDERLESS_WORKSPACE_BLOCK_REASON =
+  "This workspace storage belongs to a window with no folder open, so it has no counterpart on this computer.";
+
+/**
+ * True for a block the workspace-mapping pass set, which the per-cycle queueing
+ * pass must leave alone.
+ *
+ * Without this the modal came back every thirty seconds, forever. The sequence:
+ * `ensureWorkspaceMappings` blocks an unmappable change, so it leaves the batch
+ * and the offer goes quiet — and then the next poll re-queues the same entry,
+ * `resourceApplyBlockReason` reports "nothing wrong" because it cannot see
+ * mappings, and {@link queuePending} deletes the block. The change is ready
+ * again, the modal quits Cursor again, the helper skips it again ("workspace
+ * mapping required", which does not mark it applied, so it stays queued), and
+ * the whole thing repeats on every launch. The user's second computer sat in
+ * exactly that cycle: one workspace-storage change, re-offered after every
+ * restart, that no restart could ever write.
+ */
+function isWorkspaceMappingBlockReason(reason: string | undefined): boolean {
+  return (
+    reason === WORKSPACE_MAPPING_BLOCK_REASON ||
+    reason === FOLDERLESS_WORKSPACE_BLOCK_REASON
+  );
+}
+
+export function queuePending(
   repository: SyncRepository,
   projection: ResourceProjection,
   blockedReason?: string,
@@ -5037,7 +5101,12 @@ function queuePending(
   );
   if (existing !== undefined) {
     if (blockedReason === undefined) {
-      delete existing.blockedReason;
+      // A workspace-mapping block outlives this pass; only the mapping pass
+      // clears it, and it does so the moment the workspace resolves. See
+      // isWorkspaceMappingBlockReason for what deleting it here used to cost.
+      if (!isWorkspaceMappingBlockReason(existing.blockedReason)) {
+        delete existing.blockedReason;
+      }
     } else {
       existing.blockedReason = blockedReason;
     }
