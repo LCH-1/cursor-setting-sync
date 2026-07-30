@@ -3,6 +3,7 @@ import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import {
+  APPLY_FAILURE_BLOCK_PREFIX,
   AUTOMATIC_CHECKPOINT_COOLDOWN_MS,
   AUTOMATIC_CHECKPOINT_EVENT_THRESHOLD,
   BACKUP_DIRECTORY,
@@ -961,6 +962,11 @@ export class SyncManager implements vscode.Disposable {
         await this.openGitWindow(repository);
         await repository.refreshState();
         await this.applyPendingRunningResources(repository);
+        // The user asked for this apply, so the previous one's failures get
+        // another try. The helper blocks what it could not write so the OFFER
+        // stops repeating on its own; deliberately running the command is the
+        // retry, and it re-blocks anything that fails again.
+        this.clearApplyFailureBlocks(repository);
         await this.ensureWorkspaceMappings(repository);
         batch = pendingHelperBatch(repository);
       } finally {
@@ -3067,6 +3073,22 @@ export class SyncManager implements vscode.Disposable {
     await repository.saveState();
   }
 
+  /**
+   * Drops the blocks the last apply's failures left behind, so an apply the
+   * user deliberately started tries them once more.
+   *
+   * Only from `restartToApply`. The queued-apply modal reaches the same command,
+   * but it can only appear when something UNBLOCKED is waiting - so a queue
+   * whose every entry failed goes quiet instead of quitting Cursor on a loop.
+   */
+  private clearApplyFailureBlocks(repository: SyncRepository): void {
+    for (const pending of repository.state.pendingDatabaseChanges) {
+      if (pending.blockedReason?.startsWith(APPLY_FAILURE_BLOCK_PREFIX)) {
+        delete pending.blockedReason;
+      }
+    }
+  }
+
   private async ensureWorkspaceMappings(repository: SyncRepository): Promise<void> {
     const localWorkspaces = await discoverWorkspaces(this.paths);
     const workspaceMappings = Object.assign(
@@ -5043,9 +5065,16 @@ function isPolicyExcludedUiStateResource(
  * per changed projection per cycle, so it deliberately does not know — which
  * makes these blocks something it must not overrule. See
  * {@link isWorkspaceMappingBlockReason}.
+ *
+ * The prefix is the stable part and the only thing recognition may depend on:
+ * every release up to 0.0.42 wrote "…for incoming workspace storage." with no
+ * follow-up sentence, and those entries are sitting in real repositories now.
  */
+const WORKSPACE_MAPPING_BLOCK_PREFIX =
+  "Workspace mapping is required for incoming";
+
 export const WORKSPACE_MAPPING_BLOCK_REASON =
-  "Workspace mapping is required for incoming workspace storage. " +
+  `${WORKSPACE_MAPPING_BLOCK_PREFIX} workspace storage. ` +
   'Run "Cursor Setting Sync: Restart to Apply" to be asked again, after opening the folder on this computer.';
 
 const FOLDERLESS_WORKSPACE_BLOCK_REASON =
@@ -5067,8 +5096,20 @@ const FOLDERLESS_WORKSPACE_BLOCK_REASON =
  * restart, that no restart could ever write.
  */
 function isWorkspaceMappingBlockReason(reason: string | undefined): boolean {
+  if (reason === undefined) {
+    return false;
+  }
+  // Matched on the PREFIX, never on the whole sentence. These reasons are
+  // persisted in the repository state, so the strings this build compares
+  // against are strings OLDER builds wrote — and 0.0.43 itself appended a
+  // sentence to this one. Exact equality would have failed to recognize every
+  // block written before the upgrade, un-blocked it on the first poll, and put
+  // the very computer this was written for straight back into the loop. The
+  // reason text is user-facing prose and will be reworded again; the prefix is
+  // the part that identifies who owns the block.
   return (
-    reason === WORKSPACE_MAPPING_BLOCK_REASON ||
+    reason.startsWith(WORKSPACE_MAPPING_BLOCK_PREFIX) ||
+    reason.startsWith(APPLY_FAILURE_BLOCK_PREFIX) ||
     reason === FOLDERLESS_WORKSPACE_BLOCK_REASON
   );
 }

@@ -125,6 +125,32 @@ export const RESTART_TO_APPLY_COMMAND = "cursorSync.restartToApply";
 export const RESTART_TO_APPLY_TITLE = "Cursor Setting Sync: Restart to Apply";
 
 /**
+ * Marks a queued change the offline helper tried to write and could not.
+ *
+ * Shared by the helper (which sets it) and the extension host (which must not
+ * clear it on the next poll), so the two cannot drift. Matched on this prefix
+ * alone: the rest of the line is the underlying error, which differs per
+ * resource and changes wording between releases.
+ *
+ * A per-resource apply failure is deliberately survivable - one corrupt
+ * database must not abort the batch - so the entry stays queued, which is
+ * correct. What was missing is that a queued entry is also an OFFER: it counts
+ * toward the modal that quits Cursor to write it. A resource that fails the
+ * same way every time therefore re-offered itself after every single restart,
+ * quitting Cursor each round to run an apply that could not succeed. The user's
+ * second computer did exactly that on a workspace database whose local copy
+ * fails SQLite's quick_check ("wrong # of entries in index"): the pre-write
+ * backup cannot be taken, the helper refuses to write without one - rightly -
+ * and "applied 0 resource(s)" left the queue exactly as it found it.
+ *
+ * Blocking stops the offer without discarding the change: it stays in the queue
+ * and in diagnostics with the real reason attached, and an explicit
+ * {@link RESTART_TO_APPLY_TITLE} clears the block and tries again.
+ */
+export const APPLY_FAILURE_BLOCK_PREFIX =
+  "The last apply could not write this resource";
+
+/**
  * How long after issuing the quit this window waits before concluding that the
  * quit never started.
  *

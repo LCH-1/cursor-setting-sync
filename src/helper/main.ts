@@ -12,9 +12,11 @@ import {
   CURSOR_EXIT_WAIT_MS,
   FINALIZER_EXIT_WAIT_MS,
   FINALIZER_LOCK_TRUST_MS,
+  APPLY_FAILURE_BLOCK_PREFIX,
   HELPER_REQUEST_VERSION,
   MAX_APPLY_BATCH_BYTES,
   REPOSITORY_FILE,
+  RESTART_TO_APPLY_TITLE,
 } from "../constants";
 import type {
   RepositoryFile,
@@ -424,6 +426,7 @@ async function executeRequest(
     applied,
     retainedLocal,
     { ...globalRetainedHashes, ...nonGlobalResult.retainedLocalHashes },
+    nonGlobalResult.failureByResourceId,
   );
   await repository.saveState();
   await finishGitTransport(
@@ -787,6 +790,7 @@ function markAppliedProjections(
   appliedResourceIds: string[],
   retainedLocalResourceIds: ReadonlySet<string>,
   retainedLocalHashes: Readonly<Record<string, string>> = {},
+  failureByResourceId: Readonly<Record<string, string>> = {},
 ): void {
   const applied = new Set(appliedResourceIds);
   for (const change of eligible) {
@@ -820,6 +824,18 @@ function markAppliedProjections(
     repository.state.pendingDatabaseChanges.filter(
       (pending) => !applied.has(pending.resourceId),
     );
+  // A change that was tried and failed stays queued - one corrupt database must
+  // not cost the batch - but it stops being OFFERED. Without this it counted
+  // toward the modal that quits Cursor to write it, so a resource that fails
+  // identically every time re-offered itself after every restart forever. See
+  // APPLY_FAILURE_BLOCK_PREFIX.
+  for (const pending of repository.state.pendingDatabaseChanges) {
+    const failure = failureByResourceId[pending.resourceId];
+    if (failure === undefined) {
+      continue;
+    }
+    pending.blockedReason = `${APPLY_FAILURE_BLOCK_PREFIX}: ${failure} Run "${RESTART_TO_APPLY_TITLE}" to try it again.`;
+  }
 }
 
 async function assertRuntimeVersion(request: HelperRequest): Promise<void> {

@@ -2,6 +2,15 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.44] - 2026-07-30
+
+0.0.43 fixed a way the apply prompt could repeat. It was not the way that was actually happening.
+
+### Fixed
+
+- **A change the helper cannot write no longer quits Cursor to retry it on every launch.** The real loop, from the second computer's own diagnostics: one workspace database whose *local* copy fails SQLite's `quick_check` (`wrong # of entries in index sqlite_autoindex_ItemTable_1`). The pre-write backup cannot be taken, the helper refuses to write without one — which is right — and it reported `applied 0 resource(s)`. A per-resource failure is deliberately survivable, so the entry stayed queued; what nobody accounted for is that a queued entry is also an *offer*. It counted toward the modal that quits Cursor to write it, so a resource failing identically every time re-offered itself after every restart, forever, quitting the editor each round for an apply that could not succeed. The helper now blocks what it just failed to write, with the underlying error attached: the change stays in the queue and in diagnostics instead of being discarded, the offer stops, and running `Restart to Apply` deliberately clears the block and tries again — re-blocking it if it fails again. One corrupt database no longer costs the rest of the queue *or* the ability to use the editor.
+- The 0.0.43 block-preservation rule was itself broken on upgrade. It compared the blocked reason by exact string equality, but that reason is persisted in repository state — so the strings it compares against are strings older builds wrote, and 0.0.43 had just reworded one of them. Every block written before the upgrade went unrecognized and was cleared on the first poll. Recognition is now by prefix, which is the part that identifies which pass owns the block; the wording is user-facing prose and free to change.
+
 ## [0.0.43] - 2026-07-30
 
 Two dead ends found by using the thing: a button that did nothing, and a restart prompt that could never be satisfied.

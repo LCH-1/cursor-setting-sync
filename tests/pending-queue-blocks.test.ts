@@ -9,6 +9,7 @@ import {
   WORKSPACE_MAPPING_BLOCK_REASON,
   queuePending,
 } from "../src/sync/manager";
+import { APPLY_FAILURE_BLOCK_PREFIX } from "../src/constants";
 import type { SyncRepository } from "../src/protocol/repository";
 import type { ResourceProjection } from "../src/protocol/reconciler";
 import type { PendingDatabaseChange, ResourceTip } from "../src/types";
@@ -48,6 +49,59 @@ describe("the queued-change block a workspace mapping owns", () => {
     expect(repository.state.pendingDatabaseChanges[0]?.blockedReason).toBe(
       WORKSPACE_MAPPING_BLOCK_REASON,
     );
+  });
+
+  it("recognizes a block an older build wrote, whose wording has since changed", () => {
+    // The reason is persisted in repository state, so what this build compares
+    // against is what an OLDER build wrote. 0.0.43 appended a sentence to the
+    // text; matching the whole sentence would have failed to recognize every
+    // block already sitting in the field, un-blocked it on the first poll after
+    // the upgrade, and put the computer this was written for straight back into
+    // the loop the upgrade was supposed to end.
+    const legacyReason =
+      "Workspace mapping is required for incoming workspace storage.";
+    expect(WORKSPACE_MAPPING_BLOCK_REASON).not.toBe(legacyReason);
+
+    const repository = repositoryWith([
+      {
+        eventHash: EVENT_HASH,
+        changeIndex: 0,
+        resourceId: RESOURCE_ID,
+        kind: "workspace-storage",
+        blockedReason: legacyReason,
+      },
+    ]);
+
+    queuePending(repository, projection(), undefined);
+
+    expect(repository.state.pendingDatabaseChanges[0]?.blockedReason).toBe(
+      legacyReason,
+    );
+  });
+
+  it("keeps a change the last apply failed to write out of the next offer", () => {
+    // The real loop, measured on the user's second computer: one workspace
+    // database whose LOCAL copy fails SQLite's quick_check ("wrong # of entries
+    // in index sqlite_autoindex_ItemTable_1"). The pre-write backup cannot be
+    // taken, the helper refuses to write without one, and it reported "applied
+    // 0 resource(s)" - so the entry stayed queued, which is correct, and stayed
+    // OFFERED, which is not. Every launch raised the modal, quit Cursor, ran an
+    // apply that could not succeed, and reopened to the same modal.
+    const repository = repositoryWith([
+      {
+        eventHash: EVENT_HASH,
+        changeIndex: 0,
+        resourceId: RESOURCE_ID,
+        kind: "workspace-storage",
+        blockedReason: `${APPLY_FAILURE_BLOCK_PREFIX}: SQLite quick_check failed: wrong # of entries in index sqlite_autoindex_ItemTable_1`,
+      },
+    ]);
+
+    queuePending(repository, projection(), undefined);
+
+    expect(
+      repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toContain(APPLY_FAILURE_BLOCK_PREFIX);
   });
 
   it("still clears a block this pass does own", () => {

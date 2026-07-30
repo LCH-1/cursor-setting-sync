@@ -62,6 +62,13 @@ export interface NonGlobalApplyResult {
   skipped: string[];
   /** The subset of skipped that is a real failure, promoted to warnings. */
   failures: string[];
+  /**
+   * The same failures keyed by resource, so the queue can block what it just
+   * failed to write instead of offering it again on every launch. Kept
+   * structured rather than parsed back out of {@link failures}, whose lines are
+   * prose meant for a human.
+   */
+  failureByResourceId: Record<string, string>;
   backupPaths: string[];
   backups: HelperBackup[];
   retainedLocal: string[];
@@ -99,6 +106,7 @@ export async function applyNonGlobalChanges(
   const retainedLocal: string[] = [];
   const retainedLocalHashes: Record<string, string> = {};
   const failures: string[] = [];
+  const failureByResourceId: Record<string, string> = {};
   const localWorkspaces =
     request.syncOptions.syncWorkspaceStorage &&
     prepared.some((item) => item.change.kind === "workspace-storage")
@@ -318,11 +326,11 @@ export async function applyNonGlobalChanges(
       // is ALSO a failure: folded into skipped alone it sat between routine
       // "tombstone retained" lines inside a green success result, and a
       // resource that failed the same way on every apply was never surfaced.
-      const line = `${change.resourceId}: ${
-        error instanceof Error ? error.message : String(error)
-      }`;
+      const message = error instanceof Error ? error.message : String(error);
+      const line = `${change.resourceId}: ${message}`;
       skipped.push(line);
       failures.push(`Applying ${line}`);
+      failureByResourceId[change.resourceId] = message;
     }
   }
 
@@ -342,6 +350,7 @@ export async function applyNonGlobalChanges(
     applied,
     skipped,
     failures,
+    failureByResourceId,
     backupPaths: backups.map((backup) => backup.backupPath),
     backups,
     retainedLocal,
