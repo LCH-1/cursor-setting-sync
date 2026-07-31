@@ -3482,6 +3482,13 @@ export class SyncManager implements vscode.Disposable {
         this.configuration.workspaceMappings,
         this.configuration.maxPayloadBytes,
         this.ignoredWorkspaceMatcher(),
+        // Images only, and live. A chat is published within thirty seconds of
+        // being written; its screenshots used to wait for the next shutdown,
+        // so the other computer received a conversation it could not open -
+        // Cursor refuses a turn whose image is missing. The databases still
+        // wait for the shutdown export, which is the pass that has Cursor to
+        // itself. The helper builds its own adapter without this flag.
+        true,
       ),
     ];
     if (this.compatibility.compatible) {

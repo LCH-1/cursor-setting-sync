@@ -35,7 +35,11 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
   readonly id = "workspace-storage";
   readonly kinds = ["workspace-storage"] as const;
   readonly appliesWhileRunning = false;
-  readonly scanWhileRunning = false;
+  /**
+   * True in the extension host, where the scan is restricted to the files
+   * Cursor is not holding open. See {@link imagesOnly}.
+   */
+  readonly scanWhileRunning: boolean;
 
   constructor(
     private readonly paths: CursorPaths,
@@ -53,7 +57,26 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
      * wrong direction to fail in.
      */
     private readonly ignoredWorkspaces: IgnoreMatcher = EMPTY_IGNORE_MATCHER,
-  ) {}
+    /**
+     * Scan only `images/`, and do it while Cursor is running.
+     *
+     * The whole adapter used to wait for shutdown, because `state.vscdb` is a
+     * database Cursor holds open and reading it mid-write is how you capture a
+     * torn snapshot. Chat images are not that: each is written once under a
+     * fresh UUID and never touched again, and the chat that references them is
+     * published within thirty seconds of being written.
+     *
+     * Holding the images to shutdown meant a conversation could arrive on the
+     * other computer whole while its screenshots did not exist there — and
+     * Cursor cannot continue a chat whose image is missing. It reports
+     * "Couldn't process image ..." and then fails the turn outright. The user
+     * hit exactly that: the chat had crossed, the PNG was still sitting on the
+     * machine that took it, waiting for a quit that had not happened.
+     */
+    private readonly imagesOnly = false,
+  ) {
+    this.scanWhileRunning = imagesOnly;
+  }
 
   async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
     const snapshots: ResourceSnapshot[] = [];
@@ -96,6 +119,12 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
           actualRelativePath,
         );
         if (!isBackedUpWorkspaceStorageFile(actualRelativePath)) {
+          continue;
+        }
+        // While Cursor runs, only the write-once files. `state.vscdb` is open
+        // and `notepads.json` is rewritten as the user types; both wait for
+        // the shutdown export, which is the pass that has Cursor to itself.
+        if (this.imagesOnly && !isWorkspaceImagePath(actualRelativePath)) {
           continue;
         }
         const canonicalWorkspaceId = canonicalWorkspaceStorageId(
@@ -425,6 +454,12 @@ export function isWorkspaceStateDatabasePath(relativePath: string): boolean {
     segments.length === 2 &&
     segments[1]?.toLowerCase() === "state.vscdb"
   );
+}
+
+/** `<workspaceId>/images/<name>` — chat attachments, written once and never edited. */
+export function isWorkspaceImagePath(relativePath: string): boolean {
+  const segments = relativePath.split("/");
+  return segments.length >= 3 && segments[1]?.toLowerCase() === "images";
 }
 
 /** `<workspaceId>/notepads.json` — the one workspace file that is a JSON list. */

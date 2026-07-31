@@ -2,6 +2,14 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.51] - 2026-07-31
+
+### Fixed
+
+- **A chat with an image can be continued on the other computer.** Images pasted into a chat are stored under `workspaceStorage/<workspace>/images/`, and that whole folder was scanned only at shutdown, because it also holds `state.vscdb` — a database Cursor keeps open, where reading mid-write captures a torn snapshot. The chat itself publishes within thirty seconds. So a conversation crossed to the other machine while its screenshots stayed behind on the one that took them, waiting for a quit that had not happened, and Cursor will not continue a chat whose image is missing: it reports `Couldn't process image ...` and then fails the turn outright.
+
+  Chat images are not databases. Each is written once under a fresh name and never edited, so they are now scanned while Cursor runs and travel with the chat that references them. `state.vscdb` and `notepads.json` still wait for the shutdown export, which is the pass that has Cursor to itself.
+
 ## [0.0.50] - 2026-07-31
 
 ### Changed
