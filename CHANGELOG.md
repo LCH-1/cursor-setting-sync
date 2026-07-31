@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.50] - 2026-07-31
+
+### Changed
+
+- **A quiet poll now reconciles once instead of three times.** Measured on a real machine: every open window burned a full CPU core for 5-10 seconds every 30 seconds, ~20-35% of a core each, continuously. A reconcile rebuilds the version graph of every resource from every event — 13,628 events and 2,235 resources on the repository this was found on — and the sync cycle ran one after the scan and one after the publish regardless of whether either had changed anything. Both are now conditional: the post-publish pass is skipped when the cycle published nothing (the common case, and nothing between the two passes writes to the repository), and the post-synthetic pass is skipped when there were no synthetic tips to apply. The reconcile after an auto-merge was already conditional and stays that way. A cycle that publishes something still recomputes exactly as before.
+
+  The remaining per-cycle cost is one `stat` per event file, which the cache uses to notice a file another device is pruning out from under it. That one is *not* safe to drop — the filename carries the content hash, but a file can be truncated in place while a deletion propagates, and without the check a cached decode outlives the bytes it was made from and a folded-away event comes back. It is left alone.
+
+  The real lever on both remaining costs is repository size: `Forget Device` for a computer that is gone, then `Checkpoint & Prune History`, cuts the event count the cycle walks.
+
 ## [0.0.49] - 2026-07-31
 
 ### Changed

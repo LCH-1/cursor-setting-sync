@@ -2460,15 +2460,18 @@ export class SyncManager implements vscode.Disposable {
           checkpoint,
         );
       }
-      const syntheticSkips = await this.applySyntheticProjectionsBeforeScan(
+      const synthetic = await this.applySyntheticProjectionsBeforeScan(
         repository,
         preResult.projections,
       );
-      preResult = reconciler.reconcile(
-        await repository.listEvents(),
-        repository.state,
-        checkpoint,
-      );
+      const syntheticSkips = synthetic.driftSkipped;
+      if (synthetic.changed) {
+        preResult = reconciler.reconcile(
+          await repository.listEvents(),
+          repository.state,
+          checkpoint,
+        );
+      }
       const requiredKinds = new Set(
         preResult.projections
           .filter((projection) => projection.changed)
@@ -2607,11 +2610,21 @@ export class SyncManager implements vscode.Disposable {
         publishError = error instanceof Error ? error : new Error(String(error));
       }
 
-      let result = reconciler.reconcile(
-        await repository.listEvents(),
-        repository.state,
-        checkpoint,
-      );
+      // Recomputed only when this cycle actually added something to the log.
+      // A reconcile walks every event to rebuild every resource's version
+      // graph - 13,628 events and 2,235 resources on the repository this was
+      // measured against - and with nothing published since `preResult` it
+      // reads the same files and reaches the same answer. The common cycle
+      // publishes nothing, so this was a second full pass, every thirty
+      // seconds, in every open window.
+      let result =
+        publishedCount > 0
+          ? reconciler.reconcile(
+              await repository.listEvents(),
+              repository.state,
+              checkpoint,
+            )
+          : preResult;
       if (
         await autoMergeConflicts(
           repository,
@@ -2964,13 +2977,21 @@ export class SyncManager implements vscode.Disposable {
   private async applySyntheticProjectionsBeforeScan(
     repository: SyncRepository,
     projections: ResourceProjection[],
-  ): Promise<Set<string>> {
+  ): Promise<SyntheticApplyResult> {
     const driftSkipped = new Set<string>();
     const scannedByAdapter = new Map<string, AdapterScanIndex | null>();
+    // Whether this pass touched the state at all. The caller re-reconciles
+    // afterwards, which on the measured repository walks 13,628 events to
+    // rebuild 2,235 version graphs - so doing it after a pass that changed
+    // nothing is a second full reconcile for no new information, on every
+    // poll, in every window. Synthetic tips are rare; the usual answer is
+    // that there were none.
+    let changed = false;
     for (const projection of projections) {
       if (!projection.changed || !isSyntheticTip(projection.tip)) {
         continue;
       }
+      changed = true;
       const tip = projection.tip;
       if (
         tip.operation === "delete" &&
@@ -3011,8 +3032,10 @@ export class SyncManager implements vscode.Disposable {
       }
       await this.applyProjectionGuarded(repository, adapter, projection);
     }
-    await repository.saveState();
-    return driftSkipped;
+    if (changed) {
+      await repository.saveState();
+    }
+    return { driftSkipped, changed };
   }
 
   private async scanAdapterForDrift(
@@ -4797,6 +4820,12 @@ function mergeSyncScopes(scopes: ReadonlySet<SyncScope>): SyncScope {
     return "chat";
   }
   return "remote";
+}
+
+/** What the pre-scan synthetic apply did, and whether it changed anything. */
+interface SyntheticApplyResult {
+  driftSkipped: Set<string>;
+  changed: boolean;
 }
 
 interface CheckpointCommandOutcome {

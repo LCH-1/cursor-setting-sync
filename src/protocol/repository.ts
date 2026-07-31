@@ -598,6 +598,14 @@ export class SyncRepository {
           // Event files are immutable, so an unchanged size and mtime means the
           // bytes are the ones that were hashed, decrypted and validated
           // earlier; only a file that actually changed pays that cost again.
+          //
+          // The filename carries the content hash, so it is tempting to trust
+          // the name alone and drop this syscall - 13,628 of them per cycle on
+          // the largest repository measured. It is not safe: a file another
+          // device is pruning can be truncated or rewritten in place while the
+          // cloud client propagates the deletion, and the stat is what notices.
+          // Without it a cached decode outlives the bytes it was made from and
+          // an event the checkpoint has already folded away comes back.
           const info = await statResilient(eventPath);
           const cached = this.decodedEvents.get(cacheKey);
           if (
