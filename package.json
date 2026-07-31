@@ -2,7 +2,7 @@
   "name": "cursor-setting-sync",
   "displayName": "Cursor Setting Sync",
   "description": "Securely synchronize Cursor settings, workspace state, profiles, extensions, user files, and chat data across devices.",
-  "version": "0.0.48",
+  "version": "0.0.49",
   "publisher": "lch",
   "icon": "icon.png",
   "license": "MIT",
@@ -142,6 +142,11 @@
           "type": "boolean",
           "default": true,
           "description": "Back up allowlisted Cursor workspaceStorage data after Cursor exits and restore it offline."
+        },
+        "cursorSettingSync.applyOnShutdown": {
+          "type": "boolean",
+          "default": true,
+          "description": "Write queued database changes when you close Cursor, instead of asking you to quit it again. Chat, profiles, extensions and workspace storage live in databases Cursor holds open, so they can only be written while it is not running - this uses the shutdown you were already performing. Turn it off to be prompted for an explicit \"Restart to Apply\" instead. Either way, files apply immediately and nothing is written while Cursor is running."
         },
         "cursorSettingSync.syncLocalWorkspaces": {
           "type": "boolean",

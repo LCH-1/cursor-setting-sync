@@ -35,6 +35,7 @@ import { commitAndPush, isGitRepository, pullLatest } from "../platform/git";
 import { acquireFileLock, type FileLock } from "../platform/lock";
 import { SyncRepository } from "../protocol/repository";
 import { EventReconciler, parentsForLocalChange } from "../protocol/reconciler";
+import type { ResourceProjection } from "../protocol/reconciler";
 import {
   absorbedCheckpointManifest,
   filterPublishableChanges,
@@ -330,7 +331,16 @@ async function executeRequest(
   // standing warning for them without also flagging every deliberately
   // retained tombstone and every superseded change.
   const warnings = [...gitWarnings, ...exported.warnings];
-  if (request.mode === "final-export") {
+  // The shutdown finalizer applies the queue too, when the user has left that
+  // on. This is the moment the queue was always waiting for - Cursor is closed
+  // because the user closed it - and it costs them nothing: no modal, no
+  // second quit, no relaunch (`request.restart` is false for this mode). The
+  // alternative they lived with was a dialog on every launch offering to quit
+  // the editor they had just opened.
+  const shutdownApply =
+    request.mode === "final-export" &&
+    request.syncOptions.applyOnShutdown !== false;
+  if (request.mode === "final-export" && !shutdownApply) {
     await finishGitTransport(
       gitActive,
       request.repositoryRoot,
@@ -354,11 +364,17 @@ async function executeRequest(
     repository.state,
     await absorbedCheckpointManifest(repository),
   );
-  const eligible = request.changes.filter((change) =>
+  // Read from the queue for a shutdown, handed over for an explicit apply; see
+  // {@link shutdownApplyBatch} for why the finalizer cannot use a list decided
+  // at arm time.
+  const requestedChanges = shutdownApply
+    ? shutdownApplyBatch(repository, reconcileResult.projections)
+    : request.changes;
+  const eligible = requestedChanges.filter((change) =>
     isEligible(change, reconcileResult.projections, repository.state.conflicts),
   );
   const skipped = [
-    ...request.changes
+    ...requestedChanges
     .filter((change) => !eligible.includes(change))
     .map((change) => `${change.resourceId}: superseded or conflicted`),
   ];
@@ -445,7 +461,9 @@ async function executeRequest(
   await finishGitTransport(
     gitActive,
     request.repositoryRoot,
-    `apply (${request.requestId.slice(0, 8)})`,
+    shutdownApply
+      ? `shutdown export and apply (${repository.state.device.deviceId.slice(0, 8)})`
+      : `apply (${request.requestId.slice(0, 8)})`,
     warnings,
   );
   return successResult(
@@ -796,6 +814,65 @@ export async function prepareChanges(
     }
   }
   return { prepared, skipped, failureByResourceId };
+}
+
+/**
+ * What the shutdown finalizer applies: the queue as it stands right now.
+ *
+ * The apply-and-restart path is handed its change list by the extension host,
+ * which built it seconds earlier. The finalizer cannot work that way — it is
+ * armed when Cursor STARTS and runs whenever Cursor exits, so anything decided
+ * at arm time is stale by the time it matters. It reads the queue itself
+ * instead, from the state it has just reconciled.
+ *
+ * Mirrors `pendingHelperBatch` in the extension host: blocked entries are
+ * skipped, entries whose tip is gone are skipped, and the batch stops at the
+ * same byte ceiling so one shutdown cannot be asked to hold half a gigabyte of
+ * payloads in memory. Whatever does not fit stays queued for the next quit.
+ */
+function shutdownApplyBatch(
+  repository: SyncRepository,
+  projections: ResourceProjection[],
+): HelperChange[] {
+  const tipByVersionId = new Map<string, ResourceProjection>();
+  for (const projection of projections) {
+    tipByVersionId.set(projection.tip.versionId, projection);
+  }
+  const changes: HelperChange[] = [];
+  let totalBytes = 0;
+  for (const pending of repository.state.pendingDatabaseChanges) {
+    if (pending.blockedReason !== undefined) {
+      continue;
+    }
+    const projection = tipByVersionId.get(
+      `${pending.eventHash}#${pending.changeIndex}`,
+    );
+    if (projection === undefined) {
+      continue;
+    }
+    const tip = projection.tip;
+    const payloadBytes = tip.payload?.plainBytes ?? 0;
+    if (totalBytes + payloadBytes > MAX_APPLY_BATCH_BYTES) {
+      continue;
+    }
+    const change: HelperChange = {
+      eventHash: tip.eventHash,
+      changeIndex: tip.changeIndex,
+      resourceId: projection.resourceId,
+      kind: tip.kind,
+      operation: tip.operation,
+      semanticHash: tip.semanticHash,
+    };
+    if (tip.payload !== undefined) {
+      change.payload = tip.payload;
+    }
+    if (tip.metadata !== undefined) {
+      change.metadata = tip.metadata;
+    }
+    changes.push(change);
+    totalBytes += payloadBytes;
+  }
+  return changes;
 }
 
 function isEligible(

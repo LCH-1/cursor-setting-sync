@@ -50,6 +50,15 @@ export interface HelperRequest {
      */
     ignoredWorkspaces?: string[];
     machineScopedSettings: string[];
+    /**
+     * Whether the shutdown finalizer writes the queue as well as exporting it.
+     *
+     * Absent in helper-request files written before this option existed, and a
+     * finalizer armed by an older build carries no such field - so the reader
+     * treats only an explicit `false` as off. Getting that backwards would
+     * silently stop applying for anyone mid-upgrade.
+     */
+    applyOnShutdown?: boolean;
     syncChat: boolean;
     syncWorkspaceStorage: boolean;
     maxPayloadBytes: number;

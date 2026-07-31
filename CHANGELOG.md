@@ -2,6 +2,17 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.49] - 2026-07-31
+
+### Changed
+
+- **Queued changes are written when you close Cursor, instead of asking you to close it.** The queue needs a Cursor that is not running, and the only way to give it one was a modal — on every launch — offering to quit the editor you had just opened. But a shutdown finalizer already runs at every quit: it waits for the last process to exit, takes the lock, and exports this session's workspaceStorage. It now writes the pending queue in the same pass. No modal, no second quit, no relaunch. The finalizer reads the queue itself rather than a list decided when it was armed, because it is armed at startup and runs whenever you happen to close the editor. Turn it off with `cursorSettingSync.applyOnShutdown` to be prompted for an explicit `Restart to Apply` instead; either way files still apply immediately while Cursor runs, and nothing is ever written to a database Cursor holds open.
+- The status bar says so: queued changes now read as "written the next time you close Cursor - no restart needed", with `Restart to Apply` offered for anyone who wants them sooner.
+
+### Fixed
+
+- **Checkpoints no longer accumulate in the shared folder while one computer is behind.** A checkpoint is created whenever any event has been published since the last one, and the *only* thing that deletes a superseded checkpoint file is a prune that gets past the gate requiring every device to have absorbed the current one. With a device stuck — the real pair had one whose acknowledgements stopped three days earlier — every maintenance run added a 2.6 MB file that nothing would ever remove: **60 files, 150 MB, written in 34 hours**, all uploaded to the shared folder. Creating one also made the prune in the same run abort, because creating absorbs it and the prune then reports "a newer checkpoint was absorbed" — so the act of creating guaranteed the act of deleting could not follow. The lagging-device check now runs *before* the write, and a run that cannot prune keeps the existing checkpoint and names the device holding things up.
+
 ## [0.0.48] - 2026-07-30
 
 ### Added

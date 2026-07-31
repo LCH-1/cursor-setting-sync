@@ -194,6 +194,25 @@ describe("the queued-changes status detail", () => {
     expect(detail).not.toContain("deferred");
   });
 
+  it("stops prescribing a restart once quitting applies the queue", () => {
+    // The complaint this answers: the modal and the status bar both told the
+    // user to quit the editor they had just opened, on every launch, for a
+    // queue that the shutdown they were going to perform anyway can write.
+    const detail = pendingRestartDetail(pending("chat", 4), true);
+
+    expect(detail).toContain("the next time you close Cursor");
+    expect(detail).toContain("no restart needed");
+    expect(detail).not.toContain("quitting and reopening Cursor does not");
+    // The explicit command is still offered for someone who wants it now.
+    expect(detail).toContain(RESTART_TO_APPLY_TITLE);
+  });
+
+  it("keeps the old wording when shutdown apply is off", () => {
+    const detail = pendingRestartDetail(pending("chat", 4), false);
+    expect(detail).toContain("quitting and reopening Cursor does not");
+    expect(detail).not.toContain("no restart needed");
+  });
+
   it("classifies every reason the block sites can produce", () => {
     // The classification is by exact string, so a reworded reason silently
     // changes which bucket it lands in. These are the constants themselves.

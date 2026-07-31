@@ -88,6 +88,15 @@ export class ExtensionConfiguration {
     return setting<boolean>("syncWorkspaceStorage", true);
   }
 
+  /**
+   * On by default: the shutdown this already waits for is the exact moment the
+   * queue can be written, and using it costs the user nothing they would have
+   * chosen otherwise.
+   */
+  get applyOnShutdown(): boolean {
+    return setting<boolean>("applyOnShutdown", true);
+  }
+
   get gitSync(): boolean {
     return setting<boolean>("gitSync", true);
   }

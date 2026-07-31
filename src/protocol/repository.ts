@@ -1094,6 +1094,53 @@ export class SyncRepository {
     };
   }
 
+  /**
+   * Devices that have not absorbed the current checkpoint, and why.
+   *
+   * Split out so the caller can ask BEFORE writing a new checkpoint. Creating
+   * one costs 2.6 MB in the shared folder on this repository, and the only
+   * thing that ever deletes a shared checkpoint file is a prune that gets past
+   * this gate — so while a device is stuck, every attempt added a file that
+   * nothing would remove. Measured: 60 files, 150 MB, all written in 34 hours,
+   * against a device whose acks stopped three days earlier.
+   *
+   * Empty when there is no checkpoint yet: nothing can lag behind a checkpoint
+   * that does not exist, and the first one has to be creatable.
+   */
+  async laggingDeviceReasons(): Promise<string[]> {
+    const checkpoint = this.state.checkpoint;
+    if (checkpoint === undefined) {
+      return [];
+    }
+    const manifest = await this.loadAbsorbedCheckpointManifest();
+    if (manifest === null) {
+      return [];
+    }
+    const lagging: string[] = [];
+    const ancestryCache = new Map<string, CheckpointManifest | null>();
+    ancestryCache.set(checkpoint.hash, manifest);
+    for (const deviceId of await this.listVisibleDeviceIds()) {
+      if (this.state.retiredDevices.includes(deviceId)) {
+        continue;
+      }
+      const acks = await this.readDeviceAcks(deviceId);
+      const absorbed = acks?.absorbedCheckpoint ?? null;
+      if (absorbed === null) {
+        lagging.push(`${deviceId}: no absorbed checkpoint recorded`);
+        continue;
+      }
+      const verdict = await this.ackCoversCheckpoint(
+        absorbed.hash,
+        checkpoint.hash,
+        ancestryCache,
+      );
+      if (verdict !== null) {
+        lagging.push(`${deviceId}: ${verdict}`);
+      }
+    }
+    return lagging;
+  }
+
   async pruneWithGates(options: PruneOptions): Promise<PruneResult> {
     if (this.pendingRecovery !== null) {
       throw this.pendingRecovery;

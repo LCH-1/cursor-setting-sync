@@ -585,6 +585,14 @@ export class SyncManager implements vscode.Disposable {
     if (repository === null || this.queuedApplyDeclined) {
       return;
     }
+    // Nothing to offer when quitting will do it. The modal exists because the
+    // queue needs a closed Cursor and the user had no other way to give it one;
+    // with the finalizer applying, asking them to quit the editor they just
+    // opened is asking for something they were going to do anyway, at the one
+    // moment it interrupts them most.
+    if (this.configuration.applyOnShutdown) {
+      return;
+    }
     if (await this.applyAlreadyInProgress()) {
       // A sibling window committed to an apply and the offer lock is free
       // again because its dialog was answered - but its syncNow, git pull and
@@ -1731,6 +1739,7 @@ export class SyncManager implements vscode.Disposable {
         autoApplyFiles: this.configuration.autoApplyFiles,
         syncChat: this.configuration.syncChat,
         syncWorkspaceStorage: this.configuration.syncWorkspaceStorage,
+        applyOnShutdown: this.configuration.applyOnShutdown,
         gitSync: this.configuration.gitSync,
         maxPayloadMiB: Math.round(
           this.configuration.maxPayloadBytes / (1024 * 1024),
@@ -2161,13 +2170,28 @@ export class SyncManager implements vscode.Disposable {
         );
       }
       let created: CheckpointCreateResult | null = null;
+      // Asked before writing, not after. A checkpoint is 2.6 MB in the shared
+      // folder and only a prune past the lagging-device gate ever deletes one,
+      // so creating another while a device is stuck adds a file nothing will
+      // remove - 60 of them, 150 MB, in 34 hours on the repository this was
+      // found on. Worse, creating one absorbs it, which makes the prune in
+      // this very run abort on "a newer checkpoint was absorbed": the act of
+      // creating guaranteed the act of deleting could not follow it.
+      const lagging = await repository.laggingDeviceReasons();
       if (
+        lagging.length === 0 &&
         !checkpointCoversStreams(
           repository.state.checkpoint,
           repository.state.streams,
         )
       ) {
         created = await repository.createCheckpoint(true);
+      } else if (lagging.length > 0) {
+        report("Waiting for every device to absorb the current checkpoint...");
+        this.status.log(
+          `Kept the existing checkpoint rather than adding another: ${lagging.join("; ")}. ` +
+            'Run "Cursor Setting Sync: Forget Device" for a computer that is gone.',
+        );
       }
       if (created === null && repository.state.checkpoint === undefined) {
         return { created: null, prune: null, gitSquash: null };
@@ -3732,6 +3756,7 @@ export class SyncManager implements vscode.Disposable {
       machineScopedSettings: this.machineSpecificSettingPatterns(),
       syncChat: this.configuration.syncChat,
       syncWorkspaceStorage: this.configuration.syncWorkspaceStorage,
+      applyOnShutdown: this.configuration.applyOnShutdown,
       maxPayloadBytes: this.configuration.maxPayloadBytes,
       gitSync: this.configuration.gitSync,
     };
@@ -3801,7 +3826,10 @@ export class SyncManager implements vscode.Disposable {
     ) {
       this.status.setStatus(
         "pending-restart",
-        pendingRestartDetail(repository.state.pendingDatabaseChanges),
+        pendingRestartDetail(
+          repository.state.pendingDatabaseChanges,
+          this.configuration.applyOnShutdown,
+        ),
       );
     } else if (!this.configuration.enabled) {
       this.status.setStatus("disabled");
@@ -4496,6 +4524,7 @@ export function helperFailureDetail(error: string | null): string {
  */
 export function pendingRestartDetail(
   pending: readonly PendingDatabaseChange[],
+  applyOnShutdown = false,
 ): string {
   const ready = pending.filter((change) => change.blockedReason === undefined);
   // Split three ways, not two. A change held by a standing decision of this
@@ -4515,8 +4544,12 @@ export function pendingRestartDetail(
   return [
     ready.length === 0
       ? ""
-      : `${ready.length} change(s) from another device (${summarizePendingKinds(ready)}) are queued. ` +
-        `Run "${RESTART_TO_APPLY_TITLE}" to write them - quitting and reopening Cursor does not.`,
+      : applyOnShutdown
+        ? `${ready.length} change(s) from another device (${summarizePendingKinds(ready)}) are queued. ` +
+          `They are written the next time you close Cursor - no restart needed. ` +
+          `Run "${RESTART_TO_APPLY_TITLE}" to write them now instead.`
+        : `${ready.length} change(s) from another device (${summarizePendingKinds(ready)}) are queued. ` +
+          `Run "${RESTART_TO_APPLY_TITLE}" to write them - quitting and reopening Cursor does not.`,
     deferred.length === 0
       ? ""
       : `${deferred.length} change(s) are deferred: ${commonestBlockedReason(deferred)}`,

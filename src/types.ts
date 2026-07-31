@@ -382,6 +382,7 @@ export interface DiagnosticConfiguration {
   autoApplyFiles: boolean;
   syncChat: boolean;
   syncWorkspaceStorage: boolean;
+  applyOnShutdown: boolean;
   gitSync: boolean;
   maxPayloadMiB: number;
   useDefaultIgnoredSettings: boolean;
