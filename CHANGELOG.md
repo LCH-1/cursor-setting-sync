@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.58] - 2026-08-03
+
+### Changed
+
+- **`Restore Version History` shows how many messages a chat version holds.** Recovering a conversation is the one case where two versions of the same resource have to be told apart on content, and the payload size was the only clue on the line. `3f1a2b4c · put · 412 KB · 167 messages` says which entry still has the conversation in it, which is what makes the 0.0.57 recovery path usable by hand.
+
 ## [0.0.57] - 2026-08-03
 
 ### Fixed

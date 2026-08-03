@@ -25,6 +25,7 @@ import type {
   CompatibilityReport,
   DiagnosticSnapshot,
   EventProducer,
+  JsonValue,
   LocalProjection,
   MergeOutcome,
   PendingDatabaseChange,
@@ -1608,7 +1609,9 @@ export class SyncManager implements vscode.Disposable {
           summary.plainBytes === null
             ? "no payload"
             : formatBytes(summary.plainBytes)
-        }${summary.fromCheckpoint ? " · checkpoint" : ""}`,
+        }${versionMessageCount(summary.metadata)}${
+          summary.fromCheckpoint ? " · checkpoint" : ""
+        }`,
         ...(blockedReason === null ? {} : { detail: blockedReason }),
         summary,
         blockedReason,
@@ -4637,6 +4640,24 @@ export function isInterruptedResult(result: {
       "Cursor was reopened before offline changes could be applied",
     )
   );
+}
+
+/**
+ * " · 167 messages" for a chat version, and nothing for anything else.
+ *
+ * Restoring a conversation is the one case where the user has to tell two
+ * versions of the same resource apart on content, and bytes are a poor proxy:
+ * a pruned capture and a full one differ by orders of magnitude, but nothing
+ * on the line said which number meant "the conversation is still in here".
+ */
+function versionMessageCount(
+  metadata: Record<string, JsonValue> | undefined,
+): string {
+  const count = metadata?.["bubbleCount"];
+  if (typeof count !== "number") {
+    return "";
+  }
+  return ` · ${count} message${count === 1 ? "" : "s"}`;
 }
 
 /** "3m 12s", or "7s" under a minute. */
