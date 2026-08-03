@@ -105,6 +105,12 @@ export interface HelperResult {
    * message text for those.
    */
   interrupted?: boolean;
+  /**
+   * When the helper process started, so the extension host can report how long
+   * an offline pass took. Cursor is closed for the whole of one, so this is the
+   * only way the duration is ever visible. Absent before 0.0.55.
+   */
+  startedAt?: string;
   completedAt: string;
   applied: string[];
   /**

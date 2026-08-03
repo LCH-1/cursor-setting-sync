@@ -81,6 +81,13 @@ import type { HelperBackup, HelperChange, HelperRequest, HelperResult } from "./
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Stamped once at process start so every result can say how long the offline
+ * pass took. Cursor is closed for the whole of one, so the completion line is
+ * the only place that duration is ever visible.
+ */
+const HELPER_STARTED_AT = new Date().toISOString();
+
 interface CollectedBackups {
   backupPath: string | null;
   backups: HelperBackup[];
@@ -195,6 +202,7 @@ async function run(): Promise<void> {
         success: false,
         // Not a failure the user has to act on; see HelperResult.interrupted.
         ...(error instanceof CursorReopenedError ? { interrupted: true } : {}),
+        startedAt: HELPER_STARTED_AT,
         completedAt: new Date().toISOString(),
         applied: [],
         skipped: [],
@@ -1411,6 +1419,7 @@ function successResult(
     requestId: request.requestId,
     mode: request.mode,
     success: true,
+    startedAt: HELPER_STARTED_AT,
     completedAt: new Date().toISOString(),
     applied,
     skipped,

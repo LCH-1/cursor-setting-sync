@@ -5,7 +5,7 @@ vi.mock("vscode", () => ({
   extensions: { all: [] },
 }));
 
-import { isInterruptedResult } from "../src/sync/manager";
+import { helperRunDuration, isInterruptedResult } from "../src/sync/manager";
 
 const REOPENED =
   "CursorReopenedError: Cursor was reopened before offline changes could be applied. Close Cursor and try again.";
@@ -44,5 +44,33 @@ describe("a shutdown pass cut short by the editor reopening", () => {
     expect(isInterruptedResult({ interrupted: false, error: "disk full" })).toBe(
       false,
     );
+  });
+});
+
+describe("how long the offline pass took", () => {
+  it("is reported, because Cursor is closed for all of it", () => {
+    // The apply runs with the editor shut, so there is no UI it could report
+    // into while it works. The completion line is the only place the duration
+    // is ever visible - without it a pass that took four minutes and one that
+    // took four seconds read identically.
+    expect(
+      helperRunDuration({
+        startedAt: "2026-08-03T10:00:00.000Z",
+        completedAt: "2026-08-03T10:03:12.000Z",
+      }),
+    ).toBe(" in 3m 12s");
+    expect(
+      helperRunDuration({
+        startedAt: "2026-08-03T10:00:00.000Z",
+        completedAt: "2026-08-03T10:00:07.000Z",
+      }),
+    ).toBe(" in 7s");
+  });
+
+  it("says nothing when the helper did not report a start time", () => {
+    // A helper armed before this shipped is still the one that runs at the
+    // first shutdown after the update.
+    expect(helperRunDuration({ completedAt: "2026-08-03T10:00:00.000Z" })).toBe("");
+    expect(helperRunDuration({})).toBe("");
   });
 });

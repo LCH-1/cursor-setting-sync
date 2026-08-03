@@ -969,37 +969,68 @@ export class SyncManager implements vscode.Disposable {
     const claim = await this.markApplyInProgress();
     let committed = false;
     try {
-      await this.syncNow(true);
-      // The sync above releases the lock, so this races the background cycle
-      // for it a moment later - which is how the command the user asked for
-      // failed with "another Cursor window is synchronizing" about this
-      // window's own poll. Waiting is shown rather than silent.
-      const lock = await this.withProgress(
+      // One progress notification across the WHOLE preparation, and a line per
+      // phase in the output channel.
+      //
+      // Only the lock wait used to be shown, and it disappears the moment the
+      // lock is taken - after which the synchronize, the git fetch, the state
+      // reload and the mapping pass ran in silence. On a repository of any
+      // size that is minutes of a command that has visibly done nothing, with
+      // no way to tell it apart from one that has hung. The log lines carry
+      // elapsed times and survive the quit, so the record is still there when
+      // Cursor comes back.
+      const startedAt = Date.now();
+      const phase = (
+        report: (message: string) => void,
+        message: string,
+      ): void => {
+        report(message);
+        this.status.log(
+          `Restart to Apply [${Math.round((Date.now() - startedAt) / 1000)}s]: ${message}`,
+        );
+      };
+      const batch = await this.withProgress(
         RESTART_TO_APPLY_TITLE,
-        async (report) => this.takeCommandLock(report),
+        async (report) => {
+          phase(report, "Synchronizing before the apply...");
+          await this.syncNow(true);
+          // The sync above releases the lock, so this races the background
+          // cycle for it a moment later - which is how the command the user
+          // asked for failed with "another Cursor window is synchronizing"
+          // about this window's own poll. Waiting is shown rather than silent.
+          phase(report, "Taking the synchronization lock...");
+          const lock = await this.takeCommandLock((message) =>
+            phase(report, message),
+          );
+          try {
+            phase(report, "Fetching the shared folder...");
+            await this.openGitWindow(repository);
+            phase(report, "Reading the queue...");
+            await repository.refreshState();
+            phase(report, "Writing what can be applied while Cursor runs...");
+            await this.applyPendingRunningResources(repository);
+            // The user asked for this apply, so the previous one's failures get
+            // another try. The helper blocks what it could not write so the
+            // OFFER stops repeating on its own; deliberately running the
+            // command is the retry, and it re-blocks anything that fails again.
+            this.clearApplyFailureBlocks(repository);
+            phase(report, "Checking workspace mappings...");
+            await this.ensureWorkspaceMappings(repository);
+            // Both of the above only touched memory. Everything else that
+            // blocks a queued change is derived from the synchronous
+            // `resourceApplyBlockReason` and reaches disk through the poll's
+            // own save - but workspace mappings are exactly what that function
+            // cannot see, so without this the answer the user just gave a
+            // mapping prompt died with the process it was given to. The quit is
+            // seconds away.
+            await repository.saveState();
+            phase(report, "Preparing the batch...");
+            return pendingHelperBatch(repository);
+          } finally {
+            await lock.release();
+          }
+        },
       );
-      let batch: PendingHelperBatch;
-      try {
-        await this.openGitWindow(repository);
-        await repository.refreshState();
-        await this.applyPendingRunningResources(repository);
-        // The user asked for this apply, so the previous one's failures get
-        // another try. The helper blocks what it could not write so the OFFER
-        // stops repeating on its own; deliberately running the command is the
-        // retry, and it re-blocks anything that fails again.
-        this.clearApplyFailureBlocks(repository);
-        await this.ensureWorkspaceMappings(repository);
-        // Both of the above only touched memory. Everything else that blocks a
-        // queued change is derived from the synchronous
-        // `resourceApplyBlockReason` and reaches disk through the poll's own
-        // save - but workspace mappings are exactly what that function cannot
-        // see, so without this the answer the user just gave a mapping prompt
-        // died with the process it was given to. The quit is seconds away.
-        await repository.saveState();
-        batch = pendingHelperBatch(repository);
-      } finally {
-        await lock.release();
-      }
       if (this.disposed || this.repository !== repository || this.masterKey === null) {
         // Disconnect or Setup ran while this command was parked in prompts or
         // waits; quitting every window to apply into a repository this device
@@ -1058,6 +1089,16 @@ export class SyncManager implements vscode.Disposable {
           `Applying ${changes.length} change(s); ${batch.deferredForBatchLimit} more exceed the per-apply size limit, stay queued, and are offered again after this pass.`,
         );
       }
+      // The last thing written before the window goes away, and the first
+      // thing the user reads when it comes back. The offline pass runs with
+      // Cursor closed, so there is no UI it could report into: this line plus
+      // the completion line the result produces are the whole record of a
+      // stretch that takes minutes on a large queue.
+      this.status.log(
+        `Applying ${changes.length} change(s) offline (${summarizePendingKinds(changes)}). ` +
+          "Cursor closes now, the helper writes them with the editor shut, and Cursor reopens by itself. " +
+          "Reopening it by hand before that finishes cancels the pass and leaves the queue for next time.",
+      );
       committed = true;
       await this.launchApplyHelper(repository, masterKey, changes, claim);
     } finally {
@@ -4010,7 +4051,8 @@ export class SyncManager implements vscode.Disposable {
       await this.recordHelperBackups(result);
       if (result.success) {
         this.status.log(
-          `Helper ${result.requestId} applied ${result.applied.length} resource(s).`,
+          `Helper ${result.requestId} applied ${result.applied.length} resource(s)` +
+            `${helperRunDuration(result)}.`,
         );
         if (result.skipped.length > 0) {
           const details = result.skipped.slice(0, 20).join(" | ");
@@ -4572,6 +4614,23 @@ export function isInterruptedResult(result: {
       "Cursor was reopened before offline changes could be applied",
     )
   );
+}
+
+/** " in 3m 12s", or nothing when the helper did not report a start time. */
+export function helperRunDuration(result: {
+  startedAt?: string;
+  completedAt?: string;
+}): string {
+  const started = Date.parse(result.startedAt ?? "");
+  const completed = Date.parse(result.completedAt ?? "");
+  if (!Number.isFinite(started) || !Number.isFinite(completed)) {
+    return "";
+  }
+  const seconds = Math.max(0, Math.round((completed - started) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  return minutes === 0
+    ? ` in ${seconds}s`
+    : ` in ${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
 export function helperFailureDetail(error: string | null): string {

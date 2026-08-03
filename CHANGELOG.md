@@ -2,6 +2,13 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.55] - 2026-08-03
+
+### Changed
+
+- **`Restart to Apply` says what it is doing.** Only the wait for the synchronization lock was ever shown, and that notification disappears the moment the lock is taken — after which the synchronize, the shared-folder fetch, the state reload and the workspace-mapping pass all ran in silence. On a large repository that is minutes of a command that has visibly done nothing, with no way to tell it apart from one that has hung. The whole preparation now runs under one progress notification that names each phase, and every phase is written to the output channel with an elapsed time, so the record survives the quit and is still there when Cursor comes back.
+- **The offline pass is bracketed by two log lines.** It runs with Cursor closed, so there is no UI it can report into while it works. The line before the quit names how many changes are going and warns that reopening the editor by hand cancels the pass; the line after the relaunch reports what landed and how long it took — a pass that took four minutes and one that took four seconds used to read identically.
+
 ## [0.0.54] - 2026-08-03
 
 ### Fixed
