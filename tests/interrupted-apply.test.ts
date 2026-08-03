@@ -5,7 +5,11 @@ vi.mock("vscode", () => ({
   extensions: { all: [] },
 }));
 
-import { helperRunDuration, isInterruptedResult } from "../src/sync/manager";
+import {
+  formatDuration,
+  helperRunDuration,
+  isInterruptedResult,
+} from "../src/sync/manager";
 
 const REOPENED =
   "CursorReopenedError: Cursor was reopened before offline changes could be applied. Close Cursor and try again.";
@@ -65,6 +69,17 @@ describe("how long the offline pass took", () => {
         completedAt: "2026-08-03T10:00:07.000Z",
       }),
     ).toBe(" in 7s");
+  });
+
+  it("is spelled the same wherever a duration is reported", () => {
+    // Shared with the slow-cycle line, which is how a repository whose cycles
+    // outlast the poll interval - the state that starves a command of the
+    // lock - becomes something the log actually says.
+    expect(formatDuration(0)).toBe("0s");
+    expect(formatDuration(-5_000)).toBe("0s");
+    expect(formatDuration(59_400)).toBe("59s");
+    expect(formatDuration(60_000)).toBe("1m 00s");
+    expect(formatDuration(192_000)).toBe("3m 12s");
   });
 
   it("says nothing when the helper did not report a start time", () => {

@@ -2,7 +2,7 @@
   "name": "cursor-setting-sync",
   "displayName": "Cursor Setting Sync",
   "description": "Securely synchronize Cursor settings, workspace state, profiles, extensions, user files, and chat data across devices.",
-  "version": "0.0.55",
+  "version": "0.0.56",
   "publisher": "lch",
   "icon": "icon.png",
   "license": "MIT",

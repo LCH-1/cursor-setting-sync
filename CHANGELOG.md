@@ -2,6 +2,23 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.56] - 2026-08-03
+
+### Fixed
+
+- **`Restart to Apply` could wait forever on its first phase.** The command opens with a synchronize, and every caller of that synchronize waited not for its own cycle but for the whole queue behind it to empty. On a repository where one cycle outlasts the poll interval the queue is *never* empty: the two 30-second timers and the shared-folder watcher hand the drain a fresh scope while the cycle they are queued behind is still running, so the loop kept working correctly and the caller was simply never told. Observed on a 1.1 GB repository as an apply that sat on "Synchronizing before the apply..." for over an hour while the output channel showed cycle after cycle completing normally. Each request now resolves when the cycle that took *its* scope ends.
+
+  The 0.0.55 phase logging is what made this legible — the log stopping at phase one while sync warnings kept arriving on the hour is the whole diagnosis. The call itself has been there since 0.0.34.
+
+- **A user-invoked command no longer competes with this window's own polling.** Commands take the same lock the background cycle holds and wait up to a minute for it — ample against one cycle, hopeless against a queue that refills itself, so the command failed with "this window's own background synchronization is still running", which was true and useless because waiting longer could not help. Automatic requests now stand down while a command prepares. They are withheld rather than dropped: the scope decides what the next cycle even looks at, so a watcher event during a command is still picked up, in one widened cycle, as soon as the command is done.
+
+- **A cycle that fails no longer strands the requests queued behind it.** They waited on a promise nothing would ever settle. They now report that their cycle never ran, with the failure that ended the drain kept as the cause — rather than reporting somebody else's error as their own.
+
+### Changed
+
+- **A phase that runs long says so while it runs.** Phases logged when they started, so the slowest one — exactly the one somebody goes to the log about — wrote nothing until the next began. `Restart to Apply` now repeats the phase it is still on every 30 seconds, with the elapsed time.
+- **A synchronization cycle slower than a minute reports its duration.** That number is what decides whether the poll interval leaves the queue any idle at all; a cycle longer than the interval means the next one starts the moment this one ends, which costs CPU continuously and is what starved commands of the lock.
+
 ## [0.0.55] - 2026-08-03
 
 ### Changed

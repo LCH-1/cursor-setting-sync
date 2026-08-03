@@ -125,6 +125,25 @@ export const RESTART_TO_APPLY_COMMAND = "cursorSync.restartToApply";
 export const RESTART_TO_APPLY_TITLE = "Cursor Setting Sync: Restart to Apply";
 
 /**
+ * How often the apply's preparation repeats the phase it is still on.
+ *
+ * Each phase logs when it starts, so a slow one leaves the channel silent for
+ * as long as it runs - which is precisely when somebody goes looking. Rare
+ * enough not to bury the log, frequent enough to answer "is this moving".
+ */
+export const RESTART_TO_APPLY_HEARTBEAT_MS = 30_000;
+
+/**
+ * A cycle slower than this says so in the log when it ends.
+ *
+ * The duration is otherwise invisible, and it is the number that decides
+ * whether the poll interval is long enough to leave the queue any idle: a
+ * cycle that outlasts it means the drain is running back to back, which is
+ * both a CPU cost and what starves a command of the lock.
+ */
+export const SLOW_SYNC_CYCLE_MS = 60_000;
+
+/**
  * Marks a queued change the offline helper tried to write and could not.
  *
  * Shared by the helper (which sets it) and the extension host (which must not

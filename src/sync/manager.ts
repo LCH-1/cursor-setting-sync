@@ -15,7 +15,9 @@ import {
   QUIT_START_GRACE_MS,
   REPOSITORY_FILE,
   RESTART_TO_APPLY_COMMAND,
+  RESTART_TO_APPLY_HEARTBEAT_MS,
   RESTART_TO_APPLY_TITLE,
+  SLOW_SYNC_CYCLE_MS,
   SYNC_INDICATOR_DELAY_MS,
 } from "../constants";
 import type {
@@ -192,6 +194,8 @@ import {
   publishWarningSource,
   standingWarningDiagnostics,
 } from "./warningLog";
+import { SyncCycleQueue } from "./cycleQueue";
+import type { SyncScope } from "./cycleQueue";
 import {
   PERMANENT_EXCLUSION_REASONS,
   isChatResourceKind,
@@ -207,6 +211,7 @@ interface StoredHelperBackup {
   targetPath: string;
   recordedAt: string;
 }
+
 
 export interface AdapterScanIndex {
   snapshots: Map<string, ResourceSnapshot>;
@@ -234,9 +239,33 @@ export class SyncManager implements vscode.Disposable {
   private finalizerRestartRequested = false;
   /** Resources whose payload has not crossed the shared folder yet, to log once. */
   private readonly deferredApplyNoted = new Set<string>();
-  private syncPromise: Promise<void> | null = null;
-  private readonly pendingSyncScopes = new Set<SyncScope>();
-  private pendingManualSync = false;
+  private readonly cycles = new SyncCycleQueue({
+    runCycle: async (manual, scope) => {
+      const startedAt = Date.now();
+      try {
+        await this.performSync(manual, scope);
+      } finally {
+        const took = Date.now() - startedAt;
+        if (took >= SLOW_SYNC_CYCLE_MS) {
+          // Silent otherwise, and it is the number that explains a repository
+          // where commands wait on the lock and the CPU never idles: a cycle
+          // longer than the poll interval means the next one starts the
+          // moment this ends.
+          this.status.log(
+            `Synchronization cycle (${scope}) took ${formatDuration(took)}.`,
+          );
+        }
+      }
+    },
+    runMaintenance: () => this.runRequestedMaintenance(),
+    onAutomaticFailure: (error: unknown) => {
+      this.status.log(
+        `Queued automatic synchronization failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    },
+  });
   private readonly helper: HelperLauncher;
   private readonly producer: EventProducer;
   private readonly historyDocuments = new Map<string, string>();
@@ -802,7 +831,10 @@ export class SyncManager implements vscode.Disposable {
       this.reconnectProbeTimer = null;
     }
     try {
-      await this.syncPromise;
+      // Safe to await the whole drain here only because `disposeRuntime`
+      // above stopped the timers and closed the watcher, so nothing can put
+      // another scope in front of it.
+      await this.cycles.settled();
     } catch {
       // A failing final cycle has already recorded its own error; it must not
       // block the disconnect the user asked for.
@@ -843,34 +875,7 @@ export class SyncManager implements vscode.Disposable {
     manual = true,
     scope: SyncScope = "all",
   ): Promise<void> {
-    this.pendingSyncScopes.add(scope);
-    this.pendingManualSync ||= manual;
-    if (this.syncPromise === null) {
-      this.syncPromise = this.drainSyncQueue().finally(() => {
-        this.syncPromise = null;
-      });
-    }
-    await this.syncPromise;
-  }
-
-  private async drainSyncQueue(): Promise<void> {
-    // Maintenance runs inside the drain loop, not after it: a checkpoint of a
-    // multi-GiB repository holds the lock for minutes, and a "Sync Now" issued
-    // during that window queues a scope, sees the promise in flight, and
-    // awaits it - so returning without re-checking the queue resolved that
-    // caller's await without any sync having run.
-    do {
-      while (this.pendingSyncScopes.size > 0) {
-        const scope = mergeSyncScopes(this.pendingSyncScopes);
-        const manual = this.pendingManualSync;
-        this.pendingSyncScopes.clear();
-        this.pendingManualSync = false;
-        await this.performSync(manual, scope);
-      }
-      // Outside the cycle, because the maintenance phases take the same lock
-      // the cycle holds.
-      await this.runRequestedMaintenance();
-    } while (this.pendingSyncScopes.size > 0);
+    await this.cycles.request(manual, scope);
   }
 
   /**
@@ -943,7 +948,9 @@ export class SyncManager implements vscode.Disposable {
     // repository with an all-zero key and failed after quitting Cursor.
     const masterKey = Buffer.from(this.requireMasterKey());
     try {
-      await this.restartToApplyWithKey(repository, masterKey);
+      await this.cycles.withCommandFloor(() =>
+        this.restartToApplyWithKey(repository, masterKey),
+      );
     } finally {
       masterKey.fill(0);
     }
@@ -980,14 +987,27 @@ export class SyncManager implements vscode.Disposable {
       // elapsed times and survive the quit, so the record is still there when
       // Cursor comes back.
       const startedAt = Date.now();
+      const elapsed = (): string =>
+        `${Math.round((Date.now() - startedAt) / 1000)}s`;
+      // A phase logs when it STARTS, so a phase that runs long writes nothing
+      // until the next one begins - which is exactly the case the user is
+      // staring at the log for. The heartbeat says the same phase is still
+      // running rather than leaving the last line an hour old.
+      let current: string | null = null;
+      const heartbeat = setInterval(() => {
+        if (current !== null) {
+          this.status.log(
+            `Restart to Apply [${elapsed()}]: still working on: ${current}`,
+          );
+        }
+      }, RESTART_TO_APPLY_HEARTBEAT_MS);
       const phase = (
         report: (message: string) => void,
         message: string,
       ): void => {
+        current = message;
         report(message);
-        this.status.log(
-          `Restart to Apply [${Math.round((Date.now() - startedAt) / 1000)}s]: ${message}`,
-        );
+        this.status.log(`Restart to Apply [${elapsed()}]: ${message}`);
       };
       const batch = await this.withProgress(
         RESTART_TO_APPLY_TITLE,
@@ -1030,7 +1050,10 @@ export class SyncManager implements vscode.Disposable {
             await lock.release();
           }
         },
-      );
+      ).finally(() => {
+        clearInterval(heartbeat);
+        current = null;
+      });
       if (this.disposed || this.repository !== repository || this.masterKey === null) {
         // Disconnect or Setup ran while this command was parked in prompts or
         // waits; quitting every window to apply into a repository this device
@@ -3844,7 +3867,7 @@ export class SyncManager implements vscode.Disposable {
   }
 
   private scheduleAutomaticSync(scope: SyncScope): void {
-    void this.syncNow(false, scope).catch((error: unknown) => {
+    void this.cycles.requestAutomatic(scope).catch((error: unknown) => {
       this.status.log(
         `Queued automatic synchronization failed: ${
           error instanceof Error ? error.message : String(error)
@@ -4434,7 +4457,7 @@ function unresolvedConflicts(repository: SyncRepository): SyncConflict[] {
   );
 }
 
-export type SyncScope = "all" | "files" | "chat" | "remote";
+export type { SyncScope };
 
 export interface LocalScanResult {
   snapshots: ResourceSnapshot[];
@@ -4616,6 +4639,15 @@ export function isInterruptedResult(result: {
   );
 }
 
+/** "3m 12s", or "7s" under a minute. */
+export function formatDuration(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(seconds / 60);
+  return minutes === 0
+    ? `${seconds}s`
+    : `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+}
+
 /** " in 3m 12s", or nothing when the helper did not report a start time. */
 export function helperRunDuration(result: {
   startedAt?: string;
@@ -4626,11 +4658,7 @@ export function helperRunDuration(result: {
   if (!Number.isFinite(started) || !Number.isFinite(completed)) {
     return "";
   }
-  const seconds = Math.max(0, Math.round((completed - started) / 1000));
-  const minutes = Math.floor(seconds / 60);
-  return minutes === 0
-    ? ` in ${seconds}s`
-    : ` in ${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return ` in ${formatDuration(completed - started)}`;
 }
 
 export function helperFailureDetail(error: string | null): string {
@@ -4919,21 +4947,6 @@ export function shouldScanAdapter(
   return false;
 }
 
-function mergeSyncScopes(scopes: ReadonlySet<SyncScope>): SyncScope {
-  if (
-    scopes.has("all") ||
-    (scopes.has("files") && scopes.has("chat"))
-  ) {
-    return "all";
-  }
-  if (scopes.has("files")) {
-    return "files";
-  }
-  if (scopes.has("chat")) {
-    return "chat";
-  }
-  return "remote";
-}
 
 /** What the pre-scan synthetic apply did, and whether it changed anything. */
 interface SyntheticApplyResult {
