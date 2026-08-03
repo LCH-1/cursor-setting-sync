@@ -61,6 +61,22 @@ export type ResourceKind = (typeof SUPPORTED_RESOURCE_KINDS)[number];
  * needs it and must not depend on them; `tests/offline-apply-kinds.test.ts`
  * compares the two so they cannot drift apart.
  */
+/**
+ * The kinds written into the global `state.vscdb` ItemTable.
+ *
+ * The helper routes prepared changes to one applier or another by kind, and a
+ * kind on neither list is silently dropped - prepared, never written, never
+ * marked applied, queued forever. `tests/offline-apply-kinds.test.ts` checks
+ * this against the write path so the two cannot drift.
+ */
+export const GLOBAL_DATABASE_KINDS: readonly ResourceKind[] = [
+  "chat",
+  "ui-state",
+  "cursor-user-rules",
+  "remote-targets",
+  "profile",
+];
+
 export const HELPER_APPLIED_KINDS: ReadonlySet<ResourceKind> = new Set([
   "extension",
   "profile",

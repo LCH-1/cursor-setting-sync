@@ -18,6 +18,7 @@ import {
   REPOSITORY_FILE,
   RESTART_TO_APPLY_TITLE,
 } from "../constants";
+import { GLOBAL_DATABASE_KINDS } from "../types";
 import type {
   RepositoryFile,
   ResourceDeletion,
@@ -392,10 +393,15 @@ async function executeRequest(
   }
   const prepared = preparation.prepared;
 
+  // Every kind that lives in the global `state.vscdb`. Missing one here does
+  // not fail loudly: the change is prepared, routed to neither applier, and
+  // dropped - so it is never marked applied and sits in the queue forever,
+  // re-offered on every launch and applied by nothing. `remote-targets` was
+  // added in 0.0.48 with its write path in the database layer but not with
+  // this list, and the SSH folder history it carries never once landed on
+  // either computer.
   const globalPrepared = prepared.filter((item) =>
-    ["chat", "ui-state", "cursor-user-rules", "profile"].includes(
-      item.change.kind,
-    ),
+    GLOBAL_DATABASE_KINDS.includes(item.change.kind),
   );
   let backupPath: string | null = null;
   const applied: string[] = [];

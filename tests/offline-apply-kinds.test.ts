@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { HELPER_APPLIED_KINDS, SUPPORTED_RESOURCE_KINDS } from "../src/types";
+import {
+  GLOBAL_DATABASE_KINDS,
+  HELPER_APPLIED_KINDS,
+  SUPPORTED_RESOURCE_KINDS,
+} from "../src/types";
 import type { CursorPaths } from "../src/platform/paths";
 import type { ResourceAdapter } from "../src/resources/resource";
 import type { ResourceKind } from "../src/types";
@@ -49,6 +53,34 @@ describe("HELPER_APPLIED_KINDS", () => {
       }
     }
     expect([...HELPER_APPLIED_KINDS].sort()).toEqual([...declared].sort());
+  });
+
+  it("routes every helper-applied kind to an applier", () => {
+    // The helper splits prepared changes by kind: GLOBAL_DATABASE_KINDS go to
+    // the global state.vscdb writer, the rest to applyNonGlobalChanges. A kind
+    // on neither side is not an error - it is prepared, written by nobody, and
+    // never marked applied, so it sits in the queue forever being re-offered.
+    // `remote-targets` shipped in 0.0.48 with its write path but not its
+    // routing, and the SSH folder history it carries never landed on either
+    // computer until 0.0.52.
+    const nonGlobal: ResourceKind[] = [
+      "extension",
+      "chat-transcript",
+      "chat-store",
+      "workspace-storage",
+    ];
+    const routed = new Set<ResourceKind>([
+      ...GLOBAL_DATABASE_KINDS,
+      ...nonGlobal,
+    ]);
+
+    expect(
+      [...HELPER_APPLIED_KINDS].filter((kind) => !routed.has(kind)),
+    ).toEqual([]);
+    // And nothing is claimed by both halves, which would apply it twice.
+    expect(
+      GLOBAL_DATABASE_KINDS.filter((kind) => nonGlobal.includes(kind)),
+    ).toEqual([]);
   });
 
   it("leaves no supported kind unclaimed by an adapter", () => {

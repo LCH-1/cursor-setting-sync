@@ -2,6 +2,14 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.52] - 2026-08-03
+
+### Fixed
+
+- **SSH folder history never actually landed on either computer.** 0.0.48 added the `remote-targets` kind: it scanned correctly, published correctly, and merged two machines' host lists into a union correctly — the shared folder held the right answer the whole time. What it did not do was write it. The helper splits prepared changes by kind, global-database kinds to one applier and the rest to another, and the new kind was added to neither list. That is not an error anyone sees: the change is prepared, handed to nobody, and never marked applied — so it sits in the queue forever, re-offered on every launch and written by nothing. Both computers kept their own list and the merged one waited in the repository.
+
+  Found by tracing why a folder opened on one machine never appeared on the other: the repository held a correct auto-merged union, and both devices had it queued and unapplied. The kind list is now shared between the routing and the write path, and `tests/offline-apply-kinds.test.ts` fails if a helper-applied kind is ever routed to neither half again.
+
 ## [0.0.51] - 2026-07-31
 
 ### Fixed
