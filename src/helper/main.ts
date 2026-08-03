@@ -193,6 +193,8 @@ async function run(): Promise<void> {
         requestId: request.requestId,
         mode: request.mode,
         success: false,
+        // Not a failure the user has to act on; see HelperResult.interrupted.
+        ...(error instanceof CursorReopenedError ? { interrupted: true } : {}),
         completedAt: new Date().toISOString(),
         applied: [],
         skipped: [],

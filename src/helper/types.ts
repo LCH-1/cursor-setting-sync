@@ -88,6 +88,23 @@ export interface HelperResult {
    */
   mode?: HelperRequest["mode"];
   success: boolean;
+  /**
+   * The run stopped because Cursor was open again, not because anything went
+   * wrong. Nothing was written, the queue is untouched, and the next shutdown
+   * applies it.
+   *
+   * Reported apart from `success` because the two call for opposite
+   * treatment. A real failure is a red status bar and a notification: the user
+   * has to do something. This is neither - it is the ordinary outcome of
+   * closing Cursor and opening it again before the offline pass finished,
+   * which became routine when 0.0.49 started applying the whole queue at
+   * shutdown rather than only exporting. Painting it red taught the user to
+   * ignore the one signal that means their data did not land.
+   *
+   * Absent on results written before 0.0.54; the consumer falls back to the
+   * message text for those.
+   */
+  interrupted?: boolean;
   completedAt: string;
   applied: string[];
   /**

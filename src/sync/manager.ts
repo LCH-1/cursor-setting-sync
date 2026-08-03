@@ -281,6 +281,11 @@ export class SyncManager implements vscode.Disposable {
    */
   private helperFailure: string | null = null;
   /**
+   * Whether the previous shutdown apply was cut short by Cursor reopening.
+   * Re-enables the queued-apply offer for this session; see where it is read.
+   */
+  private shutdownApplyInterrupted = false;
+  /**
    * Whether the queued-apply offer has already been turned down this session.
    *
    * The offer is shown once per window launch and never again after a "no": it
@@ -590,7 +595,12 @@ export class SyncManager implements vscode.Disposable {
     // with the finalizer applying, asking them to quit the editor they just
     // opened is asking for something they were going to do anyway, at the one
     // moment it interrupts them most.
-    if (this.configuration.applyOnShutdown) {
+    //
+    // Unless the last shutdown pass was cut short by the editor reopening. The
+    // offer is the only path that controls the quit itself, so without this a
+    // user who reopens quickly every time gets no successful shutdown apply
+    // AND no prompt, and the queue never drains.
+    if (this.configuration.applyOnShutdown && !this.shutdownApplyInterrupted) {
       return;
     }
     if (await this.applyAlreadyInProgress()) {
@@ -4020,6 +4030,21 @@ export class SyncManager implements vscode.Disposable {
         if (result.mode !== "final-export") {
           this.helperFailure = null;
         }
+      } else if (isInterruptedResult(result)) {
+        // Cursor was open again before the offline pass could write anything.
+        // Nothing was applied and the queue is intact, so there is nothing to
+        // report and nothing to fix - it applies at the next shutdown. This
+        // became the routine outcome when 0.0.49 began applying the whole
+        // queue at shutdown instead of only exporting: the pass takes minutes,
+        // and reopening the editor inside that window is not a mistake.
+        //
+        // The offer is re-enabled for the session, though. Without it a user
+        // who always reopens quickly would get neither a successful shutdown
+        // apply nor a prompt, and the queue would never drain.
+        this.status.log(
+          `Helper ${result.requestId} stopped because Cursor was reopened; nothing was applied and the queue is unchanged.`,
+        );
+        this.shutdownApplyInterrupted = true;
       } else {
         this.status.log(`Helper ${result.requestId} failed: ${result.error ?? "unknown"}`);
         this.helperFailure = helperFailureDetail(result.error);
@@ -4527,6 +4552,28 @@ export function isHelperResultFileName(name: string): boolean {
  * of the user-facing text, in a status bar tooltip, on a device where the
  * failure meant 146 incoming chats stayed unwritten.
  */
+/**
+ * A run that stopped because Cursor was open again, rather than one that
+ * failed.
+ *
+ * Prefers the structured flag and falls back to the message, because a helper
+ * armed before 0.0.54 is still the one that runs at the first shutdown after
+ * an update - the finalizer process is spawned at startup and holds that
+ * build's code - so the very upgrade that introduces the flag reports without
+ * it exactly once.
+ */
+export function isInterruptedResult(result: {
+  interrupted?: boolean;
+  error?: string | null;
+}): boolean {
+  return (
+    result.interrupted === true ||
+    (result.error ?? "").includes(
+      "Cursor was reopened before offline changes could be applied",
+    )
+  );
+}
+
 export function helperFailureDetail(error: string | null): string {
   const summary = (error ?? "")
     .split("\n")[0]

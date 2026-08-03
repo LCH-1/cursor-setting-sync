@@ -2,6 +2,14 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.54] - 2026-08-03
+
+### Fixed
+
+- **Reopening Cursor during the shutdown pass is no longer reported as a failure.** "Cursor was reopened before offline changes could be applied" arrived as a red status bar and a notification — the treatment a real failure gets — when nothing had gone wrong: nothing was written, the queue is exactly as it was, and the next shutdown applies it. This became the routine outcome in 0.0.49, when the shutdown pass started applying the whole queue instead of only exporting: that takes minutes, and closing the editor and opening it again inside that window is not a mistake. Showing it in red taught the user to ignore the one signal that means their data did not land. It is now a log line, and the status returns to Queued.
+- **A queue that keeps getting interrupted can still be drained.** With the shutdown apply enabled, the queued-apply offer stays out of the way — but if the previous shutdown pass was cut short, the offer comes back for that session. Otherwise someone who always reopens quickly would get neither a completed shutdown apply nor a prompt, and the queue would never drain. The offer is the only path that controls the quit itself.
+- The detection prefers a structured flag on the helper result and falls back to the message text, because the finalizer that runs at the first shutdown after an update is the *previous* build's — it is spawned at startup — so the release that introduces the flag reports without it exactly once.
+
 ## [0.0.53] - 2026-08-03
 
 ### Fixed
