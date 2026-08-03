@@ -2,7 +2,7 @@
   "name": "cursor-setting-sync",
   "displayName": "Cursor Setting Sync",
   "description": "Securely synchronize Cursor settings, workspace state, profiles, extensions, user files, and chat data across devices.",
-  "version": "0.0.58",
+  "version": "0.0.59",
   "publisher": "lch",
   "icon": "icon.png",
   "license": "MIT",
@@ -217,19 +217,20 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run check && npm run build",
+    "vscode:prepublish": "npm run verify",
     "build": "node esbuild.mjs && npm run smoke",
     "smoke": "node scripts/smoke-bundle.cjs",
     "watch": "node esbuild.mjs --watch",
     "check": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "package": "npm run build && vsce package --out cursor-setting-sync.vsix",
-    "publish": "npm run build && vsce publish",
-    "publish:patch": "npm run build && vsce publish patch",
-    "publish:minor": "npm run build && vsce publish minor",
-    "publish:major": "npm run build && vsce publish major",
-    "ovsx:publish": "npx ovsx publish --pat $OVSX_TOKEN"
+    "verify": "npm run check && npm run lint && npm test && npm run build",
+    "package": "vsce package --out cursor-setting-sync.vsix",
+    "publish": "vsce publish",
+    "publish:patch": "vsce publish patch",
+    "publish:minor": "vsce publish minor",
+    "publish:major": "vsce publish major",
+    "ovsx:publish": "npm run verify && npx ovsx publish --pat $OVSX_TOKEN"
   },
   "dependencies": {
     "jsonc-parser": "^3.3.1",

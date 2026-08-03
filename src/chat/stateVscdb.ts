@@ -142,7 +142,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
       for (const row of database
         .prepare(
           "SELECT substr(key, 10, instr(substr(key, 10), ':') - 1) AS composerId, COUNT(*) AS total " +
-            "FROM cursorDiskKV WHERE key LIKE 'bubbleId:%' GROUP BY composerId",
+            "FROM cursorDiskKV WHERE key >= 'bubbleId:' AND key < 'bubbleId;' GROUP BY composerId",
         )
         .all() as Array<{ composerId: SqliteRowValue; total: SqliteRowValue }>) {
         const id = composerIdText(row.composerId);
@@ -159,10 +159,10 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           "SELECT key, value, typeof(value) AS valueType FROM cursorDiskKV WHERE key = ?",
         ),
         bubbles: database.prepare(
-          "SELECT key, value, typeof(value) AS valueType FROM cursorDiskKV WHERE key LIKE ? ORDER BY key",
+          "SELECT key, value, typeof(value) AS valueType FROM cursorDiskKV WHERE key >= ? AND key < ? ORDER BY key",
         ),
         bubbleCount: database.prepare(
-          "SELECT COUNT(*) AS total FROM cursorDiskKV WHERE key LIKE ?",
+          "SELECT COUNT(*) AS total FROM cursorDiskKV WHERE key >= ? AND key < ?",
         ),
       };
       for (const rawHeader of headers) {
@@ -408,9 +408,10 @@ function captureChat(
     // `LocalProjection.sourceBubbleCount` for why the timestamp alone is not
     // enough. Counted inside the transaction so it agrees with the rows the
     // capture below would read.
+    const bubbleRange = bubbleKeyRange(header.composerId);
     const liveBubbleCount = plainNumber(
       (
-        statements.bubbleCount.get(`bubbleId:${header.composerId}:%`) as
+        statements.bubbleCount.get(...bubbleRange) as
           | { total?: SqliteRowValue }
           | undefined
       )?.total ?? 0,
@@ -452,9 +453,7 @@ function captureChat(
       database.exec("COMMIT");
       return { kind: "pruned", had: knownCount, has: liveBubbleCount ?? 0 };
     }
-    const bubbleRows = statements.bubbles.all(
-      `bubbleId:${header.composerId}:%`,
-    ) as RawKvRow[];
+    const bubbleRows = statements.bubbles.all(...bubbleRange) as RawKvRow[];
     const snapshot: PortableChatSnapshot = {
       schemaVersion: 1,
       composerId: header.composerId,
@@ -468,6 +467,19 @@ function captureChat(
     database.exec("ROLLBACK");
     throw error;
   }
+}
+
+/**
+ * Index-friendly bounds for every bubble row belonging to one composer.
+ *
+ * Cursor's keys use `bubbleId:<uuid>:<bubble>`. `:` and its immediate ASCII
+ * successor `;` form an exact half-open prefix range under SQLite's default
+ * BINARY collation. Unlike `LIKE ?`, this remains an index range when the
+ * prefix is bound at runtime and avoids scanning the 1+ GiB cursorDiskKV
+ * covering index on every poll.
+ */
+export function bubbleKeyRange(composerId: string): [string, string] {
+  return [`bubbleId:${composerId}:`, `bubbleId:${composerId};`];
 }
 
 function normalizeHeader(

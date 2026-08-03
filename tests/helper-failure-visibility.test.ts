@@ -1,11 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 vi.mock("vscode", () => ({
   window: {},
   extensions: { all: [] },
 }));
 
-import { helperFailureDetail, isHelperResultFileName } from "../src/sync/manager";
+import {
+  helperFailureDetail,
+  helperStderrLogPathForResult,
+  helperStderrLogPaths,
+  isHelperResultFileName,
+  removeAbandonedHelperStderrLogs,
+} from "../src/sync/manager";
 import { cursorExitTimeoutDetail } from "../src/platform/compatibility";
 import { RESTART_TO_APPLY_TITLE } from "../src/constants";
 
@@ -31,6 +40,109 @@ describe("which files in the storage root are helper results", () => {
         "helper-request-11111111-1111-4111-8111-111111111111.json",
       ),
     ).toBe(false);
+  });
+});
+
+describe("the stderr log paired with a consumed helper result", () => {
+  const requestId = "11111111-1111-4111-8111-111111111111";
+  const resultFileName = `helper-result-${requestId}.json`;
+  const storageRoot = join("safe", "extension-storage");
+
+  it("returns the matching request log inside extension storage", () => {
+    expect(
+      helperStderrLogPathForResult(storageRoot, resultFileName, requestId),
+    ).toBe(
+      join(
+        storageRoot,
+        `helper-request-${requestId}.json.stderr.log`,
+      ),
+    );
+  });
+
+  it.each([
+    "../../outside",
+    "..\\..\\outside",
+    "/tmp/outside",
+    "C:\\outside",
+    "11111111-1111-1111-8111-111111111111",
+    "11111111-1111-4111-7111-111111111111",
+    "11111111-1111-4111-8111-111111111111/../outside",
+    null,
+    42,
+  ])("rejects an unsafe or malformed request id (%s)", (unsafeRequestId) => {
+    expect(
+      helperStderrLogPathForResult(
+        storageRoot,
+        resultFileName,
+        unsafeRequestId,
+      ),
+    ).toBeNull();
+  });
+
+  it("does not let a valid-looking result delete another request's log", () => {
+    const otherRequestId = "22222222-2222-4222-8222-222222222222";
+    expect(
+      helperStderrLogPathForResult(
+        storageRoot,
+        resultFileName,
+        otherRequestId,
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("abandoned helper stderr logs", () => {
+  it("removes only old strict-UUID logs whose request is absent", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-helper-stderr-"));
+    const oldOrphanId = "11111111-1111-4111-8111-111111111111";
+    const activeId = "22222222-2222-4222-8222-222222222222";
+    const recentId = "33333333-3333-4333-8333-333333333333";
+    const oldOrphan = `helper-request-${oldOrphanId}.json.stderr.log`;
+    const activeLog = `helper-request-${activeId}.json.stderr.log`;
+    const activeRequest = `helper-request-${activeId}.json`;
+    const recentLog = `helper-request-${recentId}.json.stderr.log`;
+    const malformedLog = "helper-request-..%2F..%2Foutside.json.stderr.log";
+    const now = Date.now();
+    const old = new Date(now - 60 * 60_000);
+    try {
+      for (const name of [oldOrphan, activeLog, recentLog, malformedLog]) {
+        await writeFile(join(root, name), "", "utf8");
+      }
+      await writeFile(join(root, activeRequest), "{}", "utf8");
+      for (const name of [oldOrphan, activeLog, malformedLog]) {
+        await utimes(join(root, name), old, old);
+      }
+
+      expect(await removeAbandonedHelperStderrLogs(root, now)).toBe(1);
+      expect((await readdir(root)).sort()).toEqual(
+        [activeLog, activeRequest, malformedLog, recentLog].sort(),
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("derives paths only from a canonical UUID basename", () => {
+    const root = join("safe", "extension-storage");
+    const requestId = "11111111-1111-4111-8111-111111111111";
+    expect(
+      helperStderrLogPaths(
+        root,
+        `helper-request-${requestId}.json.stderr.log`,
+      ),
+    ).toEqual({
+      requestPath: join(root, `helper-request-${requestId}.json`),
+      stderrLogPath: join(
+        root,
+        `helper-request-${requestId}.json.stderr.log`,
+      ),
+    });
+    expect(
+      helperStderrLogPaths(
+        root,
+        "helper-request-../../outside.json.stderr.log",
+      ),
+    ).toBeNull();
   });
 });
 

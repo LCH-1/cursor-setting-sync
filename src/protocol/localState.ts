@@ -1,20 +1,26 @@
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { LOCAL_STATE_FILE, LOCAL_STATE_VERSION } from "../constants";
 import type { LocalSyncState } from "../types";
-import { ensureDirectory, pathExists, readJsonFile, writeJsonAtomic } from "../platform/files";
+import {
+  ensureDirectory,
+  pathExists,
+  readJsonFile,
+  writeFileAtomic,
+} from "../platform/files";
 
 export class LocalStateStore {
   /**
-   * The bytes last written, per repository. `save()` is called several times
-   * per cycle from independent places — the own-stream walk, the synthetic
-   * projection pass, the end of the cycle — and most of those calls have
-   * nothing new to say. Comparing first turns each of them into a string
-   * compare instead of a multi-megabyte serialize, temp-file write, fsync,
-   * rename and directory fsync.
+   * A fixed-size digest of the bytes last written, per repository.
+   *
+   * `save()` is called several times per cycle from independent places — the
+   * own-stream walk, the synthetic projection pass, the end of the cycle — and
+   * most calls have nothing new to say. The digest avoids the temp-file write,
+   * fsync and rename without retaining another multi-megabyte copy of the
+   * state string in every Cursor window.
    */
-  private readonly lastWritten = new Map<string, string>();
+  private readonly lastWrittenDigest = new Map<string, string>();
 
   constructor(readonly storageRoot: string) {}
 
@@ -24,7 +30,10 @@ export class LocalStateStore {
     if (await pathExists(path)) {
       const state = await readJsonFile<LocalSyncState>(path);
       validateState(state, repositoryId);
-      this.lastWritten.set(repositoryId, JSON.stringify(state));
+      this.lastWrittenDigest.set(
+        repositoryId,
+        stateDigest(JSON.stringify(state)),
+      );
       return state;
     }
 
@@ -57,17 +66,26 @@ export class LocalStateStore {
     validateState(state, repositoryId);
     // Keeps the write memo aligned with what is actually on disk, so a file
     // another process rewrote is never mistaken for one this store wrote.
-    this.lastWritten.set(repositoryId, JSON.stringify(state));
+    this.lastWrittenDigest.set(
+      repositoryId,
+      stateDigest(JSON.stringify(state)),
+    );
     return state;
   }
 
   async save(state: LocalSyncState): Promise<void> {
     const serialized = JSON.stringify(state);
-    if (this.lastWritten.get(state.repositoryId) === serialized) {
+    const digest = stateDigest(serialized);
+    if (this.lastWrittenDigest.get(state.repositoryId) === digest) {
       return;
     }
-    await writeJsonAtomic(this.pathFor(state.repositoryId), state, false);
-    this.lastWritten.set(state.repositoryId, serialized);
+    // Reuse the serialization that was just hashed. writeJsonAtomic would
+    // stringify this multi-megabyte state a second time before every write.
+    await writeFileAtomic(
+      this.pathFor(state.repositoryId),
+      Buffer.from(`${serialized}\n`, "utf8"),
+    );
+    this.lastWrittenDigest.set(state.repositoryId, digest);
   }
 
   private pathFor(repositoryId: string): string {
@@ -76,6 +94,11 @@ export class LocalStateStore {
       LOCAL_STATE_FILE.replace(".json", `-${repositoryId}.json`),
     );
   }
+}
+
+/** A fixed-size memo instead of retaining a multi-megabyte JSON string. */
+function stateDigest(serialized: string): string {
+  return createHash("sha256").update(serialized).digest("base64url");
 }
 
 function validateState(state: LocalSyncState, repositoryId: string): void {

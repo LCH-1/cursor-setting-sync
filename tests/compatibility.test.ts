@@ -4,13 +4,124 @@ import {
   cursorExecutableForRestart,
   cursorLaunchCommand,
   databaseApplyBlockReason,
+  inspectGlobalDatabaseSchemaCapabilities,
   isDatabaseBackedKind,
   isExpectedCursorExecutable,
   parseCursorProcessIds,
 } from "../src/platform/compatibility";
+import type { openDatabase } from "../src/platform/sqlite";
 import type { CompatibilityReport, EventProducer } from "../src/types";
 import { shouldPublishSnapshot } from "../src/sync/versionPolicy";
 import { resourceConfigurationBlockReason } from "../src/sync/resourcePolicy";
+
+describe("activation database compatibility inspection", () => {
+  it("checks schema and small metadata indexes without scanning the full database", () => {
+    const databasePath = "C:/Cursor/User/globalStorage/state.vscdb";
+    const tableColumns = new Map<string, readonly string[]>([
+      ["ItemTable", ["key", "value"]],
+      [
+        "composerHeaders",
+        [
+          "composerId",
+          "workspaceId",
+          "createdAt",
+          "lastUpdatedAt",
+          "isArchived",
+          "isSubagent",
+          "recency",
+          "checkpointAt",
+          "value",
+        ],
+      ],
+      ["cursorDiskKV", ["key", "value"]],
+    ]);
+    const executedSql: string[] = [];
+    let closed = false;
+    let itemTableIntegrity = "ok";
+    const database = {
+      exec(sql: string): void {
+        executedSql.push(sql);
+      },
+      prepare(sql: string) {
+        executedSql.push(sql);
+        if (
+          sql ===
+          "SELECT name FROM sqlite_master WHERE type = ? AND name = ?"
+        ) {
+          return {
+            get: (_type: string, table: string) =>
+              tableColumns.has(table) ? { name: table } : undefined,
+          };
+        }
+
+        const tableName = /^PRAGMA table_info\("([^"]+)"\)$/.exec(sql)?.[1];
+        if (tableName !== undefined) {
+          return {
+            all: () =>
+              (tableColumns.get(tableName) ?? []).map((name) => ({ name })),
+          };
+        }
+
+        if (sql === "PRAGMA journal_mode") {
+          return { get: () => ({ journal_mode: "wal" }) };
+        }
+
+        if (sql === 'PRAGMA integrity_check("ItemTable")') {
+          return {
+            all: () => [{ integrity_check: itemTableIntegrity }],
+          };
+        }
+
+        if (sql === 'PRAGMA integrity_check("composerHeaders")') {
+          return { all: () => [{ integrity_check: "ok" }] };
+        }
+
+        throw new Error(`Unexpected activation SQL: ${sql}`);
+      },
+      close(): void {
+        closed = true;
+      },
+    } as unknown as ReturnType<typeof openDatabase>;
+    const warnings: string[] = [];
+
+    const capabilities = inspectGlobalDatabaseSchemaCapabilities(
+      databasePath,
+      warnings,
+      (openedPath, options) => {
+        expect(openedPath).toBe(databasePath);
+        expect(options).toEqual({ readOnly: true });
+        return database;
+      },
+    );
+
+    expect(capabilities["global-item-table"].available).toBe(true);
+    expect(capabilities["global-chat"].available).toBe(true);
+    expect(warnings).toEqual([]);
+    expect(executedSql).toContain("PRAGMA query_only=ON");
+    expect(executedSql).toContain("PRAGMA journal_mode");
+    expect(executedSql).toContain('PRAGMA integrity_check("ItemTable")');
+    expect(executedSql).toContain(
+      'PRAGMA integrity_check("composerHeaders")',
+    );
+    expect(executedSql).not.toContain("PRAGMA quick_check");
+    expect(executedSql).not.toContain("PRAGMA integrity_check");
+    expect(closed).toBe(true);
+
+    // A silent missing-index-entry failure in ItemTable can otherwise make a
+    // real profile manifest look absent and publish an empty replacement.
+    itemTableIntegrity = "wrong # of entries in index ItemTable_autoindex";
+    const corrupted = inspectGlobalDatabaseSchemaCapabilities(
+      databasePath,
+      [],
+      () => database,
+    );
+    expect(corrupted["global-item-table"].available).toBe(false);
+    expect(corrupted["global-item-table"].reasons.join(" ")).toContain(
+      "wrong # of entries",
+    );
+    expect(corrupted["global-chat"].available).toBe(true);
+  });
+});
 
 describe("cross-version synchronization policy", () => {
   it("allows older database data to move to a newer installation", () => {

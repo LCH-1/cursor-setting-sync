@@ -379,13 +379,17 @@ function numericVersion(value: string): number[] | null {
 export function inspectGlobalDatabaseSchemaCapabilities(
   databasePath: string,
   warnings: string[] = [],
+  openForInspection: (
+    path: string,
+    options: { readOnly: true },
+  ) => ReturnType<typeof openDatabase> = openDatabase,
 ): Pick<
   CompatibilityReport["databaseCapabilities"],
   "global-item-table" | "global-chat"
 > {
   let database: ReturnType<typeof openDatabase>;
   try {
-    database = openDatabase(databasePath, { readOnly: true });
+    database = openForInspection(databasePath, { readOnly: true });
   } catch (error) {
     const reason = `Cursor global database could not be opened: ${formatError(error)}`;
     return {
@@ -397,12 +401,15 @@ export function inspectGlobalDatabaseSchemaCapabilities(
     database.exec("PRAGMA query_only=ON");
     const itemReasons = inspectRequiredTables(database, ITEM_TABLE_COLUMNS);
     const chatReasons = inspectRequiredTables(database, CHAT_TABLE_COLUMNS);
-    const quickCheck = database.prepare("PRAGMA quick_check").get();
-    if (quickCheck === undefined || quickCheck.quick_check !== "ok") {
-      const reason = "Cursor global database quick_check did not return ok.";
-      itemReasons.push(reason);
-      chatReasons.push(reason);
-    }
+    // The former unscoped quick_check walked the entire multi-gigabyte chat KV
+    // store synchronously in every extension host. These partial checks retain
+    // the important silent-index-corruption gate for the small tables whose
+    // missing rows can look like destructive profile/UI/chat-header changes,
+    // without scanning cursorDiskKV during activation. For chats with an
+    // existing projection, bubble-count regressions are independently treated
+    // as pruning and are not published over the known complete snapshot.
+    itemReasons.push(...inspectTableIntegrity(database, "ItemTable"));
+    chatReasons.push(...inspectTableIntegrity(database, "composerHeaders"));
     const journalMode = database.prepare("PRAGMA journal_mode").get();
     if (journalMode?.journal_mode !== "wal") {
       warnings.push(`Unexpected journal mode: ${String(journalMode?.journal_mode)}`);
@@ -464,6 +471,31 @@ function inspectRequiredTables(
     }
   }
   return reasons;
+}
+
+function inspectTableIntegrity(
+  database: ReturnType<typeof openDatabase>,
+  table: string,
+): string[] {
+  const quotedTable = table.replaceAll('"', '""');
+  try {
+    const rows = database
+      .prepare(`PRAGMA integrity_check("${quotedTable}")`)
+      .all() as Array<{ integrity_check?: unknown }>;
+    const messages = rows.map((row) => String(row.integrity_check));
+    if (messages.length === 1 && messages[0] === "ok") {
+      return [];
+    }
+    return [
+      `SQLite integrity check for ${table} did not return ok: ${
+        messages.slice(0, 3).join("; ") || "no result"
+      }`,
+    ];
+  } catch (error) {
+    return [
+      `SQLite integrity check for ${table} failed: ${formatError(error)}`,
+    ];
+  }
 }
 
 function capability(reasons: readonly string[]): DatabaseCapabilityStatus {

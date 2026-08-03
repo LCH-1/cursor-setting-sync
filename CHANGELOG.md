@@ -2,6 +2,17 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.59] - 2026-08-03
+
+### Changed
+
+- **Opening more Cursor windows no longer multiplies background synchronization work.** One window now owns the recursive repository watcher, automatic file/chat polling, and the machine-wide shutdown finalizer. Other windows stay passive and automatically elect a replacement within 15–30 seconds if the owner exits. Commands remain available in every window.
+- **Slow synchronization cannot turn periodic polling into a permanent CPU backlog.** Poll ticks already covered by a running cycle are dropped, a different scope is coalesced into at most one fair follow-up, the next interval begins only after its request settles, and equal file/chat intervals share one widened cycle. Repository-watcher bursts also share one queued waiter instead of allocating one promise handler per event.
+- **Startup no longer integrity-scans Cursor's entire global database in every window.** Activation now performs schema checks plus integrity checks limited to the small destructive-metadata tables; full SQLite integrity checks remain in the offline write path where they protect an actual database change. On the reported 1.8 GB database, this dropped from tens of seconds to roughly 8 ms while retaining the profile/UI/chat-header index-corruption gate.
+- **Chat polling uses the database key index instead of scanning it.** Bubble lookups now use exact half-open key ranges, and large local synchronization states retain only a fixed-size digest rather than a second multi-megabyte JSON string. This lowers steady-state CPU and memory use.
+- **Offline-helper stderr logs are cleaned up safely.** A processed result removes its matching log, and old request-less logs are pruned at startup after identity, age, and race checks.
+- **Packaging and publishing now run the complete verification gate.** Type checking, linting, all scenario tests, bundling, and smoke loading must succeed before a VSIX can be produced or published.
+
 ## [0.0.58] - 2026-08-03
 
 ### Changed

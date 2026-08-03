@@ -85,18 +85,19 @@ describe("a request parked behind a queue that keeps refilling", () => {
     const command = bench.queue.request(true, "all");
     expect(bench.cycles).toEqual([{ manual: true, scope: "all" }]);
 
-    // Two poll ticks land while that first cycle is still running.
-    void bench.queue.request(false, "files");
-    void bench.queue.request(false, "chat");
+    // A watcher notification lands while that first cycle is still running.
+    // Unlike a repeated poll tick, it carries a unique observation and must
+    // remain queued behind the active cycle.
+    void bench.queue.requestAutomatic("remote");
     expect(await settledState(command)).toBe("pending");
 
     bench.finish();
     expect(await settledState(command)).toBe("resolved");
-    // ...and the drain carried straight on with the refill, so nothing the
-    // timers asked for was lost in exchange.
+    // ...and the drain carried straight on with the refill, so the watcher
+    // notification was not lost in exchange.
     expect(bench.cycles).toEqual([
       { manual: true, scope: "all" },
-      { manual: false, scope: "all" },
+      { manual: false, scope: "remote" },
     ]);
   });
 
@@ -149,6 +150,132 @@ describe("a cycle that throws", () => {
     await expect(behind.catch((error: unknown) => (error as Error).cause)).resolves.toEqual(
       new Error("lock is held"),
     );
+    expect(bench.queue.draining).toBe(false);
+  });
+});
+
+describe("periodic polling", () => {
+  it("drops covered ticks but coalesces one disjoint follow-up", async () => {
+    const bench = harness();
+    const first = bench.queue.requestPolling("files");
+    expect(bench.cycles).toEqual([{ manual: false, scope: "files" }]);
+
+    // Repeated file ticks carry no new information because the active cycle
+    // already covers them. Chat is disjoint and must not be phase-starved, but
+    // its whole burst shares one bounded follow-up.
+    await bench.queue.requestPolling("files");
+    const chat = Array.from({ length: 10_000 }, () =>
+      bench.queue.requestPolling("chat"),
+    );
+    expect(new Set(chat).size).toBe(1);
+    expect(bench.cycles).toEqual([{ manual: false, scope: "files" }]);
+
+    bench.finish();
+    await first;
+    expect(bench.cycles).toEqual([
+      { manual: false, scope: "files" },
+      { manual: false, scope: "chat" },
+    ]);
+    bench.finish();
+    await Promise.all(chat);
+    await flush();
+    expect(bench.queue.draining).toBe(false);
+  });
+
+  it("keeps unequal scopes live across repeated slow-cycle overlaps", async () => {
+    const bench = harness();
+    let active = bench.queue.requestPolling("files");
+    const expected = ["files"];
+
+    for (const nextScope of ["chat", "files", "chat", "files"] as const) {
+      const next = bench.queue.requestPolling(nextScope);
+      bench.finish();
+      await active;
+      expected.push(nextScope);
+      expect(bench.cycles.map((cycle) => cycle.scope)).toEqual(expected);
+      active = next;
+    }
+
+    bench.finish();
+    await active;
+    await flush();
+    expect(bench.queue.draining).toBe(false);
+  });
+
+  it("drops ticks while a command holds the floor", async () => {
+    const bench = harness();
+    await bench.queue.withCommandFloor(async () => {
+      await bench.queue.requestPolling("files");
+      await bench.queue.requestPolling("chat");
+    });
+    await flush();
+    expect(bench.cycles).toEqual([]);
+
+    const next = bench.queue.requestPolling("all");
+    expect(bench.cycles).toEqual([{ manual: false, scope: "all" }]);
+    bench.finish();
+    await next;
+  });
+});
+
+describe("automatic notification bursts", () => {
+  it("shares one resolving waiter for 10,000 notifications behind a cycle", async () => {
+    const bench = harness();
+    const gate = bench.queue.request(true, "all");
+    const notifications = Array.from({ length: 10_000 }, (_, index) =>
+      bench.queue.requestAutomatic(index % 2 === 0 ? "files" : "chat"),
+    );
+
+    expect(new Set(notifications).size).toBe(1);
+    expect(bench.cycles).toEqual([{ manual: true, scope: "all" }]);
+
+    bench.finish();
+    await gate;
+    expect(bench.cycles).toEqual([
+      { manual: true, scope: "all" },
+      { manual: false, scope: "all" },
+    ]);
+
+    bench.finish();
+    await Promise.all(notifications);
+    await flush();
+    expect(bench.queue.draining).toBe(false);
+  });
+
+  it("rejects one shared burst and leaves the queue reusable", async () => {
+    const bench = harness();
+    const gate = bench.queue.request(true, "files");
+    const notifications = Array.from({ length: 10_000 }, () =>
+      bench.queue.requestAutomatic("remote"),
+    );
+    const shared = notifications[0];
+    if (shared === undefined) {
+      throw new Error("the notification burst was empty");
+    }
+    const outcome = shared.then(
+      () => null,
+      (error: unknown) => error,
+    );
+
+    expect(new Set(notifications).size).toBe(1);
+    bench.finish();
+    await gate;
+    expect(bench.cycles).toEqual([
+      { manual: true, scope: "files" },
+      { manual: false, scope: "remote" },
+    ]);
+
+    const failure = new Error("watcher cycle failed");
+    bench.finish(failure);
+    expect(await outcome).toBe(failure);
+    await flush();
+    expect(bench.queue.draining).toBe(false);
+
+    const recovery = bench.queue.requestAutomatic("remote");
+    expect(bench.cycles).toHaveLength(3);
+    bench.finish();
+    await recovery;
+    await flush();
     expect(bench.queue.draining).toBe(false);
   });
 });
@@ -232,6 +359,19 @@ describe("the floor a user-invoked command stands on", () => {
       bench.queue.withCommandFloor(() => Promise.reject(new Error("cancelled"))),
     ).rejects.toThrow("cancelled");
     expect(bench.queue.commandRunning).toBe(false);
+  });
+
+  it("cannot refill after shutdown releases a command floor", async () => {
+    const bench = harness();
+    await bench.queue.withCommandFloor(async () => {
+      await bench.queue.requestAutomatic("remote");
+      bench.queue.close();
+    });
+    await bench.queue.request(true, "all");
+    await bench.queue.requestPolling("chat");
+    await flush();
+    expect(bench.cycles).toEqual([]);
+    expect(bench.queue.draining).toBe(false);
   });
 });
 

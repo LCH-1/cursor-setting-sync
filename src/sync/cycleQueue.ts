@@ -37,6 +37,24 @@ interface CycleWaiter {
   reject: (error: unknown) => void;
 }
 
+/** One promise shared by every automatic request in the same pending cycle. */
+interface SharedCycleWaiter {
+  promise: Promise<void>;
+  waiter: CycleWaiter;
+}
+
+function createSharedCycleWaiter(): SharedCycleWaiter {
+  const waiter: CycleWaiter = {
+    resolve: () => {},
+    reject: () => {},
+  };
+  const promise = new Promise<void>((resolve, reject) => {
+    waiter.resolve = resolve;
+    waiter.reject = reject;
+  });
+  return { promise, waiter };
+}
+
 /** Releases one cycle's callers; `null` means the cycle succeeded. */
 function settle(waiters: readonly CycleWaiter[], error: unknown): void {
   for (const waiter of waiters) {
@@ -77,8 +95,13 @@ export class SyncCycleQueue {
    */
   private readonly waiters: CycleWaiter[] = [];
   private drain: Promise<void> | null = null;
+  /** Scope currently inside runCycle; null while idle or in maintenance. */
+  private runningScope: SyncScope | null = null;
+  private closed = false;
   private floor = 0;
   private readonly deferredScopes = new Set<SyncScope>();
+  /** The single waiter carried by automatic requests not yet claimed. */
+  private pendingAutomaticWaiter: SharedCycleWaiter | null = null;
 
   constructor(private readonly options: SyncCycleQueueOptions) {}
 
@@ -104,12 +127,21 @@ export class SyncCycleQueue {
     await this.drain;
   }
 
+  /** Permanently refuses new work while allowing the current drain to finish. */
+  close(): void {
+    this.closed = true;
+    this.deferredScopes.clear();
+  }
+
   /**
    * Queues a request and resolves when the cycle that takes its scope ends.
    *
    * Not when the queue empties: see {@link waiters}.
    */
   request(manual: boolean, scope: SyncScope): Promise<void> {
+    if (this.closed) {
+      return Promise.resolve();
+    }
     this.pendingScopes.add(scope);
     this.pendingManual ||= manual;
     // Pushed before the drain is started below, because an async function
@@ -118,30 +150,61 @@ export class SyncCycleQueue {
     const cycle = new Promise<void>((resolve, reject) => {
       this.waiters.push({ resolve, reject });
     });
-    if (this.drain === null) {
-      this.drain = this.drainQueue().finally(() => {
-        this.drain = null;
-      });
-      // Nothing awaits the drain itself, so an escape from it would be an
-      // unhandled rejection: every outcome reaches callers through the cycle
-      // promise above instead.
-      void this.drain.catch(() => undefined);
-    }
+    this.startDrain();
     return cycle;
   }
 
   /**
-   * A request from a timer or the watcher rather than the user.
+   * A one-shot automatic request, such as a repository watcher notification.
    *
    * Withheld while a command holds the floor - remembered, not dropped, since
    * the scope decides what the next cycle even looks at and discarding a
    * watcher's "remote" would leave the folder's changes unread until
-   * something else asked for that scope by name.
+   * something else asked for that scope by name. Periodic timers use
+   * {@link requestPolling} instead because their next tick is guaranteed.
    */
   requestAutomatic(scope: SyncScope): Promise<void> {
+    if (this.closed) {
+      return Promise.resolve();
+    }
     if (this.floor > 0) {
       this.deferredScopes.add(scope);
       return Promise.resolve();
+    }
+    this.pendingScopes.add(scope);
+    let shared = this.pendingAutomaticWaiter;
+    if (shared === null) {
+      shared = createSharedCycleWaiter();
+      this.pendingAutomaticWaiter = shared;
+      this.waiters.push(shared.waiter);
+    }
+    // Capture `shared` above: drainQueue claims it synchronously before its
+    // first await and clears pendingAutomaticWaiter for the following cycle.
+    this.startDrain();
+    return shared.promise;
+  }
+
+  /**
+   * Starts a periodic polling cycle only while the queue is idle.
+   *
+   * Unlike a watcher notification, a poll tick carries no unique information.
+   * A tick already covered by the running scope is dropped. A disjoint scope
+   * is coalesced into the queue's one shared automatic batch, however, or two
+   * unequal timers can phase-lock and starve one resource forever. This bounds
+   * the backlog at one widened follow-up cycle while preserving liveness.
+   */
+  requestPolling(scope: SyncScope): Promise<void> {
+    if (this.closed || this.floor > 0) {
+      return Promise.resolve();
+    }
+    if (this.drain !== null) {
+      if (
+        this.runningScope !== null &&
+        syncScopeCovers(this.runningScope, scope)
+      ) {
+        return Promise.resolve();
+      }
+      return this.requestAutomatic(scope);
     }
     return this.request(false, scope);
   }
@@ -165,14 +228,31 @@ export class SyncCycleQueue {
       return await run();
     } finally {
       this.floor -= 1;
-      if (this.floor === 0 && this.deferredScopes.size > 0) {
+      if (
+        !this.closed &&
+        this.floor === 0 &&
+        this.deferredScopes.size > 0
+      ) {
         const scope = mergeSyncScopes(this.deferredScopes);
         this.deferredScopes.clear();
-        void this.request(false, scope).catch((error: unknown) => {
+        void this.requestAutomatic(scope).catch((error: unknown) => {
           this.options.onAutomaticFailure(error);
         });
       }
     }
+  }
+
+  private startDrain(): void {
+    if (this.drain !== null) {
+      return;
+    }
+    this.drain = this.drainQueue().finally(() => {
+      this.drain = null;
+    });
+    // Nothing awaits the drain itself, so an escape from it would be an
+    // unhandled rejection: every outcome reaches callers through a cycle
+    // promise instead.
+    void this.drain.catch(() => undefined);
   }
 
   private async drainQueue(): Promise<void> {
@@ -184,6 +264,9 @@ export class SyncCycleQueue {
           const manual = this.pendingManual;
           this.pendingScopes.clear();
           this.pendingManual = false;
+          // Automatic notifications that arrive after this point belong to
+          // the following cycle and therefore need a fresh shared promise.
+          this.pendingAutomaticWaiter = null;
           // Claimed before the await, and in the same synchronous step as the
           // clear above, so it is exactly the callers whose scopes this cycle
           // just took. A request arriving while the cycle runs lands in the
@@ -191,11 +274,14 @@ export class SyncCycleQueue {
           // cycle that will carry it.
           const carried = this.waiters.splice(0);
           try {
+            this.runningScope = scope;
             await this.options.runCycle(manual, scope);
           } catch (error) {
             escaped = error;
             settle(carried, error);
             throw error;
+          } finally {
+            this.runningScope = null;
           }
           settle(carried, null);
         }
@@ -215,12 +301,19 @@ export class SyncCycleQueue {
       // handing them "the lock is held" would have them report a failure that
       // happened to somebody else's request as their own. The reason is still
       // reachable as the cause.
+      const stranded = this.waiters.splice(0);
+      this.pendingAutomaticWaiter = null;
       settle(
-        this.waiters.splice(0),
+        stranded,
         new Error("The synchronization cycle ended before this request ran.", {
           cause: escaped,
         }),
       );
     }
   }
+}
+
+/** Whether one completed/running scope already observes the requested scope. */
+function syncScopeCovers(cover: SyncScope, requested: SyncScope): boolean {
+  return cover === "all" || cover === requested || requested === "remote";
 }

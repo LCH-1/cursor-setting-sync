@@ -135,9 +135,10 @@ function announceReducedCapability(
     });
 }
 
-export function deactivate(): void {
-  manager?.dispose();
+export async function deactivate(): Promise<void> {
+  const activeManager = manager;
   manager = null;
+  await activeManager?.shutdown();
 }
 
 function registerUnsupportedPlatformCommands(

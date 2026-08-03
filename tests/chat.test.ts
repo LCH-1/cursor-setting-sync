@@ -1,6 +1,22 @@
 import { describe, expect, it } from "vitest";
 import fixture from "./fixtures/chat-snapshot.json";
-import { parsePortableChatSnapshot } from "../src/chat/stateVscdb";
+import {
+  bubbleKeyRange,
+  parsePortableChatSnapshot,
+} from "../src/chat/stateVscdb";
+
+describe("chat bubble index range", () => {
+  it("covers exactly one composer's bubble prefix", () => {
+    const composerId = "11111111-1111-4111-8111-111111111111";
+    const [lower, upper] = bubbleKeyRange(composerId);
+    const belongs = `bubbleId:${composerId}:message-a`;
+
+    expect(belongs >= lower && belongs < upper).toBe(true);
+    expect(`bubbleId:${composerId}9:message` >= lower).toBe(false);
+    const composerRow = `composerData:${composerId}`;
+    expect(composerRow >= lower && composerRow < upper).toBe(false);
+  });
+});
 
 describe("portable chat snapshot", () => {
   it("accepts an anonymous valid fixture", () => {

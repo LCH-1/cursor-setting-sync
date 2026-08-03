@@ -1,4 +1,5 @@
 import { basename, isAbsolute, join, relative } from "node:path";
+import type { Dirent } from "node:fs";
 import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
@@ -197,6 +198,8 @@ import {
 } from "./warningLog";
 import { SyncCycleQueue } from "./cycleQueue";
 import type { SyncScope } from "./cycleQueue";
+import { BackgroundCoordinator } from "./backgroundCoordinator";
+import { createPollPlan, type PollPlanEntry } from "./pollPlan";
 import {
   PERMANENT_EXCLUSION_REASONS,
   isChatResourceKind,
@@ -205,6 +208,7 @@ import {
 } from "./resourcePolicy";
 
 const LAST_HELPER_BACKUPS_KEY = "lastHelperBackups";
+const ALWAYS_RELEVANT_FINALIZER = (): boolean => true;
 
 interface StoredHelperBackup {
   backupPath: string;
@@ -232,12 +236,17 @@ export class SyncManager implements vscode.Disposable {
   private pollTimer: NodeJS.Timeout | null = null;
   private chatPollTimer: NodeJS.Timeout | null = null;
   private watcherDebounce: NodeJS.Timeout | null = null;
+  private automaticSyncRequest: Promise<void> | null = null;
+  /** Only one Cursor window owns repository watches and automatic polling. */
+  private readonly backgroundCoordinator: BackgroundCoordinator;
   private finalizerRetryTimer: NodeJS.Timeout | null = null;
+  private finalizerRetryGuard: (() => boolean) | null = null;
   private reconnectProbeTimer: NodeJS.Timeout | null = null;
   /** The nonce of the apply/restore claim this window currently holds. */
   private activeApplyClaim: string | null = null;
   private finalizerStartInFlight: Promise<void> | null = null;
   private finalizerRestartRequested = false;
+  private finalizerRestartGuard: (() => boolean) | null = null;
   /** Resources whose payload has not crossed the shared folder yet, to log once. */
   private readonly deferredApplyNoted = new Set<string>();
   private readonly cycles = new SyncCycleQueue({
@@ -328,6 +337,7 @@ export class SyncManager implements vscode.Disposable {
   private maintenanceRequested = false;
   private largeFileCheckAt = 0;
   private disposed = false;
+  private shutdownPromise: Promise<void> | null = null;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -338,6 +348,32 @@ export class SyncManager implements vscode.Disposable {
     private readonly conflicts: ConflictController,
   ) {
     this.helper = new HelperLauncher(paths, compatibility);
+    this.backgroundCoordinator = new BackgroundCoordinator({
+      acquire: () => acquireFileLock(this.backgroundRoleLockPath()),
+      activate: async (runInitialSync, isCurrent) => {
+        // The shutdown finalizer is machine-wide too. Only the elected window
+        // replaces it, avoiding one cancel/wait/spawn sequence per open window.
+        await this.startFinalizer(isCurrent);
+        if (!isCurrent()) {
+          return;
+        }
+        if (runInitialSync) {
+          await this.syncNow(false);
+          if (!isCurrent()) {
+            return;
+          }
+        }
+        this.startBackgroundRuntime(isCurrent);
+      },
+      deactivate: () => this.disposeBackgroundRuntime(),
+      onError: (error) => {
+        this.status.log(
+          `Background coordinator failed: ${
+            error instanceof Error ? error.message : String(error)
+          }. Retrying shortly.`,
+        );
+      },
+    });
     this.producer = {
       extensionVersion: compatibility.extensionVersion,
       cursorVersion: compatibility.cursorVersion,
@@ -374,20 +410,20 @@ export class SyncManager implements vscode.Disposable {
       this.status.setStatus("disabled");
       return;
     }
-    await this.syncNow(false);
-    await this.startFinalizer();
-    this.startWatching();
+    await this.startWatching(true);
     // Last, and guarded: activation is finished by the lines above, and an
     // offer that threw - a lock it could not take, a quit that failed - must
     // not take the poll timer and the finalizer down with it.
-    try {
-      await this.offerQueuedApply("launch");
-    } catch (error) {
-      this.status.log(
-        `Could not offer to apply the queued changes: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+    if (this.backgroundCoordinator.active) {
+      try {
+        await this.offerQueuedApply("launch");
+      } catch (error) {
+        this.status.log(
+          `Could not offer to apply the queued changes: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
     }
   }
 
@@ -397,14 +433,12 @@ export class SyncManager implements vscode.Disposable {
       this.syncRepositoryLimit(this.repository);
     }
     if (!this.configuration.enabled) {
-      this.disposeRuntime();
+      await this.backgroundCoordinator.stop();
       await this.helper.cancelFinalizers();
       this.status.setStatus("disabled");
       return;
     }
-    await this.startFinalizer();
-    this.startWatching();
-    await this.syncNow(false);
+    await this.startWatching(true);
   }
 
   async setup(): Promise<void> {
@@ -535,7 +569,16 @@ export class SyncManager implements vscode.Disposable {
       }
       throw error;
     }
-    this.disposeRuntime();
+    await this.backgroundCoordinator.stop();
+    try {
+      // A polling cycle can already be past its timer callback when teardown
+      // closes the runtime. Let it finish against the old repository before
+      // replacing the repository and key underneath it.
+      await this.cycles.settled();
+    } catch {
+      // The cycle reported its own failure; Setup can still install the newly
+      // opened repository and let its explicit first sync report live errors.
+    }
     this.masterKey?.fill(0);
     this.repository = openedRepository;
     this.masterKey = Buffer.from(this.repository.masterKey);
@@ -575,15 +618,11 @@ export class SyncManager implements vscode.Disposable {
         // must not leave the freshly configured session with no shutdown
         // exporter and no polling until the next launch: arm and watch, then
         // surface the sync error as what it is.
-        report("Preparing the offline helper...");
-        await this.startFinalizer();
-        this.startWatching();
+        await this.startWatching();
         throw error;
       }
-      report("Preparing the offline helper...");
-      await this.startFinalizer();
     });
-    this.startWatching();
+    await this.startWatching();
     const configured =
       'Cursor Setting Sync is configured. The check mark confirms a local shared-folder write, not OneDrive cloud upload completion. The encrypted sync set includes ~/.cursor/mcp.json and cli-config.json, which may contain API keys - add them to "cursorSettingSync.ignoredUserFiles" to keep them on this device only.';
     // Also to the channel: the offer below can quit Cursor within seconds, and
@@ -826,15 +865,15 @@ export class SyncManager implements vscode.Disposable {
     // Stop the timers first, then let an in-flight cycle finish before the
     // repository is dropped. Tearing down underneath it would publish into the
     // shared folder after the user was told this device had disconnected.
-    this.disposeRuntime();
+    await this.backgroundCoordinator.stop();
     if (this.reconnectProbeTimer !== null) {
       clearTimeout(this.reconnectProbeTimer);
       this.reconnectProbeTimer = null;
     }
     try {
-      // Safe to await the whole drain here only because `disposeRuntime`
-      // above stopped the timers and closed the watcher, so nothing can put
-      // another scope in front of it.
+      // Safe to await the whole drain here only because the background
+      // coordinator above stopped the timers and closed the watcher, so
+      // nothing can put another scope in front of it.
       await this.cycles.settled();
     } catch {
       // A failing final cycle has already recorded its own error; it must not
@@ -1217,7 +1256,10 @@ export class SyncManager implements vscode.Disposable {
     ) {
       return false;
     }
-    this.disposeRuntime();
+    // This path can be reached from the coordinator's own activation cycle.
+    // Invalidating it is synchronous; awaiting here would queue behind the
+    // activation that is currently waiting for us and deadlock.
+    void this.backgroundCoordinator.stop();
     // The disconnecting window cancelled the finalizer it knew about, but an
     // arm in flight in THIS window at that moment survives it; without a
     // second cancel from whoever observes the marker, that exporter performs
@@ -1276,8 +1318,7 @@ export class SyncManager implements vscode.Disposable {
           const masterKey = await this.configuration.getMasterKey();
           if (root !== null && masterKey !== null) {
             await this.openConfiguredRepository(masterKey);
-            await this.startFinalizer();
-            this.startWatching();
+            await this.startWatching(true);
             this.status.log(
               "Reconnected after another window's Setup; synchronization resumed in this window.",
             );
@@ -2433,21 +2474,44 @@ export class SyncManager implements vscode.Disposable {
   }
 
   dispose(): void {
+    void this.shutdown();
+  }
+
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise !== null) {
+      return this.shutdownPromise;
+    }
     this.disposed = true;
+    this.cycles.close();
     if (this.finalizerRetryTimer !== null) {
       clearTimeout(this.finalizerRetryTimer);
       this.finalizerRetryTimer = null;
+      this.finalizerRetryGuard = null;
     }
     if (this.reconnectProbeTimer !== null) {
       clearTimeout(this.reconnectProbeTimer);
       this.reconnectProbeTimer = null;
     }
-    this.disposeRuntime();
-    this.warnings.clear();
-    this.historyPreviewRegistration.dispose();
-    this.helper.dispose();
-    this.masterKey?.fill(0);
-    this.masterKey = null;
+    const coordinatorShutdown = this.backgroundCoordinator.dispose();
+    this.shutdownPromise = (async () => {
+      try {
+        await coordinatorShutdown;
+        // A timeout callback may already have entered the queue when runtime
+        // teardown clears it. Keep the repository, helper and key alive until
+        // that final protected cycle has released sync.lock.
+        await this.cycles.settled();
+      } catch {
+        // A failed final cycle already reported its own diagnostic. Teardown
+        // must still release every in-process resource below.
+      } finally {
+        this.warnings.clear();
+        this.historyPreviewRegistration.dispose();
+        this.helper.dispose();
+        this.masterKey?.fill(0);
+        this.masterKey = null;
+      }
+    })();
+    return this.shutdownPromise;
   }
 
   private async performSync(manual: boolean, scope: SyncScope): Promise<void> {
@@ -2834,6 +2898,10 @@ export class SyncManager implements vscode.Disposable {
 
   private syncLockPath(): string {
     return join(this.paths.extensionStorage, "sync.lock");
+  }
+
+  private backgroundRoleLockPath(): string {
+    return join(this.paths.extensionStorage, "background-role.lock");
   }
 
   /**
@@ -3679,28 +3747,46 @@ export class SyncManager implements vscode.Disposable {
    * before initialize() is awaited, so two invocations can overlap. The
    * follow-up flag ensures the LAST request's configuration wins.
    */
-  private async startFinalizer(): Promise<void> {
+  private async startFinalizer(
+    retryGuard: () => boolean = ALWAYS_RELEVANT_FINALIZER,
+  ): Promise<void> {
+    if (this.disposed || !retryGuard()) {
+      return;
+    }
     if (this.finalizerStartInFlight !== null) {
       this.finalizerRestartRequested = true;
+      // Configuration updates can overlap activation. The newest request's
+      // generation decides whether the serialized follow-up is still useful.
+      this.finalizerRestartGuard = retryGuard;
       return this.finalizerStartInFlight;
     }
-    const run = this.startFinalizerOnce().finally(() => {
+    const run = this.startFinalizerOnce(retryGuard).finally(() => {
       this.finalizerStartInFlight = null;
-      if (this.finalizerRestartRequested && !this.disposed) {
-        this.finalizerRestartRequested = false;
-        void this.startFinalizer();
+      const restart = this.finalizerRestartRequested;
+      const nextGuard =
+        this.finalizerRestartGuard ?? ALWAYS_RELEVANT_FINALIZER;
+      this.finalizerRestartRequested = false;
+      this.finalizerRestartGuard = null;
+      if (restart && !this.disposed && nextGuard()) {
+        void this.startFinalizer(nextGuard);
       }
     });
     this.finalizerStartInFlight = run;
     return run;
   }
 
-  private async startFinalizerOnce(): Promise<void> {
+  private async startFinalizerOnce(
+    retryGuard: () => boolean,
+  ): Promise<void> {
     if (this.finalizerRetryTimer !== null) {
       clearTimeout(this.finalizerRetryTimer);
       this.finalizerRetryTimer = null;
+      this.finalizerRetryGuard = null;
     }
     try {
+      if (!retryGuard()) {
+        return;
+      }
       if (await this.disconnectedElsewhere()) {
         return;
       }
@@ -3709,6 +3795,7 @@ export class SyncManager implements vscode.Disposable {
         !this.configuration.enabled ||
         this.repository === null ||
         this.masterKey === null ||
+        !retryGuard() ||
         !this.compatibility.compatible ||
         !(await pathExists(this.paths.helperScript))
       ) {
@@ -3732,6 +3819,11 @@ export class SyncManager implements vscode.Disposable {
         );
       } finally {
         masterKey.fill(0);
+      }
+      if (!retryGuard()) {
+        // The finalizer just installed is machine-wide and remains useful, but
+        // this former leader must not replace or retry it again.
+        return;
       }
       if (outcome === "adopted") {
         // Another window installed a fresh finalizer after this window asked
@@ -3768,43 +3860,74 @@ export class SyncManager implements vscode.Disposable {
         // Typically a finalizer mid-export from the previous quit, which
         // cannot read its cancel marker until it finishes. It exits on its
         // own; retry until this session's finalizer lands.
-        this.status.log(
-          "The previous shutdown finalizer is still busy, likely finishing an export; retrying in a minute.",
-        );
-        this.scheduleFinalizerRetry();
+        if (this.scheduleFinalizerRetry(retryGuard)) {
+          this.status.log(
+            "The previous shutdown finalizer is still busy, likely finishing an export; retrying in a minute.",
+          );
+        }
       }
     } catch (error) {
       // A spawn that failed (helper bundle mid-update, a transient EPERM on
       // the lock file) leaves the session without a shutdown export unless it
       // is retried - and must never take the caller down with it.
-      this.status.log(
-        `Arming the shutdown finalizer failed (retrying in a minute): ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      this.scheduleFinalizerRetry();
+      if (this.scheduleFinalizerRetry(retryGuard)) {
+        this.status.log(
+          `Arming the shutdown finalizer failed (retrying in a minute): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
     }
   }
 
-  private scheduleFinalizerRetry(): void {
-    if (this.finalizerRetryTimer !== null || this.disposed) {
-      return;
+  private scheduleFinalizerRetry(retryGuard: () => boolean): boolean {
+    if (this.disposed || !retryGuard()) {
+      return false;
     }
+    if (this.finalizerRetryTimer !== null) {
+      if (this.finalizerRetryGuard?.() !== false) {
+        return true;
+      }
+      clearTimeout(this.finalizerRetryTimer);
+      this.finalizerRetryTimer = null;
+    }
+    this.finalizerRetryGuard = retryGuard;
     this.finalizerRetryTimer = setTimeout(() => {
       this.finalizerRetryTimer = null;
-      if (this.disposed || !this.configuration.enabled) {
+      this.finalizerRetryGuard = null;
+      if (
+        this.disposed ||
+        !this.configuration.enabled ||
+        !retryGuard()
+      ) {
         return;
       }
-      void this.startFinalizer();
+      void this.startFinalizer(retryGuard);
     }, FINALIZER_RETRY_DELAY_MS);
+    this.finalizerRetryTimer.unref();
+    return true;
   }
 
-  private startWatching(): void {
+  private async startWatching(runInitialSync = false): Promise<void> {
     const root = this.configuration.repositoryPath;
-    if (root === null || this.disposed) {
+    if (root === null || this.disposed || !this.configuration.enabled) {
+      await this.backgroundCoordinator.stop();
       return;
     }
-    this.disposeRuntime();
+    await this.backgroundCoordinator.start(runInitialSync);
+    if (!this.backgroundCoordinator.active && this.repository !== null) {
+      this.updateStatus(this.repository);
+    }
+  }
+
+  private startBackgroundRuntime(isCurrent: () => boolean): void {
+    if (!isCurrent()) {
+      return;
+    }
+    const root = this.configuration.repositoryPath;
+    if (root === null || this.disposed || !this.configuration.enabled) {
+      throw new Error("background synchronization is no longer enabled");
+    }
     // Git remotes emit no filesystem events; incoming remote commits are
     // detected by the poll timers below, not by this watcher.
     this.repositoryWatcher = createRepositoryWatcher(
@@ -3829,23 +3952,129 @@ export class SyncManager implements vscode.Disposable {
           clearTimeout(this.watcherDebounce);
         }
         this.watcherDebounce = setTimeout(() => {
+          this.watcherDebounce = null;
+          if (
+            !isCurrent() ||
+            !this.backgroundCoordinator.validateOwnership()
+          ) {
+            return;
+          }
           this.scheduleAutomaticSync("remote");
         }, 1000);
+        this.watcherDebounce.unref();
       },
       (message) => {
-        this.status.log(`Repository watcher error: ${message}`);
+        if (isCurrent()) {
+          this.status.log(`Repository watcher error: ${message}`);
+        }
       },
     );
-    this.pollTimer = setInterval(
-      () => this.scheduleAutomaticSync("files"),
-      this.configuration.pollIntervalSeconds * 1000,
+    const filesInterval = this.configuration.pollIntervalSeconds * 1000;
+    const chatInterval = this.configuration.chatPollIntervalSeconds * 1000;
+    const plan = createPollPlan(
+      filesInterval,
+      chatInterval,
+      this.configuration.syncChat,
     );
-    if (this.configuration.syncChat) {
-      this.chatPollTimer = setInterval(
-        () => this.scheduleAutomaticSync("chat"),
-        this.configuration.chatPollIntervalSeconds * 1000,
-      );
+    const slots: Array<"pollTimer" | "chatPollTimer"> = [
+      "pollTimer",
+      "chatPollTimer",
+    ];
+    for (const [index, entry] of plan.entries()) {
+      const slot = slots[index];
+      if (slot !== undefined) {
+        this.startPollingLoop(slot, entry, isCurrent);
+      }
     }
+  }
+
+  private startPollingLoop(
+    slot: "pollTimer" | "chatPollTimer",
+    entry: PollPlanEntry,
+    isCurrent: () => boolean,
+  ): void {
+    const scheduleNext = (): void => {
+      if (!isCurrent() || this.disposed || !this.configuration.enabled) {
+        return;
+      }
+      const timer = setTimeout(() => {
+        if (this[slot] === timer) {
+          this[slot] = null;
+        }
+        if (
+          !isCurrent() ||
+          !this.backgroundCoordinator.validateOwnership()
+        ) {
+          return;
+        }
+        // Start the next interval only after this request settles. Slow cycles
+        // therefore create a cooldown instead of a permanent timer backlog.
+        void this.cycles
+          .requestPolling(entry.scope)
+          .catch((error: unknown) => {
+            this.status.log(
+              `Queued polling synchronization failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          })
+          .finally(scheduleNext);
+      }, entry.intervalMs);
+      timer.unref();
+      this[slot] = timer;
+    };
+    scheduleNext();
+  }
+
+  private scheduleAutomaticSync(scope: SyncScope): void {
+    const request = this.cycles.requestAutomatic(scope);
+    if (request === this.automaticSyncRequest) {
+      return;
+    }
+    this.automaticSyncRequest = request;
+    void request
+      .catch((error: unknown) => {
+        this.status.log(
+          `Queued automatic synchronization failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      })
+      .finally(() => {
+        if (this.automaticSyncRequest === request) {
+          this.automaticSyncRequest = null;
+        }
+      });
+  }
+
+  private disposeBackgroundRuntime(): void {
+    this.repositoryWatcher?.close();
+    this.repositoryWatcher = null;
+    if (this.pollTimer !== null) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = null;
+    }
+    if (this.chatPollTimer !== null) {
+      clearTimeout(this.chatPollTimer);
+      this.chatPollTimer = null;
+    }
+    if (this.watcherDebounce !== null) {
+      clearTimeout(this.watcherDebounce);
+      this.watcherDebounce = null;
+    }
+    if (
+      this.finalizerRetryTimer !== null &&
+      this.finalizerRetryGuard?.() === false
+    ) {
+      clearTimeout(this.finalizerRetryTimer);
+      this.finalizerRetryTimer = null;
+      this.finalizerRetryGuard = null;
+    }
+    this.automaticSyncRequest = null;
+    // The reconnect probe deliberately survives this: background teardown also
+    // runs on configuration changes seen by every window. The probe dies only
+    // with dispose() and disconnect(), the explicit ends of participation.
+    this.clearSyncIndicator();
   }
 
   private helperSyncOptions(): HelperSyncOptions {
@@ -3867,40 +4096,6 @@ export class SyncManager implements vscode.Disposable {
       maxPayloadBytes: this.configuration.maxPayloadBytes,
       gitSync: this.configuration.gitSync,
     };
-  }
-
-  private scheduleAutomaticSync(scope: SyncScope): void {
-    void this.cycles.requestAutomatic(scope).catch((error: unknown) => {
-      this.status.log(
-        `Queued automatic synchronization failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    });
-  }
-
-  private disposeRuntime(): void {
-    this.repositoryWatcher?.close();
-    this.repositoryWatcher = null;
-    if (this.pollTimer !== null) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
-    if (this.chatPollTimer !== null) {
-      clearInterval(this.chatPollTimer);
-      this.chatPollTimer = null;
-    }
-    if (this.watcherDebounce !== null) {
-      clearTimeout(this.watcherDebounce);
-      this.watcherDebounce = null;
-    }
-    // The reconnect probe deliberately survives this: disposeRuntime also
-    // runs on every startWatching and on ANY configuration change (which
-    // reaches every window through the shared settings.json), and killing
-    // the probe there permanently stranded a disconnected-elsewhere window
-    // at "locked". The probe dies only with dispose() and disconnect() - the
-    // explicit ends of this window's participation.
-    this.clearSyncIndicator();
   }
 
   private updateStatus(repository: SyncRepository): void {
@@ -4126,6 +4321,26 @@ export class SyncManager implements vscode.Disposable {
         void this.startFinalizer();
       }
       await rm(claimedPath, { force: true });
+      const stderrLogPath = helperStderrLogPathForResult(
+        this.paths.extensionStorage,
+        name,
+        result.requestId,
+      );
+      if (stderrLogPath !== null) {
+        // A successful helper removes its request in `finally`, but the
+        // launcher's stderr capture is a sibling file owned by the extension
+        // host. Without this, every clean finalizer left another zero-byte log
+        // in global storage forever. Only remove it after the structured result
+        // was processed and claimed away, so a crash result still has its log
+        // available to the abandoned-helper diagnostics until then.
+        await rm(stderrLogPath, { force: true }).catch((error: unknown) => {
+          this.status.log(
+            `Could not remove helper stderr log ${basename(stderrLogPath)}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+      }
     }
     if (!options.atStartup) {
       // The result file is already deleted, so skipping observation here
@@ -4271,6 +4486,24 @@ export class SyncManager implements vscode.Disposable {
       }
       await rm(requestPath, { force: true });
       await rm(logPath, { force: true });
+    }
+    try {
+      const removedLogs = await removeAbandonedHelperStderrLogs(
+        this.paths.extensionStorage,
+      );
+      if (removedLogs > 0) {
+        this.status.log(
+          `Removed ${removedLogs} abandoned offline-helper stderr log(s).`,
+        );
+      }
+    } catch (error) {
+      // Historical log cleanup is housekeeping. A transient EPERM from an
+      // antivirus or another window must not fail extension activation.
+      this.status.log(
+        `Could not clean abandoned offline-helper stderr logs: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
 
@@ -4610,6 +4843,130 @@ export const QUIT_STALLED_MESSAGE =
  */
 export function isHelperResultFileName(name: string): boolean {
   return name.startsWith("helper-result-") && name.endsWith(".json");
+}
+
+const HELPER_REQUEST_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+export interface HelperStderrLogPaths {
+  requestPath: string;
+  stderrLogPath: string;
+}
+
+/** Safe paths named by one canonical helper stderr-log basename. */
+export function helperStderrLogPaths(
+  storageRoot: string,
+  stderrLogFileName: string,
+): HelperStderrLogPaths | null {
+  const prefix = "helper-request-";
+  const suffix = ".json.stderr.log";
+  if (
+    !stderrLogFileName.startsWith(prefix) ||
+    !stderrLogFileName.endsWith(suffix)
+  ) {
+    return null;
+  }
+  const requestId = stderrLogFileName.slice(
+    prefix.length,
+    -suffix.length,
+  );
+  if (!HELPER_REQUEST_ID_PATTERN.test(requestId)) {
+    return null;
+  }
+  return {
+    requestPath: join(storageRoot, `helper-request-${requestId}.json`),
+    stderrLogPath: join(storageRoot, stderrLogFileName),
+  };
+}
+
+/**
+ * Removes old stderr captures whose helper request no longer exists.
+ *
+ * The helper writes its request before the launcher opens this log, and keeps
+ * the request until its run finishes. The age gate covers the small interval
+ * after that final removal, while the repeated request/mtime checks keep a
+ * concurrent startup or final write from being mistaken for historical litter.
+ */
+export async function removeAbandonedHelperStderrLogs(
+  storageRoot: string,
+  now = Date.now(),
+): Promise<number> {
+  let entries: Dirent<string>[];
+  try {
+    entries = await readdir(storageRoot, { withFileTypes: true });
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return 0;
+    }
+    throw error;
+  }
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    const paths = helperStderrLogPaths(storageRoot, entry.name);
+    if (paths === null || (await pathExists(paths.requestPath))) {
+      continue;
+    }
+    let info;
+    try {
+      info = await stat(paths.stderrLogPath);
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        continue;
+      }
+      throw error;
+    }
+    if (now - info.mtimeMs <= ABANDONED_HELPER_MIN_AGE_MS) {
+      continue;
+    }
+    // Re-check both facts immediately before deletion. A helper cannot
+    // legitimately own a log without its request, and any recent write makes
+    // the log young again even if the initial directory snapshot was stale.
+    if (await pathExists(paths.requestPath)) {
+      continue;
+    }
+    try {
+      info = await stat(paths.stderrLogPath);
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        continue;
+      }
+      throw error;
+    }
+    if (now - info.mtimeMs <= ABANDONED_HELPER_MIN_AGE_MS) {
+      continue;
+    }
+    await rm(paths.stderrLogPath, { force: true });
+    removed += 1;
+  }
+  return removed;
+}
+
+/**
+ * The stderr capture belonging to one claimed helper result, when its identity
+ * is safe and self-consistent.
+ *
+ * Result JSON is external process output and therefore untrusted at runtime;
+ * its TypeScript `requestId: string` annotation is not validation. Requiring
+ * the canonical UUID produced by `randomUUID()` prevents path separators,
+ * absolute paths and dot segments, while matching the result file name stops a
+ * malformed result from deleting another still-running helper's log.
+ */
+export function helperStderrLogPathForResult(
+  storageRoot: string,
+  resultFileName: string,
+  requestId: unknown,
+): string | null {
+  if (
+    typeof requestId !== "string" ||
+    !HELPER_REQUEST_ID_PATTERN.test(requestId) ||
+    resultFileName !== `helper-result-${requestId}.json`
+  ) {
+    return null;
+  }
+  return join(storageRoot, `helper-request-${requestId}.json.stderr.log`);
 }
 
 /**
@@ -6444,4 +6801,3 @@ function isJsonMergeKind(
   }
   return false;
 }
-
