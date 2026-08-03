@@ -253,6 +253,20 @@ export interface LocalProjection {
   payloadObjectId?: string;
   retainedLocalHash?: string;
   sourceTimestamp?: number;
+  /**
+   * How many messages the published version of a chat held.
+   *
+   * `sourceTimestamp` alone is not a change signal for a chat. Cursor stamps
+   * `composerHeaders.lastUpdatedAt` once, near the start of a conversation, and
+   * then streams the rest of the messages into `cursorDiskKV` without touching
+   * it again. A scan that ran while the conversation had one message published
+   * one message, recorded that timestamp, and from then on every later scan
+   * compared equal and skipped the chat - so the conversation stayed frozen at
+   * its first message in the repository no matter how long it went on. Measured
+   * on the real pair: a chat with 63 messages on disk, published with one, and
+   * the other computer showing exactly that one.
+   */
+  sourceBubbleCount?: number;
 }
 
 export interface SyncConflict {

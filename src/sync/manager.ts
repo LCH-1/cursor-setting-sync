@@ -5070,6 +5070,11 @@ function markProjection(
       : retainedTombstoneHash === undefined
         ? {}
         : { retainedLocalHash: retainedTombstoneHash }),
+    // Recorded beside the timestamp because for a chat the timestamp alone is
+    // not a change signal; see LocalProjection.sourceBubbleCount.
+    ...(typeof tip.metadata?.bubbleCount === "number"
+      ? { sourceBubbleCount: tip.metadata.bubbleCount }
+      : {}),
     ...(typeof tip.metadata?.lastUpdatedAt === "number"
       ? { sourceTimestamp: tip.metadata.lastUpdatedAt }
       : {}),

@@ -2,6 +2,16 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.53] - 2026-08-03
+
+### Fixed
+
+- **A conversation that kept going was frozen at its first message.** Cursor stamps `composerHeaders.lastUpdatedAt` once, near the start of a chat, and then streams every later message into `cursorDiskKV` without touching it again. The scan used that timestamp alone as its change signal — so a poll that happened to land while a chat had one message published one message, recorded the timestamp, and from then on every scan compared equal and skipped the chat entirely. The conversation grew for hours; the repository kept the first line.
+
+  Measured on the real pair: a chat with **63 messages on disk, published with `bubbleCount: 1`**, and the second computer showing exactly that one message under the title "New Agent" — the header had never travelled either. Another chat with 68 messages had never been published at all.
+
+  The change signal is now the timestamp **and** the message count, gathered for every conversation in one grouped query per scan rather than a count per chat. A projection written by an earlier version carries no count, which reads as "unknown" and forces a re-read — so chats frozen by this bug republish in full on the first scan after the update, without anyone having to touch them.
+
 ## [0.0.52] - 2026-08-03
 
 ### Fixed

@@ -60,6 +60,7 @@ interface ChatStatements {
   header: ChatStatement;
   data: ChatStatement;
   bubbles: ChatStatement;
+  bubbleCount: ChatStatement;
 }
 
 interface ChatIdentity {
@@ -126,6 +127,28 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         composerId: SqliteRowValue;
         lastUpdatedAt: SqliteRowValue;
       }>;
+      // How many messages each conversation currently holds, in one grouped
+      // pass rather than a COUNT per chat per poll.
+      //
+      // This is the half of the change signal that `lastUpdatedAt` does not
+      // provide: Cursor stamps the header once near the start of a conversation
+      // and then streams the remaining messages into `cursorDiskKV` without
+      // touching it, so a timestamp comparison alone reports "unchanged" for a
+      // chat that has grown from one message to sixty-three. See
+      // `LocalProjection.sourceBubbleCount`.
+      const bubbleCounts = new Map<string, number>();
+      for (const row of database
+        .prepare(
+          "SELECT substr(key, 10, instr(substr(key, 10), ':') - 1) AS composerId, COUNT(*) AS total " +
+            "FROM cursorDiskKV WHERE key LIKE 'bubbleId:%' GROUP BY composerId",
+        )
+        .all() as Array<{ composerId: SqliteRowValue; total: SqliteRowValue }>) {
+        const id = composerIdText(row.composerId);
+        const total = plainNumber(row.total);
+        if (id !== null && total !== null) {
+          bubbleCounts.set(id, total);
+        }
+      }
       const statements: ChatStatements = {
         header: database.prepare(
           "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, recency, checkpointAt, value FROM composerHeaders WHERE composerId = ? AND COALESCE(isSubagent, 0) = 0",
@@ -135,6 +158,9 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         ),
         bubbles: database.prepare(
           "SELECT key, value, typeof(value) AS valueType FROM cursorDiskKV WHERE key LIKE ? ORDER BY key",
+        ),
+        bubbleCount: database.prepare(
+          "SELECT COUNT(*) AS total FROM cursorDiskKV WHERE key LIKE ?",
         ),
       };
       for (const rawHeader of headers) {
@@ -175,7 +201,9 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         if (
           listedTimestamp !== null &&
           known[resourceId]?.kind === "chat" &&
-          known[resourceId]?.sourceTimestamp === listedTimestamp
+          known[resourceId]?.sourceTimestamp === listedTimestamp &&
+          known[resourceId]?.sourceBubbleCount ===
+            (bubbleCounts.get(composerId) ?? 0)
         ) {
           current.add(resourceId);
           continue;
@@ -363,10 +391,22 @@ function captureChat(
     const resourceId = `chat/${header.composerId}`;
     // A null timestamp carries no change information, so it must never
     // short-circuit against a projection that simply recorded none either.
+    // Same two-part signal as the listing pass; see
+    // `LocalProjection.sourceBubbleCount` for why the timestamp alone is not
+    // enough. Counted inside the transaction so it agrees with the rows the
+    // capture below would read.
+    const liveBubbleCount = plainNumber(
+      (
+        statements.bubbleCount.get(`bubbleId:${header.composerId}:%`) as
+          | { total?: SqliteRowValue }
+          | undefined
+      )?.total ?? 0,
+    );
     if (
       header.lastUpdatedAt !== null &&
       known[resourceId]?.kind === "chat" &&
-      known[resourceId]?.sourceTimestamp === header.lastUpdatedAt
+      known[resourceId]?.sourceTimestamp === header.lastUpdatedAt &&
+      known[resourceId]?.sourceBubbleCount === (liveBubbleCount ?? 0)
     ) {
       database.exec("COMMIT");
       return { kind: "unchanged" };

@@ -709,6 +709,9 @@ async function exportFinalChanges(
         ...(projection.tip.payload === undefined
           ? {}
           : { payloadObjectId: projection.tip.payload.objectId }),
+        ...(typeof projection.tip.metadata?.bubbleCount === "number"
+          ? { sourceBubbleCount: projection.tip.metadata.bubbleCount }
+          : {}),
         ...(typeof projection.tip.metadata?.lastUpdatedAt === "number"
           ? { sourceTimestamp: projection.tip.metadata.lastUpdatedAt }
           : {}),
@@ -923,6 +926,9 @@ function markAppliedProjections(
       ...(change.payload === undefined
         ? {}
         : { payloadObjectId: change.payload.objectId }),
+      ...(typeof change.metadata?.bubbleCount === "number"
+        ? { sourceBubbleCount: change.metadata.bubbleCount }
+        : {}),
       ...(typeof change.metadata?.lastUpdatedAt === "number"
         ? { sourceTimestamp: change.metadata.lastUpdatedAt }
         : {}),
