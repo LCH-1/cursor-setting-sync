@@ -2,6 +2,18 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.57] - 2026-08-03
+
+### Fixed
+
+- **Applying a chat no longer deletes messages this computer still has.** The applier removed every `bubbleId:` row the incoming snapshot did not contain, on the rule that a message deleted on the source must not survive on the target. There is no such deletion: Cursor offers no way to remove a single message, so every absence is Cursor pruning a conversation body on one computer alone. Replicating it turned one machine's housekeeping into the other machine's data loss — and because the emptied side then published its own empty capture, a conversation pruned on *either* computer ended up empty on **both**, rendering up to a point and then failing with "Conversation data missing".
+
+  Measured on the real pair: 553 conversations, 58,062 messages, and **5 chats holding 377 messages between them gone — every one an all-or-nothing loss, not a partial one**, which is the signature of wholesale replication rather than corruption. Unreferenced rows are inert (`composerData.fullConversationHeadersOnly` decides what a conversation contains), so keeping them costs storage and nothing else — the same reasoning the conflict merge already used to union messages instead of choosing between them.
+
+- **A conversation that lost messages here is no longer published over the fuller copy.** Even without the delete, republishing a pruned capture would overwrite the shared `composerData`. A chat whose message count has *dropped* since this device last published it is now held back, with a notice naming the chats and the counts. Growth still publishes exactly as before, and a chat this device has never published is unaffected — an absent count means "unknown", not "zero".
+
+  This also gives the other direction for free: because the shared folder keeps the fuller version, it stays available to be written back to the computer that pruned it.
+
 ## [0.0.56] - 2026-08-03
 
 ### Fixed

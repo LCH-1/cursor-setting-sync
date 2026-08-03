@@ -1097,23 +1097,26 @@ function upsertChat(
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
   );
   insertKv.run(snapshot.composerData.key, portableKvValue(snapshot.composerData));
-  const incomingBubbleKeys = new Set(
-    snapshot.bubbles.map((bubble) => bubble.key),
-  );
   for (const bubble of snapshot.bubbles) {
     insertKv.run(bubble.key, portableKvValue(bubble));
   }
-  // Bubbles deleted on the source must not persist on the target. The
-  // composer ID is UUID-validated, so the LIKE prefix contains no wildcards.
-  const existingBubbleRows = database
-    .prepare("SELECT key FROM cursorDiskKV WHERE key LIKE ?")
-    .all(`bubbleId:${snapshot.composerId}:%`) as Array<{ key: string }>;
-  const deleteKv = database.prepare("DELETE FROM cursorDiskKV WHERE key = ?");
-  for (const row of existingBubbleRows) {
-    if (!incomingBubbleKeys.has(row.key)) {
-      deleteKv.run(row.key);
-    }
-  }
+  // Bubbles present here and absent from the snapshot are LEFT ALONE.
+  //
+  // This used to delete them, on the rule that a message removed on the source
+  // should not survive on the target. There is no such removal: Cursor gives
+  // nobody a way to delete one message, and every disappearance is Cursor
+  // pruning a conversation body on that computer alone. Replicating it turned
+  // one machine's housekeeping into the other machine's data loss, and because
+  // the emptied side then published its own empty capture, a chat pruned on
+  // either computer ended up empty on BOTH - the conversation rendering up to
+  // a point and then failing with "Conversation data missing". Measured on the
+  // real pair: five chats holding 377 messages between them, every one of them
+  // an all-or-nothing loss rather than a partial one.
+  //
+  // Keeping them costs storage and nothing else: `composerData`'s
+  // `fullConversationHeadersOnly` decides what the conversation contains, so a
+  // row it does not reference is inert - the same reason the conflict merge
+  // unions bubbles instead of choosing between them.
   const header = snapshot.header;
   database
     .prepare(

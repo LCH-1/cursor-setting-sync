@@ -692,7 +692,7 @@ describeWithBackup("offline database helper", () => {
     }
   });
 
-  it("preserves chat KV storage classes and removes stale bubbles", async () => {
+  it("preserves chat KV storage classes and never deletes local messages", async () => {
     const fixture = await createFixture();
     const composerId = "00000000-0000-4000-8000-000000000001";
     const otherComposerId = "11111111-1111-4111-8111-111111111111";
@@ -708,7 +708,7 @@ describeWithBackup("offline database helper", () => {
     const seed = new DatabaseSync(fixture.databasePath);
     seed
       .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
-      .run(`bubbleId:${composerId}:stale`, "deleted-on-source");
+      .run(`bubbleId:${composerId}:stale`, "absent-from-the-snapshot");
     seed
       .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
       .run(`bubbleId:${otherComposerId}:kept`, "other-composer");
@@ -786,7 +786,16 @@ describeWithBackup("offline database helper", () => {
       expect(
         readKvType(database, `bubbleId:${composerId}:legacy-blob-bubble`),
       ).toBe("blob");
-      expect(readKvType(database, `bubbleId:${composerId}:stale`)).toBeUndefined();
+      // A message this computer holds and the incoming snapshot does not is
+      // KEPT. It used to be deleted, on the rule that a removal on the source
+      // should not survive here - but Cursor gives nobody a way to delete one
+      // message, so every such absence is Cursor pruning a conversation body
+      // on the other computer alone. Deleting made one machine's housekeeping
+      // the other machine's data loss, and since the emptied side then
+      // published its own empty capture, a chat pruned anywhere ended up empty
+      // everywhere. `composerData` decides what the conversation contains, so
+      // an unreferenced row is inert.
+      expect(readKvType(database, `bubbleId:${composerId}:stale`)).toBe("text");
       expect(readKvType(database, `bubbleId:${otherComposerId}:kept`)).toBe(
         "text",
       );

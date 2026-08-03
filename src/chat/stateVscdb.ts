@@ -74,6 +74,7 @@ type ChatCapture =
   | { kind: "missing" }
   | { kind: "unchanged" }
   | { kind: "incomplete" }
+  | { kind: "pruned"; had: number; has: number }
   | { kind: "captured"; snapshot: PortableChatSnapshot };
 
 export interface PortableChatSnapshot {
@@ -104,6 +105,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
     const notices: string[] = [];
     const current = new Set<string>();
     const bodyless: string[] = [];
+    const pruned: string[] = [];
     let identityUnknown = false;
     try {
       // Cursor writes to this database while it runs; wait out short lock
@@ -242,6 +244,14 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           bodyless.push(composerId);
           continue;
         }
+        // Aggregated for the same reason, and a notice rather than a warning:
+        // the repository still holds the full conversation, so nothing was
+        // lost that this device can act on - it is the other computer's copy
+        // being protected from this one's pruning.
+        if (captured.kind === "pruned") {
+          pruned.push(`${composerId} (${captured.had} -> ${captured.has})`);
+          continue;
+        }
         const snapshot = captured.snapshot;
         const workspaceId = snapshot.header.workspaceId;
         const content = canonicalBytes(snapshot);
@@ -264,6 +274,9 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
       }
       if (bodyless.length > 0) {
         notices.push(bodylessChatsWarning(bodyless));
+      }
+      if (pruned.length > 0) {
+        notices.push(prunedChatsNotice(pruned));
       }
     } finally {
       database.close();
@@ -420,6 +433,25 @@ function captureChat(
       database.exec("COMMIT");
       return { kind: "incomplete" };
     }
+    // A conversation that has LOST messages since this device last published
+    // it is not a change to propagate.
+    //
+    // Cursor prunes conversation bodies on its own schedule, per computer.
+    // Publishing the pruned capture made this device's housekeeping the shared
+    // truth and emptied the other computer's copy of a conversation it still
+    // held in full. Messages are immutable and append-only - Cursor offers no
+    // way to delete one - so a shrink is never the user's doing, and the
+    // richer version already in the repository is the one worth keeping.
+    // Holding back also leaves that version available to be written back here.
+    const knownCount = known[resourceId]?.sourceBubbleCount;
+    if (
+      known[resourceId]?.kind === "chat" &&
+      typeof knownCount === "number" &&
+      (liveBubbleCount ?? 0) < knownCount
+    ) {
+      database.exec("COMMIT");
+      return { kind: "pruned", had: knownCount, has: liveBubbleCount ?? 0 };
+    }
     const bubbleRows = statements.bubbles.all(
       `bubbleId:${header.composerId}:%`,
     ) as RawKvRow[];
@@ -571,6 +603,22 @@ function bodylessChatsWarning(composerIds: readonly string[]): string {
   return `Skipped ${composerIds.length} chat(s) whose conversation body is not in the database: ${sample}${
     remainder === 0 ? "" : ` and ${remainder} more`
   }. Expected when Cursor prunes a conversation and keeps its list entry; if you still expect one of these chats, its body was lost locally.`;
+}
+
+/**
+ * Says which conversations this computer stopped publishing because they shrank.
+ *
+ * Not a warning: nothing is broken and there is nothing to fix. It is the
+ * record of this device declining to make its own pruning everyone's, and the
+ * counts are what make a slow local erosion visible before the repository is
+ * the only copy left.
+ */
+function prunedChatsNotice(entries: readonly string[]): string {
+  const sample = entries.slice(0, BODYLESS_SAMPLE_SIZE).join(", ");
+  const remainder = entries.length - Math.min(entries.length, BODYLESS_SAMPLE_SIZE);
+  return `Held back ${entries.length} chat(s) that lost messages on this computer: ${sample}${
+    remainder === 0 ? "" : ` and ${remainder} more`
+  }. Cursor prunes conversation bodies per computer and messages are never deleted individually, so the fuller copy already in the shared folder is kept instead of being overwritten with this one.`;
 }
 
 function findChatDeletions(
