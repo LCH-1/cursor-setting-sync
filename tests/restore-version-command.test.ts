@@ -2,12 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 const ui = vi.hoisted(() => ({
   answers: [] as Array<((labels: string[]) => number | undefined) | undefined>,
   offered: [] as Array<{ title: string; labels: string[] }>,
   confirmations: [] as string[],
   information: [] as string[],
+  warningChoice: undefined as string | undefined,
 }));
 
 vi.mock("vscode", () => ({
@@ -33,6 +35,12 @@ vi.mock("vscode", () => ({
     },
     showWarningMessage: async (message: string, ...args: unknown[]) => {
       ui.confirmations.push(message);
+      if (
+        ui.warningChoice !== undefined &&
+        args.includes(ui.warningChoice)
+      ) {
+        return ui.warningChoice;
+      }
       return args.includes("Restore Version") ? "Restore Version" : undefined;
     },
     showInformationMessage: async (message: string) => {
@@ -69,6 +77,7 @@ beforeEach(() => {
   ui.offered.length = 0;
   ui.confirmations.length = 0;
   ui.information.length = 0;
+  ui.warningChoice = undefined;
 });
 
 afterEach(async () => {
@@ -129,6 +138,231 @@ describe("Restore Version History command", () => {
     }
   });
 });
+
+describe("Repair Unavailable Chats command", () => {
+  it("finds the damaged chat and publishes one complete repair without a picker", async () => {
+    const fixture = await createRepairFixture();
+    try {
+      ui.warningChoice = "Queue Repair";
+      const before = (await fixture.repository.listEvents()).length;
+      const tryReadVersion = vi.spyOn(
+        fixture.repository,
+        "tryReadVersion",
+      );
+
+      await fixture.manager.repairUnavailableChats();
+
+      const events = await fixture.repository.listEvents();
+      expect(events).toHaveLength(before + 1);
+      expect(ui.offered).toEqual([]);
+      expect(ui.confirmations).toEqual([
+        "Repair 1 unavailable Cursor conversation?",
+      ]);
+      const repaired = await fixture.repository.readVersion(
+        `${events.at(-1)?.eventHash ?? ""}#0`,
+      );
+      expect(repaired.change.metadata?.syncOrigin).toBe(
+        "automatic-chat-repair",
+      );
+      expect(repaired.change.metadata?.repairedBubbleCount).toBe(1);
+      expect(repaired.change.metadata?.repairOriginDeviceId).toBe(
+        fixture.repository.state.device.deviceId,
+      );
+      expect(
+        tryReadVersion.mock.calls.map(([versionId]) => versionId),
+      ).not.toContain(fixture.olderVersionId);
+      const payload = JSON.parse(
+        repaired.content?.toString("utf8") ?? "null",
+      ) as { header?: { value?: string }; bubbles?: Array<{ key?: string }> };
+      expect(payload.header?.value).toBe(JSON.stringify({ name: "Broken chat" }));
+      expect(payload.bubbles?.map((bubble) => bubble.key)).toEqual([
+        `bubbleId:${fixture.composerId}:a`,
+        `bubbleId:${fixture.composerId}:b`,
+        `bubbleId:${fixture.composerId}:c`,
+      ]);
+      expect(
+        ui.information.some((message) => message.includes("1 chat repair is queued")),
+      ).toBe(true);
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
+});
+
+async function createRepairFixture(): Promise<{
+  manager: SyncManager;
+  repository: SyncRepository;
+  composerId: string;
+  olderVersionId: string;
+}> {
+  const root = await mkdtemp(join(tmpdir(), "cursor-repair-command-"));
+  temporaryRoots.push(root);
+  const repository = await SyncRepository.create(
+    join(root, "repository"),
+    join(root, "storage"),
+    "a sufficiently long test passphrase",
+    4 * 1024 * 1024,
+    producer,
+  );
+  const composerId = "55555555-5555-4555-8555-555555555555";
+  const older = await repository.publish(
+    [repairChatSnapshot(composerId, ["a"])],
+    [],
+  );
+  const olderVersionId = `${requiredHash(older.eventHash)}#0`;
+  const complete = await repository.publish(
+    [
+      {
+        ...repairChatSnapshot(composerId),
+        parents: [olderVersionId],
+      },
+    ],
+    [],
+  );
+  await repository.publish(
+    [
+      {
+        // The newest partial version has an unreferenced row that must remain
+        // in the synthesized child even though the older complete source is
+        // the version that supplies missing referenced bubble b.
+        ...repairChatSnapshot(composerId, ["a", "c"]),
+        parents: [`${requiredHash(complete.eventHash)}#0`],
+      },
+    ],
+    [],
+  );
+  new EventReconciler().reconcile(await repository.listEvents(), repository.state, null);
+  await repository.saveState();
+
+  const globalDatabase = join(root, "state.vscdb");
+  const database = new DatabaseSync(globalDatabase);
+  database.exec(`
+    CREATE TABLE composerHeaders(
+      composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER,
+      lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER,
+      recency INTEGER, checkpointAt INTEGER, value TEXT
+    );
+    CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value);
+  `);
+  database
+    .prepare(
+      `INSERT INTO composerHeaders(
+        composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+        isSubagent, recency, checkpointAt, value
+      ) VALUES (?, 'project-a', 1, 2, 0, 0, 0, NULL, ?)`,
+    )
+    .run(composerId, JSON.stringify({ name: "Broken chat" }));
+  database
+    .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+    .run(
+      `composerData:${composerId}`,
+      JSON.stringify({
+        fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "b" }],
+      }),
+    );
+  database
+    .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+    .run(`bubbleId:${composerId}:a`, JSON.stringify({ text: "a" }));
+  database.close();
+
+  const paths = {
+    globalDatabase,
+    extensionStorage: join(root, "extension-storage"),
+    helperScript: join(root, "helper.js"),
+  } as unknown as CursorPaths;
+  const compatibility = {
+    compatible: true,
+    ...producer,
+    nodeVersion: process.versions.node,
+    sqliteAvailable: true,
+    sqliteBackupAvailable: true,
+    globalDatabasePath: globalDatabase,
+    databaseCapabilities: {
+      "global-item-table": { available: true, reasons: [] },
+      "global-chat": { available: true, reasons: [] },
+      "sqlite-files": { available: true, reasons: [] },
+    },
+    reasons: [],
+    warnings: [],
+  } satisfies CompatibilityReport;
+  const manager = new SyncManager(
+    {} as never,
+    paths,
+    compatibility,
+    {
+      syncChat: true,
+      syncWorkspaceStorage: true,
+    } as unknown as ExtensionConfiguration,
+    { log: vi.fn() } as unknown as StatusController,
+    {} as ConflictController,
+  );
+  const internals = manager as unknown as {
+    repository: SyncRepository;
+    takeCommandLock: () => Promise<{ release: () => Promise<void> }>;
+    openGitWindow: () => Promise<boolean>;
+    commitGitWindow: () => Promise<void>;
+    syncNow: () => Promise<void>;
+  };
+  internals.repository = repository;
+  internals.takeCommandLock = vi.fn(async () => ({
+    release: async () => undefined,
+  }));
+  internals.openGitWindow = vi.fn(async () => false);
+  internals.commitGitWindow = vi.fn(async () => undefined);
+  internals.syncNow = vi.fn(async () => undefined);
+  return { manager, repository, composerId, olderVersionId };
+}
+
+function repairChatSnapshot(
+  composerId: string,
+  bubbleIds: string[] = ["a", "b"],
+): ResourceSnapshot {
+  const content = canonicalBytes({
+    schemaVersion: 1,
+    composerId,
+    header: {
+      composerId,
+      workspaceId: "project-a",
+      createdAt: 1,
+      lastUpdatedAt: 2,
+      isArchived: 0,
+      isSubagent: 0,
+      recency: 0,
+      checkpointAt: null,
+      value: JSON.stringify({ name: "Broken chat" }),
+    },
+    composerData: {
+      key: `composerData:${composerId}`,
+      valueBase64: Buffer.from(
+        JSON.stringify({
+          fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "b" }],
+        }),
+        "utf8",
+      ).toString("base64"),
+      valueType: "text",
+    },
+    bubbles: bubbleIds.map((id) => ({
+      key: `bubbleId:${composerId}:${id}`,
+      valueBase64: Buffer.from(JSON.stringify({ text: id }), "utf8").toString(
+        "base64",
+      ),
+      valueType: "text",
+    })),
+  });
+  return {
+    resourceId: `chat/${composerId}`,
+    kind: "chat",
+    content,
+    semanticHash: sha256(content),
+    metadata: {
+      composerId,
+      workspaceId: "project-a",
+      workspaceUri: "file:///C:/work/project-a",
+      bubbleCount: bubbleIds.length,
+      title: "Broken chat",
+    },
+  };
+}
 
 async function createFixture(): Promise<{
   manager: SyncManager;

@@ -71,6 +71,7 @@ export function isSyntheticTip(tip: ResourceTip): boolean {
     tip.metadata?.syncOrigin === "conflict-resolution" ||
     tip.metadata?.syncOrigin === "auto-merge" ||
     tip.metadata?.syncOrigin === "version-restore" ||
+    tip.metadata?.syncOrigin === "automatic-chat-repair" ||
     tip.metadata?.syncOrigin === "checkpoint-marker"
   );
 }

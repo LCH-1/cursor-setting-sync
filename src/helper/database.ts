@@ -25,9 +25,16 @@ import {
   writeJsonAtomic,
 } from "../platform/files";
 import {
+  bubbleKeyRange,
   parsePortableChatSnapshot,
+  type PortableChatSnapshot,
   type PortableKvRow,
 } from "../chat/stateVscdb";
+import {
+  auditChatReferences,
+  isAutomaticChatRepairMetadata,
+  readPortableChatSnapshot,
+} from "../chat/repair";
 import {
   discoverWorkspaces,
   resolveTargetWorkspace,
@@ -58,6 +65,8 @@ export interface DatabaseApplyResult {
   backupPath: string;
   applied: string[];
   skipped: string[];
+  /** Automatic repairs that failed safely and must not retry every shutdown. */
+  failureByResourceId: Record<string, string>;
   /** Resources whose bytes on disk differ from the published version. */
   retainedLocal: string[];
   /** What the next scan of those resources will hash to. */
@@ -265,6 +274,8 @@ export async function applyGlobalDatabaseChanges(
   beforeDestructiveWrite: () => Promise<void> = async () => {},
   /** Backups earlier steps of the same run took; retention must spare them. */
   priorBackups: () => readonly string[] = () => [],
+  /** Repository device that owns this local database. Required for repairs. */
+  localDeviceId?: string,
 ): Promise<DatabaseApplyResult> {
   const localWorkspaces = await preflightGlobalChanges(request, prepared);
   const databasePath = request.paths.globalDatabase;
@@ -327,6 +338,7 @@ export async function applyGlobalDatabaseChanges(
       prepared,
       localWorkspaces,
       heartbeat,
+      localDeviceId,
     );
     assertCheck(database, "integrity_check");
     database.exec("COMMIT");
@@ -777,6 +789,13 @@ async function preflightGlobalChanges(
  */
 class FatalApplyError extends Error {}
 
+/**
+ * A repair-specific refusal. The savepoint still rolls back this resource,
+ * but the caller records a durable pending block so the same stale recipe
+ * does not take a multi-gigabyte backup again on every Cursor shutdown.
+ */
+class AutomaticChatRepairApplyError extends Error {}
+
 type ChangeOutcome =
   | {
       status: "applied";
@@ -797,7 +816,8 @@ type ChangeOutcome =
    * extension and the retained tombstone branches use in `resourceApply`.
    */
   | { status: "retained-local"; reason: string }
-  | { status: "skipped"; reason: string };
+  | { status: "skipped"; reason: string }
+  | { status: "failed"; reason: string };
 
 function applyPreparedChanges(
   database: DatabaseSync,
@@ -805,14 +825,17 @@ function applyPreparedChanges(
   prepared: PreparedHelperChange[],
   localWorkspaces: Awaited<ReturnType<typeof discoverWorkspaces>>,
   heartbeat: () => void = () => {},
+  localDeviceId?: string,
 ): {
   applied: string[];
   skipped: string[];
+  failureByResourceId: Record<string, string>;
   retainedLocal: string[];
   retainedLocalHashes: Record<string, string>;
 } {
   const applied: string[] = [];
   const skipped: string[] = [];
+  const failureByResourceId: Record<string, string> = {};
   const retainedLocal: string[] = [];
   const retainedLocalHashes: Record<string, string> = {};
   const marker: MarkerState = {
@@ -837,6 +860,7 @@ function applyPreparedChanges(
         localWorkspaces,
         marker,
         ignoredUiStateKeys,
+        localDeviceId,
       );
       database.exec("RELEASE cursor_sync_change");
     } catch (error) {
@@ -846,7 +870,9 @@ function applyPreparedChanges(
         throw error;
       }
       outcome = {
-        status: "skipped",
+        status: error instanceof AutomaticChatRepairApplyError
+          ? "failed"
+          : "skipped",
         reason: error instanceof Error ? error.message : String(error),
       };
     }
@@ -861,6 +887,9 @@ function applyPreparedChanges(
       applied.push(item.change.resourceId);
     } else if (outcome.status === "skipped") {
       skipped.push(`${item.change.resourceId}: ${outcome.reason}`);
+    } else if (outcome.status === "failed") {
+      skipped.push(`${item.change.resourceId}: ${outcome.reason}`);
+      failureByResourceId[item.change.resourceId] = outcome.reason;
     }
   }
 
@@ -874,7 +903,13 @@ function applyPreparedChanges(
       )
       .run(TARGET_STORAGE_MARKER, JSON.stringify(marker.entries));
   }
-  return { applied, skipped, retainedLocal, retainedLocalHashes };
+  return {
+    applied,
+    skipped,
+    failureByResourceId,
+    retainedLocal,
+    retainedLocalHashes,
+  };
 }
 
 function applyPreparedChange(
@@ -884,6 +919,7 @@ function applyPreparedChange(
   localWorkspaces: Awaited<ReturnType<typeof discoverWorkspaces>>,
   marker: MarkerState,
   ignoredUiStateKeys: IgnoreMatcher,
+  localDeviceId?: string,
 ): ChangeOutcome {
   const { change, content } = item;
   if (change.kind === "chat") {
@@ -893,9 +929,53 @@ function applyPreparedChange(
     if (content === undefined) {
       throw new Error(`Chat payload is missing: ${change.resourceId}`);
     }
-    const snapshot = parsePortableChatSnapshot(content);
-    if (change.resourceId !== `chat/${snapshot.composerId}`) {
-      throw new Error(`Chat payload does not match ${change.resourceId}.`);
+    const automaticRepair = isAutomaticChatRepairMetadata(change.metadata);
+    let snapshot: PortableChatSnapshot;
+    try {
+      if (automaticRepair && sha256(content) !== change.semanticHash) {
+        throw new Error("Automatic chat repair payload hash does not match its event.");
+      }
+      snapshot = parsePortableChatSnapshot(content);
+      if (change.resourceId !== `chat/${snapshot.composerId}`) {
+        throw new Error(`Chat payload does not match ${change.resourceId}.`);
+      }
+      if (automaticRepair) {
+        const repairOriginDeviceId = metadataString(
+          change.metadata,
+          "repairOriginDeviceId",
+        );
+        if (
+          change.sourceDeviceId === undefined ||
+          repairOriginDeviceId !== change.sourceDeviceId
+        ) {
+          throw new Error(
+            "Automatic chat repair origin does not match its trusted event device.",
+          );
+        }
+        if (localDeviceId === undefined) {
+          throw new Error(
+            "Automatic chat repair cannot identify the local repository device.",
+          );
+        }
+        return repairUnavailableChatBubbles(
+          database,
+          request,
+          localWorkspaces,
+          snapshot,
+          change.metadata,
+          metadataString(change.metadata, "repairFingerprint"),
+          repairOriginDeviceId,
+          localDeviceId,
+          change.semanticHash,
+        );
+      }
+    } catch (error) {
+      if (automaticRepair) {
+        throw new AutomaticChatRepairApplyError(
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      throw error;
     }
     const sourceWorkspaceId = snapshot.header.workspaceId;
     if (sourceWorkspaceId === null) {
@@ -1060,6 +1140,166 @@ function chatAppliedOutcome(
   return {
     status: "applied",
     ...(writtenHash === publishedHash ? {} : { retainedLocalHash: writtenHash }),
+  };
+}
+
+/**
+ * Applies an automatic chat repair without rolling the live conversation back.
+ *
+ * The command publishes a complete synthesized snapshot so older extension
+ * versions still have a safe payload, but this build treats it as a repair
+ * recipe: preserve an existing live header and composerData, and write only
+ * rows that composerData still references but cannot currently read. On the
+ * originating device the fingerprint is rechecked after every Cursor process
+ * has exited, inside the same transaction as the write. A peer may materialize
+ * only a truly absent chat, or repair an existing chat with identical
+ * composerData from its own fresh audit.
+ */
+function repairUnavailableChatBubbles(
+  database: DatabaseSync,
+  request: HelperRequest,
+  localWorkspaces: Awaited<ReturnType<typeof discoverWorkspaces>>,
+  source: PortableChatSnapshot,
+  sourceMetadata: Record<string, JsonValue> | undefined,
+  expectedFingerprint: string,
+  repairOriginDeviceId: string,
+  localDeviceId: string,
+  publishedHash: string,
+): ChangeOutcome {
+  const sourceAudit = auditChatReferences(source);
+  if (
+    sourceAudit.status !== "known" ||
+    sourceAudit.unavailableBubbleKeys.length > 0
+  ) {
+    throw new Error("The automatic repair payload is not a complete conversation.");
+  }
+  const current = readPortableChatSnapshot(database, source.composerId);
+  if (current === null) {
+    const presence = chatRowPresence(database, source.composerId);
+    if (localDeviceId === repairOriginDeviceId) {
+      throw new Error(
+        "The originating chat disappeared before its automatic repair was applied.",
+      );
+    }
+    if (presence.header || presence.composerData || presence.bubble) {
+      throw new Error(
+        "Automatic chat repair found a partial local conversation and refused to replace it.",
+      );
+    }
+    const sourceWorkspaceId = source.header.workspaceId;
+    let targetWorkspaceId: string | null = null;
+    if (sourceWorkspaceId !== null) {
+      targetWorkspaceId = resolveTargetWorkspace(
+        sourceWorkspaceId,
+        metadataStringOrNull(sourceMetadata, "workspaceUri"),
+        localWorkspaces,
+        request.workspaceMappings,
+      ) ?? sourceWorkspaceId;
+    }
+    upsertChat(database, source, targetWorkspaceId);
+    const materialized = readPortableChatSnapshot(database, source.composerId);
+    if (materialized === null) {
+      throw new Error("The complete repair snapshot could not be materialized.");
+    }
+    const materializedAudit = auditChatReferences(materialized);
+    if (
+      materializedAudit.status !== "known" ||
+      materializedAudit.unavailableBubbleKeys.length > 0
+    ) {
+      throw new Error("The materialized repair snapshot is incomplete.");
+    }
+    return chatAppliedOutcome(publishedHash, source, targetWorkspaceId);
+  }
+  const currentAudit = auditChatReferences(current);
+  if (currentAudit.status !== "known") {
+    throw new Error(`Automatic chat repair is ambiguous: ${currentAudit.reason}.`);
+  }
+  if (currentAudit.unavailableBubbleKeys.length === 0) {
+    return {
+      status: "retained-local",
+      reason: "the local conversation is already complete",
+    };
+  }
+  const isOrigin = localDeviceId === repairOriginDeviceId;
+  if (isOrigin && currentAudit.fingerprint !== expectedFingerprint) {
+    throw new Error(
+      'The chat changed after repair was planned; run "Cursor Setting Sync: Repair Unavailable Chats" again.',
+    );
+  }
+  if (
+    !canonicalBytes(current.composerData).equals(
+      canonicalBytes(source.composerData),
+    )
+  ) {
+    throw new Error(
+      isOrigin
+        ? "The live composerData no longer matches the repair plan."
+        : "The peer conversation has different composerData and was left unchanged.",
+    );
+  }
+  const sourceRows = new Map(source.bubbles.map((row) => [row.key, row]));
+  const currentRows = new Map(current.bubbles.map((row) => [row.key, row]));
+  const insert = database.prepare(
+    "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+  );
+  const replace = database.prepare(
+    "UPDATE cursorDiskKV SET value = ? WHERE key = ?",
+  );
+  for (const key of currentAudit.unavailableBubbleKeys) {
+    const recovered = sourceRows.get(key);
+    if (recovered === undefined) {
+      throw new Error(`The repair payload does not carry referenced bubble ${key}.`);
+    }
+    const value = portableKvValue(recovered);
+    if (currentRows.has(key)) {
+      // The row exists but the fresh in-transaction audit proved it is not
+      // lossless JSON. The origin additionally matches the planned
+      // fingerprint; a peer must match composerData. A valid row is never
+      // overwritten by this path.
+      replace.run(value, key);
+    } else {
+      insert.run(key, value);
+    }
+  }
+  const repaired = readPortableChatSnapshot(database, source.composerId);
+  if (repaired === null) {
+    throw new Error("The chat disappeared while its repair was being applied.");
+  }
+  const repairedAudit = auditChatReferences(repaired);
+  if (
+    repairedAudit.status !== "known" ||
+    repairedAudit.unavailableBubbleKeys.length > 0
+  ) {
+    throw new Error("Automatic chat repair did not satisfy every live reference.");
+  }
+  // Existing conversations are never made to pretend that their complete
+  // local form byte-matches the originating device. The next scan is allowed
+  // to publish any surviving local divergence on top of the repair event.
+  return { status: "applied" };
+}
+
+function chatRowPresence(
+  database: DatabaseSync,
+  composerId: string,
+): { header: boolean; composerData: boolean; bubble: boolean } {
+  const header = database
+    .prepare(
+      "SELECT 1 AS present FROM composerHeaders WHERE CAST(composerId AS TEXT) = ? LIMIT 1",
+    )
+    .get(composerId);
+  const composerData = database
+    .prepare("SELECT 1 AS present FROM cursorDiskKV WHERE key = ? LIMIT 1")
+    .get(`composerData:${composerId}`);
+  const [lower, upper] = bubbleKeyRange(composerId);
+  const bubble = database
+    .prepare(
+      "SELECT 1 AS present FROM cursorDiskKV WHERE key >= ? AND key < ? LIMIT 1",
+    )
+    .get(lower, upper);
+  return {
+    header: header !== undefined,
+    composerData: composerData !== undefined,
+    bubble: bubble !== undefined,
   };
 }
 

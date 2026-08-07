@@ -51,6 +51,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerCommand("cursorSync.restoreVersion", () =>
       manager?.restoreVersion(),
     ),
+    registerCommand("cursorSync.repairUnavailableChats", () =>
+      manager?.repairUnavailableChats(),
+    ),
     registerCommand("cursorSync.showDiagnostics", () =>
       manager?.showDiagnostics(),
     ),
@@ -154,6 +157,7 @@ function registerUnsupportedPlatformCommands(
     "cursorSync.restartToApply",
     "cursorSync.resolveConflicts",
     "cursorSync.restoreVersion",
+    "cursorSync.repairUnavailableChats",
     "cursorSync.showDiagnostics",
     "cursorSync.restoreBackup",
     "cursorSync.forgetDevice",

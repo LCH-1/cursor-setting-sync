@@ -137,6 +137,18 @@ A restored version keeps the original version's producer metadata, so the newer-
 
 Restore also requires a complete, reconciled repository event stream. If the shared-folder provider is still delivering a missing event or exposes a fork, let it settle and synchronize again; unaccepted events are never offered as recoverable history.
 
+## Repair unavailable Cursor conversations automatically
+
+Run `Cursor Setting Sync: Repair Unavailable Chats` when a conversation renders partway and then reports that conversation data is missing. The command does not ask you to identify an internal chat ID or choose a historical version.
+
+1. The live database is audited read-only. A chat is considered definitely unavailable only when its existing `composerData.fullConversationHeadersOnly` list references a `bubbleId:` row that is absent or unreadable. Body-less list entries, unreferenced/orphan rows, deleted conversations, subagents, and unknown composerData shapes are not automatically revived.
+2. For every definitely damaged chat, the command reads its trusted current-tip ancestry once and finds the newest compatible stored snapshot that contains every unavailable referenced message. A stream gap/fork, active conflict, missing encrypted object, incompatible producer, or disagreement in newer trusted data leaves that chat unchanged.
+3. One confirmation covers all unambiguous repairs. **Repair and Restart** publishes the additive repair, synchronizes it, and starts the existing offline apply flow; **Queue Repair** publishes it without closing Cursor, for a later `Cursor Setting Sync: Restart to Apply`.
+4. After all Cursor processes exit, the helper re-reads each live chat inside the write transaction. On the PC that created the repair, the original reference fingerprint must still match. A different PC may materialize the complete snapshot only when that chat is truly absent, or add unavailable rows when its composerData is identical; a header-only, body-only, or divergent local chat is left untouched. The live header, composerData, existing valid bubbles, unrelated chats, and orphan rows are never deleted or replaced.
+5. The normal pre-apply SQLite backup, journal, transaction, per-chat savepoint, postcondition check, and `integrity_check` all apply. Running the command again after a successful repair is a no-op.
+
+The full reference audit is intentionally command-only. Running it every 30 seconds would fight Cursor's normal pruning and add a large database scan back to every open window.
+
 ## Checkpoint and prune history
 
 `Cursor Setting Sync: Checkpoint & Prune History` folds the current state of every resource into one encrypted checkpoint file and, once every device has absorbed that checkpoint, deletes the event files it covers.

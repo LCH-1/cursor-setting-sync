@@ -43,7 +43,7 @@ import {
   isSyntheticTip,
   publishInBatches,
 } from "../sync/versionPolicy";
-import { sha256 } from "../protocol/canonical";
+import { canonicalBytes, sha256 } from "../protocol/canonical";
 import { StateVscdbChatAdapter } from "../chat/stateVscdb";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
@@ -417,6 +417,7 @@ async function executeRequest(
   const applied: string[] = [];
   const retainedLocal = new Set<string>();
   const globalRetainedHashes: Record<string, string> = {};
+  const globalFailureByResourceId: Record<string, string> = {};
   if (globalPrepared.length > 0) {
     await ensureExclusiveAccess();
     const globalResult = await applyGlobalDatabaseChanges(
@@ -425,6 +426,7 @@ async function executeRequest(
       heartbeat,
       ensureExclusiveAccess,
       priorBackupPaths,
+      repository.state.device.deviceId,
     );
     backupPath = globalResult.backupPath;
     collected.backupPath = backupPath;
@@ -435,6 +437,15 @@ async function executeRequest(
     });
     applied.push(...globalResult.applied);
     skipped.push(...globalResult.skipped);
+    Object.assign(
+      globalFailureByResourceId,
+      globalResult.failureByResourceId,
+    );
+    for (const [resourceId, message] of Object.entries(
+      globalResult.failureByResourceId,
+    )) {
+      warnings.push(`Applying ${resourceId}: ${message}`);
+    }
     for (const resourceId of globalResult.retainedLocal) {
       retainedLocal.add(resourceId);
     }
@@ -470,6 +481,7 @@ async function executeRequest(
     { ...globalRetainedHashes, ...nonGlobalResult.retainedLocalHashes },
     {
       ...preparation.failureByResourceId,
+      ...globalFailureByResourceId,
       ...nonGlobalResult.failureByResourceId,
     },
   );
@@ -877,6 +889,7 @@ function shutdownApplyBatch(
     const change: HelperChange = {
       eventHash: tip.eventHash,
       changeIndex: tip.changeIndex,
+      sourceDeviceId: tip.deviceId,
       resourceId: projection.resourceId,
       kind: tip.kind,
       operation: tip.operation,
@@ -896,22 +909,62 @@ function shutdownApplyBatch(
 
 function isEligible(
   change: HelperChange,
-  projections: Array<{ resourceId: string; tip: { versionId: string } }>,
+  projections: ResourceProjection[],
   conflicts: Array<{ resourceId: string; resolvedAt?: string }>,
 ): boolean {
   const versionId = `${change.eventHash}#${change.changeIndex}`;
-  return (
-    !conflicts.some(
+  if (
+    conflicts.some(
       (conflict) =>
         conflict.resourceId === change.resourceId &&
         conflict.resolvedAt === undefined,
-    ) &&
-    projections.some(
-      (projection) =>
-        projection.resourceId === change.resourceId &&
-        projection.tip.versionId === versionId,
     )
+  ) {
+    return false;
+  }
+  const projection = projections.find(
+    (candidate) =>
+      candidate.resourceId === change.resourceId &&
+      candidate.tip.versionId === versionId,
   );
+  if (projection === undefined) {
+    return false;
+  }
+
+  const tip = projection.tip;
+  if (
+    tip.kind !== change.kind ||
+    tip.operation !== change.operation ||
+    tip.semanticHash !== change.semanticHash ||
+    !canonicalBytes(tip.payload ?? null).equals(
+      canonicalBytes(change.payload ?? null),
+    ) ||
+    !canonicalBytes(tip.metadata ?? null).equals(
+      canonicalBytes(change.metadata ?? null),
+    )
+  ) {
+    return false;
+  }
+
+  // A helper request is a local hand-off file, not the authenticated event.
+  // Re-bind automatic repair authority to the freshly reconciled projection
+  // before allowing the request metadata to reach the database layer.
+  const requestedAutomatic =
+    change.metadata?.syncOrigin === "automatic-chat-repair";
+  const projectedAutomatic =
+    tip.metadata?.syncOrigin === "automatic-chat-repair";
+  if (requestedAutomatic || projectedAutomatic) {
+    const requestedOrigin = change.metadata?.repairOriginDeviceId;
+    return (
+      requestedAutomatic &&
+      projectedAutomatic &&
+      typeof change.sourceDeviceId === "string" &&
+      tip.deviceId === change.sourceDeviceId &&
+      typeof requestedOrigin === "string" &&
+      tip.metadata?.repairOriginDeviceId === requestedOrigin
+    );
+  }
+  return true;
 }
 
 function markAppliedProjections(

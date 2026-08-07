@@ -2,6 +2,14 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.61] - 2026-08-07
+
+### Added
+
+- **`Repair Unavailable Chats` detects and repairs the `Conversation data missing` failure without making the user choose chat IDs or historical versions.** The command audits the live `composerData.fullConversationHeadersOnly` references, finds only conversations whose referenced `bubbleId:` rows are absent or unreadable, and searches the warning-free trusted current-tip ancestry for one version that contains every unavailable message. A body-less header, an orphan row, a deleted chat, a conflict, an incomplete event stream, an incompatible producer, and an unknown composerData shape are never guessed into an automatic repair.
+- **Automatic repair is additive, portable, and race-safe.** The published child keeps the live header and composerData and deterministically unions existing rows with the complete source and newer trusted rows, so checkpointing or onboarding a new PC cannot drop history that this PC does not currently reference. After Cursor exits, the originating PC must still match the exact reference fingerprint; another PC may materialize a truly absent chat or repair the same composerData, while any partial or divergent local structure is left untouched. The helper never deletes a row or replaces a live header/composerData, creates the normal SQLite backup, uses a per-resource savepoint, and verifies every live reference plus database integrity before commit.
+- **The expensive reference audit is command-only and bounded.** It streams one composer's indexed key range at a time, isolates malformed rows to that conversation, materializes full payloads only for damaged chats, and stops reading history at the newest complete source. The 30-second background poll and multi-window CPU/RAM behavior therefore do not regress. One modal repairs every unambiguous conversation in the batch, with **Repair and Restart** for immediate offline application or **Queue Repair** for a later `Restart to Apply`.
+
 ## [0.0.60] - 2026-08-07
 
 ### Changed

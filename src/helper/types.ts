@@ -10,6 +10,12 @@ import type { DatabaseContract } from "./database";
 export interface HelperChange {
   eventHash: string;
   changeIndex: number;
+  /**
+   * Authenticated publisher of the event carrying this change. The helper
+   * derives this from the reconciled projection instead of trusting repair
+   * metadata, and older request files may omit it.
+   */
+  sourceDeviceId?: string;
   resourceId: string;
   kind: ResourceKind;
   operation: ResourceOperation;

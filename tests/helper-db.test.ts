@@ -13,6 +13,9 @@ import {
 import type { HelperRequest } from "../src/helper/types";
 import { applyNonGlobalChanges } from "../src/helper/resourceApply";
 import { pathExists } from "../src/platform/files";
+import { auditChatReferences } from "../src/chat/repair";
+import type { PortableChatSnapshot } from "../src/chat/stateVscdb";
+import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 
 const temporaryRoots: string[] = [];
 const { DatabaseSync } = sqlite;
@@ -26,6 +29,8 @@ const describeWithBackup = hasBackup ? describe : describe.skip;
 // at all — goes unexercised. Local runs on a Node without `backup` stay green,
 // but a release or CI run has to opt in and then cannot miss the gap.
 const USER_RULES_KEY = "aicontext.personalContext";
+const REPAIR_ORIGIN_DEVICE = "repair-origin-device";
+const REPAIR_PEER_DEVICE = "repair-peer-device";
 
 describe("offline database helper prerequisites", () => {
   it("exercises the offline helper suite on a runtime that supports it", () => {
@@ -804,6 +809,530 @@ describeWithBackup("offline database helper", () => {
     }
   });
 
+  it("repairs only referenced missing chat rows and preserves live conversation state", async () => {
+    const fixture = await createFixture();
+    const composerId = "33333333-3333-4333-8333-333333333333";
+    const composerData = JSON.stringify({
+      _v: 17,
+      fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "b" }],
+    });
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'workspace', 1, 2, 0, 0, 99, NULL, ?)`,
+      )
+      .run(composerId, JSON.stringify({ name: "Live title" }));
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, composerData);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:a`, JSON.stringify({ text: "live a" }));
+    seed.close();
+
+    const local = repairSnapshot(
+      composerId,
+      composerData,
+      JSON.stringify({ name: "Live title" }),
+      [{ id: "a", value: { text: "live a" } }],
+    );
+    const audit = auditChatReferences(local);
+    expect(audit.status).toBe("known");
+    if (audit.status !== "known") {
+      return;
+    }
+    const source = repairSnapshot(
+      composerId,
+      composerData,
+      JSON.stringify({ name: "Historical title that must not win" }),
+      [
+        { id: "a", value: { text: "historical a" } },
+        { id: "b", value: { text: "recovered b" } },
+      ],
+    );
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(source, audit.fingerprint),
+      REPAIR_ORIGIN_DEVICE,
+    );
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    // The preserved live header is allowed to publish on the next scan rather
+    // than being hidden behind a retained-local hash from the repair source.
+    expect(result.retainedLocal).toEqual([]);
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      const header = database
+        .prepare("SELECT value, recency FROM composerHeaders WHERE composerId = ?")
+        .get(composerId) as { value?: string; recency?: number } | undefined;
+      expect(header).toEqual({
+        value: JSON.stringify({ name: "Live title" }),
+        recency: 99,
+      });
+      expect(readKv(database, `bubbleId:${composerId}:a`)).toBe(
+        JSON.stringify({ text: "live a" }),
+      );
+      expect(readKv(database, `bubbleId:${composerId}:b`)).toBe(
+        JSON.stringify({ text: "recovered b" }),
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  it("replaces a referenced unreadable JSON bubble on the repair origin", async () => {
+    const fixture = await createFixture();
+    const composerId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const composerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "broken" }],
+    });
+    const invalidJson = "{not-json";
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'workspace', 1, 2, 0, 0, 3, NULL, '{}')`,
+      )
+      .run(composerId);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, composerData);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:broken`, invalidJson);
+    seed.close();
+
+    const local = repairSnapshot(composerId, composerData, "{}", []);
+    local.bubbles.push({
+      key: `bubbleId:${composerId}:broken`,
+      valueBase64: Buffer.from(invalidJson, "utf8").toString("base64"),
+      valueType: "text",
+    });
+    const audit = auditChatReferences(local);
+    expect(audit.status).toBe("known");
+    if (audit.status !== "known") {
+      return;
+    }
+    expect(audit.unavailableBubbleKeys).toEqual([
+      `bubbleId:${composerId}:broken`,
+    ]);
+    const source = repairSnapshot(composerId, composerData, "{}", [
+      { id: "broken", value: { text: "recovered" } },
+    ]);
+
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(source, audit.fingerprint),
+      REPAIR_ORIGIN_DEVICE,
+    );
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `bubbleId:${composerId}:broken`)).toBe(
+        JSON.stringify({ text: "recovered" }),
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  it("skips an automatic chat repair when composerData changed after planning", async () => {
+    const fixture = await createFixture();
+    const composerId = "44444444-4444-4444-8444-444444444444";
+    const plannedData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "b" }],
+    });
+    const local = repairSnapshot(composerId, plannedData, "{}", [
+      { id: "a", value: { text: "a" } },
+    ]);
+    const audit = auditChatReferences(local);
+    expect(audit.status).toBe("known");
+    if (audit.status !== "known") {
+      return;
+    }
+    const changedData = JSON.stringify({
+      fullConversationHeadersOnly: [
+        { bubbleId: "a" },
+        { bubbleId: "b" },
+        { bubbleId: "c" },
+      ],
+    });
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'workspace', 1, 2, 0, 0, 0, NULL, '{}')`,
+      )
+      .run(composerId);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, changedData);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:a`, JSON.stringify({ text: "a" }));
+    seed.close();
+    const source = repairSnapshot(composerId, plannedData, "{}", [
+      { id: "a", value: { text: "a" } },
+      { id: "b", value: { text: "b" } },
+    ]);
+
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(source, audit.fingerprint),
+      REPAIR_ORIGIN_DEVICE,
+    );
+
+    expect(result.applied).toEqual([]);
+    expect(result.skipped.join("\n")).toContain("changed after repair was planned");
+    expect(result.failureByResourceId[`chat/${composerId}`]).toContain(
+      "changed after repair was planned",
+    );
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `bubbleId:${composerId}:b`)).toBeUndefined();
+    } finally {
+      database.close();
+    }
+  });
+
+  it("materializes a complete repair snapshot only on a truly empty peer", async () => {
+    const fixture = await createFixture();
+    const composerId = "66666666-6666-4666-8666-666666666666";
+    const composerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "b" }],
+    });
+    const planned = repairSnapshot(composerId, composerData, "{}", [
+      { id: "a", value: { text: "a" } },
+    ]);
+    const source = repairSnapshot(
+      composerId,
+      composerData,
+      JSON.stringify({ name: "Recovered on peer" }),
+      [
+        { id: "a", value: { text: "a" } },
+        { id: "b", value: { text: "b" } },
+      ],
+    );
+    const mappedWorkspace = "mapped-workspace";
+    await mkdir(
+      join(fixture.request.paths.workspaceStorageRoot, mappedWorkspace),
+      { recursive: true },
+    );
+    await writeFile(
+      join(
+        fixture.request.paths.workspaceStorageRoot,
+        mappedWorkspace,
+        "workspace.json",
+      ),
+      JSON.stringify({ folder: "file:///C:/work/mapped" }),
+      "utf8",
+    );
+    fixture.request.workspaceMappings.workspace = mappedWorkspace;
+
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(source, repairFingerprint(planned)),
+      REPAIR_PEER_DEVICE,
+    );
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(result.failureByResourceId).toEqual({});
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      const header = database
+        .prepare(
+          "SELECT workspaceId, value FROM composerHeaders WHERE composerId = ?",
+        )
+        .get(composerId) as
+        | { workspaceId?: string; value?: string }
+        | undefined;
+      expect(header).toEqual({
+        workspaceId: mappedWorkspace,
+        value: JSON.stringify({ name: "Recovered on peer" }),
+      });
+      expect(readKv(database, `composerData:${composerId}`)).toBe(composerData);
+      expect(readKv(database, `bubbleId:${composerId}:b`)).toBe(
+        JSON.stringify({ text: "b" }),
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  it("fails closed when the originating chat disappeared before apply", async () => {
+    const fixture = await createFixture();
+    const composerId = "77777777-7777-4777-8777-777777777777";
+    const composerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "a" }],
+    });
+    const source = repairSnapshot(composerId, composerData, "{}", [
+      { id: "a", value: { text: "a" } },
+    ]);
+
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(source, "planned"),
+      REPAIR_ORIGIN_DEVICE,
+    );
+
+    expect(result.applied).toEqual([]);
+    expect(result.failureByResourceId[`chat/${composerId}`]).toContain(
+      "originating chat disappeared",
+    );
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(
+        database
+          .prepare("SELECT 1 FROM composerHeaders WHERE composerId = ?")
+          .get(composerId),
+      ).toBeUndefined();
+    } finally {
+      database.close();
+    }
+  });
+
+  it("does not mistake a header-only peer chat for an empty target", async () => {
+    const fixture = await createFixture();
+    const composerId = "88888888-8888-4888-8888-888888888888";
+    const composerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "a" }],
+    });
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'peer-workspace', 1, 9, 1, 0, 77, NULL, ?)` ,
+      )
+      .run(composerId, JSON.stringify({ name: "Peer title" }));
+    seed.close();
+    const source = repairSnapshot(
+      composerId,
+      composerData,
+      JSON.stringify({ name: "Origin title" }),
+      [{ id: "a", value: { text: "a" } }],
+    );
+
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(source, "planned"),
+      REPAIR_PEER_DEVICE,
+    );
+
+    expect(result.applied).toEqual([]);
+    expect(result.failureByResourceId[`chat/${composerId}`]).toContain(
+      "partial local conversation",
+    );
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      const header = database
+        .prepare(
+          "SELECT value, recency FROM composerHeaders WHERE composerId = ?",
+        )
+        .get(composerId);
+      expect(header).toEqual({
+        value: JSON.stringify({ name: "Peer title" }),
+        recency: 77,
+      });
+      expect(readKv(database, `composerData:${composerId}`)).toBeUndefined();
+    } finally {
+      database.close();
+    }
+  });
+
+  it("repairs an existing peer from its fresh audit without the origin fingerprint", async () => {
+    const fixture = await createFixture();
+    const composerId = "99999999-9999-4999-8999-999999999999";
+    const composerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "b" }],
+    });
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'peer-workspace', 1, 8, 0, 0, 55, NULL, ?)` ,
+      )
+      .run(composerId, JSON.stringify({ name: "Peer title" }));
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, composerData);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:a`, JSON.stringify({ text: "peer a" }));
+    seed.close();
+    const source = repairSnapshot(composerId, composerData, "{}", [
+      { id: "a", value: { text: "origin a" } },
+      { id: "b", value: { text: "recovered b" } },
+    ]);
+
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(source, "origin-fingerprint"),
+      REPAIR_PEER_DEVICE,
+    );
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(result.retainedLocal).toEqual([]);
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `bubbleId:${composerId}:a`)).toBe(
+        JSON.stringify({ text: "peer a" }),
+      );
+      expect(readKv(database, `bubbleId:${composerId}:b`)).toBe(
+        JSON.stringify({ text: "recovered b" }),
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  it("leaves a healthy divergent peer untouched and lets its next scan publish", async () => {
+    const fixture = await createFixture();
+    const composerId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const peerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "peer" }],
+    });
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'peer-workspace', 1, 8, 0, 0, 55, NULL, ?)` ,
+      )
+      .run(composerId, JSON.stringify({ name: "Healthy peer" }));
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, peerData);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:peer`, JSON.stringify({ text: "peer" }));
+    seed.close();
+    const originData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "origin" }],
+    });
+    const source = repairSnapshot(composerId, originData, "{}", [
+      { id: "origin", value: { text: "origin" } },
+    ]);
+
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(source, "origin-fingerprint"),
+      REPAIR_PEER_DEVICE,
+    );
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(result.retainedLocal).toEqual([]);
+    expect(result.skipped.join("\n")).toContain("already complete");
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `composerData:${composerId}`)).toBe(peerData);
+      expect(readKv(database, `bubbleId:${composerId}:peer`)).toBe(
+        JSON.stringify({ text: "peer" }),
+      );
+      expect(readKv(database, `bubbleId:${composerId}:origin`)).toBeUndefined();
+    } finally {
+      database.close();
+    }
+  });
+
+  it("blocks a damaged peer whose composerData differs from the repair source", async () => {
+    const fixture = await createFixture();
+    const composerId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    const peerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "peer-missing" }],
+    });
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'peer-workspace', 1, 8, 0, 0, 55, NULL, '{}')`,
+      )
+      .run(composerId);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, peerData);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:a`, JSON.stringify({ text: "peer a" }));
+    seed.close();
+    const originData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "origin" }],
+    });
+    const source = repairSnapshot(composerId, originData, "{}", [
+      { id: "a", value: { text: "origin a" } },
+      { id: "origin", value: { text: "origin" } },
+    ]);
+
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(source, "origin-fingerprint"),
+      REPAIR_PEER_DEVICE,
+    );
+
+    expect(result.applied).toEqual([]);
+    expect(result.failureByResourceId[`chat/${composerId}`]).toContain(
+      "different composerData",
+    );
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `composerData:${composerId}`)).toBe(peerData);
+      expect(readKv(database, `bubbleId:${composerId}:origin`)).toBeUndefined();
+    } finally {
+      database.close();
+    }
+  });
+
+  it("binds repair metadata to its source device and requires a local device", async () => {
+    const fixture = await createFixture();
+    const composerId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const composerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "a" }],
+    });
+    const source = repairSnapshot(composerId, composerData, "{}", [
+      { id: "a", value: { text: "a" } },
+    ]);
+
+    const spoofed = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(
+        source,
+        "planned",
+        "actual-event-device",
+        "spoofed-origin-device",
+      ),
+      REPAIR_PEER_DEVICE,
+    );
+    expect(spoofed.failureByResourceId[`chat/${composerId}`]).toContain(
+      "origin does not match",
+    );
+    expect(spoofed.failureByResourceId[`chat/${composerId}`]).not.toContain(
+      "\n",
+    );
+
+    const unknownLocal = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(source, "planned"),
+      undefined,
+    );
+    expect(unknownLocal.failureByResourceId[`chat/${composerId}`]).toContain(
+      "cannot identify the local repository device",
+    );
+  });
+
   it("restores NULL chat values and NULL header columns as SQL NULL", async () => {
     const fixture = await createFixture();
     const composerId = "00000000-0000-4000-8000-000000000002";
@@ -1358,6 +1887,105 @@ function readKvType(
     .prepare("SELECT typeof(value) AS type FROM cursorDiskKV WHERE key = ?")
     .get(key) as { type?: string } | undefined;
   return row?.type;
+}
+
+function readKv(
+  database: InstanceType<typeof DatabaseSync>,
+  key: string,
+): string | undefined {
+  const row = database
+    .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
+    .get(key) as { value?: Uint8Array | string | null } | undefined;
+  if (row?.value === undefined || row.value === null) {
+    return undefined;
+  }
+  return typeof row.value === "string"
+    ? row.value
+    : Buffer.from(row.value).toString("utf8");
+}
+
+function repairSnapshot(
+  composerId: string,
+  composerData: string,
+  headerValue: string,
+  bubbles: Array<{ id: string; value: unknown }>,
+): PortableChatSnapshot {
+  return {
+    schemaVersion: 1,
+    composerId,
+    header: {
+      composerId,
+      workspaceId: "workspace",
+      createdAt: 1,
+      lastUpdatedAt: 2,
+      isArchived: 0,
+      isSubagent: 0,
+      recency: 1,
+      checkpointAt: null,
+      value: headerValue,
+    },
+    composerData: {
+      key: `composerData:${composerId}`,
+      valueBase64: Buffer.from(composerData, "utf8").toString("base64"),
+      valueType: "text",
+    },
+    bubbles: bubbles.map((bubble) => ({
+      key: `bubbleId:${composerId}:${bubble.id}`,
+      valueBase64: Buffer.from(JSON.stringify(bubble.value), "utf8").toString(
+        "base64",
+      ),
+      valueType: "text" as const,
+    })),
+  };
+}
+
+function automaticChatRepairChange(
+  snapshot: PortableChatSnapshot,
+  fingerprint: string,
+  sourceDeviceId = REPAIR_ORIGIN_DEVICE,
+  repairOriginDeviceId = REPAIR_ORIGIN_DEVICE,
+): PreparedHelperChange {
+  const content = canonicalBytes(snapshot);
+  return {
+    change: {
+      eventHash: "9".repeat(64),
+      changeIndex: 0,
+      sourceDeviceId,
+      resourceId: `chat/${snapshot.composerId}`,
+      kind: "chat",
+      operation: "put",
+      semanticHash: sha256(content),
+      metadata: {
+        syncOrigin: "automatic-chat-repair",
+        repairFingerprint: fingerprint,
+        repairOriginDeviceId,
+      },
+    },
+    content,
+  };
+}
+
+function repairFingerprint(snapshot: PortableChatSnapshot): string {
+  const audit = auditChatReferences(snapshot);
+  if (audit.status !== "known") {
+    throw new Error(`Expected a known repair snapshot: ${audit.reason}`);
+  }
+  return audit.fingerprint;
+}
+
+function applyAutomaticRepair(
+  request: HelperRequest,
+  change: PreparedHelperChange,
+  localDeviceId?: string,
+) {
+  return applyGlobalDatabaseChanges(
+    request,
+    [change],
+    undefined,
+    undefined,
+    undefined,
+    localDeviceId,
+  );
 }
 
 function uiStateChange(

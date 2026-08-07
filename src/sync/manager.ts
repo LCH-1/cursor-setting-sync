@@ -136,11 +136,19 @@ import {
 import {
   StateVscdbChatAdapter,
   isSyncableComposerId,
+  parsePortableChatSnapshot,
 } from "../chat/stateVscdb";
 import { mergeChatSnapshotBuffers } from "../chat/chatMerge";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
 import { chatSnapshotTitle } from "../chat/title";
+import {
+  buildChatRepairSnapshot,
+  inspectBrokenCursorChats,
+  isAutomaticChatRepairMetadata,
+  type BrokenChatObservation,
+  type ChatRepairCandidate,
+} from "../chat/repair";
 import {
   discoverWorkspaces,
   resolveTargetWorkspace,
@@ -175,7 +183,7 @@ import {
 } from "../ui/resourceHistory";
 import { mergeJsoncBuffers, parseJsonc } from "../resources/jsonc";
 import { mergeTextBuffers } from "../resources/text";
-import { sha256 } from "../protocol/canonical";
+import { canonicalBytes, sha256 } from "../protocol/canonical";
 import {
   isRepositoryPayloadFile,
   repositoryPayloadFileName,
@@ -227,6 +235,17 @@ interface StoredHelperBackup {
   contract: DatabaseContract;
   targetPath: string;
   recordedAt: string;
+}
+
+interface PlannedChatRepair {
+  resourceId: string;
+  label: string;
+  expectedTipIds: string[];
+  fingerprint: string;
+  /** Newest-first trusted candidates through and including the complete source. */
+  candidateVersionIds: string[];
+  sourceVersionId: string;
+  repairedBubbleCount: number;
 }
 
 
@@ -1556,6 +1575,437 @@ export class SyncManager implements vscode.Disposable {
         "There are no synchronization conflicts to resolve.",
       );
     }
+  }
+
+  /**
+   * Repairs every conversation whose live composerData references bubble rows
+   * that are no longer present. There is deliberately no per-chat or
+   * per-version picker: trusted history supplies only the missing rows, while
+   * the live header, composerData and every existing message remain
+   * authoritative.
+   */
+  async repairUnavailableChats(): Promise<void> {
+    const repository = this.requireRepository();
+    const configuredBlock = resourceConfigurationBlockReason("chat", {
+      syncChat: this.configuration.syncChat,
+      syncWorkspaceStorage: this.configuration.syncWorkspaceStorage,
+    });
+    if (configuredBlock !== null) {
+      void vscode.window.showWarningMessage(
+        `Unavailable chat repair is disabled: ${configuredBlock}`,
+      );
+      return;
+    }
+    assertCompatibleForDatabaseWrite(this.compatibility);
+
+    let observations: BrokenChatObservation[];
+    const plans: PlannedChatRepair[] = [];
+    let alreadyQueued = 0;
+    const inspectionLock = await this.withProgress(
+      "Cursor Setting Sync",
+      async (report) => {
+        report("Synchronizing and checking chat references...");
+        return this.takeCommandLock(report);
+      },
+    );
+    try {
+      await this.openGitWindow(repository);
+      await repository.refreshState();
+      const checkpoint = await absorbedCheckpointManifest(repository);
+      const reconciledState = structuredClone(repository.state);
+      const reconciliation = new EventReconciler().reconcile(
+        await repository.listEvents(),
+        reconciledState,
+        checkpoint,
+      );
+      if (reconciliation.warnings.length > 0) {
+        this.status.log(
+          `Unavailable chat repair blocked by repository stream warning: ${reconciliation.warnings[0]}`,
+        );
+        void vscode.window.showWarningMessage(
+          `Chats cannot be repaired while the repository event stream is incomplete. Synchronize again after the shared folder settles. ${reconciliation.warnings[0]}`,
+        );
+        return;
+      }
+      Object.assign(repository.state, reconciledState);
+      const inspection = await this.withProgress(
+        "Cursor Setting Sync",
+        async (report) => {
+          report("Checking which chat messages are unavailable...");
+          return inspectBrokenCursorChats(this.paths);
+        },
+      );
+      observations = inspection.broken;
+      if (observations.length === 0) {
+        void vscode.window.showInformationMessage(
+          `Checked ${inspection.examinedChats} Cursor conversations. No referenced chat messages are unavailable.`,
+        );
+        return;
+      }
+
+      const resourceIds = new Set(
+        observations.map((observation) => observation.resourceId),
+      );
+      const roots = new Map<string, string[]>();
+      for (const observation of observations) {
+        roots.set(
+          observation.resourceId,
+          (repository.state.tips[observation.resourceId] ?? []).map(
+            (tip) => tip.versionId,
+          ),
+        );
+      }
+      const histories = await repository.listReachableResourceHistories(
+        resourceIds,
+        roots,
+        new Set(reconciliation.acceptedEventHashes),
+        checkpoint,
+      );
+      const conflicted = new Set(
+        repository.state.conflicts
+          .filter((conflict) => conflict.resolvedAt === undefined)
+          .map((conflict) => conflict.resourceId),
+      );
+      for (const observation of observations) {
+        const tips = repository.state.tips[observation.resourceId] ?? [];
+        const tip = tips.length === 1 ? tips[0] : undefined;
+        if (
+          tip === undefined ||
+          tip.kind !== "chat" ||
+          tip.operation !== "put" ||
+          conflicted.has(observation.resourceId) ||
+          databaseApplyBlockReason(
+              tip.kind,
+              effectiveTipProducer(tip),
+              this.compatibility,
+            ) !== null
+        ) {
+          continue;
+        }
+        if (
+          isAutomaticChatRepairMetadata(tip.metadata) &&
+          tip.metadata?.repairFingerprint === observation.fingerprint
+        ) {
+          queuePending(repository, {
+            resourceId: observation.resourceId,
+            tip,
+            changed: true,
+          });
+          alreadyQueued += 1;
+          continue;
+        }
+        // Histories are newest-first. Keep only the unavailable rows carried
+        // by newer partial versions, then stop as soon as the first version
+        // carrying every unavailable row is found. Reading older payloads
+        // cannot improve that choice, and retaining whole chat snapshots here
+        // made a long conversation's complete history a temporary RAM copy.
+        const unavailableKeys = new Set(observation.unavailableBubbleKeys);
+        const newerPartialCandidates: ChatRepairCandidate[] = [];
+        let repair: Extract<
+          ReturnType<typeof buildChatRepairSnapshot>,
+          { status: "repairable" }
+        > | null = null;
+        for (const summary of histories.get(observation.resourceId) ?? []) {
+          if (
+            summary.kind !== "chat" ||
+            summary.operation !== "put" ||
+            databaseApplyBlockReason(
+                summary.kind,
+                effectiveVersionProducer(summary.metadata, summary.producer),
+                this.compatibility,
+              ) !== null
+          ) {
+            continue;
+          }
+          const data = await repository.tryReadVersion(summary.versionId);
+          if (
+            data === null ||
+            data.content === null ||
+            data.change.resourceId !== observation.resourceId ||
+            data.change.kind !== "chat" ||
+            data.change.operation !== "put" ||
+            sha256(data.content) !== data.change.semanticHash
+          ) {
+            continue;
+          }
+          try {
+            const stored = parsePortableChatSnapshot(data.content);
+            if (stored.composerId !== observation.composerId) {
+              continue;
+            }
+            // buildChatRepairSnapshot only consults a candidate's composer ID
+            // and bubble rows. Reuse the live lightweight envelope and retain
+            // only rows whose identities participate in repair/disagreement.
+            const candidate: ChatRepairCandidate = {
+              versionId: summary.versionId,
+              snapshot: {
+                ...observation.snapshot,
+                bubbles: stored.bubbles.filter((row) =>
+                  unavailableKeys.has(row.key)
+                ),
+              },
+            };
+            const candidateAlone = buildChatRepairSnapshot(
+              observation.snapshot,
+              [candidate],
+            );
+            if (candidateAlone.status !== "repairable") {
+              newerPartialCandidates.push(candidate);
+              continue;
+            }
+            newerPartialCandidates.push(candidate);
+            const withNewerDisagreementCheck = buildChatRepairSnapshot(
+              observation.snapshot,
+              newerPartialCandidates,
+            );
+            if (withNewerDisagreementCheck.status === "repairable") {
+              repair = withNewerDisagreementCheck;
+            }
+            // This is the newest complete source. If a newer partial version
+            // disagreed, older versions cannot make that ambiguity safe.
+            break;
+          } catch {
+            // An unreadable historical payload is not a recovery source. The
+            // next trusted version may still contain every missing row.
+          }
+        }
+        if (repair === null) {
+          continue;
+        }
+        plans.push({
+          resourceId: observation.resourceId,
+          label: chatRepairLabel(observation),
+          expectedTipIds: tips.map((candidate) => candidate.versionId).sort(),
+          fingerprint: observation.fingerprint,
+          candidateVersionIds: newerPartialCandidates.map(
+            (candidate) => candidate.versionId,
+          ),
+          sourceVersionId: repair.sourceVersionId,
+          repairedBubbleCount: repair.repairedBubbleCount,
+        });
+      }
+      if (alreadyQueued > 0) {
+        await repository.saveState();
+      }
+    } finally {
+      await inspectionLock.release();
+    }
+
+    if (plans.length === 0) {
+      if (alreadyQueued > 0) {
+        const restart = "Restart to Apply";
+        const choice = await vscode.window.showInformationMessage(
+          `${alreadyQueued} chat repair${alreadyQueued === 1 ? " is" : "s are"} already queued.`,
+          restart,
+        );
+        if (choice === restart) {
+          await this.restartToApply();
+        }
+        return;
+      }
+      void vscode.window.showWarningMessage(
+        `Found ${observations.length} unavailable Cursor conversation${observations.length === 1 ? "" : "s"}, but no warning-free compatible stored version contains every missing message. Nothing was changed; Restore Version History remains available for manual recovery.`,
+      );
+      return;
+    }
+
+    const skipped = observations.length - plans.length - alreadyQueued;
+    const detailLines = plans.slice(0, 8).map(
+      (plan) =>
+        `• ${plan.label}: ${plan.repairedBubbleCount} unavailable message${
+          plan.repairedBubbleCount === 1 ? "" : "s"
+        }`,
+    );
+    if (plans.length > detailLines.length) {
+      detailLines.push(`• and ${plans.length - detailLines.length} more`);
+    }
+    const repairNow = "Repair and Restart";
+    const queueRepair = "Queue Repair";
+    const choice = await vscode.window.showWarningMessage(
+      `Repair ${plans.length} unavailable Cursor conversation${plans.length === 1 ? "" : "s"}?`,
+      {
+        modal: true,
+        detail: `${detailLines.join("\n")}${
+          skipped <= 0
+            ? ""
+            : `\n\n${skipped} additional damaged conversation${skipped === 1 ? " has" : "s have"} no unambiguous synchronized source and will be left unchanged.`
+        }\n\nOnly referenced missing or unreadable message rows are recovered. Existing valid messages, the live conversation header and composerData are not replaced. Cursor must be closed for the transactional write; a database backup is created first.`,
+      },
+      repairNow,
+      queueRepair,
+    );
+    if (choice !== repairNow && choice !== queueRepair) {
+      return;
+    }
+
+    const publishedRepairResourceIds: string[] = [];
+    let changedWhileConfirming = 0;
+    const applyLock = await this.withProgress(
+      "Cursor Setting Sync",
+      async (report) => {
+        report("Rechecking chat repairs before publishing...");
+        return this.takeCommandLock(report);
+      },
+    );
+    try {
+      if (this.repository !== repository) {
+        void vscode.window.showWarningMessage(
+          "Chat repair stopped because the synchronization repository changed while confirmation was open.",
+        );
+        return;
+      }
+      const freshConfiguredBlock = resourceConfigurationBlockReason("chat", {
+        syncChat: this.configuration.syncChat,
+        syncWorkspaceStorage: this.configuration.syncWorkspaceStorage,
+      });
+      if (freshConfiguredBlock !== null) {
+        void vscode.window.showWarningMessage(
+          `Chat repair is no longer available: ${freshConfiguredBlock}`,
+        );
+        return;
+      }
+      const gitActive = await this.openGitWindow(repository);
+      await repository.refreshState();
+      const checkpoint = await absorbedCheckpointManifest(repository);
+      const freshState = structuredClone(repository.state);
+      const reconciliation = new EventReconciler().reconcile(
+        await repository.listEvents(),
+        freshState,
+        checkpoint,
+      );
+      if (reconciliation.warnings.length > 0) {
+        void vscode.window.showWarningMessage(
+          `Chat repair stopped because the repository event stream is incomplete. Synchronize again after the shared folder settles. ${reconciliation.warnings[0]}`,
+        );
+        return;
+      }
+      Object.assign(repository.state, freshState);
+      const freshInspection = await inspectBrokenCursorChats(this.paths);
+      const freshByResource = new Map(
+        freshInspection.broken.map((observation) => [
+          observation.resourceId,
+          observation,
+        ]),
+      );
+      const snapshots: ResourceSnapshot[] = [];
+      for (const plan of plans) {
+        const observation = freshByResource.get(plan.resourceId);
+        const freshTips = repository.state.tips[plan.resourceId] ?? [];
+        const conflict = repository.state.conflicts.some(
+          (item) =>
+            item.resourceId === plan.resourceId && item.resolvedAt === undefined,
+        );
+        if (
+          observation === undefined ||
+          observation.fingerprint !== plan.fingerprint ||
+          !restoreTargetIsUnchanged(
+            plan.expectedTipIds,
+            freshTips,
+            "chat",
+            conflict,
+          )
+        ) {
+          changedWhileConfirming += 1;
+          continue;
+        }
+        const candidates: ChatRepairCandidate[] = [];
+        let candidateInvalid = false;
+        for (const versionId of plan.candidateVersionIds) {
+          const source = await repository.tryReadVersion(versionId);
+          if (
+            source === null ||
+            source.content === null ||
+            source.change.resourceId !== plan.resourceId ||
+            source.change.kind !== "chat" ||
+            source.change.operation !== "put" ||
+            sha256(source.content) !== source.change.semanticHash ||
+            databaseApplyBlockReason(
+                "chat",
+                effectiveVersionProducer(source.change.metadata, source.producer),
+                this.compatibility,
+              ) !== null
+          ) {
+            candidateInvalid = true;
+            break;
+          }
+          try {
+            const candidate = parsePortableChatSnapshot(source.content);
+            if (candidate.composerId !== observation.composerId) {
+              candidateInvalid = true;
+              break;
+            }
+            candidates.push({ versionId, snapshot: candidate });
+          } catch {
+            candidateInvalid = true;
+            break;
+          }
+        }
+        const rebuilt = candidateInvalid
+          ? null
+          : buildChatRepairSnapshot(observation.snapshot, candidates);
+        if (
+          rebuilt === null ||
+          rebuilt.status !== "repairable" ||
+          rebuilt.sourceVersionId !== plan.sourceVersionId
+        ) {
+          changedWhileConfirming += 1;
+          continue;
+        }
+        const content = canonicalBytes(rebuilt.snapshot);
+        const currentTip = freshTips[0];
+        const metadata = { ...(currentTip?.metadata ?? {}) };
+        delete metadata.title;
+        snapshots.push({
+          resourceId: plan.resourceId,
+          kind: "chat",
+          content,
+          semanticHash: sha256(content),
+          parents: freshTips.map((tip) => tip.versionId),
+          metadata: {
+            ...metadata,
+            composerId: observation.composerId,
+            workspaceId: observation.workspaceId,
+            lastUpdatedAt: observation.lastUpdatedAt,
+            bubbleCount: rebuilt.snapshot.bubbles.length,
+            ...(observation.title === null ? {} : { title: observation.title }),
+            syncOrigin: "automatic-chat-repair",
+            repairOriginDeviceId: repository.state.device.deviceId,
+            repairFingerprint: observation.fingerprint,
+            repairedBubbleCount: rebuilt.repairedBubbleCount,
+          },
+        });
+      }
+      if (snapshots.length === 0) {
+        void vscode.window.showWarningMessage(
+          "The damaged chats or synchronized versions changed while confirmation was open. Nothing was changed; run Repair Unavailable Chats again.",
+        );
+        return;
+      }
+      await publishInBatches(repository, snapshots, []);
+      publishedRepairResourceIds.push(
+        ...snapshots.map((snapshot) => snapshot.resourceId),
+      );
+      await this.commitGitWindow(
+        gitActive,
+        repository.root,
+        `sync(${repository.state.device.deviceId.slice(0, 8)}): repair ${snapshots.length} chat(s)`,
+      );
+    } finally {
+      await applyLock.release();
+    }
+
+    await this.syncNow(true);
+    if (choice === repairNow) {
+      await this.restartToApply();
+      return;
+    }
+    void vscode.window.showInformationMessage(
+      `${publishedRepairResourceIds.length} chat repair${publishedRepairResourceIds.length === 1 ? " is" : "s are"} queued${
+        changedWhileConfirming === 0
+          ? "."
+          : `; ${changedWhileConfirming} changed during confirmation and was left untouched.`
+      } Run "Cursor Setting Sync: Restart to Apply" when you are ready to close Cursor and apply the transactional repair.`,
+    );
   }
 
   async restoreVersion(): Promise<void> {
@@ -5219,6 +5669,16 @@ function versionMessageCount(
   return ` · ${count} message${count === 1 ? "" : "s"}`;
 }
 
+function chatRepairLabel(observation: BrokenChatObservation): string {
+  if (observation.title !== null) {
+    return observation.title;
+  }
+  const workspace = observation.workspaceId?.trim();
+  return workspace === undefined || workspace.length === 0
+    ? `Cursor conversation ${observation.composerId.slice(0, 8)}`
+    : `${workspace} · ${observation.composerId.slice(0, 8)}`;
+}
+
 /** "3m 12s", or "7s" under a minute. */
 export function formatDuration(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
@@ -6033,6 +6493,7 @@ function pendingHelperBatch(repository: SyncRepository): PendingHelperBatch {
       const change: HelperChange = {
         eventHash: tip.eventHash,
         changeIndex: tip.changeIndex,
+        sourceDeviceId: tip.deviceId,
         resourceId: pending.resourceId,
         kind: tip.kind,
         operation: tip.operation,
