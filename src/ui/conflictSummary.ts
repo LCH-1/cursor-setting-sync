@@ -1,6 +1,7 @@
 import type { JsonValue, ResourceKind, ResourceTip, SyncConflict } from "../types";
 import { compareTips } from "../protocol/reconciler";
 import { formatBytes } from "../sync/versionPolicy";
+import { chatHeaderTitle } from "../chat/title";
 
 /**
  * Turns a conflict into the two or three sentences a person actually needs.
@@ -216,46 +217,12 @@ function chatTitle(
   for (const tip of tips) {
     const snapshot = parseJson(context.contentOf(tip));
     const header = isObject(snapshot) ? snapshot.header : undefined;
-    const title = isObject(header) ? chatHeaderName(header.value) : null;
+    const title = isObject(header) ? chatHeaderTitle(header.value) : null;
     if (title !== null) {
       return title;
     }
   }
   return null;
-}
-
-/**
- * The chat's name, out of the `composerHeaders.value` document.
- *
- * That column is not a title: it is a JSON record describing the conversation —
- * `{"type":"head","composerId":...,"name":...,"subtitle":...}` — and its `name`
- * field is what Cursor shows in the chat list. Treating the column itself as
- * the title put a raw JSON document where the chat's name belongs in the
- * resolver, on every chat conflict.
- *
- * A conversation with no name yet (a draft, an empty composer) returns null so
- * the caller falls back to the composer ID, which is at least an identifier.
- */
-function chatHeaderName(value: JsonValue | undefined): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  let parsed: JsonValue;
-  try {
-    parsed = JSON.parse(value) as JsonValue;
-  } catch {
-    // Not a document at all. An older or newer Cursor could plausibly put a
-    // bare title here, so it is used — but only when it does not look like the
-    // structured value this column actually holds today.
-    const trimmed = value.trim();
-    return trimmed.length === 0 || trimmed.startsWith("{") || trimmed.startsWith("[")
-      ? null
-      : clip(trimmed, 60);
-  }
-  const name = isObject(parsed) ? parsed.name : undefined;
-  return typeof name === "string" && name.trim().length > 0
-    ? clip(name.trim(), 60)
-    : null;
 }
 
 /**

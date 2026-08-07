@@ -83,6 +83,25 @@ describe("a conversation that grows after its header stops changing", () => {
     expect(result.snapshots).toHaveLength(1);
     expect(result.snapshots[0]?.metadata?.bubbleCount).toBe(1);
   });
+
+  it("publishes the Cursor conversation title as lightweight restore metadata", async () => {
+    const { paths, database } = await createGlobalDatabase();
+    insertHeader(
+      database,
+      COMPOSER,
+      FROZEN_TIMESTAMP,
+      JSON.stringify({ name: "Fix Restore Version History" }),
+    );
+    insertKv(database, `composerData:${COMPOSER}`, "{}");
+    insertKv(database, `bubbleId:${COMPOSER}:b0`, "{}");
+    database.close();
+
+    const result = await new StateVscdbChatAdapter(paths).scan({});
+
+    expect(result.snapshots[0]?.metadata?.title).toBe(
+      "Fix Restore Version History",
+    );
+  });
 });
 
 function knownChat(
@@ -134,15 +153,16 @@ function insertHeader(
   database: InstanceType<typeof DatabaseSync>,
   composerId: string,
   lastUpdatedAt: number,
+  value = "{}",
 ): void {
   database
     .prepare(
       `INSERT INTO composerHeaders(
         composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
         isSubagent, recency, checkpointAt, value
-      ) VALUES (?, 'workspace-a', 1, ?, 0, 0, 0, 0, '{}')`,
+      ) VALUES (?, 'workspace-a', 1, ?, 0, 0, 0, 0, ?)`,
     )
-    .run(composerId, lastUpdatedAt);
+    .run(composerId, lastUpdatedAt, value);
 }
 
 function insertKv(

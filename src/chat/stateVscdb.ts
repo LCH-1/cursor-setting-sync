@@ -14,6 +14,7 @@ import {
 } from "../protocol/canonical";
 import type { ResourceAdapter, ResourceApplyInput } from "../resources/resource";
 import { discoverWorkspaces } from "./workspace";
+import { chatHeaderTitle } from "./title";
 
 export interface PortableComposerHeader {
   composerId: string;
@@ -254,6 +255,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         }
         const snapshot = captured.snapshot;
         const workspaceId = snapshot.header.workspaceId;
+        const title = chatHeaderTitle(snapshot.header.value);
         const content = canonicalBytes(snapshot);
         snapshots.push({
           resourceId,
@@ -269,6 +271,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
                 : workspaceUris.get(workspaceId) ?? null,
             lastUpdatedAt: snapshot.header.lastUpdatedAt,
             bubbleCount: snapshot.bubbles.length,
+            ...(title === null ? {} : { title }),
           },
         });
       }

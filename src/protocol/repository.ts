@@ -131,6 +131,11 @@ export interface ResourceHistoryEntry extends ResourceVersionSummary {
   metadata?: Record<string, JsonValue>;
 }
 
+interface ResourceHistoryNode {
+  summary: ResourceHistoryEntry;
+  parents: string[];
+}
+
 interface PreparedCheckpointMarker {
   snapshots: ResourceSnapshot[];
   deletions: ResourceDeletion[];
@@ -743,16 +748,78 @@ export class SyncRepository {
   }
 
   async listResourceHistory(resourceId: string): Promise<ResourceHistoryEntry[]> {
-    const summaries = new Map<string, ResourceHistoryEntry>();
-    const manifest = await this.loadAbsorbedCheckpointManifest();
+    return (await this.listResourceHistories(new Set([resourceId]))).get(resourceId) ?? [];
+  }
+
+  /**
+   * Lists several histories with one checkpoint read and one event traversal.
+   * Restore Version History uses this after the user has chosen a data type;
+   * calling `listResourceHistory` once for every candidate would decrypt and
+   * walk the same event stream thousands of times on a mature repository.
+   */
+  async listResourceHistories(
+    resourceIds: ReadonlySet<string>,
+  ): Promise<Map<string, ResourceHistoryEntry[]>> {
+    return this.collectResourceHistories(
+      resourceIds,
+      await this.loadAbsorbedCheckpointManifest(),
+      null,
+      null,
+    );
+  }
+
+  /**
+   * Restore-safe history: only events accepted by the stream reconciler (plus
+   * visible ancestors pinned by the checkpoint) and versions reachable from a
+   * current reconciled tip are returned. A gap, fork, or unrelated sibling can
+   * therefore never be laundered into a new local event through Restore.
+   */
+  async listReachableResourceHistories(
+    resourceIds: ReadonlySet<string>,
+    rootVersionIds: ReadonlyMap<string, readonly string[]>,
+    acceptedEventHashes: ReadonlySet<string>,
+    checkpoint: CheckpointManifest | null,
+  ): Promise<Map<string, ResourceHistoryEntry[]>> {
+    return this.collectResourceHistories(
+      resourceIds,
+      checkpoint,
+      acceptedEventHashes,
+      rootVersionIds,
+    );
+  }
+
+  private async collectResourceHistories(
+    resourceIds: ReadonlySet<string>,
+    manifest: CheckpointManifest | null,
+    acceptedEventHashes: ReadonlySet<string> | null,
+    rootVersionIds: ReadonlyMap<string, readonly string[]> | null,
+  ): Promise<Map<string, ResourceHistoryEntry[]>> {
+    if (resourceIds.size === 0) {
+      return new Map();
+    }
+    const events = await this.listEvents();
+    const trustedEventHashes = acceptedEventHashes === null
+      ? null
+      : historyEventHashAllowlist(events, acceptedEventHashes, manifest);
+    const nodes = new Map<string, Map<string, ResourceHistoryNode>>();
+    const add = (summary: ResourceHistoryEntry, parents: readonly string[]): void => {
+      const history =
+        nodes.get(summary.resourceId) ??
+        new Map<string, ResourceHistoryNode>();
+      history.set(summary.versionId, { summary, parents: [...parents] });
+      nodes.set(summary.resourceId, history);
+    };
     if (manifest !== null) {
-      const folded = manifest.resources.find(
-        (resource) => resource.resourceId === resourceId,
-      );
-      if (folded !== undefined && isSupportedResourceKind(folded.kind)) {
+      for (const folded of manifest.resources) {
+        if (
+          !resourceIds.has(folded.resourceId) ||
+          !isSupportedResourceKind(folded.kind)
+        ) {
+          continue;
+        }
         const summary: ResourceHistoryEntry = {
           versionId: folded.versionId,
-          resourceId,
+          resourceId: folded.resourceId,
           kind: folded.kind,
           operation: folded.operation,
           semanticHash: folded.semanticHash,
@@ -768,18 +835,24 @@ export class SyncRepository {
         if (folded.metadata !== undefined) {
           summary.metadata = folded.metadata;
         }
-        summaries.set(folded.versionId, summary);
+        add(summary, []);
       }
     }
-    for (const event of await this.listEvents()) {
+    for (const event of events) {
+      if (trustedEventHashes !== null && !trustedEventHashes.has(event.eventHash)) {
+        continue;
+      }
       event.manifest.changes.forEach((change, changeIndex) => {
-        if (change.resourceId !== resourceId || !isSupportedResourceKind(change.kind)) {
+        if (
+          !resourceIds.has(change.resourceId) ||
+          !isSupportedResourceKind(change.kind)
+        ) {
           return;
         }
         const versionId = `${event.eventHash}#${changeIndex}`;
         const summary: ResourceHistoryEntry = {
           versionId,
-          resourceId,
+          resourceId: change.resourceId,
           kind: change.kind,
           operation: change.operation,
           semanticHash: change.semanticHash,
@@ -795,10 +868,41 @@ export class SyncRepository {
         if (change.metadata !== undefined) {
           summary.metadata = change.metadata;
         }
-        summaries.set(versionId, summary);
+        add(summary, change.parents);
       });
     }
-    return [...summaries.values()].sort(compareVersionSummaries);
+    const histories = new Map<string, ResourceHistoryEntry[]>();
+    for (const [resourceId, history] of nodes) {
+      let selected: ResourceHistoryNode[];
+      if (rootVersionIds === null) {
+        selected = [...history.values()];
+      } else {
+        const reachable = new Set<string>();
+        const pending = [...(rootVersionIds.get(resourceId) ?? [])];
+        while (pending.length > 0) {
+          const versionId = pending.pop();
+          if (versionId === undefined || reachable.has(versionId)) {
+            continue;
+          }
+          const node = history.get(versionId);
+          if (node === undefined) {
+            continue;
+          }
+          reachable.add(versionId);
+          pending.push(...node.parents);
+        }
+        selected = [...reachable]
+          .map((versionId) => history.get(versionId))
+          .filter((node): node is ResourceHistoryNode => node !== undefined);
+      }
+      if (selected.length > 0) {
+        histories.set(
+          resourceId,
+          selected.map((node) => node.summary).sort(compareVersionSummaries),
+        );
+      }
+    }
+    return histories;
   }
 
   private async readCheckpointVersion(versionId: string): Promise<ResourceVersionData> {
@@ -2411,6 +2515,38 @@ function compareCheckpointTips(left: ResourceTip, right: ResourceTip): number {
     return deviceOrder;
   }
   return compareCodeUnits(right.eventHash, left.eventHash);
+}
+
+function historyEventHashAllowlist(
+  events: readonly DecryptedEvent[],
+  acceptedEventHashes: ReadonlySet<string>,
+  checkpoint: CheckpointManifest | null,
+): Set<string> {
+  const trusted = new Set(acceptedEventHashes);
+  if (checkpoint === null) {
+    return trusted;
+  }
+  const byHash = new Map(events.map((event) => [event.eventHash, event]));
+  for (const [deviceId, cursor] of Object.entries(checkpoint.streams)) {
+    let eventHash = cursor.lastEventHash;
+    let expectedSequence = cursor.lastSequence;
+    const visited = new Set<string>();
+    while (eventHash !== null && !visited.has(eventHash)) {
+      visited.add(eventHash);
+      const event = byHash.get(eventHash);
+      if (
+        event === undefined ||
+        event.stored.header.deviceId !== deviceId ||
+        event.stored.header.sequence !== expectedSequence
+      ) {
+        break;
+      }
+      trusted.add(eventHash);
+      eventHash = event.stored.header.previousEventHash;
+      expectedSequence -= 1;
+    }
+  }
+  return trusted;
 }
 
 function compareVersionSummaries(

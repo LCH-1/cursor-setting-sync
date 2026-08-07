@@ -2,6 +2,14 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.60] - 2026-08-07
+
+### Changed
+
+- **`Restore Version History` no longer opens with thousands of internal resource IDs.** It now starts with a short data-type list, clearly separates main **Cursor conversations** from raw **Agent transcripts**, narrows large chat/transcript sets by workspace or project, and shows titles (when recorded), message counts, readable paths, and update times instead of percent-encoded IDs.
+- **Only resources with an eligible earlier version are offered.** Current-only, conflicted, disabled, deleted-version, and incompatible entries stay out of the actionable lists, while a deleted resource with an older `put` remains recoverable. Histories for the chosen type are collected in one event traversal rather than rescanning the complete event log once per resource, and are limited to trusted ancestors of freshly reconciled tips; a shared-folder stream gap or fork blocks Restore instead of exposing an unaccepted event as history.
+- **The final restore decision is easier to verify and remains race-safe.** The confirmation repeats the readable resource name, type, version time, message count, size, source device, and decoded conversation/path identity. After the picker closes, the command rechecks tips, conflicts, configuration, producer compatibility, and the selected payload identity under the command lock before publishing anything. New chat snapshots carry their Cursor title as lightweight metadata, and restoring an older chat derives that title again from its payload.
+
 ## [0.0.59] - 2026-08-03
 
 ### Changed

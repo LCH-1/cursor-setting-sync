@@ -9,7 +9,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { SyncRepository } from "../src/protocol/repository";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import { decryptAead, deriveSubkey, encryptAead } from "../src/protocol/crypto";
@@ -29,6 +29,132 @@ import type {
 } from "../src/types";
 
 describe("repository checkpoints", () => {
+  it("collects selected resource histories with one event traversal", async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "cursor-setting-sync-history-"));
+    try {
+      const repository = await createRepository(temporaryRoot);
+      await repository.publish(
+        [
+          snapshot("settings/default/editor.fontSize", "14"),
+          snapshot("settings/default/editor.tabSize", "2"),
+        ],
+        [],
+      );
+      await repository.publish(
+        [
+          snapshot("settings/default/editor.fontSize", "16"),
+          snapshot("settings/default/editor.wordWrap", "on"),
+        ],
+        [],
+      );
+      const listEvents = vi.spyOn(repository, "listEvents");
+
+      const histories = await repository.listResourceHistories(
+        new Set([
+          "settings/default/editor.fontSize",
+          "settings/default/editor.tabSize",
+          "settings/default/missing",
+        ]),
+      );
+
+      expect(listEvents).toHaveBeenCalledTimes(1);
+      expect(histories.get("settings/default/editor.fontSize")).toHaveLength(2);
+      expect(histories.get("settings/default/editor.tabSize")).toHaveLength(1);
+      expect(histories.has("settings/default/editor.wordWrap")).toBe(false);
+      expect(histories.has("settings/default/missing")).toBe(false);
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("limits restore history to trusted ancestors of the reconciled tip", async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "cursor-setting-sync-ancestors-"));
+    try {
+      const repository = await createRepository(temporaryRoot);
+      const resourceId = "settings/default/editor.fontSize";
+      const first = await repository.publish(
+        [{ ...snapshot(resourceId, "14"), parents: [] }],
+        [],
+      );
+      const firstVersion = `${first.eventHash}#0`;
+      const second = await repository.publish(
+        [{ ...snapshot(resourceId, "16"), parents: [firstVersion] }],
+        [],
+      );
+      const secondVersion = `${second.eventHash}#0`;
+      const sibling = await repository.publish(
+        [{ ...snapshot(resourceId, "15"), parents: [firstVersion] }],
+        [],
+      );
+      const siblingVersion = `${sibling.eventHash}#0`;
+      const trusted = new Set([
+        first.eventHash ?? "",
+        second.eventHash ?? "",
+        sibling.eventHash ?? "",
+      ]);
+
+      const histories = await repository.listReachableResourceHistories(
+        new Set([resourceId]),
+        new Map([[resourceId, [secondVersion]]]),
+        trusted,
+        null,
+      );
+
+      expect(histories.get(resourceId)?.map((entry) => entry.versionId)).toEqual([
+        secondVersion,
+        firstVersion,
+      ]);
+      expect(histories.get(resourceId)?.some(
+        (entry) => entry.versionId === siblingVersion,
+      )).toBe(false);
+
+      const unacceptedRoot = await repository.listReachableResourceHistories(
+        new Set([resourceId]),
+        new Map([[resourceId, [siblingVersion]]]),
+        new Set([first.eventHash ?? "", second.eventHash ?? ""]),
+        null,
+      );
+      expect(unacceptedRoot.has(resourceId)).toBe(false);
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps visible pre-checkpoint ancestors on the checkpoint's pinned stream", async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "cursor-setting-sync-folded-history-"));
+    try {
+      const repository = await createRepository(temporaryRoot);
+      const resourceId = "settings/default/editor.fontSize";
+      const first = await repository.publish(
+        [{ ...snapshot(resourceId, "14"), parents: [] }],
+        [],
+      );
+      const firstVersion = `${first.eventHash}#0`;
+      const second = await repository.publish(
+        [{ ...snapshot(resourceId, "16"), parents: [firstVersion] }],
+        [],
+      );
+      const secondVersion = `${second.eventHash}#0`;
+      await adoptTips(repository);
+      await repository.createCheckpoint(true);
+      const checkpoint = await repository.loadAbsorbedCheckpointManifest();
+
+      const histories = await repository.listReachableResourceHistories(
+        new Set([resourceId]),
+        new Map([[resourceId, [secondVersion]]]),
+        new Set(),
+        checkpoint,
+      );
+
+      expect(histories.get(resourceId)?.map((entry) => entry.versionId)).toEqual([
+        secondVersion,
+        firstVersion,
+      ]);
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   it("folds active tips and cursors into a checkpoint, absorbs it, and switches to v2 events", async () => {
     const temporaryRoot = await mkdtemp(join(tmpdir(), "cursor-setting-sync-checkpoint-"));
     try {

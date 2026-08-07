@@ -126,12 +126,16 @@ Apply payloads are limited to 512 MiB per restart. If pending items remain, run 
 ## Restore a previous version
 
 1. Run `Cursor Setting Sync: Restore Version History`.
-2. Select a resource. Resources with an active conflict must be resolved first, and resources whose kind is disabled in settings (chat or workspace storage synchronization turned off) cannot be restored.
-3. Select a version. The current content, deletions, and versions created by a newer Cursor, VS Code base, or extension than the local installation are marked and cannot be selected. A diff preview of the current content against the selected version opens automatically.
-4. Confirm **Restore Version**. The old content is re-published as a new version on top of the existing history; nothing is rewritten.
-5. Database-backed kinds (chat, Cursor User Rules, workspace storage, and similar) are applied offline; run `Cursor Setting Sync: Restart to Apply`.
+2. Select the data type. For a normal conversation that disappeared or lost messages, select **Cursor conversations**. **Agent transcripts** are separate raw files produced by agent runs and are not the main chat list.
+3. When offered, select the workspace or project. Large chat and transcript sets are narrowed here before individual resources are shown.
+4. Select a resource. Only resources with at least one earlier eligible `put` are listed, newest first, with a readable title/path, workspace, message count, and date. Active conflicts, disabled kinds, current-only resources, and version-incompatible resources are omitted. If its encrypted object has not arrived from the shared-folder provider yet, the final payload check stops safely and asks you to try again later.
+5. Select a version. Only non-current `put` versions compatible with this Cursor installation are offered. A diff preview of the current content against the selected version opens automatically.
+6. Confirm **Restore Version**. The dialog repeats the resource and version details, then the old content is re-published as a new version on top of the existing history; nothing is rewritten.
+7. Database-backed kinds (chat, Cursor User Rules, workspace storage, and similar) are applied offline; run `Cursor Setting Sync: Restart to Apply`.
 
 A restored version keeps the original version's producer metadata, so the newer-version database safety gate keeps judging the version it came from. If another device pruned the selected version while it was being picked, the restore aborts cleanly; refresh the history and pick again.
+
+Restore also requires a complete, reconciled repository event stream. If the shared-folder provider is still delivering a missing event or exposes a fork, let it settle and synchronize again; unaccepted events are never offered as recoverable history.
 
 ## Checkpoint and prune history
 

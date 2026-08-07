@@ -23,6 +23,7 @@ import {
 } from "../constants";
 import type {
   AbsorbedCheckpoint,
+  CheckpointManifest,
   CompatibilityReport,
   DiagnosticSnapshot,
   EventProducer,
@@ -81,6 +82,7 @@ import { SyncRepository } from "../protocol/repository";
 import type {
   CheckpointCreateResult,
   PruneResult,
+  ResourceHistoryEntry,
 } from "../protocol/repository";
 import {
   EventReconciler,
@@ -138,6 +140,7 @@ import {
 import { mergeChatSnapshotBuffers } from "../chat/chatMerge";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
+import { chatSnapshotTitle } from "../chat/title";
 import {
   discoverWorkspaces,
   resolveTargetWorkspace,
@@ -161,6 +164,15 @@ import type {
   ConflictController,
   ConflictResolutionResult,
 } from "../ui/conflicts";
+import {
+  buildRestoreKindChoices,
+  buildRestoreResourceChoices,
+  buildRestoreScopeChoices,
+  restorablePutVersions,
+  restoreTargetIsUnchanged,
+  restoreKindLabel,
+  type RestoreResourceDescriptor,
+} from "../ui/resourceHistory";
 import { mergeJsoncBuffers, parseJsonc } from "../resources/jsonc";
 import { mergeTextBuffers } from "../resources/text";
 import { sha256 } from "../protocol/canonical";
@@ -1548,6 +1560,8 @@ export class SyncManager implements vscode.Disposable {
 
   async restoreVersion(): Promise<void> {
     const repository = this.requireRepository();
+    let historyCheckpoint: CheckpointManifest | null = null;
+    let acceptedHistoryEventHashes = new Set<string>();
     const refreshLock = await this.withProgress(
       "Cursor Setting Sync",
       async (report) => {
@@ -1558,6 +1572,24 @@ export class SyncManager implements vscode.Disposable {
     try {
       await this.openGitWindow(repository);
       await repository.refreshState();
+      historyCheckpoint = await absorbedCheckpointManifest(repository);
+      const reconciledState = structuredClone(repository.state);
+      const reconciled = new EventReconciler().reconcile(
+        await repository.listEvents(),
+        reconciledState,
+        historyCheckpoint,
+      );
+      if (reconciled.warnings.length > 0) {
+        this.status.log(
+          `Restore Version History blocked by repository stream warning: ${reconciled.warnings[0]}`,
+        );
+        void vscode.window.showWarningMessage(
+          `Version history cannot be restored while the repository event stream is incomplete. Synchronize again after the shared folder settles. ${reconciled.warnings[0]}`,
+        );
+        return;
+      }
+      Object.assign(repository.state, reconciledState);
+      acceptedHistoryEventHashes = new Set(reconciled.acceptedEventHashes);
     } finally {
       await refreshLock.release();
     }
@@ -1580,97 +1612,206 @@ export class SyncManager implements vscode.Disposable {
         .filter((conflict) => conflict.resolvedAt === undefined)
         .map((conflict) => conflict.resourceId),
     );
-    const resourceItems = resourceIds.map((resourceId) => {
-      const kind =
-        repository.state.tips[resourceId]?.[0]?.kind ??
-        repository.state.projections[resourceId]?.kind;
-      const blockedReason = conflictedResources.has(resourceId)
-        ? "Resolve the conflict first."
-        : kind === undefined
-          ? "The resource kind is unknown."
+    const resources: RestoreResourceDescriptor[] = [];
+    const historyRoots = new Map<string, string[]>();
+    let unknownResourceCount = 0;
+    for (const resourceId of resourceIds) {
+      const projection = repository.state.projections[resourceId];
+      const resourceTips = repository.state.tips[resourceId] ?? [];
+      const tip = [...resourceTips].sort(compareTips)[0];
+      const kind = tip?.kind ?? projection?.kind;
+      if (kind === undefined) {
+        unknownResourceCount += 1;
+        continue;
+      }
+      historyRoots.set(
+        resourceId,
+        resourceTips.map((candidate) => candidate.versionId),
+      );
+      resources.push({
+        resourceId,
+        kind,
+        metadata: tip?.metadata,
+        sourceTimestamp: projection?.sourceTimestamp,
+        eventCreatedAt: tip?.createdAt,
+        blockedReason: conflictedResources.has(resourceId)
+          ? "Resolve the conflict first."
+          : resourceTips.length === 0
+            ? "No current repository tip is available for this resource."
           : resourceConfigurationBlockReason(kind, {
               syncChat: this.configuration.syncChat,
               syncWorkspaceStorage: this.configuration.syncWorkspaceStorage,
-            });
-      return {
-        label:
-          blockedReason === null
-            ? resourceId
-            : `$(circle-slash) ${resourceId}`,
-        ...(blockedReason === null ? {} : { description: blockedReason }),
-        resourceId,
-        blockedReason,
-      };
-    });
-    const selectedResource = await vscode.window.showQuickPick(resourceItems, {
-      title: "Select a resource whose version history should be restored",
+            }),
+      });
+    }
+    if (unknownResourceCount > 0) {
+      this.status.log(
+        `Restore Version History omitted ${unknownResourceCount} resource(s) whose kind is unknown.`,
+      );
+    }
+    const kindItems = buildRestoreKindChoices(resources);
+    if (kindItems.length === 0) {
+      void vscode.window.showInformationMessage(
+        "There are no recognized synchronized resources to restore.",
+      );
+      return;
+    }
+    const selectedKind = await vscode.window.showQuickPick(kindItems, {
+      title: "Restore Version History: choose a data type",
       placeHolder:
-        "Resources with an active conflict or a disabled kind cannot be restored.",
+        "For a missing chat, choose Cursor conversations — Agent transcripts are separate files.",
       ignoreFocusOut: true,
       matchOnDescription: true,
+      matchOnDetail: true,
+    });
+    if (selectedKind === undefined) {
+      return;
+    }
+    if (selectedKind.blockedReason !== null) {
+      void vscode.window.showWarningMessage(
+        `${restoreKindLabel(selectedKind.resourceKind)}: ${selectedKind.blockedReason}`,
+      );
+      return;
+    }
+    const resourcesOfKind = resources.filter(
+      (resource) => resource.kind === selectedKind.resourceKind,
+    );
+    const histories = await this.withProgress(
+      "Cursor Setting Sync",
+      async (report) => {
+        report(`Reading ${restoreKindLabel(selectedKind.resourceKind)} history...`);
+        return repository.listReachableResourceHistories(
+          new Set(resourcesOfKind.map((resource) => resource.resourceId)),
+          historyRoots,
+          acceptedHistoryEventHashes,
+          historyCheckpoint,
+        );
+      },
+    );
+    const restorableHistory = new Map<string, ResourceHistoryEntry[]>();
+    const restorableResources: RestoreResourceDescriptor[] = [];
+    for (const resource of resourcesOfKind) {
+      if (resource.blockedReason !== null) {
+        continue;
+      }
+      const history = histories.get(resource.resourceId) ?? [];
+      const currentTipIds = new Set(
+        (repository.state.tips[resource.resourceId] ?? []).map(
+          (tip) => tip.versionId,
+        ),
+      );
+      const eligible = restorablePutVersions(
+        history,
+        currentTipIds,
+        (summary) =>
+          summary.resourceId !== resource.resourceId ||
+          summary.kind !== resource.kind
+            ? "The history entry does not match this resource."
+            : databaseApplyBlockReason(
+                summary.kind,
+                effectiveVersionProducer(summary.metadata, summary.producer),
+                this.compatibility,
+              ),
+      );
+      if (eligible.length === 0) {
+        continue;
+      }
+      restorableHistory.set(resource.resourceId, eligible);
+      const newestRestorable = eligible[0];
+      restorableResources.push({
+        ...resource,
+        metadata: {
+          ...(newestRestorable?.metadata ?? {}),
+          ...(resource.metadata ?? {}),
+        },
+        eventCreatedAt:
+          resource.eventCreatedAt ?? newestRestorable?.createdAt,
+      });
+    }
+    if (restorableResources.length === 0) {
+      void vscode.window.showInformationMessage(
+        `No earlier restorable versions are available for ${restoreKindLabel(
+          selectedKind.resourceKind,
+        )}. Current-only, conflicting, disabled, and incompatible entries are omitted.`,
+      );
+      return;
+    }
+    const scopeItems = buildRestoreScopeChoices(restorableResources);
+    const selectedScope = scopeItems.length <= 1
+      ? scopeItems[0]
+      : await vscode.window.showQuickPick(scopeItems, {
+          title: `Restore Version History: choose a workspace or project`,
+          placeHolder: "Most recently updated first. Search by workspace or project name.",
+          ignoreFocusOut: true,
+          matchOnDescription: true,
+          matchOnDetail: true,
+        });
+    if (selectedScope === undefined) {
+      return;
+    }
+    const scopedResourceIds = new Set(selectedScope.resourceIds);
+    const scopedResources = restorableResources.filter((resource) =>
+      scopedResourceIds.has(resource.resourceId),
+    );
+    const resourceItems = buildRestoreResourceChoices(scopedResources);
+    const omitted = resourcesOfKind.length - restorableResources.length;
+    const kindLabel = restoreKindLabel(selectedKind.resourceKind);
+    const scopeSuffix = selectedScope.label === kindLabel
+      ? ""
+      : ` — ${selectedScope.label}`;
+    const selectedResource = await vscode.window.showQuickPick(resourceItems, {
+      title: `Restore Version History: ${kindLabel}${scopeSuffix}`,
+      placeHolder: `Newest first. Search by title, workspace, date, message count, path, or ID.${
+        omitted === 0 ? "" : ` ${omitted} unavailable item(s) are hidden.`
+      }`,
+      ignoreFocusOut: true,
+      matchOnDescription: true,
+      matchOnDetail: true,
     });
     if (selectedResource === undefined) {
       return;
     }
-    if (selectedResource.blockedReason !== null) {
-      void vscode.window.showWarningMessage(
-        `${selectedResource.resourceId}: ${selectedResource.blockedReason}`,
-      );
-      return;
-    }
     const resourceId = selectedResource.resourceId;
-    const history = await repository.listResourceHistory(resourceId);
-    if (history.length === 0) {
+    const history = histories.get(resourceId) ?? [];
+    const eligibleHistory = restorableHistory.get(resourceId) ?? [];
+    if (history.length === 0 || eligibleHistory.length === 0) {
       void vscode.window.showInformationMessage(
-        `No version history is available for ${resourceId}.`,
+        `No earlier restorable version is available for ${selectedResource.label}.`,
       );
       return;
     }
     const tips = repository.state.tips[resourceId] ?? [];
     const expectedTipIds = tips.map((tip) => tip.versionId).sort();
-    const currentTipIds = new Set(expectedTipIds);
-    const versionItems = history.map((summary, index) => {
-      const isCurrent = currentTipIds.has(summary.versionId);
-      const blockedReason = isCurrent
-        ? "This version is already the current content."
-        : summary.operation === "delete"
-          ? "A deletion cannot be restored."
-          : databaseApplyBlockReason(
-              summary.kind,
-              effectiveVersionProducer(summary.metadata, summary.producer),
-              this.compatibility,
-            );
+    const historyIndex = new Map(
+      history.map((summary, index) => [summary.versionId, index]),
+    );
+    const versionItems = eligibleHistory.map((summary) => {
+      const index = historyIndex.get(summary.versionId);
       return {
-        label: `${blockedReason === null ? "" : "$(circle-slash) "}v${
-          history.length - index
-        } ${new Date(summary.createdAt).toLocaleString()}${
-          isCurrent ? " (current)" : ""
+        label: `${new Date(summary.createdAt).toLocaleString()}${
+          versionMessageCount(summary.metadata)
         }`,
         description: `${summary.deviceId.slice(0, 8)} · ${summary.operation} · ${
           summary.plainBytes === null
             ? "no payload"
             : formatBytes(summary.plainBytes)
-        }${versionMessageCount(summary.metadata)}${
+        }${
           summary.fromCheckpoint ? " · checkpoint" : ""
         }`,
-        ...(blockedReason === null ? {} : { detail: blockedReason }),
+        detail: index === undefined
+          ? "Stored version"
+          : `Stored version v${history.length - index}`,
         summary,
-        blockedReason,
       };
     });
     const selectedVersion = await vscode.window.showQuickPick(versionItems, {
-      title: `Restore a version of ${resourceId}`,
-      placeHolder:
-        "Newest first. Current, deleted, and version-gated entries cannot be restored.",
+      title: `Restore a version of ${selectedResource.label}`,
+      placeHolder: "Newest restorable versions first. Select one to preview.",
       ignoreFocusOut: true,
+      matchOnDescription: true,
+      matchOnDetail: true,
     });
     if (selectedVersion === undefined) {
-      return;
-    }
-    if (selectedVersion.blockedReason !== null) {
-      void vscode.window.showWarningMessage(
-        `${resourceId}: ${selectedVersion.blockedReason}`,
-      );
       return;
     }
     await this.showHistoryPreview(
@@ -1680,8 +1821,13 @@ export class SyncManager implements vscode.Disposable {
       selectedVersion.summary,
     );
     const confirmed = await vscode.window.showWarningMessage(
-      `Publish the selected version of ${resourceId} as the new current content? History is not rewritten; the old content becomes a new version on top of it.`,
-      { modal: true },
+      `Restore "${selectedResource.label}"?`,
+      {
+        modal: true,
+        detail: `${restoreKindLabel(selectedVersion.summary.kind)} · ${
+          selectedVersion.label
+        }\n${selectedVersion.description}\n${selectedResource.detail}\n\nHistory is not rewritten. The selected content is published as a new version on top.`,
+      },
       "Restore Version",
     );
     if (confirmed !== "Restore Version") {
@@ -1691,19 +1837,56 @@ export class SyncManager implements vscode.Disposable {
     try {
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
-      const freshTipIds = (repository.state.tips[resourceId] ?? [])
-        .map((tip) => tip.versionId)
-        .sort();
+      const freshCheckpoint = await absorbedCheckpointManifest(repository);
+      const freshState = structuredClone(repository.state);
+      const freshReconciliation = new EventReconciler().reconcile(
+        await repository.listEvents(),
+        freshState,
+        freshCheckpoint,
+      );
+      if (freshReconciliation.warnings.length > 0) {
+        this.status.log(
+          `Restore Version History stopped by repository stream warning: ${freshReconciliation.warnings[0]}`,
+        );
+        void vscode.window.showWarningMessage(
+          `Restore stopped because the repository event stream is incomplete. Synchronize again after the shared folder settles. ${freshReconciliation.warnings[0]}`,
+        );
+        return;
+      }
+      Object.assign(repository.state, freshState);
+      const freshTips = repository.state.tips[resourceId] ?? [];
       const conflicted = repository.state.conflicts.some(
         (conflict) =>
           conflict.resourceId === resourceId &&
           conflict.resolvedAt === undefined,
       );
+      const configuredBlock = resourceConfigurationBlockReason(
+        selectedVersion.summary.kind,
+        {
+          syncChat: this.configuration.syncChat,
+          syncWorkspaceStorage: this.configuration.syncWorkspaceStorage,
+        },
+      );
+      const compatibilityBlock = databaseApplyBlockReason(
+        selectedVersion.summary.kind,
+        effectiveVersionProducer(
+          selectedVersion.summary.metadata,
+          selectedVersion.summary.producer,
+        ),
+        this.compatibility,
+      );
+      if (configuredBlock !== null || compatibilityBlock !== null) {
+        void vscode.window.showWarningMessage(
+          `Restore is no longer available: ${configuredBlock ?? compatibilityBlock}`,
+        );
+        return;
+      }
       if (
-        conflicted ||
-        freshTipIds.length !== expectedTipIds.length ||
-        !freshTipIds.every(
-          (versionId, index) => versionId === expectedTipIds[index],
+        !restoreTargetIsUnchanged(
+          expectedTipIds,
+          freshTips,
+          selectedVersion.summary.kind,
+          conflicted,
         )
       ) {
         void vscode.window.showWarningMessage(
@@ -1720,6 +1903,17 @@ export class SyncManager implements vscode.Disposable {
         );
         return;
       }
+      if (
+        selectedResource.resourceKind !== selectedVersion.summary.kind ||
+        data.change.resourceId !== resourceId ||
+        data.change.kind !== selectedVersion.summary.kind ||
+        data.change.operation !== "put"
+      ) {
+        void vscode.window.showWarningMessage(
+          "The selected history entry no longer matches this resource; refresh the history and pick again.",
+        );
+        return;
+      }
       const tipProducer = (repository.state.tips[resourceId] ?? []).find(
         (tip) => tip.producer !== undefined,
       )?.producer;
@@ -1729,13 +1923,21 @@ export class SyncManager implements vscode.Disposable {
         data.change.metadata,
         data.producer ?? selectedVersion.summary.producer ?? tipProducer,
       );
+      const restoredChatTitle = selectedVersion.summary.kind === "chat"
+        ? chatSnapshotTitle(data.content)
+        : null;
+      const restoredMetadata = { ...(data.change.metadata ?? {}) };
+      if (selectedVersion.summary.kind === "chat") {
+        delete restoredMetadata.title;
+      }
       const snapshot: ResourceSnapshot = {
         resourceId,
         kind: selectedVersion.summary.kind,
         content: data.content,
         semanticHash: data.change.semanticHash,
         metadata: {
-          ...(data.change.metadata ?? {}),
+          ...restoredMetadata,
+          ...(restoredChatTitle === null ? {} : { title: restoredChatTitle }),
           syncOrigin: "version-restore",
           ...(originalProducer === undefined
             ? {}
@@ -1754,11 +1956,11 @@ export class SyncManager implements vscode.Disposable {
     await this.syncNow(true);
     if (isDatabaseBackedKind(selectedVersion.summary.kind)) {
       void vscode.window.showInformationMessage(
-        `The restored version of ${resourceId} is queued for the offline helper. Run "Cursor Setting Sync: Restart to Apply" to write it into the Cursor databases.`,
+        `The restored version of "${selectedResource.label}" is queued for the offline helper. Run "Cursor Setting Sync: Restart to Apply" to write it into the Cursor databases.`,
       );
     } else {
       void vscode.window.showInformationMessage(
-        `Restored ${resourceId}; the selected version is published as the new current content.`,
+        `Restored "${selectedResource.label}"; the selected version is published as the new current content.`,
       );
     }
   }
