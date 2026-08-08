@@ -1,23 +1,39 @@
 import { open, readFile, rename, rm, stat, utimes } from "node:fs/promises";
 import { readFileSync, utimesSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { ensureDirectory, isMissingPathError } from "./files";
 import { dirname } from "node:path";
 
-// The holder refreshes the lock file's mtime so other processes can tell a
-// live lock from one whose PID was recycled after a reboot. Staleness needs
-// either a dead PID or an mtime older than the TTL, so a recycled PID that
-// never heartbeats the file heals instead of blocking sync forever. The TTL
-// is fifteen heartbeats so a holder stalled in long synchronous work does
-// not lose a live lock over a few missed refreshes.
+// The holder refreshes the lock file's mtime so diagnostics can report recent
+// activity and a half-created/corrupt file can eventually heal. A readable
+// lock is NEVER displaced merely because its heartbeat is old while its PID
+// is alive: sleep, hibernation, a stopped debugger, synchronous work and wall
+// clock jumps can all make an entirely valid heartbeat look arbitrarily old.
+// New lock payloads also carry the OS process-start identity, which lets an old
+// lock heal when its PID has genuinely been recycled without weakening that
+// rule. Older payloads remain valid and take the conservative live-PID path.
 const HEARTBEAT_INTERVAL_MS = 60_000;
 const STALE_LOCK_TTL_MS = 15 * 60_000;
+const PROCESS_IDENTITY_CACHE_MS = 30_000;
+const execFileAsync = promisify(execFile);
 
 interface LockContent {
   pid: number;
   token: string;
   createdAt: string;
+  /** Optional for compatibility with locks written before process identity. */
+  processStartId?: string;
 }
+
+interface CachedProcessIdentity {
+  checkedAt: number;
+  value: string | null;
+}
+
+const processIdentityCache = new Map<number, CachedProcessIdentity>();
+const processIdentityLookups = new Map<number, Promise<string | null>>();
 
 export interface FileLock {
   path: string;
@@ -210,8 +226,9 @@ export async function reportLockHolder(path: string): Promise<LockHolderReport> 
     pid: existing.pid,
     description:
       `Another Cursor window or the offline helper (pid ${existing.pid}${heldFor}) is synchronizing. ` +
-      "Close other Cursor windows, or wait - a lock whose holder has exited is " +
-      `released automatically, and any lock goes stale after ${staleMinutes} minutes. ` +
+      "Close other Cursor windows, or wait - a lock whose holder has exited is released automatically, " +
+      "and current lock files also detect PID reuse. " +
+      `An unreadable lock file is recovered after ${staleMinutes} minutes. ` +
       `Lock file: ${path}.`,
   };
 }
@@ -256,13 +273,21 @@ async function tryCreateLock(
 ): Promise<FileLock | null> {
   try {
     const handle = await open(path, "wx");
+    let storedContent = content;
     try {
-      await handle.writeFile(JSON.stringify(content), "utf8");
+      // Resolve the potentially slower Windows/macOS process metadata only
+      // after this contender has won open("wx"). Losing Cursor windows never
+      // spawn a probe, and the winner caches the result for every later lock.
+      const processStartId = await getProcessStartIdentity(process.pid);
+      if (processStartId !== null) {
+        storedContent = { ...content, processStartId };
+      }
+      await handle.writeFile(JSON.stringify(storedContent), "utf8");
       await handle.sync();
     } finally {
       await handle.close();
     }
-    return createLock(path, content);
+    return createLock(path, storedContent);
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "EEXIST") {
       return null;
@@ -273,7 +298,11 @@ async function tryCreateLock(
 
 async function readLock(path: string): Promise<LockContent | null> {
   try {
-    return JSON.parse(await readFile(path, "utf8")) as LockContent;
+    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
+    if (!isLockContent(parsed)) {
+      return null;
+    }
+    return parsed;
   } catch (error) {
     if (isMissingPathError(error) || error instanceof SyntaxError) {
       return null;
@@ -298,15 +327,39 @@ async function isLockStale(path: string, existing: LockContent): Promise<boolean
   if (!isProcessAlive(existing.pid)) {
     return true;
   }
+
+  // A live PID is sufficient proof for legacy locks. Age alone is not proof
+  // of death: in particular, Windows resumes all Cursor processes with an old
+  // mtime after sleep, and the previous implementation let the first window
+  // steal a lock from the still-running holder.
+  if (existing.processStartId === undefined) {
+    return false;
+  }
+
   try {
     const lockStat = await stat(path);
-    return Date.now() - lockStat.mtimeMs > STALE_LOCK_TTL_MS;
+    if (Date.now() - lockStat.mtimeMs <= STALE_LOCK_TTL_MS) {
+      return false;
+    }
   } catch (error) {
     if (isMissingPathError(error)) {
       return true;
     }
     throw error;
   }
+
+  // Only an OS identity mismatch can make a readable lock stale while its
+  // numeric PID is alive. An unavailable/unsupported probe fails closed and
+  // leaves the lock alone; the holder exiting will still release it normally.
+  const actualProcessStartId = await getProcessStartIdentity(existing.pid);
+  return (
+    actualProcessStartId !== null &&
+    haveComparableProcessStartIds(
+      existing.processStartId,
+      actualProcessStartId,
+    ) &&
+    existing.processStartId !== actualProcessStartId
+  );
 }
 
 function createLock(path: string, content: LockContent): FileLock {
@@ -373,4 +426,132 @@ function isProcessAlive(pid: number): boolean {
     // EPERM means the process exists but cannot be signalled from here.
     return error instanceof Error && "code" in error && error.code === "EPERM";
   }
+}
+
+function isLockContent(value: unknown): value is LockContent {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.pid === "number" &&
+    Number.isSafeInteger(candidate.pid) &&
+    candidate.pid > 0 &&
+    typeof candidate.token === "string" &&
+    candidate.token.length > 0 &&
+    typeof candidate.createdAt === "string" &&
+    (candidate.processStartId === undefined ||
+      (typeof candidate.processStartId === "string" &&
+        candidate.processStartId.length > 0))
+  );
+}
+
+function haveComparableProcessStartIds(left: string, right: string): boolean {
+  const leftScheme = processStartIdScheme(left);
+  return leftScheme !== null && leftScheme === processStartIdScheme(right);
+}
+
+function processStartIdScheme(value: string): string | null {
+  if (/^linux:\d+$/u.test(value)) {
+    return "linux";
+  }
+  if (/^win32:\d+$/u.test(value)) {
+    return "win32";
+  }
+  if (value.startsWith("darwin:")) {
+    const timestamp = value.slice("darwin:".length);
+    return timestamp.length > 0 && Number.isFinite(Date.parse(timestamp))
+      ? "darwin"
+      : null;
+  }
+  return null;
+}
+
+async function getProcessStartIdentity(pid: number): Promise<string | null> {
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return null;
+  }
+  const checkedAt = process.uptime() * 1_000;
+  const cached = processIdentityCache.get(pid);
+  if (
+    cached !== undefined &&
+    (pid === process.pid ||
+      checkedAt - cached.checkedAt < PROCESS_IDENTITY_CACHE_MS)
+  ) {
+    // This process cannot reuse its own PID while it is running, so its
+    // identity is immutable and safe to cache for the module lifetime. This
+    // also prevents a PowerShell process from being launched on every poll.
+    return cached.value;
+  }
+
+  const pending = processIdentityLookups.get(pid);
+  if (pending !== undefined) {
+    return pending;
+  }
+
+  const lookup = readProcessStartIdentity(pid)
+    .catch(() => null)
+    .then((value) => {
+      processIdentityCache.set(pid, {
+        checkedAt: process.uptime() * 1_000,
+        value,
+      });
+      return value;
+    })
+    .finally(() => {
+      processIdentityLookups.delete(pid);
+    });
+  processIdentityLookups.set(pid, lookup);
+  return lookup;
+}
+
+async function readProcessStartIdentity(pid: number): Promise<string | null> {
+  if (process.platform === "linux") {
+    const raw = await readFile(`/proc/${pid}/stat`, "utf8");
+    // comm (field 2) is parenthesized and may itself contain spaces or ')'.
+    // Everything after its final ')' starts at field 3; starttime is field 22.
+    const commEnd = raw.lastIndexOf(")");
+    if (commEnd < 0) {
+      return null;
+    }
+    const fields = raw.slice(commEnd + 1).trim().split(/\s+/u);
+    const startTicks = fields[19];
+    return startTicks === undefined || !/^\d+$/u.test(startTicks)
+      ? null
+      : `linux:${startTicks}`;
+  }
+
+  if (process.platform === "win32") {
+    const script =
+      "$ErrorActionPreference='Stop';" +
+      `$p=Get-Process -Id ${pid};` +
+      "[Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks)";
+    const { stdout } = await execFileAsync(
+      "powershell.exe",
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+      {
+        encoding: "utf8",
+        timeout: 5_000,
+        windowsHide: true,
+      },
+    );
+    const ticks = stdout.trim();
+    return /^\d+$/u.test(ticks) ? `win32:${ticks}` : null;
+  }
+
+  if (process.platform === "darwin") {
+    const { stdout } = await execFileAsync(
+      "ps",
+      ["-p", String(pid), "-o", "lstart="],
+      {
+        encoding: "utf8",
+        env: { ...process.env, LC_ALL: "C" },
+        timeout: 5_000,
+      },
+    );
+    const startedAt = stdout.trim().replace(/\s+/gu, " ");
+    return startedAt.length === 0 ? null : `darwin:${startedAt}`;
+  }
+
+  return null;
 }

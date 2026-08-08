@@ -17,7 +17,10 @@ interface StoredLock {
   pid: number;
   token: string;
   createdAt: string;
+  processStartId?: string;
 }
+
+const DEFINITELY_DEAD_PID = 2_000_000_000;
 
 const renameHook = vi.hoisted(() => ({
   beforeRename: null as (() => Promise<void>) | null,
@@ -41,11 +44,16 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-function lockJson(token: string): string {
+function lockJson(
+  token: string,
+  pid = process.pid,
+  processStartId?: string,
+): string {
   return JSON.stringify({
-    pid: process.pid,
+    pid,
     token,
     createdAt: new Date().toISOString(),
+    ...(processStartId === undefined ? {} : { processStartId }),
   });
 }
 
@@ -69,6 +77,11 @@ describe("file lock", () => {
       }
       const stored = JSON.parse(await readFile(path, "utf8")) as StoredLock;
       expect(stored.pid).toBe(process.pid);
+      if (["darwin", "linux", "win32"].includes(process.platform)) {
+        expect(stored.processStartId).toMatch(
+          new RegExp(`^${process.platform}:`),
+        );
+      }
 
       await lock.release();
       await expect(readFile(path, "utf8")).rejects.toThrow();
@@ -91,12 +104,12 @@ describe("file lock", () => {
     }
   });
 
-  it("keeps a live lock whose heartbeat is ten minutes old", async () => {
+  it("keeps a legacy live lock even when its heartbeat is a day old", async () => {
     const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
     try {
       const path = join(root, "sync.lock");
       await writeFile(path, lockJson("holder"), "utf8");
-      await ageFile(path, 10 * 60_000);
+      await ageFile(path, 24 * 60 * 60_000);
 
       expect(await acquireFileLock(path)).toBeNull();
       const stored = JSON.parse(await readFile(path, "utf8")) as StoredLock;
@@ -106,12 +119,35 @@ describe("file lock", () => {
     }
   });
 
-  it("takes over a lock idle past the TTL", async () => {
+  it("keeps an identified live lock after sleep makes its heartbeat old", async () => {
     const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
     try {
       const path = join(root, "sync.lock");
-      await writeFile(path, lockJson("stale"), "utf8");
-      await ageFile(path, 16 * 60_000);
+      const held = await acquireFileLock(path);
+      if (held === null) {
+        throw new Error("Expected the free lock to be acquired.");
+      }
+      const before = JSON.parse(await readFile(path, "utf8")) as StoredLock;
+      await ageFile(path, 24 * 60 * 60_000);
+
+      expect(await acquireFileLock(path)).toBeNull();
+      const after = JSON.parse(await readFile(path, "utf8")) as StoredLock;
+      expect(after.token).toBe(before.token);
+      await held.release();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("takes over a lock whose holder PID is dead", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
+    try {
+      const path = join(root, "sync.lock");
+      await writeFile(
+        path,
+        lockJson("stale", DEFINITELY_DEAD_PID),
+        "utf8",
+      );
 
       const lock = await acquireFileLock(path);
       if (lock === null) {
@@ -121,6 +157,68 @@ describe("file lock", () => {
       expect(stored.token).not.toBe("stale");
       expect(stored.pid).toBe(process.pid);
       await lock.release();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("takes over an old lock when the live PID was reused", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
+    try {
+      const path = join(root, "sync.lock");
+      const probe = await acquireFileLock(path);
+      if (probe === null) {
+        throw new Error("Expected the free lock to be acquired.");
+      }
+      const current = JSON.parse(await readFile(path, "utf8")) as StoredLock;
+      await probe.release();
+      if (current.processStartId === undefined) {
+        // The module deliberately falls back to live-PID safety on an
+        // unsupported OS. Windows, Linux and macOS all provide an identity.
+        expect(["darwin", "linux", "win32"]).not.toContain(process.platform);
+        return;
+      }
+      const scheme = current.processStartId.slice(
+        0,
+        current.processStartId.indexOf(":"),
+      );
+      const reusedIdentity =
+        scheme === "darwin"
+          ? "darwin:Thu Jan 01 00:00:00 1970"
+          : `${scheme}:0`;
+      await writeFile(
+        path,
+        lockJson("reused", process.pid, reusedIdentity),
+        "utf8",
+      );
+      await ageFile(path, 16 * 60_000);
+
+      const replacement = await acquireFileLock(path);
+      if (replacement === null) {
+        throw new Error("Expected the recycled-PID lock to be taken over.");
+      }
+      const stored = JSON.parse(await readFile(path, "utf8")) as StoredLock;
+      expect(stored.token).not.toBe("reused");
+      await replacement.release();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed for an unrecognized process-start identity", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
+    try {
+      const path = join(root, "sync.lock");
+      await writeFile(
+        path,
+        lockJson("unknown-identity", process.pid, "future-format:opaque"),
+        "utf8",
+      );
+      await ageFile(path, 24 * 60 * 60_000);
+
+      expect(await acquireFileLock(path)).toBeNull();
+      const stored = JSON.parse(await readFile(path, "utf8")) as StoredLock;
+      expect(stored.token).toBe("unknown-identity");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -168,7 +266,11 @@ describe("file lock", () => {
     const root = await mkdtemp(join(tmpdir(), "cursor-sync-lock-"));
     try {
       const path = join(root, "sync.lock");
-      await writeFile(path, lockJson("stale"), "utf8");
+      await writeFile(
+        path,
+        lockJson("stale", DEFINITELY_DEAD_PID),
+        "utf8",
+      );
       await ageFile(path, 16 * 60_000);
 
       // Another contender wins the race: it replaces the stale lock with its

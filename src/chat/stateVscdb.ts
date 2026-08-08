@@ -1,5 +1,7 @@
 import type { DatabaseSync } from "../platform/sqlite";
 import { openDatabase } from "../platform/sqlite";
+import { createHash } from "node:crypto";
+import { open } from "node:fs/promises";
 import type {
   LocalProjection,
   ResourceDeletion,
@@ -9,6 +11,7 @@ import type {
 import type { CursorPaths } from "../platform/paths";
 import {
   canonicalBytes,
+  canonicalJson,
   isCanonicalBase64Text,
   sha256,
 } from "../protocol/canonical";
@@ -71,6 +74,35 @@ interface ChatIdentity {
   headerKey: SqliteRowValue;
 }
 
+interface SettledChatScan {
+  /** Main database plus WAL identity captured before the successful scan. */
+  databaseFingerprint: string;
+  /** Repository-side chat projections the scan compared against. */
+  knownFingerprint: string;
+  /** Narrows a repository-only change to the chats whose bodies need reading. */
+  projectionFingerprints: ReadonlyMap<string, string>;
+  /** Detects header edits for which Cursor left lastUpdatedAt unchanged. */
+  headerFingerprints: ReadonlyMap<string, string>;
+  /** Stable informational notices still need to remain visible to the UI. */
+  notices: readonly string[];
+}
+
+interface DeepVerificationSweep {
+  /** Index in the sorted, syncable composer IDs for the current pass. */
+  nextIndex: number;
+  /** A mutation during this pass requires one more complete pass. */
+  needsAnotherPass: boolean;
+  /** Last fingerprints observed, so new changes do not restart this pass. */
+  databaseFingerprint: string;
+  knownFingerprint: string;
+}
+
+interface PendingChatSnapshot {
+  semanticHash: string;
+  /** Database generation from which the returned snapshot was captured. */
+  databaseFingerprint: string;
+}
+
 type ChatCapture =
   | { kind: "missing" }
   | { kind: "unchanged" }
@@ -91,9 +123,91 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
   readonly kinds = ["chat"] as const;
   readonly appliesWhileRunning = false;
 
+  /** Last stable full header observation, whether or not it emitted work. */
+  private lastScan: SettledChatScan | null = null;
+  /** Observation eligible for the zero-SQLite idle shortcut. */
+  private settledScan: SettledChatScan | null = null;
+  /** Equal-count body verification, spread across bounded polling cycles. */
+  private deepVerificationSweep: DeepVerificationSweep | null = null;
+  /** Snapshots returned to the manager but not yet reflected by `known`. */
+  private readonly pendingSnapshots = new Map<string, PendingChatSnapshot>();
+
   constructor(private readonly paths: CursorPaths) {}
 
   async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
+    const databaseFingerprint = await stateVscdbFingerprint(
+      this.paths.globalDatabase,
+    );
+    const knownFingerprints = knownChatsFingerprints(known);
+    const knownFingerprint = knownFingerprints.combined;
+    const acknowledgedPendingSnapshots = new Set<string>();
+    for (const [resourceId, pending] of this.pendingSnapshots) {
+      const projection = known[resourceId];
+      if (
+        projection?.kind === "chat" &&
+        (projection.semanticHash === pending.semanticHash ||
+          projection.retainedLocalHash === pending.semanticHash)
+      ) {
+        if (pending.databaseFingerprint === databaseFingerprint) {
+          acknowledgedPendingSnapshots.add(resourceId);
+        }
+        this.pendingSnapshots.delete(resourceId);
+      }
+    }
+    const previousScan = this.lastScan;
+    const settledScan = this.settledScan;
+    if (
+      this.pendingSnapshots.size === 0 &&
+      this.deepVerificationSweep === null &&
+      settledScan?.databaseFingerprint === databaseFingerprint &&
+      settledScan.knownFingerprint === knownFingerprint
+    ) {
+      // A successful settled scan produced neither snapshots nor deletions. If
+      // neither side of that comparison moved, repeating synchronous SQLite
+      // work cannot produce a different answer. In particular this avoids
+      // waking a multi-gigabyte state.vscdb every thirty seconds while Cursor
+      // is idle. Notices are repeated because the standing-notice registry
+      // expects adapters to keep reporting conditions that remain true.
+      return {
+        snapshots: [],
+        deletions: [],
+        warnings: [],
+        notices: [...settledScan.notices],
+      };
+    }
+    // A scan that is about to touch SQLite invalidates the idle shortcut. The
+    // last stable observation remains available for narrow header/projection
+    // comparisons even when the preceding scan emitted a snapshot.
+    this.settledScan = null;
+    const isInitialScan = previousScan === null;
+    const databaseChangedSinceLastScan =
+      previousScan !== null &&
+      previousScan.databaseFingerprint !== databaseFingerprint;
+    if (isInitialScan || databaseChangedSinceLastScan) {
+      if (this.deepVerificationSweep === null) {
+        this.deepVerificationSweep = {
+          nextIndex: 0,
+          needsAnotherPass: false,
+          databaseFingerprint,
+          knownFingerprint,
+        };
+      }
+    }
+    const activeSweep = this.deepVerificationSweep;
+    if (
+      activeSweep !== null &&
+      (activeSweep.databaseFingerprint !== databaseFingerprint ||
+        activeSweep.knownFingerprint !== knownFingerprint)
+    ) {
+      // Finish the current pass instead of restarting at index zero. Cursor can
+      // append to the WAL every few seconds; resetting here would starve chats
+      // near the end forever. One follow-up pass over the latest stable state
+      // closes the gap once churn stops, while continuous churn still audits
+      // every chat round-robin.
+      activeSweep.needsAnotherPass = true;
+      activeSweep.databaseFingerprint = databaseFingerprint;
+      activeSweep.knownFingerprint = knownFingerprint;
+    }
     const workspaceUris = new Map(
       (await discoverWorkspaces(this.paths)).map((workspace) => [
         workspace.id,
@@ -107,7 +221,11 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
     const current = new Set<string>();
     const bodyless: string[] = [];
     const pruned: string[] = [];
+    const nonReconstructablePendingSnapshots = new Set<string>();
+    const headerFingerprints = new Map<string, string>();
     let identityUnknown = false;
+    let syncableResourceCount: number;
+    let sweepEndIndex: number;
     try {
       // Cursor writes to this database while it runs; wait out short lock
       // bursts instead of failing the whole sync cycle with SQLITE_BUSY.
@@ -116,42 +234,39 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
       // NULL = 0 is NULL, not true, so a composer whose late-added isSubagent
       // column was never backfilled must be matched explicitly or it silently
       // drops out of the scan and is published as a deletion.
-      // `lastUpdatedAt` is selected here as well so the steady state - every
-      // chat unchanged - is answered from this one query. Re-opening a
-      // transaction and re-reading the header row per composer, only to compare
-      // the same timestamp and roll straight back out, cost three statement
-      // executions per chat on every 30-second poll against a database Cursor
-      // is concurrently writing to.
+      // Every header column is selected because Cursor does not consistently
+      // advance lastUpdatedAt when it edits archive/title/recency fields. The
+      // table is small; fingerprinting these rows is cheap and prevents such an
+      // edit from hiding behind an unchanged timestamp and bubble count.
       const headers = database
         .prepare(
-          "SELECT composerId, lastUpdatedAt FROM composerHeaders WHERE COALESCE(isSubagent, 0) = 0",
+          "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, recency, checkpointAt, value " +
+            "FROM composerHeaders WHERE COALESCE(isSubagent, 0) = 0",
         )
-        .all() as Array<{
-        composerId: SqliteRowValue;
-        lastUpdatedAt: SqliteRowValue;
-      }>;
-      // How many messages each conversation currently holds, in one grouped
-      // pass rather than a COUNT per chat per poll.
-      //
-      // This is the half of the change signal that `lastUpdatedAt` does not
-      // provide: Cursor stamps the header once near the start of a conversation
-      // and then streams the remaining messages into `cursorDiskKV` without
-      // touching it, so a timestamp comparison alone reports "unchanged" for a
-      // chat that has grown from one message to sixty-three. See
-      // `LocalProjection.sourceBubbleCount`.
-      const bubbleCounts = new Map<string, number>();
-      for (const row of database
-        .prepare(
-          "SELECT substr(key, 10, instr(substr(key, 10), ':') - 1) AS composerId, COUNT(*) AS total " +
-            "FROM cursorDiskKV WHERE key >= 'bubbleId:' AND key < 'bubbleId;' GROUP BY composerId",
-        )
-        .all() as Array<{ composerId: SqliteRowValue; total: SqliteRowValue }>) {
-        const id = composerIdText(row.composerId);
-        const total = plainNumber(row.total);
-        if (id !== null && total !== null) {
-          bubbleCounts.set(id, total);
-        }
-      }
+        .all() as RawComposerHeader[];
+      const syncableResourceIds = [
+        ...new Set(
+          headers
+            .map((header) => composerIdText(header.composerId))
+            .filter(
+              (composerId): composerId is string =>
+                composerId !== null && COMPOSER_ID_PATTERN.test(composerId),
+            )
+            .map((composerId) => `chat/${composerId}`),
+        ),
+      ].sort();
+      syncableResourceCount = syncableResourceIds.length;
+      const sweepStartIndex = activeSweep?.nextIndex ?? 0;
+      sweepEndIndex =
+        activeSweep === null
+          ? 0
+          : Math.min(
+              syncableResourceIds.length,
+              sweepStartIndex + DEEP_VERIFICATION_BATCH_SIZE,
+            );
+      const deepVerificationIds = new Set(
+        syncableResourceIds.slice(sweepStartIndex, sweepEndIndex),
+      );
       const statements: ChatStatements = {
         header: database.prepare(
           "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, recency, checkpointAt, value FROM composerHeaders WHERE composerId = ? AND COALESCE(isSubagent, 0) = 0",
@@ -196,17 +311,40 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           current.add(resourceId);
           continue;
         }
+        const headerFingerprint = rawHeaderFingerprint(rawHeader);
+        headerFingerprints.set(resourceId, headerFingerprint);
         // Only a timestamp that is a real number carries change information, and
         // the projection has to already be a chat for the comparison to mean
         // anything. Anything else falls through to the transactional capture,
         // which is where the authoritative comparison still lives.
         const listedTimestamp = plainNumber(rawHeader.lastUpdatedAt);
+        const projection = known[resourceId];
+        const headerChangedSinceSettledScan =
+          previousScan !== null &&
+          previousScan.headerFingerprints.get(resourceId) !==
+            headerFingerprint;
+        const projectionChangedSinceSettledScan =
+          previousScan !== null &&
+          !acknowledgedPendingSnapshots.has(resourceId) &&
+          previousScan.projectionFingerprints.get(resourceId) !==
+            knownFingerprints.byResource.get(resourceId);
+        const bodyMustBeRead =
+          this.pendingSnapshots.has(resourceId) ||
+          deepVerificationIds.has(resourceId) ||
+          projectionChangedSinceSettledScan ||
+          headerChangedSinceSettledScan;
+        // Cursor usually advances lastUpdatedAt with a header edit, but not for
+        // every column in every release. A changed row fingerprint must
+        // therefore fall through to the transactional capture even if its
+        // timestamp and bubble count still match the projection.
         if (
+          !bodyMustBeRead &&
           listedTimestamp !== null &&
-          known[resourceId]?.kind === "chat" &&
-          known[resourceId]?.sourceTimestamp === listedTimestamp &&
-          known[resourceId]?.sourceBubbleCount ===
-            (bubbleCounts.get(composerId) ?? 0)
+          projection?.kind === "chat" &&
+          projection.sourceTimestamp === listedTimestamp &&
+          typeof projection.sourceBubbleCount === "number" &&
+          projection.sourceBubbleCount ===
+            currentBubbleCount(statements.bubbleCount, composerId)
         ) {
           current.add(resourceId);
           continue;
@@ -218,7 +356,16 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
             statements,
             { composerId, headerKey: rawHeader.composerId },
             known,
+            bodyMustBeRead,
           );
+          // Deep verification can materialize several megabytes of SQLite
+          // text and canonical JSON for one conversation. Yield between those
+          // exceptional body reads so the shared extension host can service
+          // Cursor and the other extensions instead of appearing frozen for
+          // one long synchronous burst.
+          if (bodyMustBeRead) {
+            await new Promise<void>((resolve) => setImmediate(resolve));
+          }
         } catch (error) {
           // One unusable row must never take the whole adapter down. The
           // resource stays in `current` so it is not published as a deletion.
@@ -235,6 +382,12 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         }
         current.add(resourceId);
         if (captured.kind === "unchanged") {
+          // A previously emitted snapshot can be superseded locally before the
+          // manager acknowledges it (for example Cursor/undo restores the
+          // repository version). Forced streaming verification proved the
+          // current bytes equal that known version, so the obsolete retry must
+          // not keep the zero-SQLite idle path disabled forever.
+          this.pendingSnapshots.delete(resourceId);
           continue;
         }
         // Aggregated rather than warned per chat: a body that never arrives is
@@ -242,6 +395,12 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         // forever. The IDs still travel with the count, because a body-less
         // header is also what a mass loss looks like.
         if (captured.kind === "incomplete") {
+          // A previously returned put can no longer be reconstructed from this
+          // database. Keep the repository's older complete copy and allow the
+          // adapter to settle instead of forcing this body-less row forever.
+          if (this.pendingSnapshots.has(resourceId)) {
+            nonReconstructablePendingSnapshots.add(resourceId);
+          }
           bodyless.push(composerId);
           continue;
         }
@@ -250,6 +409,9 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         // lost that this device can act on - it is the other computer's copy
         // being protected from this one's pruning.
         if (captured.kind === "pruned") {
+          if (this.pendingSnapshots.has(resourceId)) {
+            nonReconstructablePendingSnapshots.add(resourceId);
+          }
           pruned.push(`${composerId} (${captured.had} -> ${captured.has})`);
           continue;
         }
@@ -257,11 +419,32 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         const workspaceId = snapshot.header.workspaceId;
         const title = chatHeaderTitle(snapshot.header.value);
         const content = canonicalBytes(snapshot);
+        const semanticHash = sha256(content);
+        if (
+          projection?.kind === "chat" &&
+          (projection.semanticHash === semanticHash ||
+            projection.retainedLocalHash === semanticHash)
+        ) {
+          // A forced body verification must read exact bytes, but it need not
+          // retain and hand the unchanged (potentially huge) snapshot to the
+          // manager. The manager's publish policy makes the same two checks.
+          rememberObservedChatSource(
+            projection,
+            snapshot.header.lastUpdatedAt,
+            snapshot.bubbles.length,
+          );
+          this.pendingSnapshots.delete(resourceId);
+          continue;
+        }
+        this.pendingSnapshots.set(resourceId, {
+          semanticHash,
+          databaseFingerprint,
+        });
         snapshots.push({
           resourceId,
           kind: "chat",
           content,
-          semanticHash: sha256(content),
+          semanticHash,
           metadata: {
             composerId: snapshot.header.composerId,
             workspaceId,
@@ -285,12 +468,103 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
       database.close();
     }
 
-    return {
+    const candidateDeletions = identityUnknown
+      ? []
+      : findChatDeletions(known, current);
+    let afterDatabaseFingerprint: string | null = null;
+    let databaseStable = false;
+    try {
+      afterDatabaseFingerprint = await stateVscdbFingerprint(
+        this.paths.globalDatabase,
+      );
+      databaseStable = afterDatabaseFingerprint === databaseFingerprint;
+    } catch {
+      // Replacing or temporarily hiding the database after the header listing
+      // is indistinguishable from a concurrent mutation. Fail closed below.
+    }
+    if (databaseStable) {
+      for (const resourceId of nonReconstructablePendingSnapshots) {
+        this.pendingSnapshots.delete(resourceId);
+      }
+      for (const resourceId of this.pendingSnapshots.keys()) {
+        if (!current.has(resourceId)) {
+          // The pending put no longer describes local state. A stable missing
+          // header is represented by the deletion candidate below instead of
+          // replaying an obsolete snapshot forever.
+          this.pendingSnapshots.delete(resourceId);
+        }
+      }
+    }
+    // `scan` owns this projection object for the duration of the awaited call.
+    // Exact semantic verification above may have upgraded legacy source
+    // metadata in place, so the sweep must remember the post-upgrade value.
+    // Keeping its pre-scan fingerprint would mistake its own learning for an
+    // external repository change on the next poll and repeat the whole sweep.
+    const observedKnownFingerprints = knownChatsFingerprints(known);
+
+    if (activeSweep !== null) {
+      if (!databaseStable) {
+        activeSweep.needsAnotherPass = true;
+      }
+      activeSweep.databaseFingerprint =
+        afterDatabaseFingerprint ?? databaseFingerprint;
+      activeSweep.knownFingerprint = observedKnownFingerprints.combined;
+      if (sweepEndIndex >= syncableResourceCount) {
+        if (activeSweep.needsAnotherPass) {
+          // Complete the pass that was already in flight, then cover the
+          // latest generation from the beginning. This avoids starvation
+          // under a continuously growing WAL.
+          activeSweep.nextIndex = 0;
+          activeSweep.needsAnotherPass = false;
+        } else {
+          this.deepVerificationSweep = null;
+        }
+      } else {
+        activeSweep.nextIndex = sweepEndIndex;
+      }
+    }
+    const result: ResourceScanResult = {
       snapshots,
-      deletions: identityUnknown ? [] : findChatDeletions(known, current),
+      // A header inserted after the initial listing otherwise looks deleted.
+      // Tombstones are destructive and may only come from one settled view of
+      // the database; snapshots remain safe to publish from per-chat read
+      // transactions and are rechecked by semantic hash downstream.
+      deletions: databaseStable ? candidateDeletions : [],
       warnings,
       notices,
     };
+    const scanIsQuiet =
+      result.snapshots.length === 0 &&
+      result.deletions.length === 0 &&
+      result.warnings.length === 0;
+    let stableObservation: SettledChatScan | null = null;
+    if (databaseStable) {
+      stableObservation = {
+        databaseFingerprint,
+        knownFingerprint: observedKnownFingerprints.combined,
+        projectionFingerprints: observedKnownFingerprints.byResource,
+        headerFingerprints,
+        notices: [...notices],
+      };
+      // Pending snapshots above make unacknowledged puts reproducible even when
+      // a later quiet batch advances this baseline. Warnings remain untrusted:
+      // advancing past a malformed row could hide it behind timestamp/count.
+      if (result.warnings.length === 0) {
+        this.lastScan = stableObservation;
+      }
+    }
+    if (
+      scanIsQuiet &&
+      this.deepVerificationSweep === null &&
+      stableObservation !== null
+    ) {
+      // Fingerprint again after closing SQLite. If Cursor committed during the
+      // scan, caching the later file state against an earlier DB snapshot could
+      // hide that commit forever. Only equal before/after fingerprints are a
+      // settled observation; otherwise the next poll deliberately scans again.
+      this.settledScan = stableObservation;
+    }
+    return result;
   }
 
   async apply(_input: ResourceApplyInput): Promise<void> {
@@ -390,6 +664,7 @@ function captureChat(
   statements: ChatStatements,
   identity: ChatIdentity,
   known: Record<string, LocalProjection>,
+  forceCapture = false,
 ): ChatCapture {
   database.exec("BEGIN");
   try {
@@ -420,6 +695,7 @@ function captureChat(
       )?.total ?? 0,
     );
     if (
+      !forceCapture &&
       header.lastUpdatedAt !== null &&
       known[resourceId]?.kind === "chat" &&
       known[resourceId]?.sourceTimestamp === header.lastUpdatedAt &&
@@ -456,6 +732,31 @@ function captureChat(
       database.exec("COMMIT");
       return { kind: "pruned", had: knownCount, has: liveBubbleCount ?? 0 };
     }
+    if (forceCapture && known[resourceId]?.kind === "chat") {
+      // Equal timestamp/count verification is deliberately streamed. A real
+      // Cursor conversation can be tens of megabytes; materializing all rows,
+      // their Base64 copies, the sorted object graph and one giant canonical
+      // JSON buffer merely to prove that nothing changed caused large periodic
+      // CPU and RAM spikes. Hashing the exact same canonical byte sequence one
+      // row at a time keeps memory bounded by the largest single SQLite value.
+      const semanticHash = streamedChatSemanticHash(
+        header,
+        composerDataRow,
+        statements.bubbles.iterate(...bubbleRange) as Iterable<RawKvRow>,
+      );
+      if (
+        semanticHash === known[resourceId]?.semanticHash ||
+        semanticHash === known[resourceId]?.retainedLocalHash
+      ) {
+        database.exec("COMMIT");
+        rememberObservedChatSource(
+          known[resourceId],
+          header.lastUpdatedAt,
+          liveBubbleCount ?? 0,
+        );
+        return { kind: "unchanged" };
+      }
+    }
     const bubbleRows = statements.bubbles.all(...bubbleRange) as RawKvRow[];
     const snapshot: PortableChatSnapshot = {
       schemaVersion: 1,
@@ -473,6 +774,41 @@ function captureChat(
 }
 
 /**
+ * Hashes the canonical PortableChatSnapshot representation without retaining
+ * the complete conversation or its complete JSON serialization in memory.
+ *
+ * The literal member order below is the UTF-16 code-unit order enforced by
+ * `canonicalBytes`: bubbles, composerData, composerId, header, schemaVersion.
+ * Each nested object still goes through the canonical encoder, so escaping,
+ * nullable header fields and SQLite TEXT/BLOB/NULL distinctions remain byte
+ * for byte identical to the published snapshot format.
+ */
+function streamedChatSemanticHash(
+  header: PortableComposerHeader,
+  composerData: RawKvRow,
+  bubbles: Iterable<RawKvRow>,
+): string {
+  const hash = createHash("sha256");
+  hash.update('{"bubbles":[');
+  let first = true;
+  for (const bubble of bubbles) {
+    if (!first) {
+      hash.update(",");
+    }
+    first = false;
+    hash.update(canonicalJson(portableRow(bubble)));
+  }
+  hash.update('],"composerData":');
+  hash.update(canonicalJson(portableRow(composerData)));
+  hash.update(',"composerId":');
+  hash.update(canonicalJson(header.composerId));
+  hash.update(',"header":');
+  hash.update(canonicalJson(header));
+  hash.update(',"schemaVersion":1}');
+  return hash.digest("hex");
+}
+
+/**
  * Index-friendly bounds for every bubble row belonging to one composer.
  *
  * Cursor's keys use `bubbleId:<uuid>:<bubble>`. `:` and its immediate ASCII
@@ -483,6 +819,173 @@ function captureChat(
  */
 export function bubbleKeyRange(composerId: string): [string, string] {
   return [`bubbleId:${composerId}:`, `bubbleId:${composerId};`];
+}
+
+function currentBubbleCount(
+  statement: ChatStatement,
+  composerId: string,
+): number {
+  const total = plainNumber(
+    (
+      statement.get(...bubbleKeyRange(composerId)) as
+        | { total?: SqliteRowValue }
+        | undefined
+    )?.total ?? 0,
+  );
+  return total ?? 0;
+}
+
+/**
+ * Records a cheap future change signal only after exact semantic bytes were
+ * proven equal to the projection. This upgrades legacy projections in place
+ * without publishing hundreds of duplicate multi-megabyte chat snapshots.
+ */
+function rememberObservedChatSource(
+  projection: LocalProjection,
+  lastUpdatedAt: number | null,
+  bubbleCount: number,
+): void {
+  if (lastUpdatedAt === null) {
+    delete projection.sourceTimestamp;
+  } else {
+    projection.sourceTimestamp = lastUpdatedAt;
+  }
+  projection.sourceBubbleCount = bubbleCount;
+}
+
+/**
+ * O(1) change signal for the live SQLite file.
+ *
+ * Cursor uses WAL mode, so looking only at state.vscdb misses nearly every
+ * running-session commit. Size plus nanosecond timestamps and file identity for
+ * both files catches WAL append/reset/checkpoint and database replacement
+ * without opening SQLite or reading the multi-gigabyte database. `-shm` is
+ * deliberately absent: readers update it for lock coordination without
+ * changing durable data, which would defeat the idle fast path.
+ */
+async function stateVscdbFingerprint(databasePath: string): Promise<string> {
+  const [database, wal] = await Promise.all([
+    fileFingerprint(databasePath, false, 100),
+    fileFingerprint(`${databasePath}-wal`, true, 32),
+  ]);
+  return sha256(`${database}\n${wal}`);
+}
+
+async function fileFingerprint(
+  path: string,
+  optional: boolean,
+  headerLength: number,
+): Promise<string> {
+  let handle: Awaited<ReturnType<typeof open>> | null = null;
+  try {
+    handle = await open(path, "r");
+    const before = await handle.stat({ bigint: true });
+    const header = Buffer.allocUnsafe(headerLength);
+    let bytesRead = 0;
+    while (bytesRead < headerLength) {
+      const result = await handle.read(
+        header,
+        bytesRead,
+        headerLength - bytesRead,
+        bytesRead,
+      );
+      if (result.bytesRead === 0) {
+        break;
+      }
+      bytesRead += result.bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    return [
+      before.dev,
+      before.ino,
+      before.size,
+      before.mtimeNs,
+      before.ctimeNs,
+      before.birthtimeNs,
+      after.size,
+      after.mtimeNs,
+      after.ctimeNs,
+      sha256(header.subarray(0, bytesRead)),
+    ].join(":");
+  } catch (error) {
+    if (optional && errorCode(error) === "ENOENT") {
+      return "missing";
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return undefined;
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+interface KnownChatFingerprints {
+  combined: string;
+  byResource: ReadonlyMap<string, string>;
+}
+
+/** A repository projection change can alter the correct local scan result. */
+function knownChatsFingerprints(
+  known: Record<string, LocalProjection>,
+): KnownChatFingerprints {
+  const chats = Object.values(known)
+    .filter((projection) => projection.kind === "chat")
+    .sort((left, right) =>
+      left.resourceId < right.resourceId
+        ? -1
+        : left.resourceId > right.resourceId
+          ? 1
+          : 0,
+    );
+  return {
+    combined: sha256(canonicalBytes(chats)),
+    byResource: new Map(
+      chats.map((projection) => [
+        projection.resourceId,
+        sha256(canonicalBytes(projection)),
+      ]),
+    ),
+  };
+}
+
+function rawHeaderFingerprint(header: RawComposerHeader): string {
+  return sha256(
+    canonicalBytes(
+      [
+        header.composerId,
+        header.workspaceId,
+        header.createdAt,
+        header.lastUpdatedAt,
+        header.isArchived,
+        header.isSubagent,
+        header.recency,
+        header.checkpointAt,
+        header.value,
+      ].map(sqliteFingerprintPart),
+    ),
+  );
+}
+
+function sqliteFingerprintPart(value: SqliteRowValue): string {
+  if (value === null) {
+    return "null";
+  }
+  if (value instanceof Uint8Array) {
+    return `blob:${Buffer.from(value).toString("base64")}`;
+  }
+  if (typeof value === "bigint") {
+    return `bigint:${value.toString()}`;
+  }
+  if (typeof value === "number") {
+    return `number:${Object.is(value, -0) ? "-0" : value.toString()}`;
+  }
+  return `text:${value}`;
 }
 
 function normalizeHeader(
@@ -571,6 +1074,16 @@ function plainNumber(value: SqliteRowValue): number | null {
 const COMPOSER_ID_PATTERN =
   /^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/;
 const BODYLESS_SAMPLE_SIZE = 5;
+/**
+ * Bounds the fallback audit for equal-timestamp/equal-count edits.
+ *
+ * Normal chat growth is selected immediately by its header or bubble count.
+ * This round-robin exists only for the rare in-place edit that changes neither.
+ * Sixteen real conversations could allocate hundreds of MiB and monopolize an
+ * extension-host core for most of a 30-second poll; four retains eventual full
+ * coverage while keeping each burst small enough for interactive Cursor use.
+ */
+const DEEP_VERIFICATION_BATCH_SIZE = 4;
 
 /**
  * Whether a composer ID names a chat this build can carry between devices.
@@ -643,14 +1156,19 @@ function findChatDeletions(
   return Object.values(known)
     .filter(
       (projection) =>
-        projection.kind === "chat" && !current.has(projection.resourceId),
+        projection.kind === "chat" &&
+        !current.has(projection.resourceId) &&
+        // The repository projection can already be the deterministic
+        // tombstone produced by an earlier scan. Re-emitting that no-op on
+        // every poll prevented the adapter from ever becoming settled.
+        projection.semanticHash !== chatDeletionHash(projection.resourceId),
     )
     .map((projection) => {
       const composerId = projection.resourceId.slice("chat/".length);
       return {
         resourceId: projection.resourceId,
         kind: "chat",
-        semanticHash: sha256(`deleted:${projection.resourceId}`),
+        semanticHash: chatDeletionHash(projection.resourceId),
         metadata: {
           composerId,
           ...(projection.sourceTimestamp === undefined
@@ -659,4 +1177,8 @@ function findChatDeletions(
         },
       };
     });
+}
+
+function chatDeletionHash(resourceId: string): string {
+  return sha256(`deleted:${resourceId}`);
 }

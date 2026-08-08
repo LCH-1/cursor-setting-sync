@@ -173,16 +173,75 @@ describe("Repair Unavailable Chats command", () => {
       ).not.toContain(fixture.olderVersionId);
       const payload = JSON.parse(
         repaired.content?.toString("utf8") ?? "null",
-      ) as { header?: { value?: string }; bubbles?: Array<{ key?: string }> };
+      ) as {
+        header?: { value?: string };
+        bubbles?: Array<{ key?: string; valueBase64?: string }>;
+      };
       expect(payload.header?.value).toBe(JSON.stringify({ name: "Broken chat" }));
       expect(payload.bubbles?.map((bubble) => bubble.key)).toEqual([
         `bubbleId:${fixture.composerId}:a`,
         `bubbleId:${fixture.composerId}:b`,
         `bubbleId:${fixture.composerId}:c`,
       ]);
+      const preservedC = payload.bubbles?.find(
+        (bubble) => bubble.key === `bubbleId:${fixture.composerId}:c`,
+      );
+      expect(
+        Buffer.from(preservedC?.valueBase64 ?? "", "base64").toString("utf8"),
+      ).toBe(JSON.stringify({ text: "c" }));
       expect(
         ui.information.some((message) => message.includes("1 chat repair is queued")),
       ).toBe(true);
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
+
+  it("releases the planning lock before walking history payloads", async () => {
+    const fixture = await createRepairFixture();
+    try {
+      ui.warningChoice = "Queue Repair";
+      let firstLockReleased = false;
+      let lockCount = 0;
+      const internals = fixture.manager as unknown as {
+        takeCommandLock: () => Promise<{ release: () => Promise<void> }>;
+      };
+      internals.takeCommandLock = vi.fn(async () => {
+        lockCount += 1;
+        const thisLock = lockCount;
+        return {
+          release: async () => {
+            if (thisLock === 1) {
+              firstLockReleased = true;
+            }
+          },
+        };
+      });
+      const originalHistories =
+        fixture.repository.listReachableResourceHistories.bind(
+          fixture.repository,
+        );
+      const histories = vi
+        .spyOn(fixture.repository, "listReachableResourceHistories")
+        .mockImplementation(async (...args) => {
+          expect(firstLockReleased).toBe(true);
+          return originalHistories(...args);
+        });
+      const originalRead = fixture.repository.tryReadVersion.bind(
+        fixture.repository,
+      );
+      const reads = vi
+        .spyOn(fixture.repository, "tryReadVersion")
+        .mockImplementation(async (versionId) => {
+          expect(firstLockReleased).toBe(true);
+          return originalRead(versionId);
+        });
+
+      await fixture.manager.repairUnavailableChats();
+
+      expect(histories).toHaveBeenCalledOnce();
+      expect(reads).toHaveBeenCalled();
+      expect(lockCount).toBe(2);
     } finally {
       fixture.manager.dispose();
     }
@@ -213,7 +272,7 @@ async function createRepairFixture(): Promise<{
   const complete = await repository.publish(
     [
       {
-        ...repairChatSnapshot(composerId),
+        ...repairChatSnapshot(composerId, ["a", "b", "c"]),
         parents: [olderVersionId],
       },
     ],
@@ -222,10 +281,10 @@ async function createRepairFixture(): Promise<{
   await repository.publish(
     [
       {
-        // The newest partial version has an unreferenced row that must remain
-        // in the synthesized child even though the older complete source is
-        // the version that supplies missing referenced bubble b.
-        ...repairChatSnapshot(composerId, ["a", "c"]),
+        // The newest partial version has an unreferenced row. Selection only
+        // retains missing-key candidates, but the published repair must still
+        // preserve the older usable c for future peers when this copy is bad.
+        ...repairChatSnapshot(composerId, ["a", "c"], ["c"]),
         parents: [`${requiredHash(complete.eventHash)}#0`],
       },
     ],
@@ -316,7 +375,9 @@ async function createRepairFixture(): Promise<{
 function repairChatSnapshot(
   composerId: string,
   bubbleIds: string[] = ["a", "b"],
+  invalidBubbleIds: string[] = [],
 ): ResourceSnapshot {
+  const invalid = new Set(invalidBubbleIds);
   const content = canonicalBytes({
     schemaVersion: 1,
     composerId,
@@ -343,9 +404,10 @@ function repairChatSnapshot(
     },
     bubbles: bubbleIds.map((id) => ({
       key: `bubbleId:${composerId}:${id}`,
-      valueBase64: Buffer.from(JSON.stringify({ text: id }), "utf8").toString(
-        "base64",
-      ),
+      valueBase64: Buffer.from(
+        invalid.has(id) ? "not-json" : JSON.stringify({ text: id }),
+        "utf8",
+      ).toString("base64"),
       valueType: "text",
     })),
   });

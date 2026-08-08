@@ -115,6 +115,13 @@ interface CachedEvent {
   mtimeMs: number;
 }
 
+/** A checkpoint-filtered listing kept separate from full version history. */
+interface ReconciliationEventsCache {
+  cursorKey: string;
+  streams: Record<string, StreamCursor>;
+  events: DecryptedEvent[];
+}
+
 export interface PublishResult {
   eventHash: string | null;
   eventPath: string | null;
@@ -172,6 +179,20 @@ export interface PruneResult {
   warnings: string[];
 }
 
+/** Replaces, rather than overlays, an atomically loaded state snapshot. */
+function replaceLocalState(
+  target: LocalSyncState,
+  source: LocalSyncState,
+): void {
+  const mutable = target as unknown as Record<string, unknown>;
+  for (const key of Object.keys(mutable)) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) {
+      delete mutable[key];
+    }
+  }
+  Object.assign(target, source);
+}
+
 export class SyncRepository {
   private readonly eventKey: Buffer;
   private readonly objectKey: Buffer;
@@ -179,6 +200,8 @@ export class SyncRepository {
   private readonly checkpointKey: Buffer;
   /** Per-cycle memo of the sorted listing; cleared whenever state reloads. */
   private eventsCache: DecryptedEvent[] | null = null;
+  /** Per-cycle memo containing only events newer than one checkpoint cursor. */
+  private reconciliationEventsCache: ReconciliationEventsCache | null = null;
   /**
    * Every event file this process has already read, verified and decrypted,
    * keyed by `<deviceId>/<fileName>`. Event files are immutable and content
@@ -190,6 +213,12 @@ export class SyncRepository {
   private readonly decodedEvents = new Map<string, CachedEvent>();
   private checkpointManifestCache: { hash: string; manifest: CheckpointManifest } | null = null;
   private lastWrittenAck: { payload: string; writtenAt: number } | null = null;
+  /**
+   * Deferred extension-host opens load only atomic local state. Shared-folder
+   * recovery is armed later, after the caller owns the machine-wide sync lock.
+   */
+  private initialized = false;
+  private initializationInFlight: Promise<void> | null = null;
   /**
    * File names this device just wrote into the shared folder. The recursive
    * watcher cannot tell its own process's writes from a peer's, so every
@@ -240,6 +269,11 @@ export class SyncRepository {
 
   get pendingRecoveryError(): Error | null {
     return this.pendingRecovery;
+  }
+
+  /** Whether checkpoint absorption and own-stream recovery have completed. */
+  get isInitialized(): boolean {
+    return this.initialized;
   }
 
   /** True when this device wrote `fileName` moments ago. */
@@ -313,7 +347,7 @@ export class SyncRepository {
         maxPayloadBytes,
         producer,
       );
-      await instance.initializeDevice();
+      await instance.ensureInitializedFromLoadedState();
       return instance;
     } catch (error) {
       created.masterKey.fill(0);
@@ -379,8 +413,105 @@ export class SyncRepository {
       maxPayloadBytes,
       producer,
     );
-    await instance.initializeDevice();
+    await instance.ensureInitializedFromLoadedState();
     return instance;
+  }
+
+  /**
+   * Opens the cheap, read-only half of a configured repository.
+   *
+   * This validates the repository envelope, derives the in-memory keys and
+   * reads the atomically persisted local state, but deliberately does not scan
+   * shared checkpoints or this device's event directory and does not write
+   * repository state. Call {@link ensureInitialized} while holding sync.lock
+   * before any synchronization or maintenance operation.
+   */
+  static async openDeferredWithMasterKey(
+    root: string,
+    storageRoot: string,
+    repository: RepositoryFile,
+    masterKey: Buffer,
+    maxPayloadBytes: number,
+    producer: EventProducer,
+  ): Promise<SyncRepository> {
+    await assertRealDirectory(root);
+    validateRepositoryFile(repository);
+    if (masterKey.byteLength !== 32) {
+      throw new Error("Repository master key has an invalid length.");
+    }
+    const stateStore = new LocalStateStore(storageRoot);
+    // Deliberately avoid writes here. A missing local state file is recoverable
+    // (for example after extension storage was cleaned), but every Cursor
+    // window must not race to persist a different replacement device. Keep an
+    // unpersisted placeholder until the elected owner holds sync.lock; corrupt
+    // or otherwise invalid existing state still fails closed.
+    let state: LocalSyncState;
+    try {
+      state = await stateStore.load(repository.repositoryId);
+    } catch (error) {
+      if (!isMissingPathError(error)) {
+        throw error;
+      }
+      state = stateStore.createUnpersisted(repository.repositoryId);
+    }
+    return new SyncRepository(
+      root,
+      repository,
+      masterKey,
+      stateStore,
+      state,
+      maxPayloadBytes,
+      producer,
+    );
+  }
+
+  /**
+   * Completes a deferred open exactly once.
+   *
+   * The local state is reloaded first because another Cursor window may have
+   * completed a cycle after this instance's lightweight snapshot was read.
+   * Reloading under the caller's sync.lock prevents deferred followers from
+   * restoring that stale snapshot over newer projections or pending queues.
+   */
+  async ensureInitialized(): Promise<void> {
+    return this.initializeOnce(true);
+  }
+
+  /** Full create/open initializes the state snapshot loaded by that same call. */
+  private async ensureInitializedFromLoadedState(): Promise<void> {
+    return this.initializeOnce(false);
+  }
+
+  private async initializeOnce(reloadLocalState: boolean): Promise<void> {
+    if (this.initialized) {
+      return;
+    }
+    if (this.initializationInFlight !== null) {
+      return this.initializationInFlight;
+    }
+    const initialization = (async () => {
+      this.eventsCache = null;
+      this.reconciliationEventsCache = null;
+      if (reloadLocalState) {
+        // Recheck-or-create while the caller owns sync.lock. If activation used
+        // an unpersisted placeholder, exactly one owner now claims the device
+        // identity; followers subsequently reload that same atomic state.
+        const latest = await this.stateStore.loadOrCreate(
+          this.repository.repositoryId,
+        );
+        replaceLocalState(this.state, latest);
+      }
+      await this.initializeDevice();
+      this.initialized = true;
+    })();
+    this.initializationInFlight = initialization;
+    try {
+      await initialization;
+    } finally {
+      if (this.initializationInFlight === initialization) {
+        this.initializationInFlight = null;
+      }
+    }
   }
 
   async publish(
@@ -518,6 +649,15 @@ export class SyncRepository {
         compareDecryptedEvents,
       );
     }
+    if (
+      this.reconciliationEventsCache !== null &&
+      isEventAfterStreams(published, this.reconciliationEventsCache.streams)
+    ) {
+      this.reconciliationEventsCache.events = [
+        ...this.reconciliationEventsCache.events,
+        published,
+      ].sort(compareDecryptedEvents);
+    }
 
     this.state.nextSequence += 1;
     this.state.lamport = manifest.lamport;
@@ -548,6 +688,48 @@ export class SyncRepository {
     if (this.eventsCache !== null) {
       return [...this.eventsCache];
     }
+    const sorted = await this.scanEvents(null);
+    this.eventsCache = sorted;
+    return [...sorted];
+  }
+
+  /**
+   * Lists only events that reconciliation can still consume.
+   *
+   * Events at or below a checkpoint cursor are represented by the checkpoint
+   * manifest itself. Filtering their sequence from the directory entry name
+   * before stat/read/decrypt avoids walking the immutable folded history on
+   * every idle cycle. Full history and repair APIs continue to use
+   * {@link listEvents} and therefore retain every visible ancestor.
+   */
+  async listReconciliationEvents(
+    checkpoint: CheckpointManifest | null,
+  ): Promise<DecryptedEvent[]> {
+    if (checkpoint === null) {
+      return this.listEvents();
+    }
+    const cursorKey = sha256(canonicalBytes(checkpoint.streams));
+    if (this.reconciliationEventsCache?.cursorKey === cursorKey) {
+      return [...this.reconciliationEventsCache.events];
+    }
+
+    const events =
+      this.eventsCache === null
+        ? await this.scanEvents(checkpoint.streams)
+        : this.eventsCache.filter((event) =>
+            isEventAfterStreams(event, checkpoint.streams),
+          );
+    this.reconciliationEventsCache = {
+      cursorKey,
+      streams: cloneStreams(checkpoint.streams),
+      events,
+    };
+    return [...events];
+  }
+
+  private async scanEvents(
+    afterStreams: Record<string, StreamCursor> | null,
+  ): Promise<DecryptedEvent[]> {
     const devicesRoot = join(this.root, "devices");
     if (!(await pathExists(devicesRoot))) {
       return [];
@@ -575,7 +757,11 @@ export class SyncRepository {
       if (!(await pathExists(eventRoot))) {
         continue;
       }
-      const checkpointCursor = this.state.checkpoint?.streams[deviceEntry.name];
+      const afterCursor = afterStreams?.[deviceEntry.name];
+      const tolerablePruneCursor =
+        afterStreams === null
+          ? this.state.checkpoint?.streams[deviceEntry.name]
+          : undefined;
       const files = await readdir(eventRoot, { withFileTypes: true });
       for (const file of files) {
         if (
@@ -596,8 +782,18 @@ export class SyncRepository {
         ) {
           continue;
         }
-        const eventPath = join(eventRoot, file.name);
         const cacheKey = `${deviceEntry.name}/${file.name}`;
+        if (
+          afterCursor !== undefined &&
+          fileSequence <= afterCursor.lastSequence
+        ) {
+          // A folded event no longer needs to occupy the persistent decoded
+          // cache either. Crucially, this happens before even constructing a
+          // path for stat/read/decrypt.
+          this.decodedEvents.delete(cacheKey);
+          continue;
+        }
+        const eventPath = join(eventRoot, file.name);
         try {
           // One stat decides whether the already-verified decode can be reused.
           // Event files are immutable, so an unchanged size and mtime means the
@@ -636,8 +832,8 @@ export class SyncRepository {
           // partially propagated by another device's prune while this listing
           // runs; the checkpoint already covers their content.
           if (
-            checkpointCursor !== undefined &&
-            fileSequence <= checkpointCursor.lastSequence &&
+            tolerablePruneCursor !== undefined &&
+            fileSequence <= tolerablePruneCursor.lastSequence &&
             isTolerablePrunedEventError(error)
           ) {
             continue;
@@ -653,13 +849,66 @@ export class SyncRepository {
       }
     }
     const sorted = events.sort(compareDecryptedEvents);
-    this.eventsCache = sorted;
-    return [...sorted];
+    return sorted;
   }
 
   /** How many event files are currently visible, for the maintenance trigger. */
   async countEvents(): Promise<number> {
-    return (await this.listEvents()).length;
+    const devicesRoot = join(this.root, "devices");
+    let deviceEntries;
+    try {
+      deviceEntries = await readdir(devicesRoot, { withFileTypes: true });
+    } catch (error) {
+      if (isMissingPathError(error)) {
+        return 0;
+      }
+      throw error;
+    }
+    const retired = new Set(this.state.retiredDevices);
+    let count = 0;
+    for (const deviceEntry of deviceEntries) {
+      if (!deviceEntry.isDirectory() || !isSafeIdentifier(deviceEntry.name)) {
+        continue;
+      }
+      const retiredCursor = retired.has(deviceEntry.name)
+        ? this.state.streams[deviceEntry.name]
+        : undefined;
+      if (retired.has(deviceEntry.name) && retiredCursor === undefined) {
+        continue;
+      }
+      let files;
+      try {
+        files = await readdir(this.eventsRoot(deviceEntry.name), {
+          withFileTypes: true,
+        });
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          continue;
+        }
+        throw error;
+      }
+      for (const file of files) {
+        if (!file.isFile()) {
+          continue;
+        }
+        const match = EVENT_FILE_PATTERN.exec(file.name);
+        if (match === null) {
+          continue;
+        }
+        const sequence = Number(match[1]);
+        if (!Number.isSafeInteger(sequence) || sequence < 1) {
+          continue;
+        }
+        if (
+          retiredCursor !== undefined &&
+          sequence > retiredCursor.lastSequence
+        ) {
+          continue;
+        }
+        count += 1;
+      }
+    }
+    return count;
   }
 
   async readObject(reference: ObjectReference): Promise<Buffer> {
@@ -957,7 +1206,7 @@ export class SyncRepository {
     try {
       const persisted = await this.stateStore.load(this.repository.repositoryId);
       persisted.lastError = message;
-      Object.assign(this.state, persisted);
+      replaceLocalState(this.state, persisted);
       await this.stateStore.save(persisted);
       return;
     } catch {
@@ -970,8 +1219,9 @@ export class SyncRepository {
 
   async refreshState(): Promise<void> {
     this.eventsCache = null;
+    this.reconciliationEventsCache = null;
     const latest = await this.stateStore.load(this.repository.repositoryId);
-    Object.assign(this.state, latest);
+    replaceLocalState(this.state, latest);
     await this.absorbNewestCheckpoint();
     try {
       await this.recoverOwnStream();
@@ -994,7 +1244,7 @@ export class SyncRepository {
    * when the cursors move, or on a slow heartbeat so a long-idle device still
    * looks alive.
    */
-  async writeAck(): Promise<void> {
+  async writeAck(): Promise<boolean> {
     const body = {
       deviceId: this.state.device.deviceId,
       streams: this.state.streams,
@@ -1013,13 +1263,14 @@ export class SyncRepository {
       this.lastWrittenAck.payload === payload &&
       now - this.lastWrittenAck.writtenAt < ACK_HEARTBEAT_MS
     ) {
-      return;
+      return false;
     }
     await writeJsonAtomic(
       join(this.deviceRoot(this.state.device.deviceId), "acks.json"),
       { ...body, updatedAt: new Date(now).toISOString() },
     );
     this.lastWrittenAck = { payload, writtenAt: now };
+    return true;
   }
 
   async readDeviceAcks(deviceId: string): Promise<DeviceAcks | null> {
@@ -1363,6 +1614,7 @@ export class SyncRepository {
       }
     }
     this.eventsCache = null;
+    this.reconciliationEventsCache = null;
     this.decodedEvents.clear();
     this.checkpointManifestCache = null;
     let checkpointFilesDeleted = 0;
@@ -1833,6 +2085,7 @@ export class SyncRepository {
     };
     this.state.lamport = Math.max(this.state.lamport, winner.manifest.lamport);
     this.eventsCache = null;
+    this.reconciliationEventsCache = null;
     this.checkpointManifestCache = {
       hash: winner.hash,
       manifest: winner.manifest,
@@ -2333,6 +2586,17 @@ function compareDecryptedEvents(
     return deviceOrder;
   }
   return left.stored.header.sequence - right.stored.header.sequence;
+}
+
+/** Whether an event remains outside the history folded into these cursors. */
+function isEventAfterStreams(
+  event: DecryptedEvent,
+  streams: Record<string, StreamCursor>,
+): boolean {
+  const cursor = streams[event.stored.header.deviceId];
+  return (
+    cursor === undefined || event.stored.header.sequence > cursor.lastSequence
+  );
 }
 
 function pinnedOwnStream(state: LocalSyncState): StreamCursor {

@@ -2,6 +2,22 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.62] - 2026-08-08
+
+### Fixed
+
+- **Idle synchronization no longer walks the Git worktree every 30 seconds.** Background remote probes are spaced to five minutes, unchanged acknowledgement heartbeats do not rewrite the repository, and `git add/status/push` runs only for a due probe, a real publication, an acknowledgement write, or a manual sync. A failed Git window remains degraded until a real retry succeeds instead of being cleared by a skipped no-op poll.
+- **Opening several Cursor windows no longer serializes full repository recovery in every extension host.** Passive windows load only atomic local state and activate immediately; the elected owner performs checkpoint absorption and stream recovery once under `sync.lock`. Manual commands and owner failover initialize safely on demand, a missing local state file is recreated by exactly one owner, and overlapping configuration changes cannot install a stale repository or zero a key still in use.
+- **Chat polling no longer performs a global scan of every message row whenever Cursor touches its multi-gigabyte database.** A constant-size database/WAL fingerprint provides a zero-SQLite idle path, indexed per-conversation counts narrow ordinary growth, and rare same-count edits are verified in bounded round-robin batches. Verification hashes the canonical snapshot one SQLite row at a time, so an unchanged 49 MB conversation no longer requires a second full copy, a Base64 object graph, and one giant JSON buffer in memory. Legacy projections now remember the timestamp and message count learned by an exact verification instead of re-reading hundreds of unchanged conversations on every poll, and a local chat matching another current conflict tip is acknowledged as that exact version instead of being re-emitted forever. Changed snapshots are retried until the repository acknowledges them, while destructive deletions require one stable before/after database view.
+- **Checkpointed repositories no longer stat and retain every folded event during routine reconciliation.** Events covered by the authenticated checkpoint are skipped from their filename sequence before stat, read, or decrypt; full version history remains available to Restore and Repair. On the reported repository this reduces the normal reconcile set from 14,558 events to about 1,200 and releases the folded decoded-event cache.
+- **The shutdown finalizer no longer spawns `tasklist` twice per second after one window closes while other Cursor windows remain open.** Cancellation is still checked every 500 ms, but the operating-system process listing runs immediately on the owner-host exit edge and then at most once every 30 seconds.
+- **A live synchronization lock is never stolen merely because its heartbeat looks old after sleep, hibernation, a debugger pause, or long synchronous work.** New lock files carry the operating-system process start identity so genuine PID reuse still heals safely. Repository opens now wait for a real lock instead of falling back to an unlocked state write, and closing or reloading a waiting window cancels promptly.
+- **Automatic checkpoint maintenance lets an existing checkpoint reach the 24-hour prune gate.** It prunes the old checkpoint first and folds newer changes only after a successful prune, including when another device's acknowledgement arrives between the precheck and the guarded prune.
+
+### Changed
+
+- **`Repair Unavailable Chats` keeps its expensive live-database audit and history traversal outside the repository lock.** The final locked phase revalidates tips and the exact damage fingerprint, and the repair builds one complete newest-valid union so newer inert rows are preserved without holding every historical payload in memory.
+
 ## [0.0.61] - 2026-08-07
 
 ### Added

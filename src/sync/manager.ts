@@ -137,6 +137,7 @@ import {
   StateVscdbChatAdapter,
   isSyncableComposerId,
   parsePortableChatSnapshot,
+  type PortableKvRow,
 } from "../chat/stateVscdb";
 import { mergeChatSnapshotBuffers } from "../chat/chatMerge";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
@@ -229,6 +230,21 @@ import {
 
 const LAST_HELPER_BACKUPS_KEY = "lastHelperBackups";
 const ALWAYS_RELEVANT_FINALIZER = (): boolean => true;
+/**
+ * Git repositories need a remote probe because a fetch does not produce a
+ * filesystem event until it updates the worktree. Doing that probe on every
+ * thirty-second resource poll, however, turns an idle extension into a steady
+ * stream of git processes and network requests. User commands still force a
+ * pull; this only spaces the fallback background probe.
+ */
+export const BACKGROUND_GIT_PULL_INTERVAL_MS = 5 * 60_000;
+const OPEN_LOCK_WAIT_SLICE_MS = 1_000;
+const OPEN_LOCK_LOG_INTERVAL_MS = 60_000;
+
+export interface BackgroundGitPullAttempt {
+  root: string;
+  attemptedAt: number;
+}
 
 interface StoredHelperBackup {
   backupPath: string;
@@ -248,6 +264,55 @@ interface PlannedChatRepair {
   repairedBubbleCount: number;
 }
 
+/**
+ * Runs a state-mutating repository open only after its machine-wide lock is
+ * actually held.
+ *
+ * Each acquisition attempt may itself wait for a bounded interval so callers
+ * can report progress, but a timeout starts another attempt rather than
+ * silently converting the operation into an unlocked write. An operational
+ * acquire error is deliberately propagated: failing closed is safer than the
+ * stale-state overwrite this guard exists to prevent.
+ */
+export async function withRequiredFileLock<T>(
+  acquire: () => Promise<FileLock | null>,
+  run: () => Promise<T>,
+  shouldContinue: () => boolean = () => true,
+): Promise<T> {
+  for (;;) {
+    if (!shouldContinue()) {
+      throw new Error("Repository opening was cancelled before the synchronization lock became available.");
+    }
+    const lock = await acquire();
+    if (lock === null) {
+      continue;
+    }
+    if (!shouldContinue()) {
+      await lock.release();
+      throw new Error("Repository opening was cancelled before the synchronization lock became available.");
+    }
+    try {
+      return await run();
+    } finally {
+      await lock.release();
+    }
+  }
+}
+
+/** Whether the fallback background Git probe is due for this repository. */
+export function backgroundGitPullDue(
+  previous: BackgroundGitPullAttempt | null,
+  root: string,
+  now: number,
+  intervalMs = BACKGROUND_GIT_PULL_INTERVAL_MS,
+): boolean {
+  return (
+    previous === null ||
+    previous.root !== root ||
+    now < previous.attemptedAt ||
+    now - previous.attemptedAt >= intervalMs
+  );
+}
 
 export interface AdapterScanIndex {
   snapshots: Map<string, ResourceSnapshot>;
@@ -262,6 +327,8 @@ export type SyntheticApplyDecision =
 export class SyncManager implements vscode.Disposable {
   private repository: SyncRepository | null = null;
   private masterKey: Buffer | null = null;
+  /** Invalidates a configured deferred-open that a newer lifecycle won. */
+  private configuredOpenGeneration = 0;
   private adapters: ResourceAdapter[] = [];
   private repositoryWatcher: RepositoryWatcher | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
@@ -314,6 +381,16 @@ export class SyncManager implements vscode.Disposable {
   private readonly gitWarningsShown = new Set<GitErrorKind>();
   /** The LAST git window's outcome; recovers on success, unlike the toast set. */
   private lastGitWindowDegraded = false;
+  /** Last remote probe, shared by both background poll scopes in this window. */
+  private backgroundGitPullAttempt: BackgroundGitPullAttempt | null = null;
+  /** Avoids a `git rev-parse` subprocess on every throttled background poll. */
+  private backgroundGitModeCheck: {
+    root: string;
+    checkedAt: number;
+    active: boolean;
+  } | null = null;
+  /** A known-diverged worktree must stay fail-closed until a pull succeeds. */
+  private readonly backgroundGitConflicts = new Map<string, GitError>();
   private readonly warnings = new StandingWarningRegistry();
   /**
    * Deliberate exclusions, kept in their own registry.
@@ -355,6 +432,8 @@ export class SyncManager implements vscode.Disposable {
    * Re-enables the queued-apply offer for this session; see where it is read.
    */
   private shutdownApplyInterrupted = false;
+  /** Launch-time queue offer waits until deferred state has been refreshed. */
+  private launchApplyOfferPending = false;
   /**
    * Whether the queued-apply offer has already been turned down this session.
    *
@@ -433,7 +512,9 @@ export class SyncManager implements vscode.Disposable {
       this.status.setStatus("locked");
       return;
     }
-    await this.openConfiguredRepository(masterKey);
+    if (!(await this.openConfiguredRepository(masterKey))) {
+      return;
+    }
     if (!this.configuration.enabled) {
       // Configured, unlocked, and deliberately paused. Leaving the constructor
       // default in place made the status bar read "Setup" on every restart and
@@ -441,21 +522,9 @@ export class SyncManager implements vscode.Disposable {
       this.status.setStatus("disabled");
       return;
     }
+    this.launchApplyOfferPending = true;
     await this.startWatching(true);
-    // Last, and guarded: activation is finished by the lines above, and an
-    // offer that threw - a lock it could not take, a quit that failed - must
-    // not take the poll timer and the finalizer down with it.
-    if (this.backgroundCoordinator.active) {
-      try {
-        await this.offerQueuedApply("launch");
-      } catch (error) {
-        this.status.log(
-          `Could not offer to apply the queued changes: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      }
-    }
+    await this.maybeOfferQueuedApplyAtLaunch();
   }
 
   async configurationChanged(): Promise<void> {
@@ -470,6 +539,7 @@ export class SyncManager implements vscode.Disposable {
       return;
     }
     await this.startWatching(true);
+    await this.maybeOfferQueuedApplyAtLaunch();
   }
 
   async setup(): Promise<void> {
@@ -600,6 +670,7 @@ export class SyncManager implements vscode.Disposable {
       }
       throw error;
     }
+    ++this.configuredOpenGeneration;
     await this.backgroundCoordinator.stop();
     try {
       // A polling cycle can already be past its timer callback when teardown
@@ -660,6 +731,7 @@ export class SyncManager implements vscode.Disposable {
     // this notice names files that may carry API keys.
     this.status.log(configured);
     void vscode.window.showInformationMessage(configured);
+    this.launchApplyOfferPending = false;
     await this.offerQueuedApply("setup");
   }
 
@@ -685,6 +757,31 @@ export class SyncManager implements vscode.Disposable {
    * Self-limiting rather than rate-limited: it can only appear while something
    * is genuinely waiting, and applying is what makes it stop.
    */
+  private async maybeOfferQueuedApplyAtLaunch(): Promise<void> {
+    const repository = this.repository;
+    if (
+      !this.launchApplyOfferPending ||
+      !this.backgroundCoordinator.active ||
+      repository === null ||
+      !repository.isInitialized
+    ) {
+      return;
+    }
+    // One attempt per launch. A stale deferred snapshot never reaches the
+    // prompt; a first cycle skipped on a busy sync.lock leaves the flag armed
+    // and the next successful owner cycle retries after releasing that lock.
+    this.launchApplyOfferPending = false;
+    try {
+      await this.offerQueuedApply("launch");
+    } catch (error) {
+      this.status.log(
+        `Could not offer to apply the queued changes: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   private async offerQueuedApply(occasion: "setup" | "launch"): Promise<void> {
     const repository = this.repository;
     if (repository === null || this.queuedApplyDeclined) {
@@ -896,6 +993,7 @@ export class SyncManager implements vscode.Disposable {
     // Stop the timers first, then let an in-flight cycle finish before the
     // repository is dropped. Tearing down underneath it would publish into the
     // shared folder after the user was told this device had disconnected.
+    ++this.configuredOpenGeneration;
     await this.backgroundCoordinator.stop();
     if (this.reconnectProbeTimer !== null) {
       clearTimeout(this.reconnectProbeTimer);
@@ -1090,7 +1188,7 @@ export class SyncManager implements vscode.Disposable {
           // asked for failed with "another Cursor window is synchronizing"
           // about this window's own poll. Waiting is shown rather than silent.
           phase(report, "Taking the synchronization lock...");
-          const lock = await this.takeCommandLock((message) =>
+          const lock = await this.takeCommandLock(repository, (message) =>
             phase(report, message),
           );
           try {
@@ -1296,6 +1394,7 @@ export class SyncManager implements vscode.Disposable {
     // second cancel from whoever observes the marker, that exporter performs
     // one final export into a repository the device just left.
     await this.helper.cancelFinalizers();
+    ++this.configuredOpenGeneration;
     this.repository = null;
     this.masterKey?.fill(0);
     this.masterKey = null;
@@ -1348,12 +1447,13 @@ export class SyncManager implements vscode.Disposable {
           const root = this.configuration.repositoryPath;
           const masterKey = await this.configuration.getMasterKey();
           if (root !== null && masterKey !== null) {
-            await this.openConfiguredRepository(masterKey);
-            await this.startWatching(true);
-            this.status.log(
-              "Reconnected after another window's Setup; synchronization resumed in this window.",
-            );
-            return;
+            if (await this.openConfiguredRepository(masterKey)) {
+              await this.startWatching(true);
+              this.status.log(
+                "Reconnected after another window's Setup; synchronization resumed in this window.",
+              );
+              return;
+            }
           }
         } catch (error) {
           this.status.log(
@@ -1477,7 +1577,7 @@ export class SyncManager implements vscode.Disposable {
       "Cursor Setting Sync",
       async (report) => {
         report("Opening the conflict resolver...");
-        return this.takeCommandLock(report);
+        return this.takeCommandLock(repository, report);
       },
     );
     try {
@@ -1527,6 +1627,7 @@ export class SyncManager implements vscode.Disposable {
         throw await this.synchronizationBusyError();
       }
       try {
+        await repository.ensureInitialized();
         const gitActive = await this.openGitWindow(repository);
         await repository.refreshState();
         const applied = await this.conflicts.applySelections(
@@ -1537,10 +1638,11 @@ export class SyncManager implements vscode.Disposable {
         resolution.deferred.push(...applied.deferred);
         if (applied.resolved > 0) {
           const reconciler = new EventReconciler();
+          const checkpoint = await absorbedCheckpointManifest(repository);
           const result = reconciler.reconcile(
-            await repository.listEvents(),
+            await repository.listReconciliationEvents(checkpoint),
             repository.state,
-            await absorbedCheckpointManifest(repository),
+            checkpoint,
           );
           await this.applySyntheticProjectionsBeforeScan(
             repository,
@@ -1598,25 +1700,47 @@ export class SyncManager implements vscode.Disposable {
     }
     assertCompatibleForDatabaseWrite(this.compatibility);
 
-    let observations: BrokenChatObservation[];
+    // The live database walk can take minutes on a multi-gigabyte state.vscdb
+    // and does not touch repository state. Keep it outside sync.lock so other
+    // windows can continue their normal cycles while this command only reads.
+    const inspection = await this.withProgress(
+      "Cursor Setting Sync",
+      async (report) => {
+        report("Checking which chat messages are unavailable...");
+        return inspectBrokenCursorChats(this.paths);
+      },
+    );
+    const observations = inspection.broken;
+    if (observations.length === 0) {
+      void vscode.window.showInformationMessage(
+        `Checked ${inspection.examinedChats} Cursor conversations. No referenced chat messages are unavailable.`,
+      );
+      return;
+    }
+
     const plans: PlannedChatRepair[] = [];
     let alreadyQueued = 0;
+    let historyCheckpoint: CheckpointManifest | null;
+    let acceptedHistoryEventHashes: Set<string>;
+    const historyResourceIds = new Set<string>();
+    const historyRoots = new Map<string, string[]>();
+    const eligibleTips = new Map<string, ResourceTip[]>();
     const inspectionLock = await this.withProgress(
       "Cursor Setting Sync",
       async (report) => {
-        report("Synchronizing and checking chat references...");
-        return this.takeCommandLock(report);
+        report("Refreshing synchronized chat history...");
+        return this.takeCommandLock(repository, report);
       },
     );
     try {
       await this.openGitWindow(repository);
       await repository.refreshState();
-      const checkpoint = await absorbedCheckpointManifest(repository);
+      historyCheckpoint = await absorbedCheckpointManifest(repository);
       const reconciledState = structuredClone(repository.state);
       const reconciliation = new EventReconciler().reconcile(
         await repository.listEvents(),
         reconciledState,
-        checkpoint,
+        historyCheckpoint,
       );
       if (reconciliation.warnings.length > 0) {
         this.status.log(
@@ -1628,39 +1752,7 @@ export class SyncManager implements vscode.Disposable {
         return;
       }
       Object.assign(repository.state, reconciledState);
-      const inspection = await this.withProgress(
-        "Cursor Setting Sync",
-        async (report) => {
-          report("Checking which chat messages are unavailable...");
-          return inspectBrokenCursorChats(this.paths);
-        },
-      );
-      observations = inspection.broken;
-      if (observations.length === 0) {
-        void vscode.window.showInformationMessage(
-          `Checked ${inspection.examinedChats} Cursor conversations. No referenced chat messages are unavailable.`,
-        );
-        return;
-      }
-
-      const resourceIds = new Set(
-        observations.map((observation) => observation.resourceId),
-      );
-      const roots = new Map<string, string[]>();
-      for (const observation of observations) {
-        roots.set(
-          observation.resourceId,
-          (repository.state.tips[observation.resourceId] ?? []).map(
-            (tip) => tip.versionId,
-          ),
-        );
-      }
-      const histories = await repository.listReachableResourceHistories(
-        resourceIds,
-        roots,
-        new Set(reconciliation.acceptedEventHashes),
-        checkpoint,
-      );
+      acceptedHistoryEventHashes = new Set(reconciliation.acceptedEventHashes);
       const conflicted = new Set(
         repository.state.conflicts
           .filter((conflict) => conflict.resolvedAt === undefined)
@@ -1694,101 +1786,124 @@ export class SyncManager implements vscode.Disposable {
           alreadyQueued += 1;
           continue;
         }
-        // Histories are newest-first. Keep only the unavailable rows carried
-        // by newer partial versions, then stop as soon as the first version
-        // carrying every unavailable row is found. Reading older payloads
-        // cannot improve that choice, and retaining whole chat snapshots here
-        // made a long conversation's complete history a temporary RAM copy.
-        const unavailableKeys = new Set(observation.unavailableBubbleKeys);
-        const newerPartialCandidates: ChatRepairCandidate[] = [];
-        let repair: Extract<
-          ReturnType<typeof buildChatRepairSnapshot>,
-          { status: "repairable" }
-        > | null = null;
-        for (const summary of histories.get(observation.resourceId) ?? []) {
-          if (
-            summary.kind !== "chat" ||
-            summary.operation !== "put" ||
-            databaseApplyBlockReason(
-                summary.kind,
-                effectiveVersionProducer(summary.metadata, summary.producer),
-                this.compatibility,
-              ) !== null
-          ) {
-            continue;
-          }
-          const data = await repository.tryReadVersion(summary.versionId);
-          if (
-            data === null ||
-            data.content === null ||
-            data.change.resourceId !== observation.resourceId ||
-            data.change.kind !== "chat" ||
-            data.change.operation !== "put" ||
-            sha256(data.content) !== data.change.semanticHash
-          ) {
-            continue;
-          }
-          try {
-            const stored = parsePortableChatSnapshot(data.content);
-            if (stored.composerId !== observation.composerId) {
-              continue;
-            }
-            // buildChatRepairSnapshot only consults a candidate's composer ID
-            // and bubble rows. Reuse the live lightweight envelope and retain
-            // only rows whose identities participate in repair/disagreement.
-            const candidate: ChatRepairCandidate = {
-              versionId: summary.versionId,
-              snapshot: {
-                ...observation.snapshot,
-                bubbles: stored.bubbles.filter((row) =>
-                  unavailableKeys.has(row.key)
-                ),
-              },
-            };
-            const candidateAlone = buildChatRepairSnapshot(
-              observation.snapshot,
-              [candidate],
-            );
-            if (candidateAlone.status !== "repairable") {
-              newerPartialCandidates.push(candidate);
-              continue;
-            }
-            newerPartialCandidates.push(candidate);
-            const withNewerDisagreementCheck = buildChatRepairSnapshot(
-              observation.snapshot,
-              newerPartialCandidates,
-            );
-            if (withNewerDisagreementCheck.status === "repairable") {
-              repair = withNewerDisagreementCheck;
-            }
-            // This is the newest complete source. If a newer partial version
-            // disagreed, older versions cannot make that ambiguity safe.
-            break;
-          } catch {
-            // An unreadable historical payload is not a recovery source. The
-            // next trusted version may still contain every missing row.
-          }
-        }
-        if (repair === null) {
-          continue;
-        }
-        plans.push({
-          resourceId: observation.resourceId,
-          label: chatRepairLabel(observation),
-          expectedTipIds: tips.map((candidate) => candidate.versionId).sort(),
-          fingerprint: observation.fingerprint,
-          candidateVersionIds: newerPartialCandidates.map(
-            (candidate) => candidate.versionId,
-          ),
-          sourceVersionId: repair.sourceVersionId,
-          repairedBubbleCount: repair.repairedBubbleCount,
-        });
+        // Capture immutable identities under the lock. History events and
+        // payload objects are content-addressed, so their comparatively slow
+        // traversal can run after release; the second phase revalidates these
+        // exact tips and the live damage fingerprint before publishing.
+        const capturedTips = [...tips];
+        eligibleTips.set(observation.resourceId, capturedTips);
+        historyResourceIds.add(observation.resourceId);
+        historyRoots.set(
+          observation.resourceId,
+          capturedTips.map((candidate) => candidate.versionId),
+        );
       }
       if (alreadyQueued > 0) {
         await repository.saveState();
       }
     } finally {
       await inspectionLock.release();
+    }
+
+    // Walking every accepted event and decrypting candidate payloads is the
+    // expensive half of planning. It is read-only and bounded to the captured
+    // roots above, so it belongs outside the machine-wide write lock.
+    const histories =
+      historyResourceIds.size === 0
+        ? new Map<string, ResourceHistoryEntry[]>()
+        : await repository.listReachableResourceHistories(
+            historyResourceIds,
+            historyRoots,
+            acceptedHistoryEventHashes,
+            historyCheckpoint,
+          );
+    for (const observation of observations) {
+      const tips = eligibleTips.get(observation.resourceId);
+      if (tips === undefined) {
+        continue;
+      }
+      // Histories are newest-first. Keep only the unavailable rows carried by
+      // newer partial versions, then stop as soon as the first version carrying
+      // every unavailable row is found. Reading older payloads cannot improve
+      // that choice, and retaining whole chat snapshots here made a long
+      // conversation's complete history a temporary RAM copy.
+      const unavailableKeys = new Set(observation.unavailableBubbleKeys);
+      const newerPartialCandidates: ChatRepairCandidate[] = [];
+      let repair: Extract<
+        ReturnType<typeof buildChatRepairSnapshot>,
+        { status: "repairable" }
+      > | null = null;
+      for (const summary of histories.get(observation.resourceId) ?? []) {
+        if (
+          summary.kind !== "chat" ||
+          summary.operation !== "put" ||
+          databaseApplyBlockReason(
+            summary.kind,
+            effectiveVersionProducer(summary.metadata, summary.producer),
+            this.compatibility,
+          ) !== null
+        ) {
+          continue;
+        }
+        const data = await repository.tryReadVersion(summary.versionId);
+        if (
+          data === null ||
+          data.content === null ||
+          data.change.resourceId !== observation.resourceId ||
+          data.change.kind !== "chat" ||
+          data.change.operation !== "put" ||
+          sha256(data.content) !== data.change.semanticHash
+        ) {
+          continue;
+        }
+        try {
+          const candidate = chatRepairCandidateForUnavailableRows(
+            summary.versionId,
+            data.content,
+            observation,
+            unavailableKeys,
+          );
+          if (candidate === null) {
+            continue;
+          }
+          const candidateAlone = buildChatRepairSnapshot(
+            observation.snapshot,
+            [candidate],
+          );
+          if (candidateAlone.status !== "repairable") {
+            newerPartialCandidates.push(candidate);
+            continue;
+          }
+          newerPartialCandidates.push(candidate);
+          const withNewerDisagreementCheck = buildChatRepairSnapshot(
+            observation.snapshot,
+            newerPartialCandidates,
+          );
+          if (withNewerDisagreementCheck.status === "repairable") {
+            repair = withNewerDisagreementCheck;
+          }
+          // This is the newest complete source. If a newer partial version
+          // disagreed, older versions cannot make that ambiguity safe.
+          break;
+        } catch {
+          // An unreadable historical payload is not a recovery source. The
+          // next trusted version may still contain every missing row.
+        }
+      }
+      if (repair === null) {
+        continue;
+      }
+      plans.push({
+        resourceId: observation.resourceId,
+        label: chatRepairLabel(observation),
+        expectedTipIds: tips.map((candidate) => candidate.versionId).sort(),
+        fingerprint: observation.fingerprint,
+        candidateVersionIds: newerPartialCandidates.map(
+          (candidate) => candidate.versionId,
+        ),
+        sourceVersionId: repair.sourceVersionId,
+        repairedBubbleCount: repair.repairedBubbleCount,
+      });
     }
 
     if (plans.length === 0) {
@@ -1838,13 +1953,30 @@ export class SyncManager implements vscode.Disposable {
       return;
     }
 
+    // Re-read the live database after the modal, but do not monopolize the
+    // repository lock while SQLite walks it. The originating offline helper
+    // performs the definitive fingerprint check again in the write
+    // transaction, so a chat changing after this read still fails closed.
+    const freshInspection = await this.withProgress(
+      "Cursor Setting Sync",
+      async (report) => {
+        report("Rechecking unavailable chat messages...");
+        return inspectBrokenCursorChats(this.paths);
+      },
+    );
+    const freshByResource = new Map(
+      freshInspection.broken.map((observation) => [
+        observation.resourceId,
+        observation,
+      ]),
+    );
     const publishedRepairResourceIds: string[] = [];
     let changedWhileConfirming = 0;
     const applyLock = await this.withProgress(
       "Cursor Setting Sync",
       async (report) => {
         report("Rechecking chat repairs before publishing...");
-        return this.takeCommandLock(report);
+        return this.takeCommandLock(repository, report);
       },
     );
     try {
@@ -1880,13 +2012,6 @@ export class SyncManager implements vscode.Disposable {
         return;
       }
       Object.assign(repository.state, freshState);
-      const freshInspection = await inspectBrokenCursorChats(this.paths);
-      const freshByResource = new Map(
-        freshInspection.broken.map((observation) => [
-          observation.resourceId,
-          observation,
-        ]),
-      );
       const snapshots: ResourceSnapshot[] = [];
       for (const plan of plans) {
         const observation = freshByResource.get(plan.resourceId);
@@ -1909,6 +2034,8 @@ export class SyncManager implements vscode.Disposable {
           continue;
         }
         const candidates: ChatRepairCandidate[] = [];
+        const retainedRows = new Map<string, PortableKvRow>();
+        const unavailableKeys = new Set(observation.unavailableBubbleKeys);
         let candidateInvalid = false;
         for (const versionId of plan.candidateVersionIds) {
           const source = await repository.tryReadVersion(versionId);
@@ -1920,31 +2047,58 @@ export class SyncManager implements vscode.Disposable {
             source.change.operation !== "put" ||
             sha256(source.content) !== source.change.semanticHash ||
             databaseApplyBlockReason(
-                "chat",
-                effectiveVersionProducer(source.change.metadata, source.producer),
-                this.compatibility,
-              ) !== null
+              "chat",
+              effectiveVersionProducer(source.change.metadata, source.producer),
+              this.compatibility,
+            ) !== null
           ) {
             candidateInvalid = true;
             break;
           }
           try {
-            const candidate = parsePortableChatSnapshot(source.content);
-            if (candidate.composerId !== observation.composerId) {
+            // Parse one full payload at a time. The decision candidates retain
+            // only missing keys, while a single newest-usable Map preserves
+            // the full trusted union required by new peers and checkpoints.
+            // Peak memory is therefore the final union plus one parsed payload,
+            // not candidate count times the entire conversation size.
+            const parsed = parseChatRepairCandidate(
+              versionId,
+              source.content,
+              observation,
+              unavailableKeys,
+            );
+            if (parsed === null) {
               candidateInvalid = true;
               break;
             }
-            candidates.push({ versionId, snapshot: candidate });
+            retainNewestUsableChatRows(retainedRows, parsed.rows);
+            candidates.push(parsed.candidate);
           } catch {
             candidateInvalid = true;
             break;
           }
         }
-        const rebuilt = candidateInvalid
+        const decision = candidateInvalid
           ? null
           : buildChatRepairSnapshot(observation.snapshot, candidates);
         if (
-          rebuilt === null ||
+          decision === null ||
+          decision.status !== "repairable" ||
+          decision.sourceVersionId !== plan.sourceVersionId
+        ) {
+          changedWhileConfirming += 1;
+          continue;
+        }
+        const rebuilt = buildChatRepairSnapshot(observation.snapshot, [
+          {
+            versionId: decision.sourceVersionId,
+            snapshot: {
+              ...observation.snapshot,
+              bubbles: [...retainedRows.values()],
+            },
+          },
+        ]);
+        if (
           rebuilt.status !== "repairable" ||
           rebuilt.sourceVersionId !== plan.sourceVersionId
         ) {
@@ -2016,7 +2170,7 @@ export class SyncManager implements vscode.Disposable {
       "Cursor Setting Sync",
       async (report) => {
         report("Reading version history...");
-        return this.takeCommandLock(report);
+        return this.takeCommandLock(repository, report);
       },
     );
     try {
@@ -2283,7 +2437,7 @@ export class SyncManager implements vscode.Disposable {
     if (confirmed !== "Restore Version") {
       return;
     }
-    const lock = await this.takeCommandLock();
+    const lock = await this.takeCommandLock(repository);
     try {
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
@@ -2725,7 +2879,7 @@ export class SyncManager implements vscode.Disposable {
       "Cursor Setting Sync",
       async (report) => {
         report("Reading the device list...");
-        return this.takeCommandLock(report);
+        return this.takeCommandLock(repository, report);
       },
     );
     let candidates: Array<{
@@ -2796,7 +2950,7 @@ export class SyncManager implements vscode.Disposable {
         return;
       }
     }
-    const secondLock = await this.takeCommandLock();
+    const secondLock = await this.takeCommandLock(repository);
     try {
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
@@ -2849,15 +3003,16 @@ export class SyncManager implements vscode.Disposable {
 
   private async compactSafeOrphans(): Promise<void> {
     const repository = this.requireRepository();
-    const lock = await this.takeCommandLock();
+    const lock = await this.takeCommandLock(repository);
     try {
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
       const reconciler = new EventReconciler();
+      const checkpoint = await absorbedCheckpointManifest(repository);
       const result = reconciler.reconcile(
-        await repository.listEvents(),
+        await repository.listReconciliationEvents(checkpoint),
         repository.state,
-        await absorbedCheckpointManifest(repository),
+        checkpoint,
       );
       if (result.warnings.length > 0) {
         throw new Error(
@@ -2913,23 +3068,23 @@ export class SyncManager implements vscode.Disposable {
     overrideAgeGate: boolean,
     report: (message: string) => void,
   ): Promise<CheckpointCommandOutcome> {
-    const lock = await this.takeCommandLock(report);
+    const lock = await this.takeCommandLock(repository, report);
     try {
       report("Reading the repository...");
       const gitActive = await this.openGitWindow(repository);
       await repository.refreshState();
       const reconciler = new EventReconciler();
+      const checkpoint = await absorbedCheckpointManifest(repository);
       const result = reconciler.reconcile(
-        await repository.listEvents(),
+        await repository.listReconciliationEvents(checkpoint),
         repository.state,
-        await absorbedCheckpointManifest(repository),
+        checkpoint,
       );
       if (result.warnings.length > 0) {
         throw new Error(
           `Checkpointing requires a fully propagated repository; resolve this stream warning first: ${result.warnings[0]}`,
         );
       }
-      report("Folding the current tips into a checkpoint...");
       if (
         repository.state.conflicts.some(
           (conflict) => conflict.resolvedAt === undefined,
@@ -2940,21 +3095,23 @@ export class SyncManager implements vscode.Disposable {
         );
       }
       let created: CheckpointCreateResult | null = null;
-      // Asked before writing, not after. A checkpoint is 2.6 MB in the shared
-      // folder and only a prune past the lagging-device gate ever deletes one,
-      // so creating another while a device is stuck adds a file nothing will
-      // remove - 60 of them, 150 MB, in 34 hours on the repository this was
-      // found on. Worse, creating one absorbs it, which makes the prune in
-      // this very run abort on "a newer checkpoint was absorbed": the act of
-      // creating guaranteed the act of deleting could not follow it.
-      const lagging = await repository.laggingDeviceReasons();
-      if (
-        lagging.length === 0 &&
+      const checkpointAtStart = repository.state.checkpoint;
+      const checkpointWasBehind =
+        checkpointAtStart !== undefined &&
         !checkpointCoversStreams(
-          repository.state.checkpoint,
+          checkpointAtStart,
           repository.state.streams,
-        )
-      ) {
+        );
+      // Asked before writing, not after. A checkpoint is 2.6 MB in the shared
+      // folder and only a prune past the lagging-device and 24-hour gates ever
+      // deletes one. More subtly, replacing a YOUNG checkpoint before asking
+      // the age gate resets its age to zero: one event in every six-hour
+      // maintenance window then creates checkpoints forever and no checkpoint
+      // ever reaches the required day. Existing history is therefore pruned
+      // first; only a successful prune may be followed by a fresher fold.
+      const lagging = await repository.laggingDeviceReasons();
+      if (checkpointAtStart === undefined) {
+        report("Folding the current tips into the first checkpoint...");
         created = await repository.createCheckpoint(true);
       } else if (lagging.length > 0) {
         report("Waiting for every device to absorb the current checkpoint...");
@@ -2972,14 +3129,19 @@ export class SyncManager implements vscode.Disposable {
         ...(overrideAgeGate ? { overrideAgeGate: true } : {}),
       });
       if (prune.status === "pruned") {
+        if (checkpointWasBehind) {
+          report("Folding changes newer than the pruned checkpoint...");
+          created = await repository.createCheckpoint(true);
+        }
         // A warning or rollback in the post-prune reconcile skips compaction
         // for this run instead of failing the already completed prune.
         let compactionBlocked: string | null = null;
         try {
+          const postCheckpoint = await absorbedCheckpointManifest(repository);
           const postResult = reconciler.reconcile(
-            await repository.listEvents(),
+            await repository.listReconciliationEvents(postCheckpoint),
             repository.state,
-            await absorbedCheckpointManifest(repository),
+            postCheckpoint,
           );
           compactionBlocked = postResult.warnings[0] ?? null;
         } catch (error) {
@@ -3106,7 +3268,7 @@ export class SyncManager implements vscode.Disposable {
         // poll, automatic maintenance, or the offline helper deletes event
         // files mid-enumeration and the archive dies on ENOENT halfway - or
         // worse, completes while silently missing what was pruned under it.
-        const lock = await this.takeCommandLock(report);
+        const lock = await this.takeCommandLock(repository, report);
         try {
           report("Enumerating repository files...");
           const sources = await listFilesRecursively(repository.root);
@@ -3216,12 +3378,24 @@ export class SyncManager implements vscode.Disposable {
     let failed = false;
     this.beginSyncIndicator();
     try {
+      // Configured windows load only atomic local state during activation.
+      // Checkpoint absorption and own-stream recovery can write that state, so
+      // the elected owner (or an explicit follower command) completes them
+      // only after taking the same machine-wide lock as the rest of the cycle.
+      await repository.ensureInitialized();
       // Inside the lock so two cycling windows do not both report - and both
       // delete - the same result. A helper that fails while Cursor is still
       // running (a vetoed quit, or the exit wait expiring) leaves its result
       // here and nothing restarts, so the startup consume never arrives.
       await this.consumeHelperResults({ atStartup: false });
-      const gitActive = await this.openGitWindow(repository);
+      // Commands are an explicit request for the freshest remote state.
+      // Background polls use the same local Git write window but space the
+      // expensive fetch/merge probe; returning an active window when that
+      // probe is skipped preserves immediate commit/push of local publishes.
+      const pullAttemptBefore = this.backgroundGitPullAttempt;
+      const gitActive = await this.openGitWindow(repository, manual);
+      const probeAttempted =
+        this.backgroundGitPullAttempt !== pullAttemptBefore;
       await repository.refreshState();
       const checkpoint = await absorbedCheckpointManifest(repository);
       const reconciler = new EventReconciler();
@@ -3232,23 +3406,22 @@ export class SyncManager implements vscode.Disposable {
         mergeWarnings.push(warning);
       };
       let preResult = reconciler.reconcile(
-        await repository.listEvents(),
+        await repository.listReconciliationEvents(checkpoint),
         repository.state,
         checkpoint,
       );
-      if (
-        await autoMergeConflicts(
-          repository,
-          preResult.conflicts,
-          (tips) =>
-            tips.every(
-              (tip) => this.resourceApplyBlockReason(tip) === null,
-            ),
-          noteMergeWarning,
-        )
-      ) {
+      let autoMergedPublished = await autoMergeConflicts(
+        repository,
+        preResult.conflicts,
+        (tips) =>
+          tips.every(
+            (tip) => this.resourceApplyBlockReason(tip) === null,
+          ),
+        noteMergeWarning,
+      );
+      if (autoMergedPublished) {
         preResult = reconciler.reconcile(
-          await repository.listEvents(),
+          await repository.listReconciliationEvents(checkpoint),
           repository.state,
           checkpoint,
         );
@@ -3260,7 +3433,7 @@ export class SyncManager implements vscode.Disposable {
       const syntheticSkips = synthetic.driftSkipped;
       if (synthetic.changed) {
         preResult = reconciler.reconcile(
-          await repository.listEvents(),
+          await repository.listReconciliationEvents(checkpoint),
           repository.state,
           checkpoint,
         );
@@ -3302,29 +3475,24 @@ export class SyncManager implements vscode.Disposable {
             repository.state.tips[snapshot.resourceId] ?? [],
           ),
       );
-      // A suppressed snapshot whose bytes match the projection is the steady
-      // state - but the mtime fast paths in the chat adapters compare against
-      // projection.sourceTimestamp, which after a helper APPLY still holds the
-      // sender's clock. Refreshing it to the local capture's timestamp turns
-      // "fully re-read and re-hash every store and transcript on every poll,
-      // forever" into one full re-read per apply.
+      // A suppressed snapshot is already represented either by the projection
+      // or by a current PUT tip. Record that exact local version and its source
+      // metadata so stateful adapters can acknowledge their emitted snapshot.
+      // Without this, helper APPLY clock differences and unresolved conflicts
+      // both caused a full re-read and re-hash on every poll forever.
       const published = new Set(changedSnapshots.map((s) => s.resourceId));
       for (const snapshot of scan.snapshots) {
-        if (published.has(snapshot.resourceId)) {
+        if (
+          published.has(snapshot.resourceId) ||
+          protectedSyntheticResources.has(snapshot.resourceId)
+        ) {
           continue;
         }
-        const projection = repository.state.projections[snapshot.resourceId];
-        const captured = snapshot.metadata?.lastUpdatedAt;
-        if (
-          projection !== undefined &&
-          typeof captured === "number" &&
-          Number.isFinite(captured) &&
-          projection.sourceTimestamp !== captured &&
-          (projection.semanticHash === snapshot.semanticHash ||
-            projection.retainedLocalHash === snapshot.semanticHash)
-        ) {
-          projection.sourceTimestamp = captured;
-        }
+        markSuppressedSnapshotProjection(
+          repository.state.projections,
+          snapshot,
+          repository.state.tips[snapshot.resourceId] ?? [],
+        );
       }
       const publishableSnapshots = changedSnapshots.map((snapshot) => ({
         ...snapshot,
@@ -3413,24 +3581,24 @@ export class SyncManager implements vscode.Disposable {
       let result =
         publishedCount > 0
           ? reconciler.reconcile(
-              await repository.listEvents(),
+              await repository.listReconciliationEvents(checkpoint),
               repository.state,
               checkpoint,
             )
           : preResult;
-      if (
-        await autoMergeConflicts(
-          repository,
-          result.conflicts,
-          (tips) =>
-            tips.every(
-              (tip) => this.resourceApplyBlockReason(tip) === null,
-            ),
-          noteMergeWarning,
-        )
-      ) {
+      const postPublishAutoMerged = await autoMergeConflicts(
+        repository,
+        result.conflicts,
+        (tips) =>
+          tips.every(
+            (tip) => this.resourceApplyBlockReason(tip) === null,
+          ),
+        noteMergeWarning,
+      );
+      autoMergedPublished ||= postPublishAutoMerged;
+      if (postPublishAutoMerged) {
         result = reconciler.reconcile(
-          await repository.listEvents(),
+          await repository.listReconciliationEvents(checkpoint),
           repository.state,
           checkpoint,
         );
@@ -3482,12 +3650,20 @@ export class SyncManager implements vscode.Disposable {
       repository.state.lastSyncAt = new Date().toISOString();
       repository.state.lastError = null;
       await repository.saveState();
-      await repository.writeAck();
-      await this.commitGitWindow(
-        gitActive,
-        repository.root,
-        `sync(${repository.state.device.deviceId.slice(0, 8)}): ${publishedCount} change(s)`,
-      );
+      const ackWritten = await repository.writeAck();
+      if (
+        manual ||
+        probeAttempted ||
+        publishedCount > 0 ||
+        autoMergedPublished ||
+        ackWritten
+      ) {
+        await this.commitGitWindow(
+          gitActive,
+          repository.root,
+          `sync(${repository.state.device.deviceId.slice(0, 8)}): ${publishedCount} change(s)`,
+        );
+      }
       if (gitActive && publishedCount > 0) {
         await this.warnAboutLargeFiles(repository.root, true);
       }
@@ -3516,6 +3692,12 @@ export class SyncManager implements vscode.Disposable {
         this.updateStatus(repository);
       }
       await lock.release();
+    }
+    if (!failed) {
+      // The offer can enter Restart to Apply, which queues another cycle. Do
+      // not await it from the cycle that must return before that request can
+      // start, or accepting the launch prompt self-deadlocks the queue.
+      void this.maybeOfferQueuedApplyAtLaunch();
     }
   }
 
@@ -3614,6 +3796,7 @@ export class SyncManager implements vscode.Disposable {
    * command does not simply appear frozen.
    */
   private async takeCommandLock(
+    expectedRepository: SyncRepository,
     report: (message: string) => void = () => {},
   ): Promise<FileLock> {
     const lock = await acquireFileLockWithin(
@@ -3625,6 +3808,25 @@ export class SyncManager implements vscode.Disposable {
     );
     if (lock === null) {
       throw await this.synchronizationBusyError();
+    }
+    try {
+      if (this.repository !== expectedRepository) {
+        throw new Error(
+          "The synchronization repository changed while this command was waiting. Run the command again.",
+        );
+      }
+      // Commands may run in a standby window whose activation intentionally
+      // skipped shared-folder recovery. Initialize the snapshot it captured
+      // only now, while the command owns sync.lock.
+      await expectedRepository.ensureInitialized();
+      if (this.repository !== expectedRepository) {
+        throw new Error(
+          "The synchronization repository changed while this command was opening it. Run the command again.",
+        );
+      }
+    } catch (error) {
+      await lock.release();
+      throw error;
     }
     return lock;
   }
@@ -4313,72 +4515,107 @@ export class SyncManager implements vscode.Disposable {
     return adapters;
   }
 
-  private async openConfiguredRepository(masterKey: Buffer): Promise<void> {
+  private async openConfiguredRepository(masterKey: Buffer): Promise<boolean> {
     const root = this.configuration.repositoryPath;
     if (root === null) {
-      return;
+      return false;
     }
+    const expectedRepositoryId = this.configuration.repositoryId;
+    const current = this.repository;
+    if (
+      current !== null &&
+      current.root === root &&
+      (expectedRepositoryId === null ||
+        current.repository.repositoryId === expectedRepositoryId)
+    ) {
+      return true;
+    }
+    const generation = ++this.configuredOpenGeneration;
     await assertSafeRepositoryLocation(root, this.synchronizedSourceRoots());
     const repositoryFile = await readJsonFile<RepositoryFile>(
       join(root, REPOSITORY_FILE),
     );
     if (
-      this.configuration.repositoryId !== null &&
-      repositoryFile.repositoryId !== this.configuration.repositoryId
+      expectedRepositoryId !== null &&
+      repositoryFile.repositoryId !== expectedRepositoryId
     ) {
       throw new Error(
         "The configured folder now contains a different repository. Point Setup at the original folder, or run \"Cursor Setting Sync: Disconnect\" to clear the stored repository and connect to this one.",
       );
     }
-    this.masterKey?.fill(0);
-    this.masterKey = Buffer.from(masterKey);
-    this.repository = await this.withOpenLock(() =>
-      SyncRepository.openWithMasterKey(
+    // Keep the candidate key private to this attempt. Publishing it on the
+    // manager before the awaits below let an overlapping open zero the Buffer
+    // while this repository was still deriving its subkeys.
+    const openingKey = Buffer.from(masterKey);
+    let opened: SyncRepository;
+    try {
+      opened = await SyncRepository.openDeferredWithMasterKey(
         root,
         this.paths.extensionStorage,
         repositoryFile,
-        this.masterKey ?? Buffer.alloc(0),
+        openingKey,
         this.configuration.maxPayloadBytes,
         this.producer,
-      ),
-    );
+      );
+    } catch (error) {
+      openingKey.fill(0);
+      throw error;
+    }
+    const stillRelevant =
+      !this.disposed &&
+      generation === this.configuredOpenGeneration &&
+      this.configuration.repositoryPath === root &&
+      this.configuration.repositoryId === expectedRepositoryId;
+    if (!stillRelevant) {
+      openingKey.fill(0);
+      const winner = this.repository;
+      return (
+        winner !== null &&
+        winner.root === this.configuration.repositoryPath &&
+        (this.configuration.repositoryId === null ||
+          winner.repository.repositoryId === this.configuration.repositoryId)
+      );
+    }
+    this.masterKey?.fill(0);
+    this.masterKey = openingKey;
+    this.repository = opened;
     this.refreshAdapters();
+    return true;
   }
 
   /**
-   * Runs a repository open/create under sync.lock.
+   * Runs a state-mutating repository create/join under sync.lock.
    *
-   * Opening is not read-only: absorbing a newer checkpoint and recovering the
-   * device's own stream both SAVE the state file, and in a multi-window
-   * restore that save raced a sibling window's locked cycle - the opener's
-   * pre-cycle snapshot landed last and reverted projections and pending
-   * queues the cycle had just persisted, resurrecting deletions the
-   * retained-hash chain exists to prevent. The helper already opens under
-   * this lock; the extension host now does the same. If the lock cannot be
-   * had in a minute, the open proceeds unlocked with a log line - the
-   * previous behavior, but no longer the silent default.
+   * Configured activation uses `openDeferredWithMasterKey` and completes its
+   * recovery inside the first cycle instead. Setup still creates or joins with
+   * the full API, whose checkpoint absorption and own-stream recovery SAVE the
+   * state file. A long offline export or repair can legitimately hold the lock
+   * for more than a minute, so a bounded wait is repeated until it is actually
+   * available rather than falling through to an unsafe unlocked write.
    */
   private async withOpenLock<T>(run: () => Promise<T>): Promise<T> {
-    let lock: FileLock | null = null;
-    try {
-      lock = await acquireFileLockWithin(this.syncLockPath(), 60_000);
-    } catch (error) {
-      this.status.log(
-        `The sync lock could not be probed before opening the repository: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
-    if (lock === null) {
-      this.status.log(
-        "Opening the repository without the sync lock; another window held it for over a minute.",
-      );
-    }
-    try {
-      return await run();
-    } finally {
-      await lock?.release();
-    }
+    const startedAt = Date.now();
+    let lastWaitLogAt: number | null = null;
+    return withRequiredFileLock(
+      () =>
+        acquireFileLockWithin(this.syncLockPath(), OPEN_LOCK_WAIT_SLICE_MS, () => {
+          const now = Date.now();
+          if (
+            lastWaitLogAt !== null &&
+            now - lastWaitLogAt < OPEN_LOCK_LOG_INTERVAL_MS
+          ) {
+            return;
+          }
+          this.status.log(
+            lastWaitLogAt === null
+              ? "Waiting for another Cursor window or the offline helper before opening the synchronization repository."
+              : `Still waiting to open the synchronization repository safely (${Math.max(1, Math.floor((now - startedAt) / 60_000))} minute(s)).`,
+          );
+          lastWaitLogAt = now;
+        }),
+      run,
+      () => !this.disposed,
+    );
   }
 
   private synchronizedSourceRoots(): Array<{ label: string; path: string }> {
@@ -5187,20 +5424,104 @@ export class SyncManager implements vscode.Disposable {
    * rethrown as a hard failure; every other git failure degrades the window
    * to plain shared-folder mode so the local repository keeps working.
    */
-  private async openGitWindow(repository: SyncRepository): Promise<boolean> {
-    if (!(await this.gitModeFor(repository.root))) {
+  private async openGitWindow(
+    repository: SyncRepository,
+    forcePull = true,
+  ): Promise<boolean> {
+    if (!this.configuration.gitSync) {
       return false;
     }
+    let now = Date.now();
+    const cachedMode = this.backgroundGitModeCheck;
+    if (
+      !forcePull &&
+      cachedMode !== null &&
+      cachedMode.root === repository.root &&
+      now >= cachedMode.checkedAt &&
+      now - cachedMode.checkedAt < BACKGROUND_GIT_PULL_INTERVAL_MS
+    ) {
+      const conflict = this.backgroundGitConflicts.get(repository.root);
+      if (conflict !== undefined) {
+        throw conflict;
+      }
+      if (!cachedMode.active) {
+        return false;
+      }
+      if (
+        !backgroundGitPullDue(
+          this.backgroundGitPullAttempt,
+          repository.root,
+          now,
+        )
+      ) {
+        return true;
+      }
+    }
+    const gitMode = await this.gitModeFor(repository.root);
+    now = Date.now();
+    this.backgroundGitModeCheck = {
+      root: repository.root,
+      checkedAt: now,
+      active: gitMode,
+    };
+    if (!gitMode) {
+      const conflict = this.backgroundGitConflicts.get(repository.root);
+      if (conflict !== undefined) {
+        throw conflict;
+      }
+      return false;
+    }
+    if (
+      !forcePull &&
+      !backgroundGitPullDue(
+        this.backgroundGitPullAttempt,
+        repository.root,
+        now,
+      )
+    ) {
+      const conflict = this.backgroundGitConflicts.get(repository.root);
+      if (conflict !== undefined) {
+        throw conflict;
+      }
+      // Git is still the active transport for this lock window. In particular,
+      // commitGitWindow must remain enabled so a local change discovered by an
+      // otherwise throttled poll is pushed immediately.
+      return true;
+    }
+    // Stamp attempts, not only successes. An offline remote must not turn the
+    // thirty-second poll into a network-error subprocess loop; manual commands
+    // bypass the interval and can retry immediately.
+    const attempt: BackgroundGitPullAttempt = {
+      root: repository.root,
+      attemptedAt: now,
+    };
+    this.backgroundGitPullAttempt = attempt;
     try {
       await pullLatest(repository.root);
+      this.backgroundGitConflicts.delete(repository.root);
       this.lastGitWindowDegraded = false;
       return true;
     } catch (error) {
       if (error instanceof GitError && error.kind === "conflict") {
+        this.backgroundGitConflicts.set(repository.root, error);
         throw error;
+      }
+      const knownConflict = this.backgroundGitConflicts.get(repository.root);
+      if (knownConflict !== undefined) {
+        this.degradeGit(error);
+        throw knownConflict;
       }
       this.degradeGit(error);
       return false;
+    } finally {
+      // Slow commands and timeouts are throttled from completion, not start;
+      // otherwise a five-minute failure immediately launches another probe.
+      attempt.attemptedAt = Date.now();
+      this.backgroundGitModeCheck = {
+        root: repository.root,
+        checkedAt: attempt.attemptedAt,
+        active: true,
+      };
     }
   }
 
@@ -5233,6 +5554,7 @@ export class SyncManager implements vscode.Disposable {
       return true;
     } catch (error) {
       if (error instanceof GitError && error.kind === "conflict") {
+        this.backgroundGitConflicts.set(root, error);
         throw error;
       }
       // The local write is already on disk; the next successful commit window
@@ -5667,6 +5989,90 @@ function versionMessageCount(
     return "";
   }
   return ` · ${count} message${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * Converts one trusted full chat payload into the bounded candidate shape the
+ * repair decision actually consumes.
+ *
+ * The live envelope is shared rather than copied and only unavailable bubble
+ * rows survive. This preserves composer identity and value-disagreement checks
+ * while allowing the parsed historical snapshot (and its often enormous set
+ * of unrelated rows) to be collected before the next candidate is read.
+ */
+export function chatRepairCandidateForUnavailableRows(
+  versionId: string,
+  content: Buffer,
+  observation: BrokenChatObservation,
+  unavailableKeys: ReadonlySet<string>,
+): ChatRepairCandidate | null {
+  return parseChatRepairCandidate(
+    versionId,
+    content,
+    observation,
+    unavailableKeys,
+  )?.candidate ?? null;
+}
+
+interface ParsedChatRepairCandidate {
+  candidate: ChatRepairCandidate;
+  rows: PortableKvRow[];
+}
+
+function parseChatRepairCandidate(
+  versionId: string,
+  content: Buffer,
+  observation: BrokenChatObservation,
+  unavailableKeys: ReadonlySet<string>,
+): ParsedChatRepairCandidate | null {
+  const stored = parsePortableChatSnapshot(content);
+  if (stored.composerId !== observation.composerId) {
+    return null;
+  }
+  return {
+    candidate: {
+      versionId,
+      snapshot: {
+        ...observation.snapshot,
+        bubbles: stored.bubbles.filter((row) => unavailableKeys.has(row.key)),
+      },
+    },
+    rows: stored.bubbles,
+  };
+}
+
+/** Accumulates candidates in newest-first order using the repair union rule. */
+function retainNewestUsableChatRows(
+  retained: Map<string, PortableKvRow>,
+  rows: readonly PortableKvRow[],
+): void {
+  for (const row of rows) {
+    const existing = retained.get(row.key);
+    if (
+      existing === undefined ||
+      (!isUsableChatBubble(existing) && isUsableChatBubble(row))
+    ) {
+      retained.set(row.key, row);
+    }
+  }
+}
+
+/** Mirrors the repair builder's lossless-JSON bubble validity check. */
+function isUsableChatBubble(row: PortableKvRow): boolean {
+  if (row.valueType === "null") {
+    return false;
+  }
+  const bytes = Buffer.from(row.valueBase64, "base64");
+  const text = bytes.toString("utf8");
+  if (!Buffer.from(text, "utf8").equals(bytes)) {
+    return false;
+  }
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function chatRepairLabel(observation: BrokenChatObservation): string {
@@ -6184,6 +6590,79 @@ async function projectionInput(
     semanticHash: tip.semanticHash,
     ...(tip.metadata === undefined ? {} : { metadata: tip.metadata }),
   };
+}
+
+/**
+ * Records a local snapshot that did not need a new event.
+ *
+ * Usually its bytes already match the projection. During an unresolved
+ * conflict, however, the local bytes can match a different current PUT tip.
+ * `shouldPublishSnapshot` correctly suppresses that duplicate, but leaving the
+ * old/absent projection behind makes stateful adapters treat the snapshot as
+ * unacknowledged and re-read it forever. Selecting the exact matching tip is a
+ * truthful local projection; it neither resolves nor removes the conflict.
+ */
+export function markSuppressedSnapshotProjection(
+  projections: Record<string, LocalProjection>,
+  snapshot: ResourceSnapshot,
+  tips: readonly ResourceTip[],
+): boolean {
+  const current = projections[snapshot.resourceId];
+  if (
+    current !== undefined &&
+    (current.semanticHash === snapshot.semanticHash ||
+      current.retainedLocalHash === snapshot.semanticHash)
+  ) {
+    rememberSnapshotSource(current, snapshot);
+    return true;
+  }
+  const matchingTip = tips
+    .filter(
+      (tip) =>
+        tip.kind === snapshot.kind &&
+        tip.operation === "put" &&
+        tip.semanticHash === snapshot.semanticHash,
+    )
+    .sort(compareTips)[0];
+  if (matchingTip === undefined) {
+    return false;
+  }
+  const learned: LocalProjection = {
+    resourceId: snapshot.resourceId,
+    kind: matchingTip.kind,
+    semanticHash: matchingTip.semanticHash,
+    versionId: matchingTip.versionId,
+    ...(matchingTip.payload === undefined
+      ? {}
+      : { payloadObjectId: matchingTip.payload.objectId }),
+  };
+  rememberSnapshotSource(learned, snapshot);
+  projections[snapshot.resourceId] = learned;
+  return true;
+}
+
+function rememberSnapshotSource(
+  projection: LocalProjection,
+  snapshot: ResourceSnapshot,
+): void {
+  const capturedTimestamp = snapshot.metadata?.lastUpdatedAt;
+  if (
+    typeof capturedTimestamp === "number" &&
+    Number.isFinite(capturedTimestamp)
+  ) {
+    projection.sourceTimestamp = capturedTimestamp;
+  } else if (projection.kind === "chat" && capturedTimestamp === null) {
+    delete projection.sourceTimestamp;
+  }
+  const capturedBubbleCount = snapshot.metadata?.bubbleCount;
+  if (
+    projection.kind === "chat" &&
+    typeof capturedBubbleCount === "number" &&
+    Number.isSafeInteger(capturedBubbleCount) &&
+    capturedBubbleCount >= 0
+  ) {
+    projection.sourceBubbleCount = capturedBubbleCount;
+  }
 }
 
 function markProjection(

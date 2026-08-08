@@ -78,6 +78,10 @@ import {
 } from "./database";
 import { applyNonGlobalChanges, CursorReopenedError } from "./resourceApply";
 import type { HelperBackup, HelperChange, HelperRequest, HelperResult } from "./types";
+import {
+  cursorProcessListingDecision,
+  type CursorProcessListingState,
+} from "./processListingCadence";
 
 const execFileAsync = promisify(execFile);
 
@@ -370,10 +374,11 @@ async function executeRequest(
   await ensureExclusiveAccess();
 
   const reconciler = new EventReconciler();
+  const checkpoint = await absorbedCheckpointManifest(repository);
   const reconcileResult = reconciler.reconcile(
-    await repository.listEvents(),
+    await repository.listReconciliationEvents(checkpoint),
     repository.state,
-    await absorbedCheckpointManifest(repository),
+    checkpoint,
   );
   // Read from the queue for a shutdown, handed over for an explicit apply; see
   // {@link shutdownApplyBatch} for why the finalizer cannot use a list decided
@@ -550,10 +555,11 @@ async function exportFinalChanges(
   repository: SyncRepository,
 ): Promise<{ warnings: string[]; notices: string[] }> {
   const reconciler = new EventReconciler();
+  const checkpoint = await absorbedCheckpointManifest(repository);
   const preResult = reconciler.reconcile(
-    await repository.listEvents(),
+    await repository.listReconciliationEvents(checkpoint),
     repository.state,
-    await absorbedCheckpointManifest(repository),
+    checkpoint,
   );
   const conflictedResources = new Set(
     repository.state.conflicts
@@ -711,9 +717,9 @@ async function exportFinalChanges(
     publishable.deletions,
   );
   const result = reconciler.reconcile(
-    await repository.listEvents(),
+    await repository.listReconciliationEvents(checkpoint),
     repository.state,
-    await absorbedCheckpointManifest(repository),
+    checkpoint,
   );
   for (const projection of result.projections) {
     if (
@@ -1123,7 +1129,10 @@ async function waitForCursorExit(
   // unrelated long-lived process read as "Cursor still open" and held this
   // wait for its whole timeout - thirty days for a finalizer. The listing is
   // authoritative, so it runs regardless on a slower cadence.
-  let lastListingAt = 0;
+  let listingState: CursorProcessListingState = {
+    lastListingAt: null,
+    hostGone: false,
+  };
   let listingEverSucceeded = false;
   let consecutiveListingFailures = 0;
   while (Date.now() - startedAt < timeoutMs) {
@@ -1133,9 +1142,13 @@ async function waitForCursorExit(
     ) {
       return true;
     }
-    const hostGone = !isProcessAlive(request.extensionHostPid);
-    if (hostGone || Date.now() - lastListingAt > 30_000) {
-      lastListingAt = Date.now();
+    const listing = cursorProcessListingDecision(
+      listingState,
+      Date.now(),
+      !isProcessAlive(request.extensionHostPid),
+    );
+    listingState = listing.state;
+    if (listing.due) {
       try {
         const noOthers = await noOtherCursorProcesses(request);
         listingEverSucceeded = true;

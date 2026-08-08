@@ -37,7 +37,21 @@ export class LocalStateStore {
       return state;
     }
 
-    const state: LocalSyncState = {
+    const state = this.createUnpersisted(repositoryId);
+    await this.save(state);
+    return state;
+  }
+
+  /**
+   * Builds a valid in-memory placeholder without claiming a device identity.
+   *
+   * Deferred extension-host activation uses this only when the atomic state
+   * file is missing. The caller must replace it with `loadOrCreate()` while
+   * holding sync.lock before doing repository work, so concurrent Cursor
+   * windows can never persist different identities for the same installation.
+   */
+  createUnpersisted(repositoryId: string): LocalSyncState {
+    return {
       version: LOCAL_STATE_VERSION,
       repositoryId,
       device: {
@@ -57,8 +71,6 @@ export class LocalStateStore {
       lastSyncAt: null,
       lastError: null,
     };
-    await this.save(state);
-    return state;
   }
 
   async load(repositoryId: string): Promise<LocalSyncState> {
