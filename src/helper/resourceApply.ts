@@ -8,12 +8,12 @@ import {
   sqliteStorageText,
 } from "../platform/sqlite";
 import { dirname, join, relative } from "node:path";
-import { readFile, utimes } from "node:fs/promises";
+import { utimes } from "node:fs/promises";
 import type { JsonValue } from "../types";
 import type { HelperBackup, HelperRequest } from "./types";
 import type { PreparedHelperChange } from "./database";
 import { enforceBackupRetention } from "./backupRetention";
-import { canonicalBytes, sha256 } from "../protocol/canonical";
+import { sha256 } from "../protocol/canonical";
 import {
   assertSafeRelativePath,
   assertSafeRelativePathOnDisk,
@@ -24,16 +24,35 @@ import {
   writeFileAtomicWithinRoot,
 } from "../platform/files";
 import {
+  inspectStoreSnapshot,
   parsePortableStoreSnapshot,
-  readStoreSnapshot,
+  portableStoreSnapshotSemanticHash,
+  readStoreSnapshotFromDatabase,
+  STORE_DB_MAX_MATERIALIZED_RAW_BYTES,
   type PortableStoreValue,
 } from "../chat/storeDb";
+import {
+  CHAT_AUXILIARY_MAX_RESOURCE_BYTES,
+  auxiliaryResourceLimit,
+} from "../chat/auxiliaryScan";
 import { EXTENSION_ID } from "../constants";
-import { createExtensionIgnoreMatcher } from "../resources/extensions";
-import { semanticHash } from "../resources/jsonc";
+import {
+  createExtensionIgnoreMatcher,
+  MAX_EXTENSION_IDENTIFIERS,
+  MAX_EXTENSION_MANIFEST_BYTES,
+  readBoundedExtensionManifestMetadata,
+} from "../resources/extensions";
+import {
+  assertBoundedJsoncStructure,
+  semanticHash,
+} from "../resources/jsonc";
+import {
+  inspectSqliteValue,
+  readSqliteValue,
+} from "../resources/boundedScan";
 import { assertValidProfileId } from "../resources/profilePaths";
 import {
-  discoverWorkspaces,
+  lookupWorkspaceIdentityReferences,
   resolveTargetWorkspace,
 } from "../chat/workspace";
 import {
@@ -110,7 +129,11 @@ export async function applyNonGlobalChanges(
   const localWorkspaces =
     request.syncOptions.syncWorkspaceStorage &&
     prepared.some((item) => item.change.kind === "workspace-storage")
-      ? await discoverWorkspaces(request.paths)
+      ? await lookupWorkspaceIdentityReferences(
+          request.paths,
+          preparedWorkspaceStorageIds(prepared),
+          request.workspaceMappings,
+        )
       : [];
 
   for (const item of prepared) {
@@ -272,6 +295,14 @@ export async function applyNonGlobalChanges(
         if (content === undefined) {
           throw new Error(`Chat store payload is missing: ${change.resourceId}`);
         }
+        const storeWorkLimit = auxiliaryResourceLimit(
+          request.syncOptions.maxPayloadBytes,
+        );
+        if (content.byteLength > storeWorkLimit) {
+          throw new Error(
+            `Chat store payload is ${content.byteLength} bytes, above the ${storeWorkLimit} byte bounded helper work limit.`,
+          );
+        }
         const snapshot = parsePortableStoreSnapshot(content);
         if (
           change.resourceId !==
@@ -298,16 +329,14 @@ export async function applyNonGlobalChanges(
           ),
         );
         await ensureExclusiveAccess();
-        await applyStoreSnapshot(
+        const appliedHash = await applyStoreSnapshot(
           target,
           snapshot,
           request.storageRoot,
           request.requestId,
           registerBackup,
           exemptBackupPaths,
-        );
-        const appliedHash = sha256(
-          canonicalBytes(readStoreSnapshot(target, snapshot.relativePath)),
+          storeWorkLimit,
         );
         if (appliedHash !== change.semanticHash) {
           // The upsert-only merge retained target-only rows; remember the
@@ -358,6 +387,20 @@ export async function applyNonGlobalChanges(
   };
 }
 
+function* preparedWorkspaceStorageIds(
+  prepared: readonly PreparedHelperChange[],
+): Iterable<string> {
+  for (const item of prepared) {
+    if (item.change.kind !== "workspace-storage") {
+      continue;
+    }
+    const workspaceId = item.change.metadata?.workspaceId;
+    if (typeof workspaceId === "string") {
+      yield workspaceId;
+    }
+  }
+}
+
 async function mergeWorkspaceStateDatabase(
   request: HelperRequest,
   target: string,
@@ -368,7 +411,17 @@ async function mergeWorkspaceStateDatabase(
   registerBackup: (backup: HelperBackup) => void,
   exemptBackupPaths: () => readonly string[] = () => [],
 ): Promise<void> {
-  const parsed = parseWorkspaceDatabaseSnapshot(content);
+  const workspaceWorkLimit = auxiliaryResourceLimit(
+    request.syncOptions.maxPayloadBytes,
+  );
+  if (content.byteLength > workspaceWorkLimit) {
+    throw new Error(
+      `Workspace database payload is ${content.byteLength} bytes, above the ${workspaceWorkLimit} byte bounded helper work limit.`,
+    );
+  }
+  const parsed = parseWorkspaceDatabaseSnapshot(content, {
+    maxPlainBytes: workspaceWorkLimit,
+  });
   if (parsed.workspaceId !== sourceWorkspaceId) {
     throw new Error("Workspace database payload does not match its workspace metadata.");
   }
@@ -390,6 +443,7 @@ async function mergeWorkspaceStateDatabase(
     backupPath,
     targetWorkspaceId,
     incoming,
+    limits: { maxPlainBytes: workspaceWorkLimit },
     hooks: {
       afterBackupValidated: async () => {
         await enforceBackupRetention(request.storageRoot, {
@@ -408,9 +462,20 @@ async function applyStoreSnapshot(
   requestId: string,
   registerBackup: (backup: HelperBackup) => void,
   exemptBackupPaths: () => readonly string[] = () => [],
-): Promise<void> {
+  maxWorkBytes = CHAT_AUXILIARY_MAX_RESOURCE_BYTES,
+): Promise<string> {
   await ensureDirectory(dirname(target));
   if (await pathExists(target)) {
+    const existing = inspectStoreSnapshot(target, snapshot.relativePath);
+    if (
+      existing.rawBytes >
+        Math.min(STORE_DB_MAX_MATERIALIZED_RAW_BYTES, maxWorkBytes) ||
+      existing.minimumCanonicalBytes > maxWorkBytes
+    ) {
+      throw new Error(
+        `Existing chat store exceeds the ${maxWorkBytes} byte bounded helper work limit; it was left unchanged.`,
+      );
+    }
     const backupRoot = join(storageRoot, "backups");
     await ensureDirectory(backupRoot);
     const backupPath = join(
@@ -480,9 +545,23 @@ async function applyStoreSnapshot(
     for (const row of snapshot.blobs) {
       upsertBlob.run(row.id, restoreStoreValue(row.data));
     }
+    const appliedSnapshot = readStoreSnapshotFromDatabase(
+      database,
+      snapshot.relativePath,
+      undefined,
+      {
+        maxRawBytes: Math.min(
+          STORE_DB_MAX_MATERIALIZED_RAW_BYTES,
+          maxWorkBytes,
+        ),
+        maxCanonicalBytes: maxWorkBytes,
+      },
+    );
+    const appliedHash = portableStoreSnapshotSemanticHash(appliedSnapshot);
     assertIntegrity(database);
     database.exec("COMMIT");
     transactionStarted = false;
+    return appliedHash;
   } catch (error) {
     if (transactionStarted) {
       try {
@@ -743,36 +822,11 @@ async function observedExtensionManifestState(
   extensionId: string,
 ): Promise<{ preRelease: boolean; pinned: boolean } | null> {
   try {
-    const parsed = JSON.parse(
-      (await readFile(request.paths.cursorExtensionsManifest, "utf8")),
-    ) as unknown;
-    if (!Array.isArray(parsed)) {
-      return null;
-    }
-    for (const item of parsed) {
-      if (item === null || typeof item !== "object") {
-        continue;
-      }
-      const record = item as Record<string, unknown>;
-      const identifier = record.identifier;
-      const id =
-        identifier !== null && typeof identifier === "object"
-          ? (identifier as Record<string, unknown>).id
-          : undefined;
-      if (typeof id !== "string" || id.toLowerCase() !== extensionId.toLowerCase()) {
-        continue;
-      }
-      const metadata =
-        record.metadata !== null && typeof record.metadata === "object"
-          ? (record.metadata as Record<string, unknown>)
-          : {};
-      return {
-        preRelease:
-          metadata.isPreReleaseVersion === true || record.preRelease === true,
-        pinned: metadata.pinned === true || record.pinned === true,
-      };
-    }
-    return null;
+    return (
+      (await readBoundedExtensionManifestMetadata(request.paths)).get(
+        extensionId.toLowerCase(),
+      ) ?? null
+    );
   } catch {
     return null;
   }
@@ -876,12 +930,7 @@ async function updateExtensionEnablement(
     }
     database.exec("BEGIN IMMEDIATE");
     transactionStarted = true;
-    const row = database
-      .prepare("SELECT value FROM ItemTable WHERE key = ?")
-      .get("extensionsIdentifiers/disabled") as
-      | { value?: SqliteStorageValue }
-      | undefined;
-    const raw = row?.value;
+    const raw = readDisabledExtensionState(database);
     const disabled = parseDisabledExtensions(raw);
     const existingEntry = disabled.find(
       (item) => disabledExtensionId(item)?.toLowerCase() === extensionId,
@@ -895,12 +944,20 @@ async function updateExtensionEnablement(
     // A no-op enable must not gratuitously replace an absent or NULL row with
     // the string "[]" in the user's live database.
     if (filtered.length > 0 || (raw !== undefined && raw !== null)) {
+      const serializedDisabled = JSON.stringify(filtered);
+      if (
+        filtered.length > MAX_EXTENSION_IDENTIFIERS ||
+        Buffer.byteLength(serializedDisabled, "utf8") >
+          MAX_EXTENSION_MANIFEST_BYTES
+      ) {
+        throw new Error("Updated disabled extension state exceeds its limit.");
+      }
       database
         .prepare(
           `INSERT INTO ItemTable(key, value) VALUES (?, ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
         )
-        .run("extensionsIdentifiers/disabled", JSON.stringify(filtered));
+        .run("extensionsIdentifiers/disabled", serializedDisabled);
     }
     assertIntegrity(database);
     database.exec("COMMIT");
@@ -936,12 +993,7 @@ async function enablementWouldChange(
   try {
     database.exec("PRAGMA busy_timeout=5000");
     database.exec("PRAGMA query_only=ON");
-    const row = database
-      .prepare("SELECT value FROM ItemTable WHERE key = ?")
-      .get("extensionsIdentifiers/disabled") as
-      | { value?: SqliteStorageValue }
-      | undefined;
-    const raw = row?.value;
+    const raw = readDisabledExtensionState(database);
     const disabled = parseDisabledExtensions(raw);
     const listed = disabled.some(
       (item) => disabledExtensionId(item)?.toLowerCase() === extensionId,
@@ -973,15 +1025,40 @@ function parseDisabledExtensions(
   if (text.trim().length === 0) {
     return [];
   }
+  if (Buffer.byteLength(text, "utf8") > MAX_EXTENSION_MANIFEST_BYTES) {
+    throw new Error("Disabled extension state exceeds its byte limit.");
+  }
+  assertBoundedJsoncStructure(text, "Disabled extension state");
   const parsed = JSON.parse(text) as unknown;
   if (!Array.isArray(parsed)) {
     throw new Error("Disabled extension state must be an array.");
   }
-  if (parsed.length > 100_000) {
+  if (parsed.length > MAX_EXTENSION_IDENTIFIERS) {
     throw new Error("Disabled extension state contains too many entries.");
   }
   return parsed;
 }
+
+function readDisabledExtensionState(
+  database: DatabaseSync,
+  onValueRead?: () => void,
+): SqliteStorageValue | undefined {
+  const key = "extensionsIdentifiers/disabled";
+  const metadata = inspectSqliteValue(database, key);
+  if (
+    metadata.byteLength !== null &&
+    metadata.byteLength > MAX_EXTENSION_MANIFEST_BYTES
+  ) {
+    throw new Error(
+      `Disabled extension state is ${metadata.byteLength} bytes, above the ${MAX_EXTENSION_MANIFEST_BYTES}-byte read limit.`,
+    );
+  }
+  onValueRead?.();
+  return readSqliteValue(database, key);
+}
+
+/** Narrow preflight seam; callback fires only immediately before body SELECT. */
+export const __testing = Object.freeze({ readDisabledExtensionState });
 
 function disabledExtensionId(value: unknown): string | null {
   if (typeof value === "string") {
@@ -1009,7 +1086,9 @@ function parseExtensionDesiredState(
 ): ExtensionDesiredState {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(content.toString("utf8")) as unknown;
+    const source = content.toString("utf8");
+    assertBoundedJsoncStructure(source, "Extension desired state");
+    parsed = JSON.parse(source) as unknown;
   } catch (error) {
     throw new Error("Extension desired state is not valid JSON.", {
       cause: error,

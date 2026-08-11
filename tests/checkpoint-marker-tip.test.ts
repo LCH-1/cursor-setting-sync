@@ -3,8 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { SyncRepository } from "../src/protocol/repository";
+import { classifyLegacyCheckpointMarker } from "../src/protocol/checkpointMarker";
 import { EventReconciler } from "../src/protocol/reconciler";
-import { isSyntheticTip } from "../src/sync/versionPolicy";
+import {
+  effectiveSyncOrigin,
+  effectiveVersionProducer,
+  isSyntheticTip,
+} from "../src/sync/versionPolicy";
 import { sha256 } from "../src/protocol/canonical";
 import type { ResourceKind, ResourceTip } from "../src/types";
 
@@ -17,6 +22,312 @@ const producer = {
 const PEER_CHAT = "chat/00000000-0000-4000-8000-000000000001";
 
 describe("the checkpoint marker re-asserts a tip this device may never have applied", () => {
+  it("upgrades an ordinary v0.0.59 marker to explicit provenance", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-setting-sync-legacy-marker-"),
+    );
+    try {
+      const legacyMarkerProducer = {
+        extensionVersion: "0.0.59",
+        cursorVersion: "3.15.6",
+        vscodeVersion: "1.125.0",
+      };
+      const currentMarkerProducer = {
+        extensionVersion: "0.0.63",
+        cursorVersion: "3.14.0",
+        vscodeVersion: "1.124.0",
+      };
+      const repositoryRoot = join(temporaryRoot, "repository");
+      const legacyDevice = await SyncRepository.create(
+        repositoryRoot,
+        join(temporaryRoot, "storage-legacy"),
+        "a sufficiently long test passphrase",
+        1024 * 1024,
+        legacyMarkerProducer,
+      );
+      const currentDevice = await SyncRepository.open(
+        repositoryRoot,
+        join(temporaryRoot, "storage-current"),
+        "a sufficiently long test passphrase",
+        1024 * 1024,
+        currentMarkerProducer,
+      );
+      const content = Buffer.from("ordinary legacy database tip", "utf8");
+      const ordinaryMetadata = {
+        composerId: "00000000-0000-4000-8000-000000000001",
+        workspaceId: "workspace",
+        lastUpdatedAt: 59,
+        bubbleCount: 1,
+      };
+      const base = await legacyDevice.publish(
+        [
+          {
+            resourceId: PEER_CHAT,
+            kind: "chat",
+            content,
+            semanticHash: sha256(content),
+            metadata: ordinaryMetadata,
+          },
+        ],
+        [],
+      );
+      const baseVersionId = `${base.eventHash ?? ""}#0`;
+      // This is the exact v0.0.59 producer shape: spread the active metadata,
+      // replace syncOrigin, and retain only the real parent edge.
+      const legacyMarker = await legacyDevice.publish(
+        [
+          {
+            resourceId: PEER_CHAT,
+            kind: "chat",
+            content,
+            semanticHash: sha256(content),
+            metadata: { ...ordinaryMetadata, syncOrigin: "checkpoint-marker" },
+            parents: [baseVersionId],
+          },
+        ],
+        [],
+      );
+      const legacyVersionId = `${legacyMarker.eventHash ?? ""}#0`;
+      const legacyChange = (await legacyDevice.listEvents()).find(
+        (event) => event.eventHash === legacyMarker.eventHash,
+      )?.manifest.changes[0];
+      expect(classifyLegacyCheckpointMarker(legacyChange?.metadata)).toBe(
+        "ordinary",
+      );
+      expect(
+        effectiveVersionProducer(legacyChange?.metadata, legacyMarkerProducer),
+      ).toEqual(legacyMarkerProducer);
+
+      await reconcileRepository(currentDevice);
+      currentDevice.state.retiredDevices = [legacyDevice.state.device.deviceId];
+      await currentDevice.saveState();
+      await currentDevice.createCheckpoint(true);
+      const prune = await currentDevice.pruneWithGates({
+        reconciledWithoutWarnings: true,
+        overrideAgeGate: true,
+      });
+      expect(prune.status).toBe("pruned");
+      const upgraded = (await currentDevice.listEvents()).find(
+        (event) => event.eventHash === prune.markerEventHash,
+      )?.manifest.changes[0];
+      expect(upgraded?.parents).toEqual([legacyVersionId]);
+      expect(upgraded?.metadata).toMatchObject({
+        syncOrigin: "checkpoint-marker",
+        checkpointedSourceDeviceId: legacyDevice.state.device.deviceId,
+        checkpointedVersionId: legacyVersionId,
+        checkpointedProducer: legacyMarkerProducer,
+      });
+      expect(upgraded?.metadata).not.toHaveProperty("checkpointedSyncOrigin");
+      expect(
+        effectiveVersionProducer(upgraded?.metadata, currentMarkerProducer),
+      ).toEqual({
+        extensionVersion: currentMarkerProducer.extensionVersion,
+        cursorVersion: legacyMarkerProducer.cursorVersion,
+        vscodeVersion: legacyMarkerProducer.vscodeVersion,
+      });
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("distinguishes ordinary v0.0.59 markers from retained special recipes", () => {
+    const markerProducer = {
+      extensionVersion: "0.0.59",
+      cursorVersion: "3.15.6",
+      vscodeVersion: "1.125.0",
+    };
+    const originalProducer = {
+      extensionVersion: "0.0.58",
+      cursorVersion: "3.16.0",
+      vscodeVersion: "1.126.0",
+    };
+    const ordinary = {
+      syncOrigin: "checkpoint-marker",
+      composerId: "00000000-0000-4000-8000-000000000001",
+      lastUpdatedAt: 59,
+      bubbleCount: 1,
+    };
+    expect(classifyLegacyCheckpointMarker(ordinary)).toBe("ordinary");
+    expect(effectiveVersionProducer(ordinary, markerProducer)).toEqual(
+      markerProducer,
+    );
+
+    const repair = {
+      ...ordinary,
+      repairOriginDeviceId: "repair-source",
+      repairFingerprint: "a".repeat(64),
+    };
+    expect(classifyLegacyCheckpointMarker(repair)).toBe(
+      "automatic-chat-repair",
+    );
+    expect(effectiveSyncOrigin(repair)).toBe("automatic-chat-repair");
+    expect(effectiveVersionProducer(repair, markerProducer)).toBeUndefined();
+
+    const enrichment = {
+      ...ordinary,
+      chatSnapshotSchemaVersion: 2,
+      chatCoreHash: "b".repeat(64),
+      agentKvBlobCount: 2,
+      agentKvReferencedCount: 2,
+      agentKvMissingCount: 0,
+      enrichedFromVersionId: `${"c".repeat(64)}#0`,
+      enrichedFromSemanticHash: "d".repeat(64),
+      originalProducer,
+    };
+    expect(classifyLegacyCheckpointMarker(enrichment)).toBe(
+      "agent-kv-enrichment",
+    );
+    expect(effectiveSyncOrigin(enrichment)).toBe("agent-kv-enrichment");
+    expect(effectiveVersionProducer(enrichment, markerProducer)).toEqual({
+      extensionVersion: markerProducer.extensionVersion,
+      cursorVersion: originalProducer.cursorVersion,
+      vscodeVersion: originalProducer.vscodeVersion,
+    });
+
+    const restore = { ...ordinary, originalProducer };
+    expect(classifyLegacyCheckpointMarker(restore)).toBe("version-restore");
+    expect(effectiveSyncOrigin(restore)).toBe("version-restore");
+    expect(effectiveVersionProducer(restore, markerProducer)).toEqual({
+      extensionVersion: markerProducer.extensionVersion,
+      cursorVersion: originalProducer.cursorVersion,
+      vscodeVersion: originalProducer.vscodeVersion,
+    });
+
+    const partialNewMarker = {
+      ...ordinary,
+      checkpointedVersionId: `${"e".repeat(64)}#0`,
+    };
+    expect(classifyLegacyCheckpointMarker(partialNewMarker)).toBeNull();
+    expect(
+      effectiveVersionProducer(partialNewMarker, markerProducer),
+    ).toBeUndefined();
+  });
+
+  it("preserves an automatic repair's source through marker generations", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-setting-sync-marker-provenance-"),
+    );
+    try {
+      const newerSourceProducer = {
+        extensionVersion: "0.0.62",
+        cursorVersion: "3.16.0",
+        vscodeVersion: "1.126.0",
+      };
+      const olderMarkerProducer = {
+        extensionVersion: "0.0.63",
+        cursorVersion: "3.15.6",
+        vscodeVersion: "1.125.0",
+      };
+      const repositoryRoot = join(temporaryRoot, "repository");
+      const deviceA = await SyncRepository.create(
+        repositoryRoot,
+        join(temporaryRoot, "storage-a"),
+        "a sufficiently long test passphrase",
+        1024 * 1024,
+        newerSourceProducer,
+      );
+      const deviceB = await SyncRepository.open(
+        repositoryRoot,
+        join(temporaryRoot, "storage-b"),
+        "a sufficiently long test passphrase",
+        1024 * 1024,
+        olderMarkerProducer,
+      );
+      expect(deviceA.state.device.deviceId).not.toBe(
+        deviceB.state.device.deviceId,
+      );
+      const content = Buffer.from("complete automatic repair", "utf8");
+      const direct = await deviceA.publish(
+        [
+          {
+            resourceId: PEER_CHAT,
+            kind: "chat",
+            content,
+            semanticHash: sha256(content),
+            metadata: {
+              syncOrigin: "automatic-chat-repair",
+              repairOriginDeviceId: deviceA.state.device.deviceId,
+              repairFingerprint: "f".repeat(64),
+            },
+          },
+        ],
+        [],
+      );
+      const directVersionId = `${direct.eventHash ?? ""}#0`;
+
+      await reconcileRepository(deviceB);
+      // The source device is intentionally offline for this maintenance run;
+      // retiring it removes the unrelated all-devices checkpoint ACK gate so
+      // this test can isolate marker provenance.
+      deviceB.state.retiredDevices = [deviceA.state.device.deviceId];
+      await deviceB.saveState();
+      await deviceB.createCheckpoint(true);
+      const firstPrune = await deviceB.pruneWithGates({
+        reconciledWithoutWarnings: true,
+        overrideAgeGate: true,
+      });
+      expect(firstPrune.status).toBe("pruned");
+      const firstMarkerVersionId = `${firstPrune.markerEventHash ?? ""}#0`;
+      const firstMarker = (await deviceB.listEvents()).find(
+        (event) => event.eventHash === firstPrune.markerEventHash,
+      )?.manifest.changes[0];
+      expect(firstMarker?.parents).toEqual([directVersionId]);
+      expect(firstMarker?.metadata).toMatchObject({
+        syncOrigin: "checkpoint-marker",
+        checkpointedSyncOrigin: "automatic-chat-repair",
+        checkpointedSourceDeviceId: deviceA.state.device.deviceId,
+        checkpointedVersionId: directVersionId,
+        checkpointedProducer: newerSourceProducer,
+        repairOriginDeviceId: deviceA.state.device.deviceId,
+      });
+      expect(
+        effectiveVersionProducer(
+          firstMarker?.metadata,
+          olderMarkerProducer,
+        ),
+      ).toEqual({
+        extensionVersion: olderMarkerProducer.extensionVersion,
+        cursorVersion: newerSourceProducer.cursorVersion,
+        vscodeVersion: newerSourceProducer.vscodeVersion,
+      });
+
+      await reconcileRepository(deviceB);
+      await deviceB.createCheckpoint(true);
+      const secondPrune = await deviceB.pruneWithGates({
+        reconciledWithoutWarnings: true,
+        overrideAgeGate: true,
+      });
+      expect(secondPrune.status).toBe("pruned");
+      const secondMarker = (await deviceB.listEvents()).find(
+        (event) => event.eventHash === secondPrune.markerEventHash,
+      )?.manifest.changes[0];
+      expect(secondMarker?.parents).toEqual([firstMarkerVersionId]);
+      expect(secondMarker?.metadata).toMatchObject({
+        syncOrigin: "checkpoint-marker",
+        checkpointedSyncOrigin: "automatic-chat-repair",
+        // Marker-of-marker keeps A as the effective source even though B
+        // published both transport markers.
+        checkpointedSourceDeviceId: deviceA.state.device.deviceId,
+        // The immediate provenance edge advances to the first marker.
+        checkpointedVersionId: firstMarkerVersionId,
+        checkpointedProducer: newerSourceProducer,
+        repairOriginDeviceId: deviceA.state.device.deviceId,
+      });
+      expect(
+        effectiveVersionProducer(
+          secondMarker?.metadata,
+          olderMarkerProducer,
+        ),
+      ).toEqual({
+        extensionVersion: olderMarkerProducer.extensionVersion,
+        cursorVersion: newerSourceProducer.cursorVersion,
+        vscodeVersion: newerSourceProducer.vscodeVersion,
+      });
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   /**
    * Pruning republishes one current tip as a v2 marker event so old builds fail
    * loudly. The content comes out of the repository blob, not off this disk, so
@@ -44,6 +355,14 @@ describe("the checkpoint marker re-asserts a tip this device may never have appl
             kind: "chat" as const,
             content,
             semanticHash: sha256(content),
+            metadata: {
+              syncOrigin: "agent-kv-enrichment",
+              originalProducer: {
+                extensionVersion: "0.0.62",
+                cursorVersion: "3.16.0",
+                vscodeVersion: "1.126.0",
+              },
+            },
           },
         ],
         [],
@@ -70,6 +389,9 @@ describe("the checkpoint marker re-asserts a tip this device may never have appl
       expect(projection?.tip.versionId).toBe(`${prune.markerEventHash}#0`);
       expect(projection?.tip.deviceId).toBe(repository.state.device.deviceId);
       expect(projection?.tip.metadata?.syncOrigin).toBe("checkpoint-marker");
+      expect(projection?.tip.metadata?.checkpointedSyncOrigin).toBe(
+        "agent-kv-enrichment",
+      );
       expect(projection?.tip.semanticHash).toBe(sha256(content));
       expect(published.eventHash).not.toBe(prune.markerEventHash);
 
@@ -171,4 +493,13 @@ async function adoptTips(repository: SyncRepository): Promise<void> {
     });
   }
   repository.state.tips = tips;
+}
+
+async function reconcileRepository(repository: SyncRepository): Promise<void> {
+  await repository.refreshState();
+  new EventReconciler().reconcile(
+    await repository.listEvents(),
+    repository.state,
+    await repository.loadAbsorbedCheckpointManifest(),
+  );
 }

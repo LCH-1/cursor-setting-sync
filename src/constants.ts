@@ -234,6 +234,12 @@ export const MAX_CHECKPOINT_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_OBJECT_ENVELOPE_BYTES = 1537 * 1024 * 1024;
 export const MAX_EVENT_CHANGES = 10_000;
 export const MAX_APPLY_BATCH_BYTES = 512 * 1024 * 1024;
+/** Fixed in-process payload envelope for one offline helper apply page. */
+export const MAX_HELPER_APPLY_WORK_BYTES = 32 * 1024 * 1024;
+/** Fixed extension-host envelope for one appliesWhileRunning payload. */
+export const MAX_RUNNING_APPLY_PAYLOAD_BYTES = 32 * 1024 * 1024;
+/** Fixed extension-host envelope for the payload copied into a prune marker. */
+export const MAX_CHECKPOINT_MARKER_PAYLOAD_BYTES = 32 * 1024 * 1024;
 export const MAX_PARENTS_PER_CHANGE = 256;
 
 export const AES_KEY_BYTES = 32;

@@ -15,7 +15,85 @@ export interface JsonMergeResult {
   conflicts: string[];
 }
 
+export const MAX_JSONC_STRUCTURAL_TOKENS = 65_536;
+export const MAX_JSONC_NESTING_DEPTH = 128;
+
+/** Rejects structural amplification before jsonc-parser builds an object graph. */
+export function assertBoundedJsoncStructure(
+  source: string,
+  label: string,
+  maxTokens = MAX_JSONC_STRUCTURAL_TOKENS,
+  maxDepth = MAX_JSONC_NESTING_DEPTH,
+): void {
+  let tokens = 0;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index]!;
+    const next = source[index + 1];
+    if (lineComment) {
+      if (character === "\n" || character === "\r") {
+        lineComment = false;
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (character === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === "/" && next === "/") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      continue;
+    }
+    if (character === "{" || character === "[") {
+      depth += 1;
+      tokens += 1;
+      if (depth > maxDepth) {
+        throw new Error(
+          `${label} exceeds the ${maxDepth}-level automatic parse depth limit.`,
+        );
+      }
+    } else if (character === "}" || character === "]") {
+      depth = Math.max(0, depth - 1);
+    } else if (character === "," || character === ":") {
+      tokens += 1;
+    }
+    if (tokens > maxTokens) {
+      throw new Error(
+        `${label} exceeds the ${maxTokens}-token automatic parse limit.`,
+      );
+    }
+  }
+}
+
 export function parseJsonc(content: string, label: string): JsonValue {
+  assertBoundedJsoncStructure(content, label);
   const errors: ParseError[] = [];
   const value = parse(content, errors, {
     allowTrailingComma: true,

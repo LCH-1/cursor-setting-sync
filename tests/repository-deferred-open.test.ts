@@ -38,6 +38,9 @@ describe("deferred repository open", () => {
       },
       "initializeDevice",
     );
+    const onRead = vi.fn();
+    const onParse = vi.fn();
+    const onStringify = vi.fn();
     const deferred = await SyncRepository.openDeferredWithMasterKey(
       original.root,
       storageRoot,
@@ -45,10 +48,14 @@ describe("deferred repository open", () => {
       Buffer.from(original.masterKey),
       4 * 1024 * 1024,
       producer,
+      { localState: { onRead, onParse, onStringify } },
     );
 
     expect(deferred.isInitialized).toBe(false);
     expect(initializeDevice).not.toHaveBeenCalled();
+    expect(onRead).not.toHaveBeenCalled();
+    expect(onParse).not.toHaveBeenCalled();
+    expect(onStringify).not.toHaveBeenCalled();
 
     // Optional fields absent from the newer atomic snapshot must be removed,
     // not retained by an Object.assign overlay from this stale instance.
@@ -70,6 +77,9 @@ describe("deferred repository open", () => {
     expect(deferred.state.lastSyncAt).toBe(newerSyncAt);
     expect(deferred.state.checkpoint).toBeUndefined();
     expect(initializeDevice).toHaveBeenCalledOnce();
+    expect(onRead).toHaveBeenCalledOnce();
+    expect(onParse).toHaveBeenCalledOnce();
+    expect(onStringify).toHaveBeenCalledOnce();
 
     await deferred.ensureInitialized();
     expect(initializeDevice).toHaveBeenCalledOnce();

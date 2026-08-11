@@ -13,7 +13,7 @@ Cursor Setting Sync는 Cursor 설정, 허용 목록으로 지정된 워크스페
 - Cursor User Rules
 - `~/.cursor`의 MCP·CLI 구성, commands, skills, rules
 - 허용 목록으로 지정된 `%APPDATA%\Cursor\User\workspaceStorage` 상태와 notepads·images의 이식 가능한 쿼리 수준 동기화
-- Composer/채팅 기록, 에이전트 트랜스크립트, 지원되는 `store.db` 세션
+- Composer/채팅 기록(다음 대화를 이어가는 데 필요한 content-addressed 데이터 포함), 에이전트 트랜스크립트, 지원되는 `store.db` 세션
 - 불변 히스토리, 결정론적 충돌 감지, 암호화·중복 제거된 객체, 백업, 진단
 - 공유 폴더 또는 git 원격 전송: `cursorSettingSync.gitSync`가 켜져 있고 저장소 폴더가 git 워크트리이면, 매 주기마다 읽기 전에 pull하고 쓰기 후에 commit/push합니다
 
@@ -120,7 +120,7 @@ Git 전송에는 `git` CLI가 `PATH`에 있어야 합니다. 인증은 시스템
 
 - **Resolve Conflicts** — 두 PC에서 편집해 자동 병합되지 않은 충돌을 수동으로 해결합니다. 모든 충돌이 한 화면에 이름과 양쪽 값과 함께 나열됩니다 — `Setting: editor.fontSize · This PC: 14 vs Other PC: 16` — 어느 PC가 언제 썼는지도 함께 표시됩니다. *전부 최신 것으로*, *전부 이 PC 것으로*, *전부 상대 PC 것으로* 중 하나로 목록 전체를 한 번에 처리하거나, 개별 항목을 골라 diff를 열고 따로 결정할 수 있습니다. diff는 직접 확인을 요청한 항목에 대해서만 열립니다. 나중으로 미뤄도 잃는 것은 없습니다. 양쪽 버전이 저장소에 그대로 남고, **Restore Version History**로 진 쪽을 되살릴 수 있습니다. UI 상태와 채팅은 여기에 거의 나타나지 않습니다. UI 상태는 아예 동기화되지 않고, 채팅 분기는 양쪽 메시지의 합집합으로 병합되며, 워크스페이스 DB와 `notepads.json`은 행 단위·노트 단위로 합쳐지므로 어느 PC의 노트도 충돌 해결을 위해 버려지지 않습니다. 사용자가 직접 작성했고 합칠 수 없는 리소스(설정, `.cursor` 규칙과 사용자 파일, 확장)와, 같은 노트를 양쪽에서 서로 다르게 고친 경우만 확인을 요청합니다. 충돌이 열려 있는 동안 해당 리소스는 상대 PC가 이쪽 버전을 볼 수 있도록 최대 1시간에 한 번만 다시 게시하며, 충돌을 해결하면 즉시 정상 동기화로 돌아갑니다.
 - **Restore Version History** — 리소스를 과거 버전으로 되돌립니다(git revert와 유사). 먼저 데이터 종류를 고르며, 일반 채팅을 되살릴 때는 **Agent transcripts**가 아니라 **Cursor conversations**를 선택하세요. 채팅이 많으면 워크스페이스/프로젝트로 한 번 더 좁히고, 실제 과거 복원 버전이 있는 항목만 읽기 쉬운 이름·메시지 수·날짜와 함께 표시합니다. diff 미리보기에서 버전을 확인한 뒤 새 버전으로 발행하며, 기존 히스토리는 보존됩니다.
-- **Repair Unavailable Chats** — `composerData`가 계속 참조하지만 메시지 행이 사라졌거나 읽을 수 없게 된 Cursor 대화를 자동으로 찾고, 신뢰 가능한 동기화 이력에서 사용할 수 없는 행을 모두 찾아 판별 가능한 대화를 한꺼번에 복구합니다. 채팅이나 버전을 직접 고를 필요가 없습니다. 기존의 정상 메시지와 현재 제목·헤더·composerData는 유지하고, Cursor 종료 후 DB 백업과 최종 race 검사를 거쳐 참조된 손상 행만 복구합니다. 즉시 적용하려면 **Repair and Restart**를 선택하세요.
+- **Repair Unavailable Chats** — 보이는 메시지 행 손상뿐 아니라, 복원된 대화는 보이지만 다음 프롬프트가 거절되는 continuation 데이터 누락도 자동으로 찾습니다. 동기화된 완전한 사본이 있으면 채팅이나 버전을 직접 고르지 않고 복구합니다. 구버전으로 옮긴 채팅에 continuation 데이터가 아직 없다면 그 채팅을 정상적으로 이어갈 수 있는 PC를 먼저 업데이트해 **Sync Now**를 실행한 뒤, 대상 PC에서도 **Sync Now**와 이 명령을 실행하세요. 기존 메시지와 현재 제목·헤더·composerData는 유지하며, DB 쓰기는 Cursor 종료 후 백업과 최종 race 검사를 거쳐 수행합니다.
 - **Restore Backup** — DB를 이전 백업 시점으로 복원합니다. 모든 DB 쓰기 전에 SQLite 백업을 뜨며, 그중 하나를 골라 복원합니다. 잘못된 복원을 되돌릴 "pre-restore" 백업도 목록에 표시됩니다.
 
 **저장소 관리**

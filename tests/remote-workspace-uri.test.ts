@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   normalizeWorkspaceUri,
   resolveTargetWorkspace,
@@ -66,6 +66,25 @@ describe("the two spellings of one SSH host", () => {
     expect(normalizeWorkspaceUri(noHost, "linux")).toBe(
       "vscode-remote://ssh-remote+7b22706f7274223a32327d/home/x",
     );
+  });
+
+  it("rejects and memoizes a structurally hostile descriptor before parsing", () => {
+    const descriptor = Buffer.from(
+      `{"hostName":"hostile","future":[${Array.from(
+        { length: 22_000 },
+        () => "{}",
+      ).join(",")}]}`,
+      "utf8",
+    ).toString("hex");
+    const uri = `vscode-remote://ssh-remote%2B${descriptor}/home/project`;
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      expect(normalizeWorkspaceUri(uri, "linux")).toContain(descriptor);
+      expect(normalizeWorkspaceUri(uri, "linux")).toContain(descriptor);
+      expect(parse).not.toHaveBeenCalled();
+    } finally {
+      parse.mockRestore();
+    }
   });
 
   it("leaves local file URIs untouched", () => {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,8 +13,16 @@ import {
 import type { HelperRequest } from "../src/helper/types";
 import { applyNonGlobalChanges } from "../src/helper/resourceApply";
 import { pathExists } from "../src/platform/files";
-import { auditChatReferences } from "../src/chat/repair";
-import type { PortableChatSnapshot } from "../src/chat/stateVscdb";
+import {
+  auditChatReferences,
+  inspectBrokenChatContinuationsInDatabase,
+  readPortableChatSnapshot,
+} from "../src/chat/repair";
+import type {
+  PortableChatSnapshot,
+  PortableChatSnapshotV2,
+} from "../src/chat/stateVscdb";
+import { portableChatCoreHash } from "../src/chat/stateVscdb";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 
 const temporaryRoots: string[] = [];
@@ -31,6 +39,7 @@ const describeWithBackup = hasBackup ? describe : describe.skip;
 const USER_RULES_KEY = "aicontext.personalContext";
 const REPAIR_ORIGIN_DEVICE = "repair-origin-device";
 const REPAIR_PEER_DEVICE = "repair-peer-device";
+const REPAIR_MARKER_DEVICE = "repair-checkpoint-device";
 
 describe("offline database helper prerequisites", () => {
   it("exercises the offline helper suite on a runtime that supports it", () => {
@@ -55,6 +64,137 @@ afterEach(async () => {
 });
 
 describeWithBackup("offline database helper", () => {
+  it("applies a chat-only batch without reading an oversized target marker", async () => {
+    const fixture = await createFixture();
+    const database = new DatabaseSync(fixture.databasePath);
+    database
+      .prepare("UPDATE ItemTable SET value = zeroblob(?) WHERE key = ?")
+      .run(8 * 1024 * 1024 + 1, "__$__targetStorageMarker");
+    database.close();
+    const composerId = "00000000-0000-4000-8000-000000000901";
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      ordinaryChatChange(
+        repairSnapshot(composerId, "data", "header", [
+          { id: "bubble", value: { text: "chat survived" } },
+        ]),
+      ),
+    ]);
+
+    expect(result.applied).toContain(`chat/${composerId}`);
+    const verification = new DatabaseSync(fixture.databasePath, {
+      readOnly: true,
+    });
+    expect(
+      verification
+        .prepare(
+          "SELECT COUNT(*) AS count FROM composerHeaders WHERE composerId = ?",
+        )
+        .get(composerId),
+    ).toEqual({ count: 1 });
+    expect(
+      verification
+        .prepare("SELECT length(value) AS bytes FROM ItemTable WHERE key = ?")
+        .get("__$__targetStorageMarker"),
+    ).toEqual({ bytes: 8 * 1024 * 1024 + 1 });
+    verification.close();
+  });
+
+  it("isolates an over-limit marker addition while applying a chat sibling", async () => {
+    const fixture = await createFixture();
+    const entries = Object.fromEntries(
+      Array.from({ length: 16_384 }, (_, index) => [`key.${index}`, 0]),
+    );
+    const originalMarker = JSON.stringify(entries);
+    const database = new DatabaseSync(fixture.databasePath);
+    database
+      .prepare("UPDATE ItemTable SET value = ? WHERE key = ?")
+      .run(originalMarker, "__$__targetStorageMarker");
+    database.close();
+    const composerId = "00000000-0000-4000-8000-000000000902";
+    const key = "aicontext.personalContext";
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      {
+        change: {
+          eventHash: "1".repeat(64),
+          changeIndex: 0,
+          resourceId: `cursor-user-rules/${encodeURIComponent(key)}`,
+          kind: "cursor-user-rules",
+          operation: "put",
+          semanticHash: "hash",
+          metadata: { key, registeredUserTarget: true },
+        },
+        content: Buffer.from("must not land", "utf8"),
+      },
+      ordinaryChatChange(
+        repairSnapshot(composerId, "data", "header", [
+          { id: "bubble", value: { text: "chat sibling" } },
+        ]),
+        "2",
+      ),
+    ]);
+
+    expect(result.applied).toContain(`chat/${composerId}`);
+    expect(result.applied).not.toContain(`cursor-user-rules/${key}`);
+    expect(result.skipped.some((item) => item.includes("target storage marker"))).toBe(
+      true,
+    );
+    expect(readItem(fixture.databasePath, key)).toBe(null);
+    expect(readItem(fixture.databasePath, "__$__targetStorageMarker")).toBe(
+      originalMarker,
+    );
+  });
+
+  it("isolates a 1,001st stored profile while applying a chat sibling", async () => {
+    const fixture = await createFixture();
+    const stored = Array.from({ length: 1_000 }, (_, index) => ({
+      location: { path: `/profiles/local-${index}` },
+      name: `Local ${index}`,
+    }));
+    const originalManifest = JSON.stringify(stored);
+    const database = new DatabaseSync(fixture.databasePath);
+    database
+      .prepare(
+        `INSERT INTO ItemTable(key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run("userDataProfiles", originalManifest);
+    database.close();
+    const incomingProfiles = Buffer.from(
+      JSON.stringify([{ id: "new-profile", name: "New profile" }]),
+      "utf8",
+    );
+    const composerId = "00000000-0000-4000-8000-000000000903";
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      {
+        change: {
+          eventHash: "3".repeat(64),
+          changeIndex: 0,
+          resourceId: "profile/manifest",
+          kind: "profile",
+          operation: "put",
+          semanticHash: sha256(incomingProfiles),
+        },
+        content: incomingProfiles,
+      },
+      ordinaryChatChange(
+        repairSnapshot(composerId, "data", "header", [
+          { id: "bubble", value: { text: "chat sibling" } },
+        ]),
+        "4",
+      ),
+    ]);
+
+    expect(result.applied).toContain(`chat/${composerId}`);
+    expect(result.applied).not.toContain("profile/manifest");
+    expect(result.skipped.some((item) => item.includes("entry limit"))).toBe(true);
+    expect(readItem(fixture.databasePath, "userDataProfiles")).toBe(
+      originalManifest,
+    );
+  });
+
   it("backs up and applies an allowlisted UI state value", async () => {
     const fixture = await createFixture();
     const result = await applyGlobalDatabaseChanges(fixture.request, [
@@ -863,6 +1003,7 @@ describeWithBackup("offline database helper", () => {
     // The preserved live header is allowed to publish on the next scan rather
     // than being hidden behind a retained-local hash from the repair source.
     expect(result.retainedLocal).toEqual([]);
+    expect(result.localChatCoreHashes[`chat/${composerId}`]).toBeNull();
     const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
     try {
       const header = database
@@ -878,6 +1019,279 @@ describeWithBackup("offline database helper", () => {
       expect(readKv(database, `bubbleId:${composerId}:b`)).toBe(
         JSON.stringify({ text: "recovered b" }),
       );
+    } finally {
+      database.close();
+    }
+  });
+
+  it("defers automatic repair before reading an over-limit local chat body", async () => {
+    const fixture = await createFixture({ maxPayloadBytes: 1024 });
+    const composerId = "31313131-3131-4131-8131-313131313131";
+    const composerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "oversized" }],
+    });
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "local-header", 1);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, composerData);
+    seed
+      .prepare(
+        "INSERT INTO cursorDiskKV(key, value) VALUES (?, zeroblob(4096))",
+      )
+      .run(`bubbleId:${composerId}:oversized`);
+    seed.close();
+    const source = repairSnapshot(
+      composerId,
+      composerData,
+      "remote-header",
+      [{ id: "oversized", value: { text: "small repair" } }],
+    );
+
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      automaticChatRepairChange(source, "unreached-fingerprint"),
+      REPAIR_ORIGIN_DEVICE,
+    );
+
+    expect(result.applied).toEqual([]);
+    expect(result.failureByResourceId[`chat/${composerId}`]).toContain(
+      "bounded 1024-byte inspection limit",
+    );
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(
+        database
+          .prepare(
+            "SELECT typeof(value) AS valueType, length(CAST(value AS BLOB)) AS valueBytes " +
+              "FROM cursorDiskKV WHERE key = ?",
+          )
+          .get(`bubbleId:${composerId}:oversized`),
+      ).toEqual({ valueType: "blob", valueBytes: 4096 });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("leaves the database unchanged when a live bubble exceeds the JSON structure budget", async () => {
+    const fixture = await createFixture();
+    const composerId = "32323232-3232-4232-8232-323232323232";
+    const composerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "hostile" }],
+    });
+    const hostile = hostileRepairJson();
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "live-header", 1);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, composerData);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:hostile`, hostile);
+    seed.close();
+    const source = repairSnapshot(
+      composerId,
+      composerData,
+      "historical-header",
+      [
+        { id: "hostile", value: { text: "must not replace live" } },
+        { id: "source-orphan", value: { text: "must not be added" } },
+      ],
+    );
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      const result = await applyAutomaticRepair(
+        fixture.request,
+        automaticChatRepairChange(source, "unreached-fingerprint"),
+        REPAIR_ORIGIN_DEVICE,
+      );
+
+      expect(result.applied).toEqual([]);
+      expect(result.failureByResourceId[`chat/${composerId}`]).toContain(
+        "chat row JSON structural work limit was reached",
+      );
+      expect(
+        parse.mock.calls.filter(([input]) => input === hostile),
+      ).toHaveLength(0);
+      const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+      try {
+        expect(readKv(database, `composerData:${composerId}`)).toBe(composerData);
+        expect(readKv(database, `bubbleId:${composerId}:hostile`)).toBe(hostile);
+        expect(readKv(database, `bubbleId:${composerId}:source-orphan`)).toBeUndefined();
+      } finally {
+        database.close();
+      }
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  it("leaves the database unchanged when many live bubbles exhaust one audit budget", async () => {
+    const fixture = await createFixture();
+    const composerId = "33333333-3232-4232-8232-333333333333";
+    const ids = Array.from(
+      { length: 88 },
+      (_unused, index) => `aggregate-${index.toString().padStart(3, "0")}`,
+    );
+    const composerData = JSON.stringify({
+      fullConversationHeadersOnly: ids.map((bubbleId) => ({ bubbleId })),
+    });
+    const unit = smallRepairJson();
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "live-header", 1);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, composerData);
+    const insert = seed.prepare(
+      "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)",
+    );
+    seed.exec("BEGIN");
+    for (const id of ids) {
+      insert.run(`bubbleId:${composerId}:${id}`, unit);
+    }
+    seed.exec("COMMIT");
+    seed.close();
+    const source = repairSnapshot(
+      composerId,
+      composerData,
+      "historical-header",
+      [
+        ...ids.map((id) => ({ id, value: { text: `source-${id}` } })),
+        { id: "source-orphan", value: { text: "must not be added" } },
+      ],
+    );
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      const result = await applyAutomaticRepair(
+        fixture.request,
+        automaticChatRepairChange(source, "unreached-fingerprint"),
+        REPAIR_ORIGIN_DEVICE,
+      );
+
+      expect(result.applied).toEqual([]);
+      expect(result.failureByResourceId[`chat/${composerId}`]).toContain(
+        "chat row JSON structural work limit was reached",
+      );
+      const parsedUnits = parse.mock.calls.filter(([input]) => input === unit);
+      expect(parsedUnits.length).toBeGreaterThan(0);
+      expect(parsedUnits.length).toBeLessThan(ids.length);
+      const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+      try {
+        expect(readKv(database, `composerData:${composerId}`)).toBe(composerData);
+        expect(readKv(database, `bubbleId:${composerId}:${ids[0]}`)).toBe(unit);
+        expect(readKv(database, `bubbleId:${composerId}:${ids.at(-1)}`)).toBe(unit);
+        expect(readKv(database, `bubbleId:${composerId}:source-orphan`)).toBeUndefined();
+      } finally {
+        database.close();
+      }
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  it("applies automatic v2 bubble and continuation repair together and idempotently", async () => {
+    const fixture = await createFixture();
+    const composerId = "34343434-3434-4434-8434-343434343434";
+    const blob = Buffer.from("automatic repair continuation", "utf8");
+    const rootId = sha256(blob);
+    const conversationState = serializedRootState(rootId);
+    const composerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "b" }],
+      conversationState,
+    });
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, JSON.stringify({ name: "Live" }), 1);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, composerData);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:a`, JSON.stringify({ text: "a" }));
+    seed.close();
+
+    const planned = repairSnapshot(
+      composerId,
+      composerData,
+      JSON.stringify({ name: "Live" }),
+      [{ id: "a", value: { text: "a" } }],
+    );
+    const repairedCore = repairSnapshot(
+      composerId,
+      composerData,
+      JSON.stringify({ name: "Historical" }),
+      [
+        { id: "a", value: { text: "historical a" } },
+        { id: "b", value: { text: "recovered b" } },
+        ...Array.from({ length: 20 }, (_unused, index) => ({
+          id: `historical-${index.toString().padStart(2, "0")}`,
+          value: { text: `inert history ${index}` },
+        })),
+      ],
+    );
+    const source: PortableChatSnapshotV2 = {
+      ...repairedCore,
+      schemaVersion: 2,
+      agentKv: {
+        blobs: [
+          {
+            key: `agentKv:blob:${rootId}`,
+            valueBase64: blob.toString("base64"),
+            valueType: "blob",
+          },
+        ],
+        referencedIds: [rootId],
+        missingIds: [],
+      },
+    };
+    const change = automaticChatRepairChange(
+      source,
+      repairFingerprint(planned),
+    );
+
+    const first = await applyAutomaticRepair(
+      fixture.request,
+      change,
+      REPAIR_ORIGIN_DEVICE,
+    );
+    expect(first.applied).toEqual([`chat/${composerId}`]);
+
+    let database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `bubbleId:${composerId}:b`)).toBe(
+        JSON.stringify({ text: "recovered b" }),
+      );
+      expect(readKv(database, `agentKv:blob:${rootId}`)).toBe(blob.toString());
+      const bubbleCount = database
+        .prepare(
+          "SELECT COUNT(*) AS total FROM cursorDiskKV WHERE key LIKE ?",
+        )
+        .get(`bubbleId:${composerId}:%`) as { total?: number } | undefined;
+      expect(bubbleCount?.total).toBe(source.bubbles.length);
+      const audit = await inspectBrokenChatContinuationsInDatabase(database);
+      expect(audit).toMatchObject({
+        auditedChats: 1,
+        unknownChats: 0,
+        broken: [],
+      });
+    } finally {
+      database.close();
+    }
+
+    const second = await applyAutomaticRepair(
+      fixture.request,
+      change,
+      REPAIR_ORIGIN_DEVICE,
+    );
+    expect(second.applied).toEqual([`chat/${composerId}`]);
+    expect(second.skipped.join(" ")).toContain(
+      "every supplied repair row was already valid",
+    );
+    database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `bubbleId:${composerId}:b`)).toBe(
+        JSON.stringify({ text: "recovered b" }),
+      );
+      expect(readKv(database, `agentKv:blob:${rootId}`)).toBe(blob.toString());
     } finally {
       database.close();
     }
@@ -1002,6 +1416,163 @@ describeWithBackup("offline database helper", () => {
       database.close();
     }
   });
+
+  it("keeps automatic-repair fingerprint checks after checkpoint re-assertion", async () => {
+    const fixture = await createFixture();
+    const composerId = "45454545-4545-4545-8545-454545454545";
+    const plannedData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "b" }],
+    });
+    const planned = repairSnapshot(composerId, plannedData, "{}", [
+      { id: "a", value: { text: "a" } },
+    ]);
+    const changedData = JSON.stringify({
+      fullConversationHeadersOnly: [
+        { bubbleId: "a" },
+        { bubbleId: "b" },
+        { bubbleId: "later" },
+      ],
+    });
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "{}", 1);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, changedData);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:a`, JSON.stringify({ text: "a" }));
+    seed.close();
+    const source = repairSnapshot(composerId, plannedData, "{}", [
+      { id: "a", value: { text: "a" } },
+      { id: "b", value: { text: "b" } },
+    ]);
+    const change = automaticChatRepairChange(
+      source,
+      repairFingerprint(planned),
+    );
+    checkpointAutomaticRepairChange(change);
+
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      change,
+      REPAIR_ORIGIN_DEVICE,
+    );
+
+    expect(result.applied).toEqual([]);
+    expect(result.failureByResourceId[`chat/${composerId}`]).toContain(
+      "changed after repair was planned",
+    );
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `bubbleId:${composerId}:b`)).toBeUndefined();
+    } finally {
+      database.close();
+    }
+  });
+
+  it("uses checkpointed original source authority instead of the marker publisher", async () => {
+    const fixture = await createFixture();
+    const composerId = "46464646-4646-4646-8646-464646464646";
+    const composerData = JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "b" }],
+    });
+    const local = repairSnapshot(composerId, composerData, "{}", [
+      { id: "a", value: { text: "a" } },
+    ]);
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "{}", 1);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, composerData);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:a`, JSON.stringify({ text: "a" }));
+    seed.close();
+    const source = repairSnapshot(composerId, composerData, "{}", [
+      { id: "a", value: { text: "a" } },
+      { id: "b", value: { text: "recovered" } },
+    ]);
+    const change = automaticChatRepairChange(
+      source,
+      repairFingerprint(local),
+    );
+    checkpointAutomaticRepairChange(change);
+
+    const result = await applyAutomaticRepair(
+      fixture.request,
+      change,
+      REPAIR_ORIGIN_DEVICE,
+    );
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `bubbleId:${composerId}:b`)).toBe(
+        JSON.stringify({ text: "recovered" }),
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  it.each(["missing", "mismatched"] as const)(
+    "fails closed when checkpoint repair source metadata is %s",
+    async (provenance) => {
+      const fixture = await createFixture();
+      const composerId =
+        provenance === "missing"
+          ? "47474747-4747-4747-8747-474747474747"
+          : "48484848-4848-4848-8848-484848484848";
+      const composerData = JSON.stringify({
+        fullConversationHeadersOnly: [{ bubbleId: "a" }, { bubbleId: "b" }],
+      });
+      const local = repairSnapshot(composerId, composerData, "{}", [
+        { id: "a", value: { text: "a" } },
+      ]);
+      const seed = new DatabaseSync(fixture.databasePath);
+      insertTestHeader(seed, composerId, "{}", 1);
+      seed
+        .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+        .run(`composerData:${composerId}`, composerData);
+      seed
+        .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+        .run(`bubbleId:${composerId}:a`, JSON.stringify({ text: "a" }));
+      seed.close();
+      const source = repairSnapshot(composerId, composerData, "{}", [
+        { id: "a", value: { text: "a" } },
+        { id: "b", value: { text: "must-not-land" } },
+      ]);
+      const change = automaticChatRepairChange(
+        source,
+        repairFingerprint(local),
+      );
+      checkpointAutomaticRepairChange(change);
+      if (provenance === "missing") {
+        delete change.change.metadata?.checkpointedSourceDeviceId;
+      } else if (change.change.metadata !== undefined) {
+        change.change.metadata.checkpointedSourceDeviceId = REPAIR_PEER_DEVICE;
+      }
+
+      const result = await applyAutomaticRepair(
+        fixture.request,
+        change,
+        REPAIR_ORIGIN_DEVICE,
+      );
+
+      expect(result.applied).toEqual([]);
+      expect(result.failureByResourceId[`chat/${composerId}`]).toContain(
+        "origin does not match",
+      );
+      const database = new DatabaseSync(fixture.databasePath, {
+        readOnly: true,
+      });
+      try {
+        expect(readKv(database, `bubbleId:${composerId}:b`)).toBeUndefined();
+      } finally {
+        database.close();
+      }
+    },
+  );
 
   it("materializes a complete repair snapshot only on a truly empty peer", async () => {
     const fixture = await createFixture();
@@ -1336,6 +1907,34 @@ describeWithBackup("offline database helper", () => {
   it("restores NULL chat values and NULL header columns as SQL NULL", async () => {
     const fixture = await createFixture();
     const composerId = "00000000-0000-4000-8000-000000000002";
+    const snapshot: PortableChatSnapshot = {
+      schemaVersion: 1,
+      composerId,
+      header: {
+        composerId,
+        workspaceId: null,
+        createdAt: null,
+        lastUpdatedAt: null,
+        isArchived: null,
+        isSubagent: null,
+        recency: null,
+        checkpointAt: null,
+        value: null,
+      },
+      composerData: {
+        key: `composerData:${composerId}`,
+        valueBase64: "",
+        valueType: "null",
+      },
+      bubbles: [
+        {
+          key: `bubbleId:${composerId}:null-bubble`,
+          valueBase64: "",
+          valueType: "null",
+        },
+      ],
+    };
+    const content = canonicalBytes(snapshot);
     const seed = new DatabaseSync(fixture.databasePath);
     seed
       .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
@@ -1356,42 +1955,15 @@ describeWithBackup("offline database helper", () => {
           resourceId: `chat/${composerId}`,
           kind: "chat",
           operation: "put",
-          semanticHash: "hash",
+          semanticHash: sha256(content),
         },
-        content: Buffer.from(
-          JSON.stringify({
-            schemaVersion: 1,
-            composerId,
-            header: {
-              composerId,
-              workspaceId: null,
-              createdAt: null,
-              lastUpdatedAt: null,
-              isArchived: null,
-              isSubagent: null,
-              recency: null,
-              checkpointAt: null,
-              value: null,
-            },
-            composerData: {
-              key: `composerData:${composerId}`,
-              valueBase64: "",
-              valueType: "null",
-            },
-            bubbles: [
-              {
-                key: `bubbleId:${composerId}:null-bubble`,
-                valueBase64: "",
-                valueType: "null",
-              },
-            ],
-          }),
-          "utf8",
-        ),
+        content,
       },
     ]);
 
     expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(result.retainedLocal).toEqual([]);
+    expect(result.retainedLocalHashes[`chat/${composerId}`]).toBeUndefined();
     const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
     try {
       expect(readKvType(database, `composerData:${composerId}`)).toBe("null");
@@ -1586,6 +2158,822 @@ describeWithBackup("offline database helper", () => {
       "Unsupported UI state storage class: null",
     );
     expect(readItem(fixture.databasePath, USER_RULES_KEY)).toBeNull();
+  });
+
+  it("applies enrichment additively without replacing a richer live chat core", async () => {
+    const fixture = await createFixture();
+    const composerId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const blob = Buffer.from("recovered provenance", "utf8");
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "live-header", 111);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, "live-composer-data");
+    for (let index = 0; index < 111; index += 1) {
+      seed
+        .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+        .run(`bubbleId:${composerId}:b${index}`, `live-${index}`);
+    }
+    const localBefore = readPortableChatSnapshot(seed, composerId);
+    if (localBefore === null) {
+      throw new Error("expected the seeded local chat");
+    }
+    const expectedLocalCoreHash = portableChatCoreHash(localBefore);
+    seed.close();
+    const source = agentKvSnapshot(
+      composerId,
+      Array.from({ length: 115 }, (_, index) => `repo-${index}`),
+      [blob],
+    );
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      agentKvEnrichmentChange(source),
+    ]);
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(expectedLocalCoreHash).not.toBe(portableChatCoreHash(source));
+    expect(result.localChatCoreHashes[`chat/${composerId}`]).toBeNull();
+
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      const header = database
+        .prepare(
+          "SELECT value, recency FROM composerHeaders WHERE composerId = ?",
+        )
+        .get(composerId);
+      expect(header).toEqual({ value: "live-header", recency: 111 });
+      expect(readKv(database, `composerData:${composerId}`)).toBe(
+        "live-composer-data",
+      );
+      expect(readKv(database, `bubbleId:${composerId}:b0`)).toBe("live-0");
+      expect(readKv(database, `bubbleId:${composerId}:b114`)).toBeUndefined();
+      expect(
+        database
+          .prepare(
+            "SELECT COUNT(*) AS total FROM cursorDiskKV WHERE key >= ? AND key < ?",
+          )
+          .get(`bubbleId:${composerId}:`, `bubbleId:${composerId};`),
+      ).toEqual({ total: 111 });
+      expect(readKv(database, `agentKv:blob:${sha256(blob)}`)).toBe(
+        blob.toString("utf8"),
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  it("defers blob-only enrichment before reading an over-limit local chat body", async () => {
+    const fixture = await createFixture({ maxPayloadBytes: 1024 });
+    const composerId = "32323232-3232-4232-8232-323232323232";
+    const recoveredBlob = Buffer.from("must remain unapplied", "utf8");
+    const recoveredKey = `agentKv:blob:${sha256(recoveredBlob)}`;
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "local-header", 1);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, "{}");
+    seed
+      .prepare(
+        "INSERT INTO cursorDiskKV(key, value) VALUES (?, zeroblob(4096))",
+      )
+      .run(`bubbleId:${composerId}:oversized`);
+    seed.close();
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      agentKvEnrichmentChange(
+        agentKvSnapshot(composerId, ["small source"], [recoveredBlob]),
+      ),
+    ]);
+
+    expect(result.applied).toEqual([]);
+    expect(result.skipped.join("\n")).toContain(
+      "Chat enrichment deferred: the local conversation exceeds the bounded 1024-byte inspection limit",
+    );
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(
+        database
+          .prepare(
+            "SELECT typeof(value) AS valueType, length(CAST(value AS BLOB)) AS valueBytes " +
+              "FROM cursorDiskKV WHERE key = ?",
+          )
+          .get(`bubbleId:${composerId}:oversized`),
+      ).toEqual({ valueType: "blob", valueBytes: 4096 });
+      expect(readKv(database, recoveredKey)).toBeUndefined();
+    } finally {
+      database.close();
+    }
+  });
+
+  it("applies the parent core when an enrichment reaches a peer first", async () => {
+    const fixture = await createFixture();
+    const composerId = "dadadada-dada-4ada-8ada-dadadadadada";
+    const blob = Buffer.from("remote continuation", "utf8");
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "older-local-header", 1);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, "older-local-composer");
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:local`, "older-local-bubble");
+    seed.close();
+    const source = agentKvSnapshot(composerId, ["remote-new"], [blob]);
+    const change = agentKvEnrichmentChange(source);
+    change.change.metadata = {
+      ...change.change.metadata,
+      agentKvEnrichmentAppliesCore: true,
+    };
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [change]);
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(
+        database
+          .prepare(
+            "SELECT value, recency FROM composerHeaders WHERE composerId = ?",
+          )
+          .get(composerId),
+      ).toEqual({ value: "repo-header", recency: 999 });
+      expect(readKv(database, `composerData:${composerId}`)).toBe("repo-data");
+      expect(readKv(database, `bubbleId:${composerId}:b0`)).toBe("remote-new");
+      // Ordinary chat apply is additive: the older local row remains inert
+      // rather than being deleted while the remote composerData takes effect.
+      expect(readKv(database, `bubbleId:${composerId}:local`)).toBe(
+        "older-local-bubble",
+      );
+      expect(readKv(database, `agentKv:blob:${sha256(blob)}`)).toBe(
+        blob.toString("utf8"),
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  it("keeps blob-only enrichment semantics after checkpoint re-assertion", async () => {
+    const fixture = await createFixture();
+    const composerId = "dededede-dede-4ede-8ede-dededededede";
+    const blob = Buffer.from("checkpointed enrichment blob", "utf8");
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "newer-local-header", 7);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, "newer-local-composer");
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:local`, "newer-local-bubble");
+    seed.close();
+    const change = agentKvEnrichmentChange(
+      agentKvSnapshot(composerId, ["older-repo"], [blob]),
+    );
+    change.change.metadata = {
+      ...change.change.metadata,
+      syncOrigin: "checkpoint-marker",
+      checkpointedSyncOrigin: "agent-kv-enrichment",
+    };
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [change]);
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `composerData:${composerId}`)).toBe(
+        "newer-local-composer",
+      );
+      expect(readKv(database, `bubbleId:${composerId}:local`)).toBe(
+        "newer-local-bubble",
+      );
+      expect(readKv(database, `bubbleId:${composerId}:b0`)).toBeUndefined();
+      expect(readKv(database, `agentKv:blob:${sha256(blob)}`)).toBe(
+        blob.toString("utf8"),
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  it("persists a local core shortcut only when enrichment found the same core", async () => {
+    const fixture = await createFixture();
+    const composerId = "34343434-3434-4434-8434-343434343434";
+    const blob = Buffer.from("same-core blob", "utf8");
+    const source = agentKvSnapshot(composerId, ["same-core"], [blob]);
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'workspace', 1, 2, 0, 0, 999, NULL, 'repo-header')`,
+      )
+      .run(composerId);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, "repo-data");
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:b0`, "same-core");
+    seed.close();
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      agentKvEnrichmentChange(source),
+    ]);
+
+    expect(result.localChatCoreHashes[`chat/${composerId}`]).toBe(
+      portableChatCoreHash(source),
+    );
+  });
+
+  it("repairs hash-invalid agentKv rows but preserves hash-valid storage", async () => {
+    const fixture = await createFixture();
+    const composerId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const repaired = Buffer.from("replacement bytes", "utf8");
+    const preserved = Buffer.from("already valid text", "utf8");
+    const source = agentKvSnapshot(composerId, ["repo"], [repaired, preserved]);
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "live", 1);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`agentKv:blob:${sha256(repaired)}`, "corrupt");
+    // The incoming snapshot carries BLOB, but a hash-valid TEXT row is never
+    // overwritten merely to normalize its SQLite representation.
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`agentKv:blob:${sha256(preserved)}`, preserved.toString("utf8"));
+    seed.close();
+
+    await applyGlobalDatabaseChanges(fixture.request, [
+      agentKvEnrichmentChange(source),
+    ]);
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `agentKv:blob:${sha256(repaired)}`)).toBe(
+        repaired.toString("utf8"),
+      );
+      expect(readKvType(database, `agentKv:blob:${sha256(repaired)}`)).toBe(
+        "blob",
+      );
+      expect(readKv(database, `agentKv:blob:${sha256(preserved)}`)).toBe(
+        preserved.toString("utf8"),
+      );
+      expect(readKvType(database, `agentKv:blob:${sha256(preserved)}`)).toBe(
+        "text",
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  it("preflights an oversized corrupt local agentKv row before replacing it", async () => {
+    const fixture = await createFixture({ maxPayloadBytes: 1024 * 1024 });
+    const composerId = "efefefef-efef-4fef-8fef-efefefefefef";
+    const repaired = Buffer.from("bounded replacement", "utf8");
+    const key = `agentKv:blob:${sha256(repaired)}`;
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "local", 1);
+    seed
+      .prepare(
+        "INSERT INTO cursorDiskKV(key, value) VALUES (?, zeroblob(33554433))",
+      )
+      .run(key);
+    seed.close();
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      agentKvEnrichmentChange(
+        agentKvSnapshot(composerId, ["repo"], [repaired]),
+      ),
+    ]);
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, key)).toBe(repaired.toString("utf8"));
+      expect(
+        database
+          .prepare(
+            "SELECT length(CAST(value AS BLOB)) AS bytes FROM cursorDiskKV WHERE key = ?",
+          )
+          .get(key),
+      ).toEqual({ bytes: repaired.byteLength });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("leaves a source-missing local blob for bounded enrichment to publish", async () => {
+    const fixture = await createFixture();
+    const composerId = "12121212-1212-4212-8212-121212121212";
+    const local = Buffer.from("available only on target", "utf8");
+    const id = sha256(local);
+    const snapshot = agentKvSnapshot(composerId, ["repo"], [], [id]);
+    const content = canonicalBytes(snapshot);
+    const seed = new DatabaseSync(fixture.databasePath);
+    seed
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`agentKv:blob:${id}`, local.toString("utf8"));
+    seed.close();
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      {
+        change: {
+          eventHash: "f".repeat(64),
+          changeIndex: 0,
+          resourceId: `chat/${composerId}`,
+          kind: "chat",
+          operation: "put",
+          semanticHash: sha256(content),
+        },
+        content,
+      },
+    ]);
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(result.retainedLocal).toEqual([]);
+    expect(result.retainedLocalHashes[`chat/${composerId}`]).toBeUndefined();
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `agentKv:blob:${id}`)).toBe(local.toString());
+    } finally {
+      database.close();
+    }
+  });
+
+  it.each([
+    {
+      composerId: "15151515-1515-4515-8515-151515151515",
+      incomingValueType: "blob" as const,
+      existingValueType: "text" as const,
+    },
+    {
+      composerId: "16161616-1616-4616-8616-161616161616",
+      incomingValueType: "text" as const,
+      existingValueType: "blob" as const,
+    },
+  ])(
+    "hashes the preserved $existingValueType agentKv class instead of incoming $incomingValueType",
+    async ({ composerId, incomingValueType, existingValueType }) => {
+      const fixture = await createFixture();
+      const bytes = Buffer.from("same content-addressed bytes", "utf8");
+      const snapshot = agentKvSnapshot(composerId, ["core"], [bytes]);
+      snapshot.agentKv.blobs[0]!.valueType = incomingValueType;
+      const blobKey = snapshot.agentKv.blobs[0]!.key;
+      const seed = new DatabaseSync(fixture.databasePath);
+      seed
+        .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+        .run(
+          blobKey,
+          existingValueType === "text" ? bytes.toString("utf8") : bytes,
+        );
+      seed.close();
+
+      const result = await applyGlobalDatabaseChanges(fixture.request, [
+        ordinaryChatChange(snapshot),
+      ]);
+      const expected: PortableChatSnapshotV2 = {
+        ...snapshot,
+        agentKv: {
+          ...snapshot.agentKv,
+          blobs: snapshot.agentKv.blobs.map((row) => ({
+            ...row,
+            valueType: existingValueType,
+          })),
+        },
+      };
+
+      expect(result.applied).toEqual([`chat/${composerId}`]);
+      expect(result.retainedLocalHashes[`chat/${composerId}`]).toBe(
+        sha256(canonicalBytes(expected)),
+      );
+      const database = new DatabaseSync(fixture.databasePath, {
+        readOnly: true,
+      });
+      try {
+        expect(readKvType(database, blobKey)).toBe(existingValueType);
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  it("hashes legacy core rows with their normalized SQLite classes", async () => {
+    const fixture = await createFixture();
+    const composerId = "17171717-1717-4717-8717-171717171717";
+    const base = agentKvSnapshot(composerId, [], []);
+    const utf8 = Buffer.from("legacy text", "utf8");
+    const binary = Buffer.from([0xff, 0x00, 0xfe, 0x80]);
+    const snapshot: PortableChatSnapshot = {
+      schemaVersion: 1,
+      composerId,
+      header: base.header,
+      composerData: {
+        key: `composerData:${composerId}`,
+        valueBase64: utf8.toString("base64"),
+      },
+      bubbles: [
+        {
+          key: `bubbleId:${composerId}:a`,
+          valueBase64: utf8.toString("base64"),
+        },
+        {
+          key: `bubbleId:${composerId}:b`,
+          valueBase64: binary.toString("base64"),
+        },
+      ],
+    };
+    const expected: PortableChatSnapshot = {
+      ...snapshot,
+      composerData: { ...snapshot.composerData, valueType: "text" },
+      bubbles: [
+        { ...snapshot.bubbles[0]!, valueType: "text" },
+        { ...snapshot.bubbles[1]!, valueType: "blob" },
+      ],
+    };
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      ordinaryChatChange(snapshot),
+    ]);
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(result.retainedLocalHashes[`chat/${composerId}`]).toBe(
+      sha256(canonicalBytes(expected)),
+    );
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKvType(database, snapshot.composerData.key)).toBe("text");
+      expect(readKvType(database, snapshot.bubbles[0]!.key)).toBe("text");
+      expect(readKvType(database, snapshot.bubbles[1]!.key)).toBe("blob");
+    } finally {
+      database.close();
+    }
+  });
+
+  it("hashes bubbles in scanner order and drops unwritten header fields", async () => {
+    const fixture = await createFixture();
+    const composerId = "18181818-1818-4818-8818-181818181818";
+    const base = agentKvSnapshot(composerId, ["first", "second"], []);
+    const header = {
+      ...base.header,
+      futureHeaderField: "not representable in composerHeaders",
+    };
+    const snapshot: PortableChatSnapshot = {
+      schemaVersion: 1,
+      composerId,
+      header,
+      composerData: base.composerData,
+      bubbles: [base.bubbles[1]!, base.bubbles[0]!],
+    };
+    const expected: PortableChatSnapshot = {
+      schemaVersion: 1,
+      composerId,
+      header: {
+        composerId: header.composerId,
+        workspaceId: header.workspaceId,
+        createdAt: header.createdAt,
+        lastUpdatedAt: header.lastUpdatedAt,
+        isArchived: header.isArchived,
+        isSubagent: header.isSubagent,
+        recency: header.recency,
+        checkpointAt: header.checkpointAt,
+        value: header.value,
+      },
+      composerData: base.composerData,
+      bubbles: [base.bubbles[0]!, base.bubbles[1]!],
+    };
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      ordinaryChatChange(snapshot),
+    ]);
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(result.retainedLocalHashes[`chat/${composerId}`]).toBe(
+      sha256(canonicalBytes(expected)),
+    );
+  });
+
+  it("rejects a TEXT core row whose bytes are not valid UTF-8", async () => {
+    const fixture = await createFixture();
+    const composerId = "19191919-1919-4919-8919-191919191919";
+    const base = agentKvSnapshot(composerId, ["valid"], []);
+    const snapshot: PortableChatSnapshot = {
+      schemaVersion: 1,
+      composerId,
+      header: base.header,
+      composerData: base.composerData,
+      bubbles: [
+        {
+          key: `bubbleId:${composerId}:bad`,
+          valueBase64: Buffer.from([0xff, 0xfe]).toString("base64"),
+          valueType: "text",
+        },
+      ],
+    };
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      ordinaryChatChange(snapshot),
+    ]);
+
+    expect(result.applied).toEqual([]);
+    expect(result.skipped.join("\n")).toContain(
+      "A TEXT cursorDiskKV row is not valid UTF-8",
+    );
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(
+        database
+          .prepare("SELECT composerId FROM composerHeaders WHERE composerId = ?")
+          .get(composerId),
+      ).toBeUndefined();
+      expect(readKv(database, snapshot.composerData.key)).toBeUndefined();
+    } finally {
+      database.close();
+    }
+  });
+
+  it("streams the exact canonical v2 hash after workspace remapping", async () => {
+    const fixture = await createFixture();
+    const composerId = "14141414-1414-4414-8414-141414141414";
+    const mappedWorkspaceId = "mapped-v2-workspace";
+    await mkdir(
+      join(
+        fixture.request.paths.workspaceStorageRoot,
+        mappedWorkspaceId,
+      ),
+      { recursive: true },
+    );
+    await writeFile(
+      join(
+        fixture.request.paths.workspaceStorageRoot,
+        mappedWorkspaceId,
+        "workspace.json",
+      ),
+      JSON.stringify({ folder: "file:///C:/work/mapped-v2" }),
+      "utf8",
+    );
+    fixture.request.workspaceMappings.workspace = mappedWorkspaceId;
+    const snapshot = agentKvSnapshot(
+      composerId,
+      ["mapped core"],
+      [Buffer.from("mapped blob", "utf8")],
+    );
+    snapshot.header.value = 'mapped "\\\n😀\ud800';
+    const content = canonicalBytes(snapshot);
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      {
+        change: {
+          eventHash: "c".repeat(64),
+          changeIndex: 0,
+          resourceId: `chat/${composerId}`,
+          kind: "chat",
+          operation: "put",
+          semanticHash: sha256(content),
+        },
+        content,
+      },
+    ]);
+
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(result.retainedLocal).toEqual([`chat/${composerId}`]);
+    expect(result.retainedLocalHashes[`chat/${composerId}`]).toBe(
+      sha256(
+        canonicalBytes({
+          ...snapshot,
+          header: {
+            ...snapshot.header,
+            workspaceId: mappedWorkspaceId,
+          },
+        }),
+      ),
+    );
+  });
+
+  it(
+    "does not materialize many source-missing local blobs beside a near-limit core",
+    async () => {
+      const maxPayloadBytes = 8 * 1024 * 1024;
+      const fixture = await createFixture({ maxPayloadBytes });
+      const composerId = "13131313-1313-4313-8313-131313131313";
+      const localBlobBytes = 256 * 1024;
+      const localBlobs = Array.from({ length: 24 }, (_, index) =>
+        Buffer.alloc(localBlobBytes, index + 1),
+      );
+      const localIds = localBlobs.map((value) => sha256(value));
+      const snapshot = agentKvSnapshot(
+        composerId,
+        ["near-limit core"],
+        [],
+        localIds,
+      );
+      const largeHeaderValue = '"\n\\'.repeat(1_100_000);
+      snapshot.header.value = largeHeaderValue;
+      const content = canonicalBytes(snapshot);
+      expect(content.byteLength).toBeGreaterThan(6 * 1024 * 1024);
+      expect(content.byteLength).toBeLessThan(maxPayloadBytes);
+
+      const seed = new DatabaseSync(fixture.databasePath);
+      const insert = seed.prepare(
+        "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)",
+      );
+      for (let index = 0; index < localIds.length; index += 1) {
+        insert.run(`agentKv:blob:${localIds[index]!}`, localBlobs[index]!);
+      }
+      seed.close();
+
+      type BufferToString = (
+        this: Buffer,
+        encoding?: BufferEncoding,
+        start?: number,
+        end?: number,
+      ) => string;
+      const bufferPrototype = Buffer.prototype as unknown as {
+        toString: BufferToString;
+      };
+      const originalToString = bufferPrototype.toString;
+      let localBlobBase64Materializations = 0;
+      const toStringSpy = vi
+        .spyOn(bufferPrototype, "toString")
+        .mockImplementation(function (
+          this: unknown,
+          ...args: unknown[]
+        ): string {
+          const buffer = this as Buffer;
+          const [encoding, start, end] = args as [
+            BufferEncoding | undefined,
+            number | undefined,
+            number | undefined,
+          ];
+          // The crash-safe journal legitimately serializes the incoming core.
+          // The old ordinary-v2 merge also converted each exact-size local
+          // source-missing blob, which is the forbidden extra allocation here.
+          if (
+            encoding === "base64" &&
+            buffer.byteLength === localBlobBytes
+          ) {
+            localBlobBase64Materializations += 1;
+          }
+          return originalToString.call(buffer, encoding, start, end);
+        });
+
+      let result: Awaited<ReturnType<typeof applyGlobalDatabaseChanges>>;
+      try {
+        result = await applyGlobalDatabaseChanges(fixture.request, [
+          {
+            change: {
+              eventHash: "d".repeat(64),
+              changeIndex: 0,
+              resourceId: `chat/${composerId}`,
+              kind: "chat",
+              operation: "put",
+              semanticHash: sha256(content),
+            },
+            content,
+          },
+        ]);
+      } finally {
+        toStringSpy.mockRestore();
+      }
+
+      expect(result!.applied).toEqual([`chat/${composerId}`]);
+      expect(result!.retainedLocal).toEqual([]);
+      expect(
+        result!.retainedLocalHashes[`chat/${composerId}`],
+      ).toBeUndefined();
+      expect(localBlobBase64Materializations).toBe(0);
+
+      const database = new DatabaseSync(fixture.databasePath, {
+        readOnly: true,
+      });
+      try {
+        expect(
+          database
+            .prepare(
+              `SELECT COUNT(*) AS total,
+                      SUM(length(CAST(value AS BLOB))) AS bytes
+               FROM cursorDiskKV
+               WHERE key LIKE 'agentKv:blob:%'`,
+            )
+            .get(),
+        ).toEqual({
+          total: localBlobs.length,
+          bytes: localBlobs.length * localBlobBytes,
+        });
+        expect(
+          database
+            .prepare(
+              "SELECT length(CAST(value AS BLOB)) AS bytes FROM cursorDiskKV WHERE key = ?",
+            )
+            .get(`bubbleId:${composerId}:b0`),
+        ).toEqual({ bytes: Buffer.byteLength("near-limit core") });
+        expect(
+          database
+            .prepare(
+              "SELECT length(value) AS chars FROM composerHeaders WHERE composerId = ?",
+            )
+            .get(composerId),
+        ).toEqual({ chars: largeHeaderValue.length });
+      } finally {
+        database.close();
+      }
+    },
+    30_000,
+  );
+
+  it("does not materialize core rows beside a partial local chat", async () => {
+    const fixture = await createFixture();
+    const composerId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const blob = Buffer.from("only additive blob", "utf8");
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "partial-live", 7);
+    seed.close();
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      agentKvEnrichmentChange(agentKvSnapshot(composerId, ["repo"], [blob])),
+    ]);
+    expect(result.localChatCoreHashes[`chat/${composerId}`]).toBeNull();
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `composerData:${composerId}`)).toBeUndefined();
+      expect(readKv(database, `bubbleId:${composerId}:b0`)).toBeUndefined();
+      expect(readKv(database, `agentKv:blob:${sha256(blob)}`)).toBe(
+        blob.toString("utf8"),
+      );
+      expect(
+        database
+          .prepare("SELECT value FROM composerHeaders WHERE composerId = ?")
+          .get(composerId),
+      ).toEqual({ value: "partial-live" });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("materializes a wholly absent enriched chat and its reachable blobs", async () => {
+    const fixture = await createFixture();
+    const composerId = "abababab-abab-4bab-8bab-abababababab";
+    const blob = Buffer.from("portable blob", "utf8");
+    const source = agentKvSnapshot(composerId, ["first", "second"], [blob]);
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      agentKvEnrichmentChange(source),
+    ]);
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(Object.hasOwn(result.localChatCoreHashes, `chat/${composerId}`)).toBe(
+      false,
+    );
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `composerData:${composerId}`)).toBe("repo-data");
+      expect(readKv(database, `bubbleId:${composerId}:b0`)).toBe("first");
+      expect(readKv(database, `bubbleId:${composerId}:b1`)).toBe("second");
+      expect(readKv(database, `agentKv:blob:${sha256(blob)}`)).toBe(
+        blob.toString("utf8"),
+      );
+      expect(
+        database
+          .prepare("SELECT value FROM composerHeaders WHERE composerId = ?")
+          .get(composerId),
+      ).toEqual({ value: "repo-header" });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rolls back earlier agentKv writes when a later blob write fails", async () => {
+    const fixture = await createFixture();
+    const composerId = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd";
+    const values = [Buffer.from("first"), Buffer.from("second")].sort((a, b) =>
+      sha256(a).localeCompare(sha256(b)),
+    );
+    const failKey = `agentKv:blob:${sha256(values[1]!)}`;
+    const seed = new DatabaseSync(fixture.databasePath);
+    insertTestHeader(seed, composerId, "partial", 1);
+    seed.exec(
+      `CREATE TRIGGER fail_second_agent_blob
+       BEFORE INSERT ON cursorDiskKV
+       WHEN NEW.key = '${failKey}'
+       BEGIN SELECT RAISE(ABORT, 'injected agentKv failure'); END`,
+    );
+    seed.close();
+
+    const result = await applyGlobalDatabaseChanges(fixture.request, [
+      agentKvEnrichmentChange(agentKvSnapshot(composerId, ["repo"], values)),
+    ]);
+    expect(result.applied).toEqual([]);
+    expect(result.skipped.join(" ")).toContain("injected agentKv failure");
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(
+        readKv(database, `agentKv:blob:${sha256(values[0]!)}`),
+      ).toBeUndefined();
+      expect(readKv(database, failKey)).toBeUndefined();
+      expect(
+        database
+          .prepare("SELECT value FROM composerHeaders WHERE composerId = ?")
+          .get(composerId),
+      ).toEqual({ value: "partial" });
+    } finally {
+      database.close();
+    }
   });
 
   it("does not restore a stale backup when recovering an applying journal", async () => {
@@ -1904,6 +3292,108 @@ function readKv(
     : Buffer.from(row.value).toString("utf8");
 }
 
+function insertTestHeader(
+  database: InstanceType<typeof DatabaseSync>,
+  composerId: string,
+  value: string,
+  recency: number,
+): void {
+  database
+    .prepare(
+      `INSERT INTO composerHeaders(
+        composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+        isSubagent, recency, checkpointAt, value
+      ) VALUES (?, 'workspace', 1, 2, 0, 0, ?, NULL, ?)`,
+    )
+    .run(composerId, recency, value);
+}
+
+function agentKvSnapshot(
+  composerId: string,
+  bubbles: readonly string[],
+  blobValues: readonly Buffer[],
+  missingIds: readonly string[] = [],
+): PortableChatSnapshotV2 {
+  const blobs = blobValues
+    .map((bytes) => ({
+      key: `agentKv:blob:${sha256(bytes)}`,
+      valueBase64: bytes.toString("base64"),
+      valueType: "blob" as const,
+    }))
+    .sort((left, right) => left.key.localeCompare(right.key));
+  return {
+    schemaVersion: 2,
+    composerId,
+    header: {
+      composerId,
+      workspaceId: "workspace",
+      createdAt: 1,
+      lastUpdatedAt: 2,
+      isArchived: 0,
+      isSubagent: 0,
+      recency: 999,
+      checkpointAt: null,
+      value: "repo-header",
+    },
+    composerData: {
+      key: `composerData:${composerId}`,
+      valueBase64: Buffer.from("repo-data", "utf8").toString("base64"),
+      valueType: "text",
+    },
+    bubbles: bubbles.map((value, index) => ({
+      key: `bubbleId:${composerId}:b${index}`,
+      valueBase64: Buffer.from(value, "utf8").toString("base64"),
+      valueType: "text" as const,
+    })),
+    agentKv: {
+      blobs,
+      referencedIds: [
+        ...new Set([
+          ...blobs.map((blob) => blob.key.slice("agentKv:blob:".length)),
+          ...missingIds,
+        ]),
+      ].sort(),
+      missingIds: [...missingIds].sort(),
+    },
+  };
+}
+
+function agentKvEnrichmentChange(
+  snapshot: PortableChatSnapshotV2,
+): PreparedHelperChange {
+  const content = canonicalBytes(snapshot);
+  return {
+    change: {
+      eventHash: "e".repeat(64),
+      changeIndex: 0,
+      resourceId: `chat/${snapshot.composerId}`,
+      kind: "chat",
+      operation: "put",
+      semanticHash: sha256(content),
+      metadata: { syncOrigin: "agent-kv-enrichment" },
+    },
+    content,
+  };
+}
+
+function ordinaryChatChange(
+  snapshot: PortableChatSnapshot,
+  eventHashCharacter = "b",
+): PreparedHelperChange {
+  const content = canonicalBytes(snapshot);
+  return {
+    change: {
+      eventHash: eventHashCharacter.repeat(64),
+      changeIndex: 0,
+      resourceId: `chat/${snapshot.composerId}`,
+      kind: "chat",
+      operation: "put",
+      semanticHash: sha256(content),
+    },
+    content,
+  };
+}
+
 function repairSnapshot(
   composerId: string,
   composerData: string,
@@ -1965,12 +3455,38 @@ function automaticChatRepairChange(
   };
 }
 
+function checkpointAutomaticRepairChange(change: PreparedHelperChange): void {
+  change.change.sourceDeviceId = REPAIR_MARKER_DEVICE;
+  change.change.metadata = {
+    ...change.change.metadata,
+    syncOrigin: "checkpoint-marker",
+    checkpointedSyncOrigin: "automatic-chat-repair",
+    checkpointedSourceDeviceId: REPAIR_ORIGIN_DEVICE,
+    checkpointedVersionId: `${"8".repeat(64)}#0`,
+  };
+}
+
 function repairFingerprint(snapshot: PortableChatSnapshot): string {
   const audit = auditChatReferences(snapshot);
   if (audit.status !== "known") {
     throw new Error(`Expected a known repair snapshot: ${audit.reason}`);
   }
   return audit.fingerprint;
+}
+
+function hostileRepairJson(): string {
+  return `[${Array.from({ length: 87_400 }, () => "{}").join(",")}]`;
+}
+
+function smallRepairJson(): string {
+  return `[${Array.from({ length: 1_000 }, () => "{}").join(",")}]`;
+}
+
+function serializedRootState(rootId: string): string {
+  return `~${Buffer.concat([
+    Buffer.from([0x0a, 0x20]),
+    Buffer.from(rootId, "hex"),
+  ]).toString("base64")}`;
 }
 
 function applyAutomaticRepair(

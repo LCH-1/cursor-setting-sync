@@ -253,6 +253,10 @@ export interface LocalProjection {
   payloadObjectId?: string;
   retainedLocalHash?: string;
   sourceTimestamp?: number;
+  /** File size captured with the semantic hash for bounded fresh-process scans. */
+  sourceFileSize?: number;
+  /** File ctime captured with the semantic hash; paired with size and mtime. */
+  sourceFileCtimeMs?: number;
   /**
    * How many messages the published version of a chat held.
    *
@@ -267,6 +271,27 @@ export interface LocalProjection {
    * the other computer showing exactly that one.
    */
   sourceBubbleCount?: number;
+  /**
+   * Hash of the chat's legacy core only (header/composerData/bubbles), without
+   * v2 agentKv blobs. This lets a scan prove the user-visible conversation is
+   * unchanged without rereading hundreds of megabytes of content-addressed
+   * blob rows merely because the repository payload was enriched.
+   */
+  sourceChatCoreHash?: string;
+  /**
+   * Hash of the portable composer header only.  Keeping this small observation
+   * beside the projection lets the paged chat scanner detect a header edit
+   * whose timestamp did not move without retaining an O(total chats) in-memory
+   * header map across the sweep.
+   */
+  sourceHeaderFingerprint?: string;
+  /**
+   * One-shot request written by the offline helper after a legacy/incomplete
+   * automatic bubble repair.  The next live scan must walk the continuation
+   * graph even when the repaired v1 core hash already matches this projection.
+   * The adapter removes the flag after one bounded graph-capture attempt.
+   */
+  requiresAgentKvRecapture?: boolean;
 }
 
 export interface SyncConflict {

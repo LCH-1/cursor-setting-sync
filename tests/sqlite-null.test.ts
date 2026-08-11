@@ -5,6 +5,7 @@ import { join } from "node:path";
 import * as sqlite from "node:sqlite";
 import {
   parsePortableChatSnapshot,
+  portableChatCoreHash,
   StateVscdbChatAdapter,
   type PortableChatSnapshot,
 } from "../src/chat/stateVscdb";
@@ -88,12 +89,20 @@ describe("chat scan over NULL SQLite values", () => {
       checkpointAt: null,
       value: null,
     });
+    const headerFingerprint = result.snapshots[0]!.metadata?.headerFingerprint;
+    expect(headerFingerprint).toMatch(/^[0-9a-f]{64}$/);
     expect(result.snapshots[0]!.metadata).toEqual({
       composerId: COMPOSER_A,
       workspaceId: null,
       workspaceUri: null,
       lastUpdatedAt: null,
       bubbleCount: 0,
+      chatCoreHash: portableChatCoreHash(snapshot),
+      headerFingerprint,
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 0,
+      agentKvReferencedCount: 0,
+      agentKvMissingCount: 0,
     });
   });
 

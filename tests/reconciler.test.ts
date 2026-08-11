@@ -11,6 +11,7 @@ vi.mock("vscode", () => ({
 import { EventReconciler } from "../src/protocol/reconciler";
 import {
   autoMergeConflicts,
+  ordinaryApplyDecision,
   parentsWithOwnConflictTips,
   syntheticApplyDecision,
   validatedTextMergeOutcome,
@@ -856,6 +857,67 @@ describe("trivial conflict auto-resolution", () => {
     }
   });
 
+  it.each([
+    ["automatic repair", { syncOrigin: "automatic-chat-repair" }],
+    [
+      "checkpointed automatic repair",
+      {
+        syncOrigin: "checkpoint-marker",
+        checkpointedSyncOrigin: "automatic-chat-repair",
+      },
+    ],
+    ["agentKv enrichment", { syncOrigin: "agent-kv-enrichment" }],
+    ["version restore", { syncOrigin: "version-restore" }],
+    ["ordinary checkpoint marker", { syncOrigin: "checkpoint-marker" }],
+  ])("does not launder a %s survivor into ordinary auto-merge", async (_label, metadata) => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-setting-sync-protected-trivial-"),
+    );
+    try {
+      const repository = await createTestRepository(temporaryRoot);
+      const base = await repository.publish(
+        [settingsSnapshot(resourceId, "14")],
+        [],
+      );
+      const baseVersion = `${base.eventHash}#0`;
+      await repository.publish(
+        [
+          {
+            ...settingsSnapshot(resourceId, "16"),
+            parents: [baseVersion],
+            metadata,
+          },
+        ],
+        [],
+      );
+      await repository.publish(
+        [
+          {
+            ...settingsSnapshot(resourceId, "14"),
+            parents: [baseVersion],
+          },
+        ],
+        [],
+      );
+      const result = new EventReconciler().reconcile(
+        await repository.listEvents(),
+        repository.state,
+        null,
+      );
+      expect(result.conflicts).toHaveLength(1);
+      const publishes = vi.spyOn(repository, "publish");
+
+      expect(await autoMergeConflicts(repository, result.conflicts)).toBe(false);
+      expect(publishes).not.toHaveBeenCalled();
+      expect(result.conflicts[0]?.resolvedAt).toBeUndefined();
+      expect(repository.state.tips[resourceId]).toHaveLength(2);
+
+      publishes.mockRestore();
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   it("leaves a conflict alone when both tips differ from the base", async () => {
     const temporaryRoot = await mkdtemp(
       join(tmpdir(), "cursor-setting-sync-nontrivial-"),
@@ -998,6 +1060,48 @@ describe("synthetic merge drift decisions", () => {
     expect(
       syntheticApplyDecision(scanIndex([]), resourceId, tip, undefined).action,
     ).toBe("apply");
+  });
+
+  it("treats a bounded incomplete scan as drift even for a new resource", () => {
+    expect(
+      syntheticApplyDecision(
+        scanIndex([], [], false, [resourceId]),
+        resourceId,
+        tip,
+        undefined,
+      ).action,
+    ).toBe("drift");
+  });
+
+  it("lets an ordinary successor apply after a complete identity-only scan", () => {
+    const known = localProjection(resourceId, "a".repeat(64));
+    expect(
+      ordinaryApplyDecision(scanIndex([]), resourceId, tip, known).action,
+    ).toBe("apply");
+  });
+
+  it("keeps an ordinary successor queued while its scan page is incomplete", () => {
+    const known = localProjection(resourceId, "a".repeat(64));
+    expect(
+      ordinaryApplyDecision(
+        scanIndex([], [], false, ["profile-file-scope/default"]),
+        resourceId,
+        tip,
+        known,
+      ).action,
+    ).toBe("drift");
+  });
+
+  it("keeps an ordinary successor queued over an unpublished local edit", () => {
+    const known = localProjection(resourceId, "a".repeat(64));
+    expect(
+      ordinaryApplyDecision(
+        scanIndex([liveSnapshot(resourceId, "b".repeat(64))]),
+        resourceId,
+        tip,
+        known,
+      ).action,
+    ).toBe("drift");
   });
 });
 
@@ -1198,6 +1302,8 @@ function resourceDeletion(
 function scanIndex(
   snapshots: ResourceSnapshot[],
   deletions: ResourceDeletion[] = [],
+  complete = true,
+  deferredResourceIds: string[] = [],
 ): AdapterScanIndex {
   return {
     snapshots: new Map(
@@ -1206,6 +1312,8 @@ function scanIndex(
     deletions: new Map(
       deletions.map((deletion) => [deletion.resourceId, deletion]),
     ),
+    complete,
+    deferredResourceIds: new Set(deferredResourceIds),
   };
 }
 

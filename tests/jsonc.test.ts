@@ -7,6 +7,25 @@ import {
 } from "../src/resources/jsonc";
 
 describe("JSONC resource merge", () => {
+  it("rejects excessive nesting before jsonc-parser materializes it", () => {
+    const source = `${"[".repeat(129)}0${"]".repeat(129)}`;
+
+    expect(() => parseJsoncObject(source, "deep.jsonc")).toThrow(
+      "128-level automatic parse depth limit",
+    );
+  });
+
+  it("rejects excessive structural tokens before object materialization", () => {
+    const source = `{${Array.from(
+      { length: 32_769 },
+      (_, index) => `"k${index}":0`,
+    ).join(",")}}`;
+
+    expect(() => parseJsoncObject(source, "wide.jsonc")).toThrow(
+      "65536-token automatic parse limit",
+    );
+  });
+
   it("merges independent object keys", () => {
     const result = mergeJsonValues(
       { editor: { fontSize: 14, tabSize: 2 } },

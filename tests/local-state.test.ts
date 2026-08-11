@@ -42,4 +42,39 @@ describe("local sync state write memo", () => {
     };
     expect(stored.lastSyncAt).toBe(state.lastSyncAt);
   });
+
+  it("does no read, parse, or stringify for an unchanged identity probe", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-sync-local-state-probe-"));
+    temporaryRoots.push(root);
+    const repositoryId = "22222222-2222-4222-8222-222222222222";
+    const counts = { reads: 0, parses: 0, stringifies: 0 };
+    const store = new LocalStateStore(root, {
+      onRead: () => {
+        counts.reads += 1;
+      },
+      onParse: () => {
+        counts.parses += 1;
+      },
+      onStringify: () => {
+        counts.stringifies += 1;
+      },
+    });
+    await store.loadOrCreate(repositoryId);
+    counts.reads = 0;
+    counts.parses = 0;
+    counts.stringifies = 0;
+
+    await expect(store.loadIfChanged(repositoryId)).resolves.toBeNull();
+    expect(counts).toEqual({ reads: 0, parses: 0, stringifies: 0 });
+
+    const external = new LocalStateStore(root);
+    const changed = await external.load(repositoryId);
+    changed.lastError = "external change";
+    await external.save(changed);
+
+    await expect(store.loadIfChanged(repositoryId)).resolves.toMatchObject({
+      lastError: "external change",
+    });
+    expect(counts).toEqual({ reads: 1, parses: 1, stringifies: 1 });
+  });
 });

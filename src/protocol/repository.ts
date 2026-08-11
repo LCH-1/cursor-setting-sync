@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readdir, rm, stat } from "node:fs/promises";
+import type { Dirent } from "node:fs";
 import {
   CHECKPOINT_ENVELOPE_VERSION,
   CHECKPOINT_EXTENSION,
@@ -11,6 +12,7 @@ import {
   EVENT_ENVELOPE_VERSION,
   EVENT_EXTENSION,
   MAX_APPLY_BATCH_BYTES,
+  MAX_CHECKPOINT_MARKER_PAYLOAD_BYTES,
   MAX_CHECKPOINT_FILE_BYTES,
   MAX_EVENT_CHANGES,
   MAX_EVENT_FILE_BYTES,
@@ -54,9 +56,9 @@ import {
   isMissingPathError,
   listFilesRecursively,
   pathExists,
-  readFileResilient,
+  readFileBounded,
   readFileWithinRoot,
-  readJsonFile,
+  readJsonFileBounded,
   statResilient,
   writeFileAtomic,
   writeJsonAtomic,
@@ -70,6 +72,11 @@ import {
   isCanonicalBase64Text,
   sha256,
 } from "./canonical";
+import { buffersFitJsonStructureBudget } from "./jsonStructure";
+import {
+  classifyLegacyCheckpointMarker,
+  type LegacyCheckpointMarkerKind,
+} from "./checkpointMarker";
 import {
   createEncryptedRepository,
   decryptAead,
@@ -78,14 +85,31 @@ import {
   unlockRepository,
   validateRepositoryFile,
 } from "./crypto";
-import { LocalStateStore } from "./localState";
+import {
+  LocalStateStore,
+  type LocalStateStoreDiagnostics,
+} from "./localState";
 
 const gzipAsync = promisify(gzip);
 const gunzipAsync = promisify(gunzip);
 const EVENT_FILE_PATTERN = /^(\d{16})-([a-f0-9]{64})\.cse$/;
 const CHECKPOINT_FILE_PATTERN = /^(\d{16})-([a-f0-9]{64})\.csc$/;
 const LOCAL_CHECKPOINT_FILE_PATTERN = /^([a-f0-9]{64})\.csc$/;
-const MAX_REPOSITORY_FILE_BYTES = 64 * 1024;
+export const MAX_REPOSITORY_FILE_BYTES = 64 * 1024;
+const REPOSITORY_ENVELOPE_JSON_MAX_STRUCTURAL_TOKENS = 65_536;
+const REPOSITORY_MANIFEST_JSON_MAX_STRUCTURAL_TOKENS = 1_048_576;
+const REPOSITORY_JSON_MAX_NESTING_DEPTH = 256;
+
+/** One opened-handle bounded policy for every shared repository manifest read. */
+export async function readRepositoryManifest(
+  root: string,
+): Promise<RepositoryFile> {
+  return JSON.parse(
+    (
+      await readFileWithinRoot(root, REPOSITORY_FILE, MAX_REPOSITORY_FILE_BYTES)
+    ).toString("utf8"),
+  ) as RepositoryFile;
+}
 /**
  * How long an unchanged acks.json may go without a refreshed timestamp. Short
  * enough that a device that has been quiet still looks alive to a peer reading
@@ -122,16 +146,25 @@ interface ReconciliationEventsCache {
   events: DecryptedEvent[];
 }
 
+interface SharedGenerationObservation {
+  graph: string;
+  checkpoints: string;
+  devices: ReadonlyMap<string, string>;
+}
+
 export interface PublishResult {
   eventHash: string | null;
   eventPath: string | null;
   changeCount: number;
 }
 
-export interface ResourceVersionData {
+export interface ResourceVersionMetadata {
   change: ResourceChange;
-  content: Buffer | null;
   producer?: EventProducer;
+}
+
+export interface ResourceVersionData extends ResourceVersionMetadata {
+  content: Buffer | null;
 }
 
 export interface ResourceHistoryEntry extends ResourceVersionSummary {
@@ -146,6 +179,12 @@ interface ResourceHistoryNode {
 interface PreparedCheckpointMarker {
   snapshots: ResourceSnapshot[];
   deletions: ResourceDeletion[];
+}
+
+interface CheckpointMarkerPreparation {
+  marker: PreparedCheckpointMarker | null;
+  /** Largest declared payload skipped before any object-file read. */
+  largestOversizedPlainBytes: number | null;
 }
 
 export interface LoadedCheckpoint {
@@ -179,6 +218,19 @@ export interface PruneResult {
   warnings: string[];
 }
 
+export interface RepositoryRefreshOptions {
+  /** Re-read and authenticate immutable files even when metadata is unchanged. */
+  forceAudit?: boolean;
+}
+
+/** Optional counters used by bounded-I/O regression tests and diagnostics. */
+export interface RepositoryDiagnostics {
+  localState?: LocalStateStoreDiagnostics;
+  onEventDirectoryRead?: (path: string) => void;
+  onEventFileStat?: (path: string) => void;
+  onCheckpointDirectoryRead?: (path: string) => void;
+}
+
 /** Replaces, rather than overlays, an atomically loaded state snapshot. */
 function replaceLocalState(
   target: LocalSyncState,
@@ -198,7 +250,7 @@ export class SyncRepository {
   private readonly objectKey: Buffer;
   private readonly objectIdKey: Buffer;
   private readonly checkpointKey: Buffer;
-  /** Per-cycle memo of the sorted listing; cleared whenever state reloads. */
+  /** Sorted listing retained across metadata-identical background polls. */
   private eventsCache: DecryptedEvent[] | null = null;
   /** Per-cycle memo containing only events newer than one checkpoint cursor. */
   private reconciliationEventsCache: ReconciliationEventsCache | null = null;
@@ -208,7 +260,8 @@ export class SyncRepository {
    * addressed — the filename carries both the sequence and the sha256 — so a
    * file that was verified once never needs to be stat'd, read, hashed and
    * AES-decrypted again. Only an actual deletion (prune) invalidates an entry,
-   * which is why `refreshState` does not clear this.
+   * which is why ordinary `refreshState` does not clear this. Explicit watcher
+   * invalidation and manual audit intentionally do.
    */
   private readonly decodedEvents = new Map<string, CachedEvent>();
   private checkpointManifestCache: { hash: string; manifest: CheckpointManifest } | null = null;
@@ -228,6 +281,24 @@ export class SyncRepository {
    */
   private readonly selfWritten = new Map<string, number>();
   private pendingRecovery: Error | null = null;
+  /** Cheap O(device-heads) identity of the shared graph observed last poll. */
+  private sharedGenerationFingerprint: string | null = null;
+  private sharedCheckpointFingerprint: string | null = null;
+  private sharedDeviceFingerprints = new Map<string, string>();
+  /** Newest listed checkpoint is additionally stat'd to notice in-place hydration. */
+  private checkpointHeadPath: string | null = null;
+  private sharedGraphGenerationValue = 0;
+  private pendingSharedMutationObservation = false;
+  private pendingSelfEventObservation: {
+    deviceId: string;
+    fingerprint: string;
+  } | null = null;
+  private sharedAuditRequired = false;
+  private localStateGenerationValue = 0;
+  /** Digest installed into `state`, distinct from the store's latest I/O memo. */
+  private appliedLocalStateDigest: string | undefined;
+  private reconciliationInputGenerationValue = 0;
+  private appliedReconciliationInputDigest: string;
 
   private constructor(
     readonly root: string,
@@ -237,11 +308,16 @@ export class SyncRepository {
     readonly state: LocalSyncState,
     private effectiveMaxPayloadBytes: number,
     private readonly producer: EventProducer,
+    private readonly diagnostics: RepositoryDiagnostics = {},
   ) {
     this.eventKey = deriveSubkey(masterKey, "event-encryption");
     this.objectKey = deriveSubkey(masterKey, "object-encryption");
     this.objectIdKey = deriveSubkey(masterKey, "object-id");
     this.checkpointKey = deriveSubkey(masterKey, "checkpoint-encryption");
+    this.appliedLocalStateDigest = stateStore.currentDigest(
+      repository.repositoryId,
+    );
+    this.appliedReconciliationInputDigest = reconciliationInputDigest(state);
   }
 
   /**
@@ -276,6 +352,28 @@ export class SyncRepository {
     return this.initialized;
   }
 
+  /**
+   * Stable across an unchanged refresh and advanced whenever this instance
+   * observes or publishes repository graph work. Consumers can retain derived
+   * graph caches without hashing every projection on an idle poll.
+   */
+  get sharedGraphGeneration(): number {
+    return this.sharedGraphGenerationValue;
+  }
+
+  /** Advances only when the semantic local-state JSON actually changes. */
+  get localStateGeneration(): number {
+    return this.localStateGenerationValue;
+  }
+
+  /**
+   * Reconciler inputs only; housekeeping fields such as lastSyncAt/lastError
+   * do not invalidate a derived reconciliation result.
+   */
+  get reconciliationInputGeneration(): number {
+    return this.reconciliationInputGenerationValue;
+  }
+
   /** True when this device wrote `fileName` moments ago. */
   wroteRecently(fileName: string): boolean {
     const writtenAt = this.selfWritten.get(fileName);
@@ -292,6 +390,52 @@ export class SyncRepository {
       }
     }
     this.selfWritten.set(fileName, now);
+  }
+
+  private markSharedGraphMutation(checkpointChanged = false): void {
+    if (checkpointChanged) {
+      this.sharedGenerationFingerprint = null;
+      this.sharedCheckpointFingerprint = null;
+    }
+    this.sharedGraphGenerationValue += 1;
+    this.pendingSharedMutationObservation = true;
+    this.pendingSelfEventObservation = null;
+  }
+
+  /**
+   * Called by the shared-folder watcher when an immutable event/checkpoint
+   * payload changes. The next refresh bypasses metadata/decode caches and
+   * authenticates the visible files even if a provider replaced one in place.
+   */
+  invalidateSharedGraphObservation(): void {
+    this.sharedGenerationFingerprint = null;
+    this.sharedCheckpointFingerprint = null;
+    this.sharedAuditRequired = true;
+    this.pendingSelfEventObservation = null;
+    this.eventsCache = null;
+    this.reconciliationEventsCache = null;
+    this.decodedEvents.clear();
+    this.checkpointManifestCache = null;
+  }
+
+  private async persistLocalState(state = this.state): Promise<boolean> {
+    await this.stateStore.save(state);
+    const digest = this.stateStore.currentDigest(this.repository.repositoryId);
+    if (digest !== this.appliedLocalStateDigest) {
+      this.appliedLocalStateDigest = digest;
+      this.localStateGenerationValue += 1;
+      this.updateReconciliationInputGeneration(state);
+      return true;
+    }
+    return false;
+  }
+
+  private updateReconciliationInputGeneration(state: LocalSyncState): void {
+    const digest = reconciliationInputDigest(state);
+    if (digest !== this.appliedReconciliationInputDigest) {
+      this.appliedReconciliationInputDigest = digest;
+      this.reconciliationInputGenerationValue += 1;
+    }
   }
 
   get localCheckpointsRoot(): string {
@@ -312,6 +456,7 @@ export class SyncRepository {
     passphrase: string,
     maxPayloadBytes: number,
     producer: EventProducer,
+    diagnostics: RepositoryDiagnostics = {},
   ): Promise<SyncRepository> {
     await ensureDirectory(root);
     await assertRealDirectory(root);
@@ -336,7 +481,7 @@ export class SyncRepository {
         Buffer.from(`${JSON.stringify(created.repository, null, 2)}\n`, "utf8"),
         false,
       );
-      const stateStore = new LocalStateStore(storageRoot);
+      const stateStore = new LocalStateStore(storageRoot, diagnostics.localState);
       const state = await stateStore.loadOrCreate(created.repository.repositoryId);
       const instance = new SyncRepository(
         root,
@@ -346,6 +491,7 @@ export class SyncRepository {
         state,
         maxPayloadBytes,
         producer,
+        diagnostics,
       );
       await instance.ensureInitializedFromLoadedState();
       return instance;
@@ -367,17 +513,10 @@ export class SyncRepository {
     passphrase: string,
     maxPayloadBytes: number,
     producer: EventProducer,
+    diagnostics: RepositoryDiagnostics = {},
   ): Promise<SyncRepository> {
     await assertRealDirectory(root);
-    const repository = JSON.parse(
-      (
-        await readFileWithinRoot(
-          root,
-          REPOSITORY_FILE,
-          MAX_REPOSITORY_FILE_BYTES,
-        )
-      ).toString("utf8"),
-    ) as RepositoryFile;
+    const repository = await readRepositoryManifest(root);
     const masterKey = await unlockRepository(passphrase, repository);
     return SyncRepository.openWithMasterKey(
       root,
@@ -386,6 +525,7 @@ export class SyncRepository {
       masterKey,
       maxPayloadBytes,
       producer,
+      diagnostics,
     );
   }
 
@@ -396,13 +536,14 @@ export class SyncRepository {
     masterKey: Buffer,
     maxPayloadBytes: number,
     producer: EventProducer,
+    diagnostics: RepositoryDiagnostics = {},
   ): Promise<SyncRepository> {
     await assertRealDirectory(root);
     validateRepositoryFile(repository);
     if (masterKey.byteLength !== 32) {
       throw new Error("Repository master key has an invalid length.");
     }
-    const stateStore = new LocalStateStore(storageRoot);
+    const stateStore = new LocalStateStore(storageRoot, diagnostics.localState);
     const state = await stateStore.loadOrCreate(repository.repositoryId);
     const instance = new SyncRepository(
       root,
@@ -412,19 +553,21 @@ export class SyncRepository {
       state,
       maxPayloadBytes,
       producer,
+      diagnostics,
     );
     await instance.ensureInitializedFromLoadedState();
     return instance;
   }
 
   /**
-   * Opens the cheap, read-only half of a configured repository.
+   * Opens the envelope-only half of a configured repository.
    *
-   * This validates the repository envelope, derives the in-memory keys and
-   * reads the atomically persisted local state, but deliberately does not scan
-   * shared checkpoints or this device's event directory and does not write
-   * repository state. Call {@link ensureInitialized} while holding sync.lock
-   * before any synchronization or maintenance operation.
+   * This validates the repository envelope and derives the in-memory keys, but
+   * deliberately does not read or parse the potentially large local state and
+   * does not scan shared checkpoints or this device's event directory. Call
+   * {@link ensureInitialized} while holding sync.lock before any state read,
+   * synchronization or maintenance operation; that is the single local-state
+   * load for a newly elected owner or explicit standby-window command.
    */
   static async openDeferredWithMasterKey(
     root: string,
@@ -433,27 +576,21 @@ export class SyncRepository {
     masterKey: Buffer,
     maxPayloadBytes: number,
     producer: EventProducer,
+    diagnostics: RepositoryDiagnostics = {},
   ): Promise<SyncRepository> {
     await assertRealDirectory(root);
     validateRepositoryFile(repository);
     if (masterKey.byteLength !== 32) {
       throw new Error("Repository master key has an invalid length.");
     }
-    const stateStore = new LocalStateStore(storageRoot);
-    // Deliberately avoid writes here. A missing local state file is recoverable
-    // (for example after extension storage was cleaned), but every Cursor
-    // window must not race to persist a different replacement device. Keep an
-    // unpersisted placeholder until the elected owner holds sync.lock; corrupt
-    // or otherwise invalid existing state still fails closed.
-    let state: LocalSyncState;
-    try {
-      state = await stateStore.load(repository.repositoryId);
-    } catch (error) {
-      if (!isMissingPathError(error)) {
-        throw error;
-      }
-      state = stateStore.createUnpersisted(repository.repositoryId);
-    }
+    const stateStore = new LocalStateStore(storageRoot, diagnostics.localState);
+    // Every deferred opener starts with a non-persisted placeholder. Reading
+    // here doubled the peak for the elected window (this snapshot plus the
+    // mandatory locked reload) and multiplied a 100k-entry state parse across
+    // every restored Cursor window. The locked initialize below replaces the
+    // placeholder from disk or atomically claims one device identity if the
+    // file is genuinely missing.
+    const state = stateStore.createUnpersisted(repository.repositoryId);
     return new SyncRepository(
       root,
       repository,
@@ -462,16 +599,17 @@ export class SyncRepository {
       state,
       maxPayloadBytes,
       producer,
+      diagnostics,
     );
   }
 
   /**
    * Completes a deferred open exactly once.
    *
-   * The local state is reloaded first because another Cursor window may have
-   * completed a cycle after this instance's lightweight snapshot was read.
-   * Reloading under the caller's sync.lock prevents deferred followers from
-   * restoring that stale snapshot over newer projections or pending queues.
+   * The local state is loaded first because the envelope-only open deliberately
+   * retained only a placeholder. Loading under the caller's sync.lock prevents
+   * separate Cursor windows from claiming different device identities or
+   * restoring stale projections/pending queues over newer state.
    */
   async ensureInitialized(): Promise<void> {
     return this.initializeOnce(true);
@@ -500,8 +638,16 @@ export class SyncRepository {
           this.repository.repositoryId,
         );
         replaceLocalState(this.state, latest);
+        this.appliedLocalStateDigest = this.stateStore.currentDigest(
+          this.repository.repositoryId,
+        );
+        this.appliedReconciliationInputDigest = reconciliationInputDigest(
+          this.state,
+        );
       }
       await this.initializeDevice();
+      const observed = await this.observeSharedGeneration();
+      this.installSharedGenerationObservation(observed);
       this.initialized = true;
     })();
     this.initializationInFlight = initialization;
@@ -590,9 +736,15 @@ export class SyncRepository {
       changes,
     };
     validateEventManifest(manifest, this.maxPayloadBytes);
+    const manifestBytes = canonicalBytes(manifest);
+    assertRepositoryJsonStructure(
+      manifestBytes,
+      "Event manifest",
+      REPOSITORY_MANIFEST_JSON_MAX_STRUCTURAL_TOKENS,
+    );
     const encrypted = encryptAead(
       this.eventKey,
-      canonicalBytes(manifest),
+      manifestBytes,
       canonicalBytes(header),
     );
     const stored: StoredEvent = { header, ...encrypted };
@@ -600,6 +752,11 @@ export class SyncRepository {
     if (storedBytes.byteLength > MAX_EVENT_FILE_BYTES) {
       throw new Error(`Event envelope exceeds ${MAX_EVENT_FILE_BYTES} bytes.`);
     }
+    assertRepositoryJsonStructure(
+      storedBytes,
+      "Event envelope",
+      REPOSITORY_ENVELOPE_JSON_MAX_STRUCTURAL_TOKENS,
+    );
     const eventHash = sha256(storedBytes);
     const sequencePrefix = `${String(header.sequence).padStart(16, "0")}-`;
     const eventFileName = `${sequencePrefix}${eventHash}${EVENT_EXTENSION}`;
@@ -629,6 +786,7 @@ export class SyncRepository {
     }
     await writeFileAtomic(eventPath, storedBytes, false);
     this.noteSelfWrite(eventFileName);
+    this.markSharedGraphMutation();
     // The event just written is already fully decoded in memory, so it is
     // added to both caches rather than discarding them and forcing the rest of
     // the cycle to re-read and re-decrypt the entire log.
@@ -666,7 +824,7 @@ export class SyncRepository {
       lastSequence: header.sequence,
       lastEventHash: eventHash,
     };
-    await this.stateStore.save(this.state);
+    await this.persistLocalState();
     try {
       await writeJsonAtomic(join(this.deviceRoot(header.deviceId), "head.json"), {
         deviceId: header.deviceId,
@@ -680,6 +838,15 @@ export class SyncRepository {
       // damage. The event and state writes above ARE the publish; reporting
       // it failed over a hint file made a durably committed publish retry
       // and duplicate.
+    }
+    try {
+      this.pendingSelfEventObservation = {
+        deviceId: header.deviceId,
+        fingerprint: await this.observeDeviceGeneration(header.deviceId),
+      };
+    } catch {
+      // The event is already durable. If metadata probing races the provider,
+      // leave the confirmation unset and the next refresh takes the full path.
     }
     return { eventHash, eventPath, changeCount: changes.length };
   }
@@ -729,6 +896,7 @@ export class SyncRepository {
 
   private async scanEvents(
     afterStreams: Record<string, StreamCursor> | null,
+    forceAudit = false,
   ): Promise<DecryptedEvent[]> {
     const devicesRoot = join(this.root, "devices");
     if (!(await pathExists(devicesRoot))) {
@@ -759,9 +927,10 @@ export class SyncRepository {
       }
       const afterCursor = afterStreams?.[deviceEntry.name];
       const tolerablePruneCursor =
-        afterStreams === null
+        afterStreams === null && !forceAudit
           ? this.state.checkpoint?.streams[deviceEntry.name]
           : undefined;
+      this.diagnostics.onEventDirectoryRead?.(eventRoot);
       const files = await readdir(eventRoot, { withFileTypes: true });
       for (const file of files) {
         if (
@@ -807,6 +976,7 @@ export class SyncRepository {
           // cloud client propagates the deletion, and the stat is what notices.
           // Without it a cached decode outlives the bytes it was made from and
           // an event the checkpoint has already folded away comes back.
+          this.diagnostics.onEventFileStat?.(eventPath);
           const info = await statResilient(eventPath);
           const cached = this.decodedEvents.get(cacheKey);
           if (
@@ -922,15 +1092,25 @@ export class SyncRepository {
     );
     validateObjectReference(reference, readLimit);
     const path = this.objectPath(reference.deviceId, reference.objectId);
-    const fileInfo = await statResilient(path);
-    const envelopeLimit = Math.min(
-      MAX_OBJECT_ENVELOPE_BYTES,
-      Math.ceil(readLimit * 1.5) + 1024 * 1024,
+    const envelopeLimit = objectEnvelopeReadLimit(
+      this.repository.repositoryId,
+      reference,
     );
-    if (fileInfo.size > envelopeLimit) {
-      throw new Error(`Object envelope exceeds its size limit: ${reference.objectId}`);
+    let stored: StoredObject;
+    try {
+      stored = await readJsonFileBounded<StoredObject>(path, envelopeLimit);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.includes("exceeds its size limit")
+      ) {
+        throw new Error(
+          `Object envelope exceeds its size limit: ${reference.objectId}`,
+          { cause: error },
+        );
+      }
+      throw error;
     }
-    const stored = await readJsonFile<StoredObject>(path);
     validateStoredObjectEnvelope(stored, reference);
     validateObjectHeader(stored, this.repository.repositoryId, reference);
     const header = objectHeader(stored);
@@ -953,7 +1133,12 @@ export class SyncRepository {
     return plain;
   }
 
-  async readVersion(versionId: string): Promise<ResourceVersionData> {
+  /**
+   * Reads the authenticated event/checkpoint manifest record for one version
+   * without decrypting or inflating its payload object. Interactive callers
+   * use the declared plaintext length for an aggregate work preflight.
+   */
+  async readVersionMetadata(versionId: string): Promise<ResourceVersionMetadata> {
     const separator = versionId.lastIndexOf("#");
     if (separator <= 0) {
       throw new Error(`Invalid resource version ID: ${versionId}`);
@@ -965,19 +1150,43 @@ export class SyncRepository {
     );
     const change = event?.manifest.changes[changeIndex];
     if (event === undefined || change === undefined) {
-      return this.readCheckpointVersion(versionId);
+      return this.readCheckpointVersionMetadata(versionId);
     }
-    const data: ResourceVersionData = {
-      change,
-      content:
-        change.operation === "put" && change.payload !== undefined
-          ? await this.readObject(change.payload)
-          : null,
-    };
+    const data: ResourceVersionMetadata = { change };
     if (event.manifest.producer !== undefined) {
       data.producer = event.manifest.producer;
     }
     return data;
+  }
+
+  async tryReadVersionMetadata(
+    versionId: string,
+  ): Promise<ResourceVersionMetadata | null> {
+    try {
+      return await this.readVersionMetadata(versionId);
+    } catch (error) {
+      if (
+        isMissingPathError(error) ||
+        (error instanceof Error &&
+          (error.message.startsWith("Resource version is unavailable") ||
+            error.message.startsWith("Invalid resource version ID")))
+      ) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async readVersion(versionId: string): Promise<ResourceVersionData> {
+    const metadata = await this.readVersionMetadata(versionId);
+    return {
+      ...metadata,
+      content:
+        metadata.change.operation === "put" &&
+        metadata.change.payload !== undefined
+          ? await this.readObject(metadata.change.payload)
+          : null,
+    };
   }
 
   async tryReadVersion(versionId: string): Promise<ResourceVersionData | null> {
@@ -1154,7 +1363,9 @@ export class SyncRepository {
     return histories;
   }
 
-  private async readCheckpointVersion(versionId: string): Promise<ResourceVersionData> {
+  private async readCheckpointVersionMetadata(
+    versionId: string,
+  ): Promise<ResourceVersionMetadata> {
     const manifest = await this.loadAbsorbedCheckpointManifest();
     const folded = manifest?.resources.find(
       (resource) => resource.versionId === versionId,
@@ -1175,13 +1386,7 @@ export class SyncRepository {
     if (folded.metadata !== undefined) {
       change.metadata = folded.metadata;
     }
-    const data: ResourceVersionData = {
-      change,
-      content:
-        folded.operation === "put" && folded.payload !== undefined
-          ? await this.readObject(folded.payload)
-          : null,
-    };
+    const data: ResourceVersionMetadata = { change };
     if (folded.producer !== undefined) {
       data.producer = folded.producer;
     }
@@ -1189,7 +1394,7 @@ export class SyncRepository {
   }
 
   async saveState(): Promise<void> {
-    await this.stateStore.save(this.state);
+    await this.persistLocalState();
   }
 
   /**
@@ -1207,31 +1412,201 @@ export class SyncRepository {
       const persisted = await this.stateStore.load(this.repository.repositoryId);
       persisted.lastError = message;
       replaceLocalState(this.state, persisted);
-      await this.stateStore.save(persisted);
+      await this.persistLocalState(persisted);
       return;
     } catch {
       // The state file itself is unreadable; fall back to what is in memory so
       // the error is at least recorded somewhere.
     }
     this.state.lastError = message;
-    await this.stateStore.save(this.state);
+    await this.persistLocalState();
   }
 
-  async refreshState(): Promise<void> {
+  async refreshState(options: RepositoryRefreshOptions = {}): Promise<void> {
+    const forceAudit = options.forceAudit === true;
+    // forceAudit applies to authenticated immutable shared files. Atomic local
+    // state has a strong file identity memo, so re-read its body only when that
+    // identity changed; a just-initialized deferred open therefore parses the
+    // large state exactly once while still observing later window writes.
+    let latest = await this.stateStore.loadIfChanged(
+      this.repository.repositoryId,
+    );
+    let latestStateDigest = this.stateStore.currentDigest(
+      this.repository.repositoryId,
+    );
+    let localStateChanged =
+      latestStateDigest !== this.appliedLocalStateDigest;
+    if (localStateChanged && latest === null) {
+      // A caller may deliberately use the public stateStore (legacy repair
+      // tools and tests do). Its save memo then advances without replacing the
+      // repository snapshot, so reload once before installing that digest.
+      latest = await this.stateStore.load(this.repository.repositoryId);
+      latestStateDigest = this.stateStore.currentDigest(
+        this.repository.repositoryId,
+      );
+      localStateChanged = latestStateDigest !== this.appliedLocalStateDigest;
+    }
+    const observedSharedGeneration = await this.observeSharedGeneration();
+    const sharedChanged =
+      this.sharedGenerationFingerprint === null ||
+      observedSharedGeneration.graph !== this.sharedGenerationFingerprint;
+    const checkpointChanged =
+      this.sharedCheckpointFingerprint === null ||
+      observedSharedGeneration.checkpoints !== this.sharedCheckpointFingerprint;
+    const auditSharedFiles = forceAudit || this.sharedAuditRequired;
+    const selfEventObservationConfirmed =
+      this.canConfirmSelfEventObservation(observedSharedGeneration);
+    if (
+      !localStateChanged &&
+      !auditSharedFiles &&
+      selfEventObservationConfirmed
+    ) {
+      this.installSharedGenerationObservation(observedSharedGeneration);
+      this.pendingSharedMutationObservation = false;
+      this.pendingSelfEventObservation = null;
+      return;
+    }
+
+    if (!localStateChanged && !sharedChanged && !auditSharedFiles) {
+      if (this.pendingRecovery !== null) {
+        throw this.pendingRecovery;
+      }
+      return;
+    }
+    if (localStateChanged && latest !== null) {
+      replaceLocalState(this.state, latest);
+      this.appliedLocalStateDigest = latestStateDigest;
+      this.localStateGenerationValue += 1;
+      this.updateReconciliationInputGeneration(this.state);
+    }
+
     this.eventsCache = null;
     this.reconciliationEventsCache = null;
-    const latest = await this.stateStore.load(this.repository.repositoryId);
-    replaceLocalState(this.state, latest);
-    await this.absorbNewestCheckpoint();
+    if (auditSharedFiles) {
+      // A manual audit must not trust size/mtime memoization: it is the escape
+      // hatch for same-name content replacement and deliberately pays the full
+      // authentication cost.
+      this.decodedEvents.clear();
+      this.checkpointManifestCache = null;
+    }
     try {
+      await this.absorbNewestCheckpoint(
+        checkpointChanged || auditSharedFiles,
+        auditSharedFiles,
+      );
       await this.recoverOwnStream();
+      if (auditSharedFiles) {
+        this.eventsCache = await this.scanEvents(null, true);
+      }
       this.pendingRecovery = null;
+      const refreshedObservation = await this.observeSharedGeneration();
+      this.installSharedGenerationObservation(refreshedObservation);
+      if (
+        sharedChanged &&
+        (!this.pendingSharedMutationObservation ||
+          (this.pendingSelfEventObservation !== null &&
+            !selfEventObservationConfirmed))
+      ) {
+        this.sharedGraphGenerationValue += 1;
+      }
+      this.pendingSharedMutationObservation = false;
+      this.pendingSelfEventObservation = null;
+      this.sharedAuditRequired = false;
     } catch (error) {
       if (error instanceof OwnStreamPendingRecoveryError) {
         this.pendingRecovery = error;
       }
       throw error;
     }
+  }
+
+  /**
+   * Reads no event/checkpoint payload listings. Directory identities detect
+   * entry add/remove/rename, while each advisory device head and the newest
+   * checkpoint file detect in-place cloud hydration. Work is O(device heads).
+   */
+  private installSharedGenerationObservation(
+    observation: SharedGenerationObservation,
+  ): void {
+    this.sharedGenerationFingerprint = observation.graph;
+    this.sharedCheckpointFingerprint = observation.checkpoints;
+    this.sharedDeviceFingerprints = new Map(observation.devices);
+  }
+
+  private canConfirmSelfEventObservation(
+    observation: SharedGenerationObservation,
+  ): boolean {
+    const expected = this.pendingSelfEventObservation;
+    if (
+      !this.pendingSharedMutationObservation ||
+      expected === null ||
+      this.sharedCheckpointFingerprint === null ||
+      observation.checkpoints !== this.sharedCheckpointFingerprint ||
+      observation.devices.get(expected.deviceId) !== expected.fingerprint
+    ) {
+      return false;
+    }
+    const deviceIds = new Set([
+      ...this.sharedDeviceFingerprints.keys(),
+      ...observation.devices.keys(),
+    ]);
+    deviceIds.delete(expected.deviceId);
+    for (const deviceId of deviceIds) {
+      if (
+        this.sharedDeviceFingerprints.get(deviceId) !==
+        observation.devices.get(deviceId)
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async observeDeviceGeneration(deviceId: string): Promise<string> {
+    return (
+      `${await pathMetadataFingerprint(this.eventsRoot(deviceId))}:` +
+      `${await pathMetadataFingerprint(join(this.deviceRoot(deviceId), "head.json"))}`
+    );
+  }
+
+  private async observeSharedGeneration(): Promise<SharedGenerationObservation> {
+    const devicesRoot = join(this.root, "devices");
+    let deviceEntries: Dirent[] = [];
+    try {
+      deviceEntries = await readdir(devicesRoot, { withFileTypes: true });
+    } catch (error) {
+      if (!isMissingPathError(error)) {
+        throw error;
+      }
+    }
+    const devices = new Map<string, string>();
+    for (const entry of deviceEntries) {
+      if (!entry.isDirectory() || !isSafeIdentifier(entry.name)) {
+        continue;
+      }
+      devices.set(entry.name, await this.observeDeviceGeneration(entry.name));
+    }
+    const deviceRows = [...devices].map(([deviceId, fingerprint]) =>
+      `${deviceId}:${fingerprint}`,
+    );
+    deviceRows.sort(compareCodeUnits);
+    const checkpointDirectory = await pathMetadataFingerprint(
+      this.sharedCheckpointsRoot,
+    );
+    const checkpointHead =
+      this.checkpointHeadPath === null
+        ? "none"
+        : `${this.checkpointHeadPath}:${await pathMetadataFingerprint(this.checkpointHeadPath)}`;
+    const checkpoints = `${checkpointDirectory}\n${checkpointHead}`;
+    return {
+      graph: [
+        await pathMetadataFingerprint(devicesRoot),
+        ...deviceRows,
+        checkpoints,
+      ].join("\n"),
+      checkpoints,
+      devices,
+    };
   }
 
   /**
@@ -1276,8 +1651,9 @@ export class SyncRepository {
   async readDeviceAcks(deviceId: string): Promise<DeviceAcks | null> {
     let raw: unknown;
     try {
-      raw = await readJsonFile<unknown>(
+      raw = await readJsonFileBounded<unknown>(
         join(this.deviceRoot(deviceId), "acks.json"),
+        MAX_REPOSITORY_FILE_BYTES,
       );
     } catch {
       return null;
@@ -1415,6 +1791,11 @@ export class SyncRepository {
     if (manifestBytes.byteLength > MAX_CHECKPOINT_FILE_BYTES) {
       throw checkpointTooLargeError();
     }
+    assertRepositoryJsonStructure(
+      manifestBytes,
+      "Checkpoint manifest",
+      REPOSITORY_MANIFEST_JSON_MAX_STRUCTURAL_TOKENS,
+    );
     const encrypted = encryptAead(
       this.checkpointKey,
       manifestBytes,
@@ -1425,6 +1806,11 @@ export class SyncRepository {
     if (storedBytes.byteLength > MAX_CHECKPOINT_FILE_BYTES) {
       throw checkpointTooLargeError();
     }
+    assertRepositoryJsonStructure(
+      storedBytes,
+      "Checkpoint envelope",
+      REPOSITORY_ENVELOPE_JSON_MAX_STRUCTURAL_TOKENS,
+    );
     const hash = sha256(storedBytes);
     const fileName = `${String(lamport).padStart(16, "0")}-${hash}${CHECKPOINT_EXTENSION}`;
     const filePath = join(this.sharedCheckpointsRoot, fileName);
@@ -1433,6 +1819,7 @@ export class SyncRepository {
     // checkpoint files, and without this the device schedules a redundant
     // cycle over its own checkpoint.
     this.noteSelfWrite(fileName);
+    this.markSharedGraphMutation(true);
     try {
       await this.readCheckpointFile(filePath, hash, lamport);
     } catch (error) {
@@ -1577,15 +1964,19 @@ export class SyncRepository {
     // blob that has not propagated yet aborts the prune cleanly instead of
     // failing after the irreversible deletions already happened.
     const warnings: string[] = [];
-    const marker = await this.prepareCheckpointMarker();
+    const markerPreparation = await this.prepareCheckpointMarker();
+    const marker = markerPreparation.marker;
     if (marker === null) {
       if (
         Object.values(this.state.tips).some(
           (tips) => chooseCheckpointTip(tips) !== undefined,
         )
       ) {
+        const oversized = markerPreparation.largestOversizedPlainBytes;
         return abortedPrune(
-          "The checkpoint marker content is not readable yet; wait for the shared folder to deliver the tip payloads before pruning.",
+          oversized === null
+            ? "The checkpoint marker content is not readable yet; wait for the shared folder to deliver the tip payloads before pruning."
+            : `No readable checkpoint marker candidate remained within the fixed ${MAX_CHECKPOINT_MARKER_PAYLOAD_BYTES / (1024 * 1024)} MiB in-process limit. Oversized tip payloads (largest declared size: ${oversized} bytes) were skipped without reading; no history was deleted. Publish or retain a smaller current tip or tombstone, then prune again.`,
           [],
         );
       }
@@ -1639,6 +2030,9 @@ export class SyncRepository {
           reclaimedBytes += removedBytes;
         }
       }
+    }
+    if (eventsDeleted > 0 || checkpointFilesDeleted > 0) {
+      this.markSharedGraphMutation(true);
     }
     let markerEventHash: string | null = null;
     if (marker !== null) {
@@ -1754,6 +2148,7 @@ export class SyncRepository {
     const eventRoot = this.eventsRoot(deviceId);
     const pinned = pinnedOwnStream(this.state);
     const checkpointCursor = this.state.checkpoint?.streams[deviceId];
+    this.diagnostics.onEventDirectoryRead?.(eventRoot);
     const allFiles = (await readdir(eventRoot))
       .map((file) => ({ file, match: EVENT_FILE_PATTERN.exec(file) }))
       .filter(
@@ -1921,7 +2316,7 @@ export class SyncRepository {
     } else {
       this.state.streams[deviceId] = expectedCursor;
     }
-    await this.stateStore.save(this.state);
+    await this.persistLocalState();
   }
 
   private async adoptCheckpointOwnCursor(
@@ -1982,14 +2377,15 @@ export class SyncRepository {
       lastSequence: walkEnd,
       lastEventHash: previousHash,
     };
-    await this.stateStore.save(this.state);
+    await this.persistLocalState();
   }
 
   private async readOwnHeadSequence(): Promise<number | null> {
     let raw: unknown;
     try {
-      raw = await readJsonFile<unknown>(
+      raw = await readJsonFileBounded<unknown>(
         join(this.deviceRoot(this.state.device.deviceId), "head.json"),
+        MAX_REPOSITORY_FILE_BYTES,
       );
     } catch {
       return null;
@@ -2008,7 +2404,10 @@ export class SyncRepository {
     return record.sequence as number;
   }
 
-  private async absorbNewestCheckpoint(): Promise<void> {
+  private async absorbNewestCheckpoint(
+    revalidateCurrent = false,
+    strictAudit = false,
+  ): Promise<void> {
     const current = this.state.checkpoint;
     // The filename carries the (lamport, hash) pair that decides the winner, so
     // the winner is known from `readdir` alone. When it is the checkpoint this
@@ -2019,6 +2418,7 @@ export class SyncRepository {
     const sharedCandidates = await this.sharedCheckpointCandidates();
     const sharedWinner = sharedCandidates[0];
     if (
+      !revalidateCurrent &&
       current !== undefined &&
       sharedWinner !== undefined &&
       sharedWinner.hash === current.hash &&
@@ -2027,7 +2427,10 @@ export class SyncRepository {
       await this.ensureLocalCheckpointCopy(sharedWinner);
       return;
     }
-    const winner = await this.loadNewestCheckpoint(sharedCandidates);
+    const winner = await this.loadNewestCheckpoint(
+      sharedCandidates,
+      strictAudit,
+    );
     if (winner === null) {
       if (current !== undefined) {
         throw checkpointRollbackError(current.hash);
@@ -2044,6 +2447,10 @@ export class SyncRepository {
       }
       if (order === 0) {
         await this.persistLocalCheckpointCopy(winner);
+        this.checkpointManifestCache = {
+          hash: winner.hash,
+          manifest: winner.manifest,
+        };
         return;
       }
     }
@@ -2090,7 +2497,7 @@ export class SyncRepository {
       hash: winner.hash,
       manifest: winner.manifest,
     };
-    await this.stateStore.save(this.state);
+    await this.persistLocalState();
     await this.cleanupLocalCheckpointCopies(
       winner.hash,
       winner.manifest.predecessorHash,
@@ -2107,9 +2514,11 @@ export class SyncRepository {
     Array<CheckpointIdentity & { path: string }>
   > {
     if (!(await pathExists(this.sharedCheckpointsRoot))) {
+      this.checkpointHeadPath = null;
       return [];
     }
     const candidates: Array<CheckpointIdentity & { path: string }> = [];
+    this.diagnostics.onCheckpointDirectoryRead?.(this.sharedCheckpointsRoot);
     const entries = await readdir(this.sharedCheckpointsRoot, {
       withFileTypes: true,
     });
@@ -2131,9 +2540,11 @@ export class SyncRepository {
         path: join(this.sharedCheckpointsRoot, entry.name),
       });
     }
-    return candidates.sort((left, right) =>
+    const sorted = candidates.sort((left, right) =>
       compareCheckpointIdentity(right, left),
     );
+    this.checkpointHeadPath = sorted[0]?.path ?? null;
+    return sorted;
   }
 
   /**
@@ -2174,6 +2585,7 @@ export class SyncRepository {
 
   private async loadNewestCheckpoint(
     sharedCandidates: ReadonlyArray<CheckpointIdentity & { path: string }>,
+    strictAudit = false,
   ): Promise<LoadedCheckpoint | null> {
     let winner: LoadedCheckpoint | null = null;
     const consider = (candidate: LoadedCheckpoint): void => {
@@ -2211,8 +2623,8 @@ export class SyncRepository {
         // down for the whole hydration window - the exact shape 0.0.32
         // declared a bug when EVENT files produced it.
         if (
-          isMissingPathError(error) ||
-          isTolerableTornCheckpointError(error)
+          !strictAudit &&
+          (isMissingPathError(error) || isTolerableTornCheckpointError(error))
         ) {
           continue;
         }
@@ -2233,7 +2645,10 @@ export class SyncRepository {
               null,
             ),
           );
-        } catch {
+        } catch (error) {
+          if (strictAudit) {
+            throw error;
+          }
           // A damaged local copy is not authoritative; the rollback fail-stop
           // in absorbNewestCheckpoint reports the loss if nothing covers it.
           continue;
@@ -2248,13 +2663,12 @@ export class SyncRepository {
     expectedHash: string,
     expectedLamport: number | null,
   ): Promise<LoadedCheckpoint> {
-    const fileInfo = await statResilient(path);
-    if (fileInfo.size > MAX_CHECKPOINT_FILE_BYTES) {
-      throw new Error(
-        `Checkpoint file exceeds ${MAX_CHECKPOINT_FILE_BYTES} bytes: ${path}`,
-      );
-    }
-    const bytes = await readFileResilient(path);
+    const bytes = await readFileBounded(path, MAX_CHECKPOINT_FILE_BYTES);
+    assertRepositoryJsonStructure(
+      bytes,
+      "Checkpoint envelope",
+      REPOSITORY_ENVELOPE_JSON_MAX_STRUCTURAL_TOKENS,
+    );
     const stored = JSON.parse(bytes.toString("utf8")) as StoredCheckpoint;
     validateStoredCheckpointEnvelope(stored);
     validateCheckpointHeader(stored.header, this.repository.repositoryId);
@@ -2269,6 +2683,11 @@ export class SyncRepository {
       this.checkpointKey,
       stored,
       canonicalBytes(stored.header),
+    );
+    assertRepositoryJsonStructure(
+      plaintext,
+      "Checkpoint manifest",
+      REPOSITORY_MANIFEST_JSON_MAX_STRUCTURAL_TOKENS,
     );
     const manifest = JSON.parse(plaintext.toString("utf8")) as CheckpointManifest;
     // The ceiling, not the live setting - same reasoning as readEvent: a
@@ -2405,15 +2824,26 @@ export class SyncRepository {
    * available; the marker still gets published, which is what the v2 guarantee
    * needs.
    */
-  private async prepareCheckpointMarker(): Promise<PreparedCheckpointMarker | null> {
-    return (
-      (await this.checkpointMarkerFrom((kind) => !HELPER_APPLIED_KINDS.has(kind))) ??
-      (await this.checkpointMarkerFrom(() => true))
-    );
+  private async prepareCheckpointMarker(): Promise<CheckpointMarkerPreparation> {
+    const observation: CheckpointMarkerPreparation = {
+      marker: null,
+      largestOversizedPlainBytes: null,
+    };
+    observation.marker =
+      (await this.checkpointMarkerFrom(
+        (kind) => !HELPER_APPLIED_KINDS.has(kind),
+        observation,
+      )) ??
+      (await this.checkpointMarkerFrom(
+        (kind) => HELPER_APPLIED_KINDS.has(kind),
+        observation,
+      ));
+    return observation;
   }
 
   private async checkpointMarkerFrom(
     accepts: (kind: ResourceKind) => boolean,
+    observation: CheckpointMarkerPreparation,
   ): Promise<PreparedCheckpointMarker | null> {
     let tombstone: { resourceId: string; tip: ResourceTip } | null = null;
     for (const resourceId of Object.keys(this.state.tips).sort()) {
@@ -2422,6 +2852,15 @@ export class SyncRepository {
         continue;
       }
       if (active.operation === "put" && active.payload !== undefined) {
+        if (
+          active.payload.plainBytes > MAX_CHECKPOINT_MARKER_PAYLOAD_BYTES
+        ) {
+          observation.largestOversizedPlainBytes = Math.max(
+            observation.largestOversizedPlainBytes ?? 0,
+            active.payload.plainBytes,
+          );
+          continue;
+        }
         let content: Buffer;
         try {
           content = await this.readObject(active.payload);
@@ -2438,7 +2877,7 @@ export class SyncRepository {
               kind: active.kind,
               content,
               semanticHash: active.semanticHash,
-              metadata: { ...active.metadata, syncOrigin: "checkpoint-marker" },
+              metadata: checkpointMarkerMetadata(active),
               parents: [active.versionId],
             },
           ],
@@ -2457,10 +2896,7 @@ export class SyncRepository {
             resourceId: tombstone.resourceId,
             kind: tombstone.tip.kind,
             semanticHash: tombstone.tip.semanticHash,
-            metadata: {
-              ...tombstone.tip.metadata,
-              syncOrigin: "checkpoint-marker",
-            },
+            metadata: checkpointMarkerMetadata(tombstone.tip),
             parents: [tombstone.tip.versionId],
           },
         ],
@@ -2486,11 +2922,12 @@ export class SyncRepository {
     fileName: string,
     expectedDeviceId: string,
   ): Promise<DecryptedEvent> {
-    const fileInfo = await statResilient(path);
-    if (fileInfo.size > MAX_EVENT_FILE_BYTES) {
-      throw new Error(`Event file exceeds its size limit: ${fileName}`);
-    }
-    const bytes = await readFileResilient(path);
+    const bytes = await readFileBounded(path, MAX_EVENT_FILE_BYTES);
+    assertRepositoryJsonStructure(
+      bytes,
+      "Event envelope",
+      REPOSITORY_ENVELOPE_JSON_MAX_STRUCTURAL_TOKENS,
+    );
     const stored = JSON.parse(bytes.toString("utf8")) as StoredEvent;
     validateStoredEventEnvelope(stored);
     validateEventHeader(stored.header, this.repository.repositoryId);
@@ -2506,6 +2943,11 @@ export class SyncRepository {
       throw new Error(`Event sequence does not match its filename: ${fileName}`);
     }
     const plaintext = decryptAead(this.eventKey, stored, canonicalBytes(stored.header));
+    assertRepositoryJsonStructure(
+      plaintext,
+      "Event manifest",
+      REPOSITORY_MANIFEST_JSON_MAX_STRUCTURAL_TOKENS,
+    );
     const manifest = JSON.parse(plaintext.toString("utf8")) as EventManifest;
     // Validated against the absolute ceiling, not this device's live
     // maxPayloadBytes: an event already in the log was published under
@@ -2571,6 +3013,64 @@ export class SyncRepository {
       `${objectId}${OBJECT_EXTENSION}`,
     );
   }
+}
+
+function reconciliationInputDigest(state: LocalSyncState): string {
+  return sha256(
+    canonicalBytes({
+      checkpoint: state.checkpoint ?? null,
+      conflicts: state.conflicts,
+      lamport: state.lamport,
+      projections: state.projections,
+      retiredDevices: state.retiredDevices,
+      streams: state.streams,
+      tips: state.tips,
+    }),
+  );
+}
+
+async function pathMetadataFingerprint(path: string): Promise<string> {
+  try {
+    const info = await stat(path, { bigint: true });
+    return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(":");
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return "missing";
+    }
+    throw error;
+  }
+}
+
+function objectEnvelopeReadLimit(
+  repositoryId: string,
+  reference: ObjectReference,
+): number {
+  // Object references live in authenticated event/checkpoint manifests, so
+  // compressedBytes is a stronger envelope bound than the configured plain
+  // payload ceiling. AES-GCM preserves ciphertext length; nonce/tag lengths
+  // are fixed. Keep a small whitespace allowance for otherwise valid JSON,
+  // but never let a tiny authenticated object authorize a hundreds-of-MiB
+  // read before its envelope is validated.
+  const fixedBytes = canonicalBytes({
+    protocolVersion: PROTOCOL_VERSION,
+    envelopeVersion: OBJECT_ENVELOPE_VERSION,
+    repositoryId,
+    deviceId: reference.deviceId,
+    objectId: reference.objectId,
+    nonce: "",
+    ciphertext: "",
+    tag: "",
+  }).byteLength;
+  const expectedBytes =
+    fixedBytes +
+    canonicalBase64Length(12) +
+    canonicalBase64Length(reference.compressedBytes) +
+    canonicalBase64Length(16);
+  return Math.min(MAX_OBJECT_ENVELOPE_BYTES, expectedBytes + 4096);
+}
+
+function canonicalBase64Length(byteLength: number): number {
+  return Math.ceil(byteLength / 3) * 4;
 }
 
 /** Stable listing order: by device, then by sequence within that device. */
@@ -2769,6 +3269,156 @@ function chooseCheckpointTip(tips: ResourceTip[]): ResourceTip | undefined {
   return [...candidates].sort(compareCheckpointTips)[0];
 }
 
+function checkpointMarkerMetadata(
+  active: ResourceTip,
+): Record<string, JsonValue> {
+  const metadata = active.metadata;
+  const directOrigin = metadata?.syncOrigin;
+  const legacyKind = classifyLegacyCheckpointMarker(metadata);
+  const passThroughOrigin =
+    directOrigin === "checkpoint-marker"
+      ? typeof metadata?.checkpointedSyncOrigin === "string"
+        ? metadata.checkpointedSyncOrigin
+        : legacyCheckpointRecipeOrigin(legacyKind)
+      : directOrigin;
+  const preservedSource =
+    directOrigin === "checkpoint-marker"
+      ? metadata?.checkpointedSourceDeviceId
+      : undefined;
+  // A marker republishes authenticated bytes under the checkpointing device's
+  // event identity. Keep the original source separately so an additive repair
+  // cannot be laundered into authority from the marker publisher. An older or
+  // malformed marker has no trustworthy source to preserve; falling back to
+  // its authenticated active device makes later repair-origin equality fail
+  // closed instead of copying arbitrary metadata forward.
+  const checkpointedSourceDeviceId =
+    typeof preservedSource === "string" && isSafeIdentifier(preservedSource)
+      ? preservedSource
+      : active.deviceId;
+  const checkpointedProducer = checkpointedEffectiveProducer(active);
+  return {
+    ...(metadata ?? {}),
+    ...(typeof passThroughOrigin === "string"
+      ? { checkpointedSyncOrigin: passThroughOrigin }
+      : {}),
+    checkpointedSourceDeviceId,
+    // The marker event's extension version gates this transport envelope, but
+    // the copied database core must retain the Cursor/VS Code compatibility of
+    // the version that actually produced it. Null intentionally fails closed
+    // for a marker-of-marker created by an older build with no provenance.
+    checkpointedProducer:
+      checkpointedProducer === null
+        ? null
+        : {
+            extensionVersion: checkpointedProducer.extensionVersion,
+            cursorVersion: checkpointedProducer.cursorVersion,
+            vscodeVersion: checkpointedProducer.vscodeVersion,
+          },
+    // Always the immediate parent, including marker-of-marker. This binds the
+    // provenance metadata to the exact authenticated tip that was reasserted.
+    checkpointedVersionId: active.versionId,
+    syncOrigin: "checkpoint-marker",
+  };
+}
+
+function checkpointedEffectiveProducer(active: ResourceTip): EventProducer | null {
+  const metadata = active.metadata;
+  const directOrigin = metadata?.syncOrigin;
+  if (directOrigin === "checkpoint-marker") {
+    const checkpointed = eventProducerMetadata(metadata?.checkpointedProducer);
+    if (checkpointed !== null) {
+      return checkpointed;
+    }
+    // Backward-compatible safe upgrade for older enrichment/restore markers:
+    // those recipes already carried authenticated originalProducer metadata.
+    // Ordinary and automatic-repair markers did not, so they remain unknown
+    // rather than inheriting the checkpointing device's compatibility.
+    const checkpointedOrigin = metadata?.checkpointedSyncOrigin;
+    if (checkpointedOrigin === "agent-kv-enrichment") {
+      const original = eventProducerMetadata(metadata?.originalProducer);
+      if (active.producer === undefined || original === null) {
+        return null;
+      }
+      return {
+        extensionVersion: active.producer.extensionVersion,
+        cursorVersion: original.cursorVersion,
+        vscodeVersion: original.vscodeVersion,
+      };
+    }
+    if (checkpointedOrigin === "version-restore") {
+      return eventProducerMetadata(metadata?.originalProducer);
+    }
+    const legacyKind = classifyLegacyCheckpointMarker(metadata);
+    if (legacyKind === "ordinary") {
+      // v0.0.59 wrote exactly the active metadata plus checkpoint-marker. Its
+      // own authenticated manifest producer is the only compatibility datum
+      // available, and ordinary database tips did not carry a recipe whose
+      // source authority could be confused with the marker publisher.
+      return active.producer ?? null;
+    }
+    if (legacyKind === "agent-kv-enrichment") {
+      const original = eventProducerMetadata(metadata?.originalProducer);
+      if (active.producer === undefined || original === null) {
+        return null;
+      }
+      return {
+        extensionVersion: active.producer.extensionVersion,
+        cursorVersion: original.cursorVersion,
+        vscodeVersion: original.vscodeVersion,
+      };
+    }
+    if (legacyKind === "version-restore") {
+      return eventProducerMetadata(metadata?.originalProducer);
+    }
+    // A v0.0.61 repair marker cannot prove that its publisher was the repair
+    // origin, and a partially recognizable legacy recipe is equally unsafe.
+    // Re-checkpointing either shape must preserve the fail-closed state.
+    return null;
+  }
+  if (directOrigin === "agent-kv-enrichment") {
+    const original = eventProducerMetadata(metadata?.originalProducer);
+    if (active.producer === undefined || original === null) {
+      return null;
+    }
+    return {
+      extensionVersion: active.producer.extensionVersion,
+      cursorVersion: original.cursorVersion,
+      vscodeVersion: original.vscodeVersion,
+    };
+  }
+  if (directOrigin === "version-restore") {
+    return eventProducerMetadata(metadata?.originalProducer);
+  }
+  return active.producer ?? null;
+}
+
+function eventProducerMetadata(value: JsonValue | undefined): EventProducer | null {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value !== "object" ||
+    Array.isArray(value)
+  ) {
+    return null;
+  }
+  const { extensionVersion, cursorVersion, vscodeVersion } = value;
+  return typeof extensionVersion === "string" &&
+    typeof cursorVersion === "string" &&
+    typeof vscodeVersion === "string"
+    ? { extensionVersion, cursorVersion, vscodeVersion }
+    : null;
+}
+
+function legacyCheckpointRecipeOrigin(
+  kind: LegacyCheckpointMarkerKind | null,
+): string | undefined {
+  return kind === "automatic-chat-repair" ||
+    kind === "agent-kv-enrichment" ||
+    kind === "version-restore"
+    ? kind
+    : undefined;
+}
+
 function compareCheckpointTips(left: ResourceTip, right: ResourceTip): number {
   if (left.lamport !== right.lamport) {
     return right.lamport - left.lamport;
@@ -2869,6 +3519,33 @@ function validateStoredCheckpointEnvelope(stored: StoredCheckpoint): void {
     !isCanonicalBase64(stored.ciphertext)
   ) {
     throw new Error("Checkpoint envelope is invalid.");
+  }
+}
+
+/**
+ * Repository envelopes can be tens of MiB because their ciphertext is one
+ * string, while the decrypted checkpoint/event manifests can contain many
+ * legitimate resource records. A corrupted shared file can encode the same
+ * byte count as millions of tiny objects, however, and `JSON.parse` would
+ * materialize that graph before the schema validators get a chance to reject
+ * it. Scan the bytes allocation-free first and keep one fixed structural
+ * ceiling for each independent JSON document.
+ */
+function assertRepositoryJsonStructure(
+  input: Uint8Array,
+  label: string,
+  maxStructuralTokens: number,
+): void {
+  if (
+    !buffersFitJsonStructureBudget([input], {
+      maxStructuralTokens,
+      maxNestingDepth: REPOSITORY_JSON_MAX_NESTING_DEPTH,
+      allowComments: false,
+    })
+  ) {
+    throw new Error(
+      `${label} JSON exceeds the fixed structural safety limit.`,
+    );
   }
 }
 

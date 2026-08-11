@@ -1,11 +1,14 @@
 import { basename, join } from "node:path";
+import { createHash } from "node:crypto";
 import { readdir, stat } from "node:fs/promises";
 import type { CursorPaths } from "../platform/paths";
 import {
+  assertSafeIdentifier,
   isCaseInsensitivePathPlatform,
   pathExists,
   readFileWithinRoot,
 } from "../platform/files";
+import { buffersFitJsonStructureBudget } from "../protocol/jsonStructure";
 
 export interface WorkspaceIdentity {
   id: string;
@@ -32,8 +35,39 @@ export interface WorkspaceDiscovery {
 interface WorkspaceDiscoveryMemo {
   mtimeMs: number;
   entryCount: number;
-  workspaces: WorkspaceIdentity[];
+  entries: Map<string, WorkspaceIdentity | null>;
+  unreadableIds: Set<string>;
+  retryCursor: string | null;
+  structuralUnreadableIdentities: Map<string, string>;
 }
+
+const WORKSPACE_METADATA_MAX_BYTES = 1024 * 1024;
+const WORKSPACE_METADATA_RETRIES_PER_SCAN = 16;
+export const WORKSPACE_IDENTITY_LOOKUPS_PER_PAGE = 64;
+export const HELPER_WORKSPACE_IDENTITY_REFERENCES = 512;
+const WORKSPACE_IDENTITY_LOOKUP_MEMO_ENTRIES = 256;
+const REMOTE_HOST_DESCRIPTOR_MEMO_ENTRIES = 256;
+
+interface WorkspaceIdentityLookupMemo {
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  workspace: WorkspaceIdentity | null;
+}
+
+const workspaceIdentityLookupMemo = new Map<
+  string,
+  WorkspaceIdentityLookupMemo
+>();
+const remoteHostDescriptorMemo = new Map<string, string | null>();
+let workspaceStorageEnumerationObserver: (() => void) | undefined;
+
+/** Narrow instrumentation used only by fixed-work regression tests. */
+export const workspaceDiscoveryTesting = {
+  setEnumerationObserver(observer: (() => void) | undefined): void {
+    workspaceStorageEnumerationObserver = observer;
+  },
+};
 
 /**
  * Cached per workspaceStorage root.
@@ -52,6 +86,241 @@ const discoveryMemo = new Map<string, WorkspaceDiscoveryMemo>();
 /** Drops the memo; exported for tests that rewrite a workspaceStorage tree. */
 export function resetWorkspaceDiscoveryCache(): void {
   discoveryMemo.clear();
+  workspaceIdentityLookupMemo.clear();
+  remoteHostDescriptorMemo.clear();
+  workspaceStorageEnumerationObserver = undefined;
+}
+
+/**
+ * Resolves only workspace IDs referenced by the caller's current bounded page.
+ * It never enumerates `workspaceStorage`, returns at most 64 identities, and
+ * keeps a small LRU of metadata rather than the complete workspace population.
+ */
+export async function lookupWorkspaceIdentitiesById(
+  paths: CursorPaths,
+  workspaceIds: Iterable<string>,
+  options: {
+    maxLookups?: number;
+    onMetadataRead?: (workspaceId: string) => void;
+  } = {},
+): Promise<Map<string, WorkspaceIdentity>> {
+  const maxLookups =
+    options.maxLookups ?? WORKSPACE_IDENTITY_LOOKUPS_PER_PAGE;
+  if (!Number.isSafeInteger(maxLookups) || maxLookups <= 0) {
+    throw new Error("Workspace identity lookup limit must be positive.");
+  }
+  const result = new Map<string, WorkspaceIdentity>();
+  const seen = new Set<string>();
+  for (const workspaceId of workspaceIds) {
+    if (seen.has(workspaceId)) {
+      continue;
+    }
+    if (seen.size >= maxLookups) {
+      break;
+    }
+    seen.add(workspaceId);
+    try {
+      assertSafeIdentifier(workspaceId, "workspace ID");
+      const metadataPath = join(
+        paths.workspaceStorageRoot,
+        workspaceId,
+        "workspace.json",
+      );
+      const info = await stat(metadataPath);
+      if (!info.isFile() || info.size > WORKSPACE_METADATA_MAX_BYTES) {
+        continue;
+      }
+      const memoKey = `${paths.workspaceStorageRoot}\0${workspaceId}`;
+      const cached = workspaceIdentityLookupMemo.get(memoKey);
+      if (
+        cached !== undefined &&
+        cached.size === info.size &&
+        cached.mtimeMs === info.mtimeMs &&
+        cached.ctimeMs === info.ctimeMs
+      ) {
+        workspaceIdentityLookupMemo.delete(memoKey);
+        workspaceIdentityLookupMemo.set(memoKey, cached);
+        if (cached.workspace !== null) {
+          result.set(workspaceId, cached.workspace);
+        }
+        continue;
+      }
+      options.onMetadataRead?.(workspaceId);
+      const metadataBytes = await readFileWithinRoot(
+        paths.workspaceStorageRoot,
+        `${workspaceId}/workspace.json`,
+        WORKSPACE_METADATA_MAX_BYTES,
+      );
+      if (!buffersFitJsonStructureBudget([metadataBytes])) {
+        rememberWorkspaceIdentityLookup(memoKey, {
+          size: info.size,
+          mtimeMs: info.mtimeMs,
+          ctimeMs: info.ctimeMs,
+          workspace: null,
+        });
+        continue;
+      }
+      const metadata = JSON.parse(metadataBytes.toString("utf8")) as WorkspaceJson;
+      const uri = metadata.folder ?? metadata.workspace;
+      const workspace =
+        typeof uri === "string" && uri.length > 0
+          ? { id: workspaceId, uri, basename: workspaceBasename(uri) }
+          : null;
+      rememberWorkspaceIdentityLookup(memoKey, {
+        size: info.size,
+        mtimeMs: info.mtimeMs,
+        ctimeMs: info.ctimeMs,
+        workspace,
+      });
+      if (workspace !== null) {
+        result.set(workspaceId, workspace);
+      }
+    } catch {
+      // URI metadata is optional display/mapping context. Invalid, absent or
+      // transiently torn metadata safely resolves to null for this page.
+    }
+  }
+  return result;
+}
+
+/**
+ * Resolves the fixed set referenced by one authenticated helper page. The
+ * helper page itself is capped at 256 changes; the second half of this bound
+ * leaves room for explicit mapping targets without ever enumerating the
+ * potentially unbounded workspaceStorage directory.
+ */
+export async function lookupWorkspaceIdentityReferences(
+  paths: CursorPaths,
+  workspaceIds: Iterable<string>,
+  workspaceMappings: Readonly<Record<string, string>> = {},
+  options: {
+    maxReferences?: number;
+    onMetadataRead?: (workspaceId: string) => void;
+  } = {},
+): Promise<WorkspaceIdentity[]> {
+  const maxReferences =
+    options.maxReferences ?? HELPER_WORKSPACE_IDENTITY_REFERENCES;
+  if (
+    !Number.isSafeInteger(maxReferences) ||
+    maxReferences <= 0 ||
+    maxReferences > HELPER_WORKSPACE_IDENTITY_REFERENCES
+  ) {
+    throw new Error(
+      `Helper workspace identity reference limit must be between 1 and ${HELPER_WORKSPACE_IDENTITY_REFERENCES}.`,
+    );
+  }
+  const references = new Set<string>();
+  const add = (workspaceId: string): void => {
+    if (references.has(workspaceId)) {
+      return;
+    }
+    if (references.size >= maxReferences) {
+      throw new Error(
+        `Helper workspace identity page exceeds ${maxReferences} references.`,
+      );
+    }
+    references.add(workspaceId);
+  };
+  for (const workspaceId of workspaceIds) {
+    add(workspaceId);
+  }
+  // A legacy chat event may carry its workspace ID only inside the payload.
+  // Looking up the bounded explicit targets preserves those mappings without
+  // parsing a second full chat graph during preflight.
+  // Set iteration visits appended values, so this follows only the direct
+  // mapping chain connected to a referenced source. Unrelated configuration
+  // entries are neither cloned nor counted against the page.
+  for (const source of references) {
+    const target = workspaceMappings[source];
+    if (Object.hasOwn(workspaceMappings, source) && typeof target === "string") {
+      add(target);
+    }
+  }
+
+  const resolved = new Map<string, WorkspaceIdentity>();
+  let page: string[] = [];
+  const flush = async (): Promise<void> => {
+    if (page.length === 0) {
+      return;
+    }
+    const identities = await lookupWorkspaceIdentitiesById(paths, page, {
+      maxLookups: WORKSPACE_IDENTITY_LOOKUPS_PER_PAGE,
+      ...(options.onMetadataRead === undefined
+        ? {}
+        : { onMetadataRead: options.onMetadataRead }),
+    });
+    for (const [workspaceId, identity] of identities) {
+      resolved.set(workspaceId, identity);
+    }
+    page = [];
+  };
+  for (const workspaceId of references) {
+    page.push(workspaceId);
+    if (page.length >= WORKSPACE_IDENTITY_LOOKUPS_PER_PAGE) {
+      await flush();
+    }
+  }
+  await flush();
+  return [...resolved.values()];
+}
+
+/** Returns only mapping edges reachable from this bounded source page. */
+export function selectWorkspaceMappingsForReferences(
+  workspaceIds: Iterable<string>,
+  workspaceMappings: Readonly<Record<string, string>>,
+  maxReferences = HELPER_WORKSPACE_IDENTITY_REFERENCES,
+): Record<string, string> {
+  if (
+    !Number.isSafeInteger(maxReferences) ||
+    maxReferences <= 0 ||
+    maxReferences > HELPER_WORKSPACE_IDENTITY_REFERENCES
+  ) {
+    throw new Error(
+      `Helper workspace mapping reference limit must be between 1 and ${HELPER_WORKSPACE_IDENTITY_REFERENCES}.`,
+    );
+  }
+  const references = new Set<string>();
+  for (const workspaceId of workspaceIds) {
+    if (!references.has(workspaceId) && references.size >= maxReferences) {
+      throw new Error(
+        `Helper workspace mapping page exceeds ${maxReferences} references.`,
+      );
+    }
+    references.add(workspaceId);
+  }
+  const selected = Object.create(null) as Record<string, string>;
+  for (const source of references) {
+    const target = workspaceMappings[source];
+    if (!Object.hasOwn(workspaceMappings, source) || typeof target !== "string") {
+      continue;
+    }
+    if (!references.has(target) && references.size >= maxReferences) {
+      throw new Error(
+        `Helper workspace mapping page exceeds ${maxReferences} references.`,
+      );
+    }
+    references.add(target);
+    selected[source] = target;
+  }
+  return selected;
+}
+
+function rememberWorkspaceIdentityLookup(
+  key: string,
+  value: WorkspaceIdentityLookupMemo,
+): void {
+  workspaceIdentityLookupMemo.delete(key);
+  while (
+    workspaceIdentityLookupMemo.size >=
+    WORKSPACE_IDENTITY_LOOKUP_MEMO_ENTRIES
+  ) {
+    const oldest = workspaceIdentityLookupMemo.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    workspaceIdentityLookupMemo.delete(oldest);
+  }
+  workspaceIdentityLookupMemo.set(key, value);
 }
 
 export async function discoverWorkspaces(
@@ -67,6 +336,7 @@ export async function discoverWorkspacesDetailed(
     discoveryMemo.delete(paths.workspaceStorageRoot);
     return { workspaces: [], unreadableIds: [] };
   }
+  workspaceStorageEnumerationObserver?.();
   const entries = await readdir(paths.workspaceStorageRoot, { withFileTypes: true });
   let rootMtimeMs: number | null = null;
   try {
@@ -75,67 +345,107 @@ export async function discoverWorkspacesDetailed(
     // Without a root timestamp the discovery simply runs in full.
   }
   const memo = discoveryMemo.get(paths.workspaceStorageRoot);
-  if (
-    rootMtimeMs !== null &&
-    memo !== undefined &&
-    memo.mtimeMs === rootMtimeMs &&
-    memo.entryCount === entries.length
-  ) {
-    return { workspaces: [...memo.workspaces], unreadableIds: [] };
+  const directoryIds = entries
+    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+    .map((entry) => entry.name)
+    .sort((left, right) => left.localeCompare(right));
+  const currentIds = new Set(directoryIds);
+  const state: WorkspaceDiscoveryMemo = memo ?? {
+    mtimeMs: rootMtimeMs ?? -1,
+    entryCount: entries.length,
+    entries: new Map(),
+    unreadableIds: new Set(),
+    retryCursor: null,
+    structuralUnreadableIdentities: new Map(),
+  };
+  state.structuralUnreadableIdentities ??= new Map();
+  for (const cachedId of [...state.entries.keys()]) {
+    if (!currentIds.has(cachedId)) {
+      state.entries.delete(cachedId);
+      state.unreadableIds.delete(cachedId);
+      state.structuralUnreadableIdentities.delete(cachedId);
+    }
   }
-  const workspaces: WorkspaceIdentity[] = [];
-  const unreadableIds: string[] = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory() || entry.isSymbolicLink()) {
-      continue;
+  for (const id of directoryIds) {
+    if (!state.entries.has(id)) {
+      state.unreadableIds.add(id);
     }
-    const metadataPath = join(paths.workspaceStorageRoot, entry.name, "workspace.json");
-    if (!(await pathExists(metadataPath))) {
-      // A directory without its workspace.json is a window mid-creation or a
-      // torn write, not a decided state; callers must not treat it as a
-      // window that had nothing open.
-      unreadableIds.push(entry.name);
-      continue;
-    }
-    let metadata: WorkspaceJson;
+  }
+  const retryIds = rotateWorkspaceIds(
+    [...state.unreadableIds].filter((id) => currentIds.has(id)).sort(),
+    state.retryCursor,
+  ).slice(0, WORKSPACE_METADATA_RETRIES_PER_SCAN);
+  for (const id of retryIds) {
+    state.retryCursor = id;
     try {
-      metadata = JSON.parse(
-        (
-          await readFileWithinRoot(
-            paths.workspaceStorageRoot,
-            `${entry.name}/workspace.json`,
-          )
-        ).toString("utf8"),
-      ) as WorkspaceJson;
+      const metadataPath = join(
+        paths.workspaceStorageRoot,
+        id,
+        "workspace.json",
+      );
+      const metadataInfo = await stat(metadataPath);
+      if (metadataInfo.size > WORKSPACE_METADATA_MAX_BYTES) {
+        throw new Error("workspace metadata exceeds its read limit");
+      }
+      const metadataIdentity = `${metadataInfo.size}:${metadataInfo.mtimeMs}:${metadataInfo.ctimeMs}`;
+      if (
+        state.structuralUnreadableIdentities.get(id) === metadataIdentity
+      ) {
+        state.unreadableIds.add(id);
+        continue;
+      }
+      state.structuralUnreadableIdentities.delete(id);
+      const metadataBytes = await readFileWithinRoot(
+        paths.workspaceStorageRoot,
+        `${id}/workspace.json`,
+        WORKSPACE_METADATA_MAX_BYTES,
+      );
+      if (!buffersFitJsonStructureBudget([metadataBytes])) {
+        state.structuralUnreadableIdentities.set(id, metadataIdentity);
+        throw new Error("workspace metadata exceeds its structural JSON limit");
+      }
+      const metadata = JSON.parse(metadataBytes.toString("utf8")) as WorkspaceJson;
+      const uri = metadata.folder ?? metadata.workspace;
+      state.entries.set(
+        id,
+        typeof uri === "string" && uri.length > 0
+          ? { id, uri, basename: workspaceBasename(uri) }
+          : null,
+      );
+      state.unreadableIds.delete(id);
+      state.structuralUnreadableIdentities.delete(id);
     } catch {
-      unreadableIds.push(entry.name);
-      continue;
+      // Preserve a previous healthy identity if a later refresh is transient;
+      // callers also receive the ID as unknown and therefore fail closed.
+      state.unreadableIds.add(id);
     }
-    const uri = metadata.folder ?? metadata.workspace;
-    if (typeof uri !== "string" || uri.length === 0) {
-      continue;
-    }
-    workspaces.push({
-      id: entry.name,
-      uri,
-      basename: workspaceBasename(uri),
-    });
   }
-  const sorted = workspaces.sort((left, right) => left.id.localeCompare(right.id));
-  // A scan that hit an unreadable workspace.json is not memoized: the file's
-  // later arrival or repair changes neither the root's mtime nor the entry
-  // count, so a memo taken now would keep serving the incomplete answer.
-  if (rootMtimeMs !== null && unreadableIds.length === 0) {
-    discoveryMemo.set(paths.workspaceStorageRoot, {
-      mtimeMs: rootMtimeMs,
-      entryCount: entries.length,
-      workspaces: sorted,
-    });
+  state.mtimeMs = rootMtimeMs ?? state.mtimeMs;
+  state.entryCount = entries.length;
+  if (state.unreadableIds.size === 0) {
+    state.retryCursor = null;
   }
+  discoveryMemo.set(paths.workspaceStorageRoot, state);
+  const sorted = [...state.entries.values()]
+    .filter((workspace): workspace is WorkspaceIdentity => workspace !== null)
+    .sort((left, right) => left.id.localeCompare(right.id));
   return {
     workspaces: [...sorted],
-    unreadableIds: unreadableIds.sort((left, right) => left.localeCompare(right)),
+    unreadableIds: [...state.unreadableIds].sort((left, right) =>
+      left.localeCompare(right),
+    ),
   };
+}
+
+function rotateWorkspaceIds(values: string[], cursor: string | null): string[] {
+  if (cursor === null || values.length < 2) {
+    return values;
+  }
+  const index = values.indexOf(cursor);
+  if (index < 0 || index + 1 >= values.length) {
+    return values;
+  }
+  return [...values.slice(index + 1), ...values.slice(0, index + 1)];
 }
 
 export function resolveTargetWorkspace(
@@ -224,17 +534,45 @@ function remoteHostFromDescriptor(encoded: string): string | null {
   if (bytes.length * 2 !== encoded.length) {
     return null;
   }
+  const memoKey = createHash("sha256").update(encoded).digest("hex");
+  const cached = remoteHostDescriptorMemo.get(memoKey);
+  if (cached !== undefined || remoteHostDescriptorMemo.has(memoKey)) {
+    remoteHostDescriptorMemo.delete(memoKey);
+    remoteHostDescriptorMemo.set(memoKey, cached ?? null);
+    return cached ?? null;
+  }
+  if (!buffersFitJsonStructureBudget([bytes])) {
+    rememberRemoteHostDescriptor(memoKey, null);
+    return null;
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(bytes.toString("utf8"));
   } catch {
+    rememberRemoteHostDescriptor(memoKey, null);
     return null;
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    rememberRemoteHostDescriptor(memoKey, null);
     return null;
   }
   const hostName = (parsed as { hostName?: unknown }).hostName;
-  return typeof hostName === "string" && hostName.length > 0 ? hostName : null;
+  const result =
+    typeof hostName === "string" && hostName.length > 0 ? hostName : null;
+  rememberRemoteHostDescriptor(memoKey, result);
+  return result;
+}
+
+function rememberRemoteHostDescriptor(key: string, hostName: string | null): void {
+  remoteHostDescriptorMemo.delete(key);
+  while (remoteHostDescriptorMemo.size >= REMOTE_HOST_DESCRIPTOR_MEMO_ENTRIES) {
+    const oldest = remoteHostDescriptorMemo.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    remoteHostDescriptorMemo.delete(oldest);
+  }
+  remoteHostDescriptorMemo.set(key, hostName);
 }
 
 function workspaceBasename(uri: string): string {

@@ -15,8 +15,8 @@ afterEach(async () => {
   );
 });
 
-describe("profile-files deletions when a profile vanishes", () => {
-  it("does not tombstone a vanished profile's files", async () => {
+describe("profile-files additive streaming deletion policy", () => {
+  it("does not tombstone a vanished profile or a file absent from a bounded page", async () => {
     // Deleting a profile on one machine removed User/profiles/<id>, and the
     // next scan tombstoned every keybinding, snippet, task and prompt file
     // that profile ever had - peers then unlinked them live, with no backup.
@@ -40,8 +40,9 @@ describe("profile-files deletions when a profile vanishes", () => {
         semanticHash: "h1",
         versionId: "e#0",
       },
-      // A projection whose FILE is gone from a profile that still exists -
-      // this one is a genuine deletion and must still propagate.
+      // A projection whose FILE is gone from a profile that still exists.
+      // Streaming pages deliberately retain no whole-tree identity set, so
+      // absence here cannot be distinguished from an unvisited later page.
       ["keybindings/default/keybindings.json"]: {
         resourceId: "keybindings/default/keybindings.json",
         kind: "keybindings",
@@ -59,9 +60,10 @@ describe("profile-files deletions when a profile vanishes", () => {
     const result = await new ProfileFilesAdapter(paths).scan(known);
 
     const deleted = result.deletions.map((deletion) => deletion.resourceId);
-    // The vanished profile is retained everywhere; the vanished FILE within a
-    // live profile still tombstones.
+    // Both are retained. Existing remote tombstones are still understood on
+    // apply, but this bounded scanner never invents a destructive one without
+    // a stable whole-tree proof.
     expect(deleted).not.toContain("keybindings/work/keybindings.json");
-    expect(deleted).toContain("snippet/default/removed.code-snippets");
+    expect(deleted).not.toContain("snippet/default/removed.code-snippets");
   });
 });

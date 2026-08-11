@@ -5,6 +5,8 @@ coverage/
 *.log
 .DS_Store
 tmp/
+.vitest-*.json
+.*-vitest.json
 
 # Screenshots and editor scratch files land in the repository root. They are
 # never part of the extension, and an untracked pile of them hides real

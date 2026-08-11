@@ -105,7 +105,10 @@ describe("chat headers whose conversation body was pruned", () => {
     expect(result.warnings).toEqual([
       `Skipped chat ${COMPOSER_A}: cursorDiskKV key composerData:${COMPOSER_A} has an unsupported SQLite storage class: real.`,
     ]);
-    expect(result.notices).toEqual([bodyless(1, COMPOSER_B)]);
+    expect(result.notices).toEqual([
+      `${COMPOSER_C}: Kept one chat on schema v1 because this scan reached its bounded agentKv graph-work budget; repository enrichment can upgrade it later.`,
+      bodyless(1, COMPOSER_B),
+    ]);
     expect(result.snapshots.map((item) => item.resourceId)).toEqual([
       `chat/${COMPOSER_C}`,
     ]);

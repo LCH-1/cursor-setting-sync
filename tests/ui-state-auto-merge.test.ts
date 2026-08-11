@@ -307,22 +307,81 @@ describe("ui-state auto-merge", () => {
     });
   });
 
+  it("does not materialize an over-limit winner from a three-tip ui-state fork", async () => {
+    await withRepository(async (repository) => {
+      const resourceId = "ui-state/workbench.activityBar.location";
+      const published = await repository.publish(
+        [snapshot(resourceId, "ui-state", Buffer.from("base", "utf8"))],
+        [],
+      );
+      const parents = [`${published.eventHash}#0`];
+      for (const value of ["left", "middle", "right"]) {
+        await repository.publish(
+          [
+            {
+              ...snapshot(
+                resourceId,
+                "ui-state",
+                Buffer.from(value, "utf8"),
+              ),
+              parents,
+            },
+          ],
+          [],
+        );
+      }
+      const conflicts = await reconcileConflicts(repository);
+      for (const tip of repository.state.tips[resourceId] ?? []) {
+        if (tip.payload === undefined) {
+          throw new Error("expected ui-state payload metadata");
+        }
+        tip.payload.plainBytes = 32 * 1024 * 1024 + 1;
+      }
+      const reads = vi.spyOn(repository, "tryReadVersion");
+      const publishes = vi.spyOn(repository, "publish");
+      const warnings: string[] = [];
+
+      expect(
+        await autoMergeConflicts(
+          repository,
+          conflicts,
+          () => true,
+          (warning) => warnings.push(warning),
+        ),
+      ).toBe(false);
+      expect(reads).not.toHaveBeenCalled();
+      expect(publishes).not.toHaveBeenCalled();
+      expect(conflicts[0]?.resolvedAt).toBeUndefined();
+      expect(warnings.join("\n")).toContain("interactive merge budget");
+
+      reads.mockRestore();
+      publishes.mockRestore();
+    }, 64 * 1024 * 1024);
+  });
+
   it("still asks for a cursor-user-rules conflict", async () => {
     await withRepository(async (repository) => {
+      const resourceId =
+        "cursor-user-rules/aicontext.personalContext";
       const conflicts = await forkResource(
         repository,
-        "cursor-user-rules/aicontext.personalContext",
+        resourceId,
         "cursor-user-rules",
         Buffer.from("Always write tests.\n", "utf8"),
         Buffer.from("Always write tests.\nPrefer TypeScript.\n", "utf8"),
         Buffer.from("Always write tests.\nPrefer Rust.\n", "utf8"),
       );
+      const reads = vi.spyOn(repository, "tryReadVersion");
+      const publishes = vi.spyOn(repository, "publish");
 
       expect(await autoMergeConflicts(repository, conflicts)).toBe(false);
+      expect(reads).not.toHaveBeenCalled();
+      expect(publishes).not.toHaveBeenCalled();
       expect(conflicts[0]?.resolvedAt).toBeUndefined();
-      expect(repository.state.tips["cursor-user-rules/aicontext.personalContext"]).toHaveLength(
-        2,
-      );
+      expect(repository.state.tips[resourceId]).toHaveLength(2);
+
+      reads.mockRestore();
+      publishes.mockRestore();
     });
   });
 
@@ -353,6 +412,71 @@ describe("ui-state auto-merge", () => {
       expect(text).toContain('"command": "a"');
       expect(text).toContain('"command": "b"');
       expect(text).toContain('"command": "c"');
+    });
+  });
+
+  it("keeps a many-line text merge manual before diff3 array work", async () => {
+    await withRepository(async (repository) => {
+      const resourceId = "keybindings/many-lines";
+      const lines = "\n".repeat(22_000);
+      const conflicts = await forkResource(
+        repository,
+        resourceId,
+        "keybindings",
+        Buffer.from(`${lines}base`, "utf8"),
+        Buffer.from(`${lines}left`, "utf8"),
+        Buffer.from(`${lines}right`, "utf8"),
+      );
+      const publishes = vi.spyOn(repository, "publish");
+      const warnings: string[] = [];
+
+      expect(
+        await autoMergeConflicts(
+          repository,
+          conflicts,
+          () => true,
+          (warning) => warnings.push(warning),
+        ),
+      ).toBe(false);
+      expect(publishes).not.toHaveBeenCalled();
+      expect(conflicts[0]?.resolvedAt).toBeUndefined();
+      expect(warnings.join("\n")).toContain("interactive merge budget");
+
+      publishes.mockRestore();
+    });
+  });
+
+  it("keeps a minified JSON merge over the structural token cap manual", async () => {
+    await withRepository(async (repository) => {
+      const resourceId = "mcp/many-json-nodes";
+      // Each payload is tiny in bytes but has enough comma-delimited values
+      // that parsing three of them would allocate tens of thousands of nodes
+      // before recursive merge, Set construction and canonical output work.
+      const items = Array.from({ length: 22_000 }, () => "0").join(",");
+      const conflicts = await forkResource(
+        repository,
+        resourceId,
+        "mcp",
+        Buffer.from(`{"items":[${items}],"base":true}`, "utf8"),
+        Buffer.from(`{"items":[${items}],"base":true,"left":true}`, "utf8"),
+        Buffer.from(`{"items":[${items}],"base":true,"right":true}`, "utf8"),
+      );
+      const publishes = vi.spyOn(repository, "publish");
+      const warnings: string[] = [];
+
+      expect(
+        await autoMergeConflicts(
+          repository,
+          conflicts,
+          () => true,
+          (warning) => warnings.push(warning),
+        ),
+      ).toBe(false);
+      expect(publishes).not.toHaveBeenCalled();
+      expect(conflicts[0]?.resolvedAt).toBeUndefined();
+      expect(warnings.join("\n")).toContain("interactive merge budget");
+
+      publishes.mockRestore();
     });
   });
 

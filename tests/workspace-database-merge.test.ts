@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -132,6 +132,141 @@ describe("portable workspace database snapshots", () => {
     expect(() =>
       serializeWorkspaceDatabaseSnapshot(valid, { maxPlainBytes: 1 }),
     ).toThrow("configured limits");
+  });
+
+  it("rejects structurally amplified JSON before parsing it", () => {
+    const rows = Array.from({ length: 90_000 }, () => "{}").join(",");
+    const content = Buffer.from(
+      `{"format":"cursor-setting-sync.workspace-database","version":1,"workspaceId":"workspace-a","tables":[${rows}]}`,
+      "utf8",
+    );
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      expect(() => parseWorkspaceDatabaseSnapshot(content)).toThrow(
+        "structural JSON limit",
+      );
+      expect(parse).not.toHaveBeenCalled();
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  it("round-trips the full bounded ItemTable row budget", () => {
+    const snapshot: WorkspaceDatabaseSnapshot = {
+      format: "cursor-setting-sync.workspace-database",
+      version: 1,
+      workspaceId: "workspace-a",
+      sqliteUserVersion: 0,
+      tables: [
+        {
+          name: "ItemTable",
+          keyColumn: "key",
+          columns: ["value"],
+          rows: Array.from({ length: 16_384 }, (_, index) => ({
+            key: `key-${index.toString().padStart(5, "0")}`,
+            values: [{ type: "null" }],
+          })),
+        },
+        {
+          name: "cursorDiskKV",
+          keyColumn: "key",
+          columns: ["value"],
+          rows: [],
+        },
+      ],
+    };
+
+    const content = serializeWorkspaceDatabaseSnapshot(snapshot);
+
+    expect(parseWorkspaceDatabaseSnapshot(content)).toEqual(snapshot);
+  });
+
+  it("refuses a structurally excessive writer input before JSON.stringify", () => {
+    const snapshot: WorkspaceDatabaseSnapshot = {
+      format: "cursor-setting-sync.workspace-database",
+      version: 1,
+      workspaceId: "workspace-a",
+      sqliteUserVersion: 0,
+      tables: [
+        {
+          name: "ItemTable",
+          keyColumn: "key",
+          columns: ["value"],
+          rows: Array.from({ length: 20_200 }, (_, index) => ({
+            key: `key-${index}`,
+            values: [{ type: "null" }],
+          })),
+        },
+        {
+          name: "cursorDiskKV",
+          keyColumn: "key",
+          columns: ["value"],
+          rows: [],
+        },
+      ],
+    };
+    const stringify = vi.spyOn(JSON, "stringify");
+    try {
+      expect(() =>
+        serializeWorkspaceDatabaseSnapshot(snapshot, { maxRows: 30_000 }),
+      ).toThrow("structural JSON limit");
+      expect(stringify).not.toHaveBeenCalled();
+    } finally {
+      stringify.mockRestore();
+    }
+  });
+
+  it("rejects oversized SQLite blobs before their values cross into JavaScript", async () => {
+    const root = await temporaryRoot();
+    const path = join(root, "state.vscdb");
+    const database = await createDatabase(path);
+    database
+      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, zeroblob(?))")
+      .run("oversized", 8 * 1024 * 1024);
+    database.close();
+
+    const bufferFrom = vi.spyOn(Buffer, "from");
+    try {
+      expect(() =>
+        captureWorkspaceDatabaseSnapshot(path, {
+          workspaceId: "workspace-a",
+          limits: { maxPlainBytes: 1024 },
+        }),
+      ).toThrow("payload limit");
+      expect(
+        bufferFrom.mock.calls.some(([value]) => value instanceof Uint8Array),
+      ).toBe(false);
+    } finally {
+      bufferFrom.mockRestore();
+    }
+  });
+
+  it("rejects an aggregate row excess before materializing any row value", async () => {
+    const root = await temporaryRoot();
+    const path = join(root, "state.vscdb");
+    const database = await createDatabase(path);
+    const insert = database.prepare(
+      "INSERT INTO ItemTable(key, value) VALUES (?, ?)",
+    );
+    insert.run("one", Buffer.from([1]));
+    insert.run("two", Buffer.from([2]));
+    insert.run("three", Buffer.from([3]));
+    database.close();
+
+    const bufferFrom = vi.spyOn(Buffer, "from");
+    try {
+      expect(() =>
+        captureWorkspaceDatabaseSnapshot(path, {
+          workspaceId: "workspace-a",
+          limits: { maxRows: 2 },
+        }),
+      ).toThrow("row limit");
+      expect(
+        bufferFrom.mock.calls.some(([value]) => value instanceof Uint8Array),
+      ).toBe(false);
+    } finally {
+      bufferFrom.mockRestore();
+    }
   });
 });
 
@@ -480,6 +615,52 @@ describeWithBackup("workspace database query apply", () => {
       }),
     ).rejects.toThrow("refusing to create or replace");
     await expect(stat(targetPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("uses caller limits for target preflight and writes nothing on oversize", async () => {
+    const fixture = await applyFixture();
+    fixture.database
+      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, zeroblob(?))")
+      .run("local-large", 8 * 1024 * 1024);
+    fixture.database.close();
+    const incoming = makeSnapshot("workspace-a", {
+      ItemTable: { remote: text("must-not-be-written") },
+    });
+
+    const bufferFrom = vi.spyOn(Buffer, "from");
+    try {
+      await expect(
+        applyWorkspaceDatabaseSnapshot({
+          targetPath: fixture.targetPath,
+          backupPath: fixture.backupPath,
+          targetWorkspaceId: "workspace-b",
+          incoming,
+          limits: { maxPlainBytes: 1024 },
+        }),
+      ).rejects.toThrow("payload limit");
+      expect(
+        bufferFrom.mock.calls.some(([value]) => value instanceof Uint8Array),
+      ).toBe(false);
+    } finally {
+      bufferFrom.mockRestore();
+    }
+
+    await expect(stat(fixture.backupPath)).rejects.toMatchObject({ code: "ENOENT" });
+    const target = new sqlite.DatabaseSync(fixture.targetPath, { readOnly: true });
+    try {
+      expect(
+        target
+          .prepare(
+            "SELECT typeof(value) AS type, length(value) AS bytes FROM ItemTable WHERE key = ?",
+          )
+          .get("local-large"),
+      ).toEqual({ type: "blob", bytes: 8 * 1024 * 1024 });
+      expect(
+        target.prepare("SELECT 1 AS present FROM ItemTable WHERE key = ?").get("remote"),
+      ).toBeUndefined();
+    } finally {
+      target.close();
+    }
   });
 });
 

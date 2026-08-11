@@ -13,13 +13,19 @@ import {
   pathExists,
 } from "../platform/files";
 import { isCanonicalBase64Text } from "../protocol/canonical";
+import {
+  buffersFitJsonStructureBudget,
+  PORTABLE_RESOURCE_JSON_MAX_STRUCTURAL_TOKENS,
+} from "../protocol/jsonStructure";
 
 export const WORKSPACE_DATABASE_SNAPSHOT_FORMAT =
   "cursor-setting-sync.workspace-database" as const;
 export const WORKSPACE_DATABASE_SNAPSHOT_VERSION = 1 as const;
 
+export const WORKSPACE_DATABASE_MAX_ROWS = 16_384;
+
 const DEFAULT_LIMITS: WorkspaceDatabaseLimits = {
-  maxRows: 250_000,
+  maxRows: WORKSPACE_DATABASE_MAX_ROWS,
   maxPlainBytes: 256 * 1024 * 1024,
   maxKeyBytes: 64 * 1024,
 };
@@ -70,6 +76,18 @@ interface TableSchema {
   descriptor: TableDescriptor;
   extraColumns: string[];
   requiredExtraColumns: string[];
+}
+
+interface TableReadPreflight {
+  descriptor: (typeof TABLE_DESCRIPTORS)[number];
+  rowCount: number;
+  plainBytes: bigint;
+  skippedRows: bigint;
+}
+
+interface SqlByteExpression {
+  sql: string;
+  parameters: Array<string | bigint>;
 }
 
 interface MergeOperation {
@@ -232,10 +250,21 @@ export function serializeWorkspaceDatabaseSnapshot(
   snapshot: WorkspaceDatabaseSnapshot,
   limits?: Partial<WorkspaceDatabaseLimits>,
 ): Buffer {
-  const canonical = canonicalSnapshot(snapshot, normalizedLimits(limits));
+  assertWorkspaceSnapshotStructuralUpperBound(snapshot);
+  const normalized = normalizedLimits(limits);
+  const canonical = canonicalSnapshot(snapshot, normalized);
   const content = Buffer.from(JSON.stringify(canonical), "utf8");
-  if (content.byteLength > normalizedLimits(limits).maxPlainBytes) {
+  if (content.byteLength > normalized.maxPlainBytes) {
     throw new Error("Workspace database snapshot exceeds the payload limit.");
+  }
+  if (
+    !buffersFitJsonStructureBudget([content], {
+      maxStructuralTokens: PORTABLE_RESOURCE_JSON_MAX_STRUCTURAL_TOKENS,
+    })
+  ) {
+    throw new Error(
+      "Workspace database snapshot exceeds the structural JSON limit.",
+    );
   }
   return content;
 }
@@ -247,6 +276,15 @@ export function parseWorkspaceDatabaseSnapshot(
   const normalized = normalizedLimits(limits);
   if (content.byteLength > normalized.maxPlainBytes) {
     throw new Error("Workspace database snapshot exceeds the payload limit.");
+  }
+  if (
+    !buffersFitJsonStructureBudget([content], {
+      maxStructuralTokens: PORTABLE_RESOURCE_JSON_MAX_STRUCTURAL_TOKENS,
+    })
+  ) {
+    throw new Error(
+      "Workspace database snapshot exceeds the structural JSON limit.",
+    );
   }
   let parsed: unknown;
   try {
@@ -666,9 +704,13 @@ function captureFromOpenDatabase(
     );
   }
 
-  const tables: WorkspaceDatabaseTable[] = [];
-  let rowCount = 0;
-  let plainBytes = 0;
+  // Inspect every selected table before selecting a single value. In
+  // particular, SQLite evaluates length()/typeof() internally for this pass,
+  // so an oversized zeroblob never crosses the native/JS boundary merely to
+  // discover that the portable snapshot cannot be admitted.
+  const preflights: TableReadPreflight[] = [];
+  let rowCount = 0n;
+  let plainBytes = 0n;
   for (const descriptor of TABLE_DESCRIPTORS) {
     if (descriptor.name === "composerHeaders" && !includeComposerHeaders) {
       continue;
@@ -689,30 +731,44 @@ function captureFromOpenDatabase(
         `Ignored ${schema.extraColumns.length} unknown column(s) in ${descriptor.name}.`,
       );
     }
+    const preflight = preflightTableRows(
+      database,
+      descriptor,
+      snapshotWorkspaceId,
+      databaseWorkspaceId,
+      limits,
+      BigInt(limits.maxRows) - rowCount,
+      BigInt(limits.maxPlainBytes) - plainBytes,
+    );
+    rowCount += BigInt(preflight.rowCount);
+    if (rowCount > BigInt(limits.maxRows)) {
+      throw new Error("Workspace database snapshot exceeds the row limit.");
+    }
+    plainBytes += preflight.plainBytes;
+    if (plainBytes > BigInt(limits.maxPlainBytes)) {
+      throw new Error("Workspace database snapshot exceeds the payload limit.");
+    }
+    if (preflight.skippedRows > 0n) {
+      warnings.push(
+        `Skipped ${preflight.skippedRows} row(s) with a non-text key in ${descriptor.name}.`,
+      );
+    }
+    preflights.push(preflight);
+  }
+
+  assertWorkspacePreflightsStructuralUpperBound(preflights);
+
+  const tables: WorkspaceDatabaseTable[] = [];
+  for (const preflight of preflights) {
+    const descriptor = preflight.descriptor;
     const rows = readTableRows(
       database,
       descriptor,
       snapshotWorkspaceId,
       databaseWorkspaceId,
-      warnings,
+      limits,
+      preflight,
     );
-    rowCount += rows.length;
-    if (rowCount > limits.maxRows) {
-      throw new Error("Workspace database snapshot exceeds the row limit.");
-    }
-    for (const row of rows) {
-      const keyBytes = Buffer.byteLength(row.key, "utf8");
-      if (keyBytes === 0 || keyBytes > limits.maxKeyBytes) {
-        throw new Error(`Workspace database key length is invalid in ${descriptor.name}.`);
-      }
-      plainBytes += keyBytes;
-      for (const value of row.values) {
-        plainBytes += portableValueBytes(value);
-      }
-      if (plainBytes > limits.maxPlainBytes) {
-        throw new Error("Workspace database snapshot exceeds the payload limit.");
-      }
-    }
     tables.push({
       name: descriptor.name,
       keyColumn: descriptor.keyColumn,
@@ -736,6 +792,240 @@ function captureFromOpenDatabase(
     ),
     warnings,
   };
+}
+
+function assertWorkspacePreflightsStructuralUpperBound(
+  preflights: readonly TableReadPreflight[],
+): void {
+  let tokens = 14;
+  for (const preflight of preflights) {
+    tokens = checkedStructuralAdd(
+      tokens,
+      workspaceTableStructuralUpperBound(
+        preflight.descriptor.valueColumns.length,
+        preflight.rowCount,
+      ),
+    );
+  }
+  if (tokens > PORTABLE_RESOURCE_JSON_MAX_STRUCTURAL_TOKENS) {
+    throw new Error(
+      "Workspace database snapshot exceeds the structural JSON limit.",
+    );
+  }
+}
+
+function assertWorkspaceSnapshotStructuralUpperBound(
+  snapshot: WorkspaceDatabaseSnapshot,
+): void {
+  if (!Array.isArray(snapshot.tables)) {
+    return;
+  }
+  let tokens = 14;
+  for (const table of snapshot.tables) {
+    const descriptor = descriptorFor(table.name);
+    if (descriptor === undefined || !Array.isArray(table.rows)) {
+      continue;
+    }
+    tokens = checkedStructuralAdd(
+      tokens,
+      workspaceTableStructuralUpperBound(
+        descriptor.valueColumns.length,
+        table.rows.length,
+      ),
+    );
+  }
+  if (tokens > PORTABLE_RESOURCE_JSON_MAX_STRUCTURAL_TOKENS) {
+    throw new Error(
+      "Workspace database snapshot exceeds the structural JSON limit.",
+    );
+  }
+}
+
+function workspaceTableStructuralUpperBound(
+  valueColumns: number,
+  rows: number,
+): number {
+  if (!Number.isSafeInteger(rows) || rows < 0) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  // Table/object/column punctuation is 13 + valueColumns. Each row needs at
+  // most 7 + 6 * valueColumns tokens including its array separator and the
+  // two-field representation of every portable SQLite value.
+  const rowTokens = 7 + 6 * valueColumns;
+  const total = 13 + valueColumns + rows * rowTokens;
+  return Number.isSafeInteger(total) ? total : Number.MAX_SAFE_INTEGER;
+}
+
+function checkedStructuralAdd(left: number, right: number): number {
+  const total = left + right;
+  return Number.isSafeInteger(total) ? total : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Computes the exact portable row/count budget using SQLite metadata only.
+ * The first query deliberately avoids touching value columns at all so a row
+ * limit rejects cheaply. The second asks SQLite for storage lengths, not
+ * values, and therefore remains bounded even for very large blobs.
+ */
+function preflightTableRows(
+  database: DatabaseSync,
+  descriptor: (typeof TABLE_DESCRIPTORS)[number],
+  snapshotWorkspaceId: string,
+  databaseWorkspaceId: string,
+  limits: WorkspaceDatabaseLimits,
+  remainingRows: bigint,
+  remainingPlainBytes: bigint,
+): TableReadPreflight {
+  const key = quoteIdentifier(descriptor.keyColumn);
+  const keyBytes = `length(CAST(${key} AS BLOB))`;
+  const countStatement = database.prepare(
+    `SELECT
+      COUNT(*) AS total_rows,
+      COALESCE(SUM(CASE WHEN typeof(${key}) = 'text' THEN 1 ELSE 0 END), 0) AS usable_rows,
+      MIN(CASE WHEN typeof(${key}) = 'text' THEN ${keyBytes} ELSE NULL END) AS min_key_bytes,
+      MAX(CASE WHEN typeof(${key}) = 'text' THEN ${keyBytes} ELSE NULL END) AS max_key_bytes
+    FROM ${quoteIdentifier(descriptor.name)}`,
+  );
+  countStatement.setReadBigInts(true);
+  const counts = countStatement.get() as
+    | {
+        total_rows?: unknown;
+        usable_rows?: unknown;
+        min_key_bytes?: unknown;
+        max_key_bytes?: unknown;
+      }
+    | undefined;
+  const totalRows = sqliteNonNegativeInteger(
+    counts?.total_rows,
+    `${descriptor.name} row count`,
+  );
+  const usableRows = sqliteNonNegativeInteger(
+    counts?.usable_rows,
+    `${descriptor.name} usable row count`,
+  );
+  const minKeyBytes = sqliteNullableNonNegativeInteger(
+    counts?.min_key_bytes,
+    `${descriptor.name} minimum key length`,
+  );
+  const maxKeyBytes = sqliteNullableNonNegativeInteger(
+    counts?.max_key_bytes,
+    `${descriptor.name} maximum key length`,
+  );
+  if (usableRows > remainingRows) {
+    throw new Error("Workspace database snapshot exceeds the row limit.");
+  }
+  if (
+    usableRows > 0n &&
+    (minKeyBytes === null ||
+      maxKeyBytes === null ||
+      minKeyBytes === 0n ||
+      maxKeyBytes > BigInt(limits.maxKeyBytes))
+  ) {
+    throw new Error(`Workspace database key length is invalid in ${descriptor.name}.`);
+  }
+
+  const byteExpression = portableRowByteExpression(
+    descriptor,
+    snapshotWorkspaceId,
+    databaseWorkspaceId,
+  );
+  const byteStatement = database.prepare(
+    `SELECT COALESCE(SUM(${byteExpression.sql}), 0) AS plain_bytes
+     FROM ${quoteIdentifier(descriptor.name)}
+     WHERE typeof(${key}) = 'text'`,
+  );
+  byteStatement.setReadBigInts(true);
+  let byteRow: { plain_bytes?: unknown } | undefined;
+  try {
+    byteRow = byteStatement.get(...byteExpression.parameters);
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.toLowerCase().includes("integer overflow")
+    ) {
+      throw new Error("Workspace database snapshot exceeds the payload limit.", {
+        cause: error,
+      });
+    }
+    throw error;
+  }
+  const plainBytes = sqliteNonNegativeInteger(
+    byteRow?.plain_bytes,
+    `${descriptor.name} portable byte count`,
+  );
+  if (plainBytes > remainingPlainBytes) {
+    throw new Error("Workspace database snapshot exceeds the payload limit.");
+  }
+  if (usableRows > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error("Workspace database snapshot exceeds the row limit.");
+  }
+  return {
+    descriptor,
+    rowCount: Number(usableRows),
+    plainBytes,
+    skippedRows: totalRows - usableRows,
+  };
+}
+
+function portableRowByteExpression(
+  descriptor: TableDescriptor,
+  snapshotWorkspaceId: string,
+  databaseWorkspaceId: string,
+): SqlByteExpression {
+  const parameters: Array<string | bigint> = [];
+  const byteExpressions = [
+    `length(CAST(${quoteIdentifier(descriptor.keyColumn)} AS BLOB))`,
+    ...descriptor.valueColumns.map((column) => {
+      const quoted = quoteIdentifier(column);
+      if (descriptor.name === "composerHeaders" && column === "workspaceId") {
+        parameters.push(
+          databaseWorkspaceId,
+          BigInt(Buffer.byteLength(snapshotWorkspaceId, "utf8")),
+        );
+        return `CASE
+          WHEN typeof(${quoted}) = 'text' AND ${quoted} = ? THEN ?
+          ${portableSqliteValueByteCases(quoted)}
+        END`;
+      }
+      return `CASE ${portableSqliteValueByteCases(quoted)} END`;
+    }),
+  ];
+  return {
+    sql: byteExpressions.map((expression) => `(${expression})`).join(" + "),
+    parameters,
+  };
+}
+
+function portableSqliteValueByteCases(quotedColumn: string): string {
+  return `WHEN typeof(${quotedColumn}) = 'null' THEN 0
+          WHEN typeof(${quotedColumn}) = 'text' THEN length(CAST(${quotedColumn} AS BLOB))
+          WHEN typeof(${quotedColumn}) = 'blob' THEN length(${quotedColumn})
+          WHEN typeof(${quotedColumn}) = 'integer' THEN length(CAST(${quotedColumn} AS BLOB))
+          WHEN typeof(${quotedColumn}) = 'real' THEN 8
+          ELSE 0`;
+}
+
+function sqliteNullableNonNegativeInteger(
+  value: unknown,
+  label: string,
+): bigint | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return sqliteNonNegativeInteger(value, label);
+}
+
+function sqliteNonNegativeInteger(value: unknown, label: string): bigint {
+  const integer =
+    typeof value === "bigint"
+      ? value
+      : typeof value === "number" && Number.isSafeInteger(value)
+        ? BigInt(value)
+        : null;
+  if (integer === null || integer < 0n) {
+    throw new Error(`Workspace database returned an invalid ${label}.`);
+  }
+  return integer;
 }
 
 function inspectTableSchema(
@@ -828,33 +1118,40 @@ function readTableRows(
   descriptor: TableDescriptor,
   snapshotWorkspaceId: string,
   databaseWorkspaceId: string,
-  warnings: string[],
+  limits: WorkspaceDatabaseLimits,
+  preflight: TableReadPreflight,
 ): WorkspaceDatabaseRow[] {
   const columns = [descriptor.keyColumn, ...descriptor.valueColumns];
   const projection = columns.flatMap((column, index) => [
     `${quoteIdentifier(column)} AS ${quoteIdentifier(`value_${index}`)}`,
     `typeof(${quoteIdentifier(column)}) AS ${quoteIdentifier(`type_${index}`)}`,
   ]);
+  const key = quoteIdentifier(descriptor.keyColumn);
+  const byteExpression = portableRowByteExpression(
+    descriptor,
+    snapshotWorkspaceId,
+    databaseWorkspaceId,
+  );
   const statement = database.prepare(
-    `SELECT ${projection.join(", ")} FROM ${quoteIdentifier(descriptor.name)}`,
+    `SELECT ${projection.join(", ")}
+     FROM ${quoteIdentifier(descriptor.name)}
+     WHERE typeof(${key}) = 'text'
+       AND length(CAST(${key} AS BLOB)) BETWEEN 1 AND ${limits.maxKeyBytes}
+       AND (${byteExpression.sql}) <= ${limits.maxPlainBytes}
+     LIMIT ${preflight.rowCount + 1}`,
   );
   statement.setReadBigInts(true);
   const rows: WorkspaceDatabaseRow[] = [];
   const seen = new Set<string>();
-  let skippedRows = 0;
-  for (const raw of statement.iterate()) {
+  let plainBytes = 0n;
+  for (const raw of statement.iterate(...byteExpression.parameters)) {
     const keyValue = toPortableValue(
       raw.value_0 as SqliteValue,
       raw.type_0,
       `${descriptor.name}.${descriptor.keyColumn}`,
     );
-    // A row with no usable text key cannot be addressed by the upsert-only
-    // merge, so it is skipped deterministically instead of dropping the whole
-    // workspace database out of the backup. Every capture of the same file
-    // skips the same rows, so the snapshot-hash equality checks still hold.
     if (keyValue.type !== "text") {
-      skippedRows += 1;
-      continue;
+      throw new Error(`Workspace database changed while reading ${descriptor.name}.`);
     }
     if (seen.has(keyValue.value)) {
       throw new Error(`Workspace database contains a duplicate key in ${descriptor.name}.`);
@@ -877,12 +1174,24 @@ function readTableRows(
       }
       return portable;
     });
+    plainBytes += BigInt(Buffer.byteLength(keyValue.value, "utf8"));
+    for (const value of values) {
+      plainBytes += BigInt(portableValueBytes(value));
+    }
+    if (
+      rows.length >= preflight.rowCount ||
+      plainBytes > preflight.plainBytes ||
+      plainBytes > BigInt(limits.maxPlainBytes)
+    ) {
+      throw new Error(`Workspace database changed while reading ${descriptor.name}.`);
+    }
     rows.push({ key: keyValue.value, values });
   }
-  if (skippedRows > 0) {
-    warnings.push(
-      `Skipped ${skippedRows} row(s) with a non-text key in ${descriptor.name}.`,
-    );
+  if (
+    rows.length !== preflight.rowCount ||
+    plainBytes !== preflight.plainBytes
+  ) {
+    throw new Error(`Workspace database changed while reading ${descriptor.name}.`);
   }
   return rows.sort((left, right) => compareText(left.key, right.key));
 }
@@ -1314,7 +1623,15 @@ function portableValueBytes(value: PortableSqliteValue): number {
     return 0;
   }
   if (value.type === "blob") {
-    return Buffer.from(value.base64, "base64").byteLength;
+    if (value.base64.length === 0) {
+      return 0;
+    }
+    const padding = value.base64.endsWith("==")
+      ? 2
+      : value.base64.endsWith("=")
+        ? 1
+        : 0;
+    return (value.base64.length / 4) * 3 - padding;
   }
   if (value.type === "real") {
     return 8;

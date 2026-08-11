@@ -172,18 +172,22 @@ describeWithSqlite("workspaceStorage capture-side payload cap", () => {
       .run("blob", Buffer.alloc(60 * 1024, 7));
     database.close();
 
-    const result = await new WorkspaceStorageAdapter(
-      paths,
-      {},
-      64 * 1024,
-    ).scan({});
+    const adapter = new WorkspaceStorageAdapter(paths, {}, 64 * 1024);
+    const result = await adapter.scan({});
 
     expect(
       result.snapshots.map((item) => item.metadata?.relativePath),
     ).toEqual(["workspace-a/notepads.json"]);
-    const warning = result.warnings.find((item) => item.includes("state.vscdb"));
-    expect(warning).toContain("above the 65536 byte payload limit");
-    expect(warning).toContain("cursorSettingSync.maxPayloadMiB");
+    // Configured-policy oversize is represented as a lightweight settlement;
+    // the manager/helper turns that into the single shared payload warning.
+    // The adapter itself only emits a second warning for its stricter fixed
+    // automatic-work ceiling, avoiding duplicate user messages here.
+    expect(adapter.oversizedSnapshotSettlements(64 * 1024)).toEqual([
+      expect.objectContaining({
+        resourceId: "workspace-storage/workspace-a%2Fstate.vscdb",
+        maxPayloadBytes: 64 * 1024,
+      }),
+    ]);
   });
 });
 

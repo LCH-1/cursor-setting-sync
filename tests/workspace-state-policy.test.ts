@@ -208,6 +208,149 @@ describe("workspace-storage auto-merge under the policy", () => {
       ]);
     });
   });
+
+  it("reads no payload when a three-way workspace merge exceeds the declared aggregate", async () => {
+    await withRepository(async (repository) => {
+      const conflicts = await forkResource(
+        repository,
+        workspaceSnapshot({ item: [["notepadData", "base"]] }),
+        workspaceSnapshot({ item: [["notepadData", "left"]] }),
+        workspaceSnapshot({ item: [["notepadData", "right"]] }),
+      );
+      const tips = repository.state.tips[RESOURCE_ID] ?? [];
+      for (const tip of tips) {
+        if (tip.payload === undefined) {
+          throw new Error("expected workspace payload metadata");
+        }
+        tip.payload.plainBytes = 16 * 1024 * 1024;
+      }
+      const reads = vi.spyOn(repository, "tryReadVersion");
+      const publishes = vi.spyOn(repository, "publish");
+      const warnings: string[] = [];
+
+      expect(
+        await autoMergeConflicts(
+          repository,
+          conflicts,
+          () => true,
+          (warning) => warnings.push(warning),
+        ),
+      ).toBe(false);
+      expect(reads).not.toHaveBeenCalled();
+      expect(publishes).not.toHaveBeenCalled();
+      expect(conflicts[0]?.resolvedAt).toBeUndefined();
+      expect(warnings.join("\n")).toContain("32.0 MiB interactive merge budget");
+
+      reads.mockRestore();
+      publishes.mockRestore();
+    }, 64 * 1024 * 1024);
+  });
+
+  it("does not let a large trivial survivor bypass the fixed merge budget", async () => {
+    await withRepository(async (repository) => {
+      const baseSnapshot = workspaceSnapshot({
+        item: [["notepadData", "base"]],
+      });
+      const conflicts = await forkResource(
+        repository,
+        baseSnapshot,
+        baseSnapshot,
+        workspaceSnapshot({ item: [["notepadData", "survivor"]] }),
+      );
+      const baseHash = sha256(serialized(baseSnapshot));
+      const survivor = (repository.state.tips[RESOURCE_ID] ?? []).find(
+        (tip) => tip.semanticHash !== baseHash,
+      );
+      if (survivor?.payload === undefined) {
+        throw new Error("expected ordinary survivor payload metadata");
+      }
+      survivor.payload.plainBytes = 32 * 1024 * 1024 + 1;
+      const reads = vi.spyOn(repository, "tryReadVersion");
+      const publishes = vi.spyOn(repository, "publish");
+      const warnings: string[] = [];
+
+      expect(
+        await autoMergeConflicts(
+          repository,
+          conflicts,
+          () => true,
+          (warning) => warnings.push(warning),
+        ),
+      ).toBe(false);
+      expect(reads).not.toHaveBeenCalled();
+      expect(publishes).not.toHaveBeenCalled();
+      expect(conflicts[0]?.resolvedAt).toBeUndefined();
+      expect(warnings.join("\n")).toContain("interactive merge budget");
+
+      reads.mockRestore();
+      publishes.mockRestore();
+    }, 64 * 1024 * 1024);
+  });
+
+  it("keeps a tiny-row workspace merge over the structural row cap manual", async () => {
+    await withRepository(async (repository) => {
+      const manyRows = Array.from(
+        { length: 16_385 },
+        (_unused, index) => [`row-${index}`, "x"] as [string, string],
+      );
+      const conflicts = await forkResource(
+        repository,
+        workspaceSnapshot({ item: manyRows }),
+        workspaceSnapshot({ item: [["notepadData", "left"]] }),
+        workspaceSnapshot({ item: [["notepadData", "right"]] }),
+      );
+      const publishes = vi.spyOn(repository, "publish");
+      const warnings: string[] = [];
+
+      expect(
+        await autoMergeConflicts(
+          repository,
+          conflicts,
+          () => true,
+          (warning) => warnings.push(warning),
+        ),
+      ).toBe(false);
+      expect(publishes).not.toHaveBeenCalled();
+      expect(conflicts[0]?.resolvedAt).toBeUndefined();
+      expect(warnings.join("\n")).toContain("interactive merge budget");
+
+      publishes.mockRestore();
+    }, 64 * 1024 * 1024);
+  });
+
+  it("materializes admissible base-free workspace tips sequentially", async () => {
+    await withRepository(async (repository) => {
+      const conflicts = await forkBaseFree(
+        repository,
+        workspaceSnapshot({ item: [["notepadData", "left"]] }),
+        workspaceSnapshot({ item: [["interactive.sessions", "right"]] }),
+      );
+      const originalRead = repository.tryReadVersion.bind(repository);
+      let releaseFirst: (() => void) | undefined;
+      const firstGate = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      const started: string[] = [];
+      const reads = vi
+        .spyOn(repository, "tryReadVersion")
+        .mockImplementation(async (versionId) => {
+          started.push(versionId);
+          if (started.length === 1) {
+            await firstGate;
+          }
+          return originalRead(versionId);
+        });
+
+      const merge = autoMergeConflicts(repository, conflicts);
+      await vi.waitFor(() => expect(started).toHaveLength(1));
+      expect(started).toHaveLength(1);
+      releaseFirst?.();
+      await expect(merge).resolves.toBe(true);
+      expect(started).toHaveLength(2);
+
+      reads.mockRestore();
+    });
+  });
 });
 
 function workspaceSnapshot(rows: {
@@ -305,6 +448,7 @@ async function reconcileConflicts(repository: SyncRepository) {
 
 async function withRepository<T>(
   run: (repository: SyncRepository) => Promise<T>,
+  maxPayloadBytes = 1024 * 1024,
 ): Promise<T> {
   const temporaryRoot = await mkdtemp(join(tmpdir(), "cursor-ws-policy-test-"));
   try {
@@ -312,7 +456,7 @@ async function withRepository<T>(
       join(temporaryRoot, "repository"),
       join(temporaryRoot, "storage"),
       PASSPHRASE,
-      1024 * 1024,
+      maxPayloadBytes,
       PRODUCER,
     );
     return await run(repository);

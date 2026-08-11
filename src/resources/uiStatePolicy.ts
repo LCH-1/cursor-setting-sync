@@ -3,6 +3,11 @@ import type { SqliteStorageValue } from "../platform/sqlite";
 import { sqliteStorageText } from "../platform/sqlite";
 import type { IgnoreMatcher } from "./ignorePatterns";
 import { createIgnoreMatcher } from "./ignorePatterns";
+import { assertBoundedJsoncStructure } from "./jsonc";
+
+export const MAX_TARGET_STORAGE_MARKER_BYTES = 8 * 1024 * 1024;
+export const MAX_TARGET_STORAGE_MARKER_ENTRIES = 16_384;
+const MAX_TARGET_STORAGE_MARKER_KEY_BYTES = 2 * 1024 * 1024;
 
 /**
  * Keys that must never cross the repository boundary because carrying them
@@ -110,15 +115,29 @@ export function parseTargetStorageMarker(
   if (source.trim().length === 0) {
     return result;
   }
+  if (Buffer.byteLength(source, "utf8") > MAX_TARGET_STORAGE_MARKER_BYTES) {
+    throw new Error("Target storage marker exceeds its byte limit.");
+  }
+  assertBoundedJsoncStructure(source, "Target storage marker");
   const parsed = JSON.parse(source) as unknown;
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("Target storage marker must be an object.");
   }
-  const entries = Object.entries(parsed);
-  if (entries.length > 100_000) {
-    throw new Error("Target storage marker contains too many entries.");
-  }
-  for (const [key, target] of entries) {
+  let entries = 0;
+  let keyBytes = 0;
+  for (const key in parsed) {
+    if (!Object.hasOwn(parsed, key)) {
+      continue;
+    }
+    entries += 1;
+    keyBytes += Buffer.byteLength(key, "utf8");
+    if (
+      entries > MAX_TARGET_STORAGE_MARKER_ENTRIES ||
+      keyBytes > MAX_TARGET_STORAGE_MARKER_KEY_BYTES
+    ) {
+      throw new Error("Target storage marker contains too many entries.");
+    }
+    const target = (parsed as Record<string, unknown>)[key];
     if (
       key.length === 0 ||
       key.length > 4096 ||
@@ -130,6 +149,37 @@ export function parseTargetStorageMarker(
     result[key] = target;
   }
   return result;
+}
+
+/** Validates the post-apply marker before any SQL or in-memory state commits. */
+export function serializeTargetStorageMarker(
+  entries: Readonly<Record<string, number>>,
+): string {
+  let count = 0;
+  let keyBytes = 0;
+  for (const key in entries) {
+    if (!Object.hasOwn(entries, key)) {
+      continue;
+    }
+    const target = entries[key];
+    count += 1;
+    keyBytes += Buffer.byteLength(key, "utf8");
+    if (
+      count > MAX_TARGET_STORAGE_MARKER_ENTRIES ||
+      keyBytes > MAX_TARGET_STORAGE_MARKER_KEY_BYTES ||
+      key.length === 0 ||
+      key.length > 4096 ||
+      typeof target !== "number" ||
+      !Number.isSafeInteger(target)
+    ) {
+      throw new Error("Updated target storage marker contains an invalid entry.");
+    }
+  }
+  const serialized = JSON.stringify(entries);
+  if (Buffer.byteLength(serialized, "utf8") > MAX_TARGET_STORAGE_MARKER_BYTES) {
+    throw new Error("Updated target storage marker exceeds its byte limit.");
+  }
+  return serialized;
 }
 
 function escapeRegExp(value: string): string {

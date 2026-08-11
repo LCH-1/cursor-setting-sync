@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   mkdir,
   mkdtemp,
   readFile,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,6 +22,7 @@ import {
   WorkspaceStorageAdapter,
   workspaceStorageResourceId,
 } from "../src/resources/workspaceStorage";
+import { EMPTY_IGNORE_MATCHER } from "../src/resources/ignorePatterns";
 import type { JsonValue, LocalProjection } from "../src/types";
 import {
   normalizeWorkspaceUri,
@@ -182,6 +184,55 @@ describe("workspace identity mapping", () => {
 });
 
 describe("workspaceStorage adapter", () => {
+  it("memoizes structurally hostile workspace metadata while healthy siblings progress", async () => {
+    const fixture = await createFixture();
+    const workspaceRoot = fixture.paths.workspaceStorageRoot;
+    const hostileMetadata = `{"folder":"file:///hostile","future":[${Array.from(
+      { length: 22_000 },
+      () => "{}",
+    ).join(",")}]}`;
+    await writeFixtureFile(
+      workspaceRoot,
+      "workspace-hostile/workspace.json",
+      hostileMetadata,
+    );
+    await writeFixtureFile(
+      workspaceRoot,
+      "workspace-hostile/notepads.json",
+      "hostile-local",
+    );
+    await writeFixtureFile(
+      workspaceRoot,
+      "workspace-healthy/workspace.json",
+      JSON.stringify({ folder: "file:///healthy" }),
+    );
+    await writeFixtureFile(
+      workspaceRoot,
+      "workspace-healthy/notepads.json",
+      "healthy-local",
+    );
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      const first = await new WorkspaceStorageAdapter(fixture.paths).scan({});
+      const second = await new WorkspaceStorageAdapter(fixture.paths).scan({});
+
+      expect(first.snapshots).toHaveLength(2);
+      expect(second.snapshots).toHaveLength(2);
+      expect(
+        first.snapshots.some(
+          (snapshot) => snapshot.content.toString("utf8") === "healthy-local",
+        ),
+      ).toBe(true);
+      expect(
+        parse.mock.calls.filter(
+          ([value]) => typeof value === "string" && value.includes('"future"'),
+        ),
+      ).toHaveLength(0);
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
   it("scans only portable workspace state and never emits deletions", async () => {
     const fixture = await createFixture();
     const workspaceRoot = fixture.paths.workspaceStorageRoot;
@@ -261,6 +312,52 @@ describe("workspaceStorage adapter", () => {
     expect(result.warnings).toEqual([]);
   });
 
+  it("force-verifies a same-mtime plain-file rewrite with a fresh adapter", async () => {
+    const fixture = await createFixture();
+    const relativePath = "workspace-a/notepads.json";
+    const filePath = await writeFixtureFile(
+      fixture.paths.workspaceStorageRoot,
+      relativePath,
+      "old",
+    );
+    const resourceId = workspaceStorageResourceId(relativePath);
+    const initial = (
+      await new WorkspaceStorageAdapter(fixture.paths).scan({})
+    ).snapshots.find((snapshot) => snapshot.resourceId === resourceId)!;
+    const originalStat = await stat(filePath);
+    await writeFile(filePath, "new", "utf8");
+    await utimes(filePath, originalStat.mtime, originalStat.mtime);
+    const rewrittenStat = await stat(filePath);
+    expect(rewrittenStat.size).toBe(originalStat.size);
+    expect(rewrittenStat.mtimeMs).toBeCloseTo(originalStat.mtimeMs, -1);
+    const known: Record<string, LocalProjection> = {
+      [resourceId]: {
+        resourceId,
+        kind: "workspace-storage",
+        semanticHash: initial.semanticHash,
+        versionId: "b".repeat(64),
+        sourceTimestamp: rewrittenStat.mtimeMs,
+      },
+    };
+    expect(
+      (await new WorkspaceStorageAdapter(fixture.paths).scan(known)).snapshots,
+    ).toEqual([]);
+
+    const forced = await new WorkspaceStorageAdapter(
+      fixture.paths,
+      {},
+      undefined,
+      EMPTY_IGNORE_MATCHER,
+      false,
+      { forceVerificationResourceIds: new Set([resourceId]) },
+    ).scan(known);
+
+    expect(forced.snapshots).toHaveLength(1);
+    expect(forced.snapshots[0]?.resourceId).toBe(resourceId);
+    expect(forced.snapshots[0]?.content.toString("utf8")).toBe("new");
+    expect(forced.snapshots[0]?.semanticHash).not.toBe(initial.semanticHash);
+  });
+
   it("canonicalizes mapped workspace IDs and carries identity URI metadata", async () => {
     const fixture = await createFixture();
     const workspaceRoot = fixture.paths.workspaceStorageRoot;
@@ -309,6 +406,52 @@ describe("workspaceStorage adapter", () => {
 });
 
 describeWithSqlite("workspaceStorage database snapshot", () => {
+  it("policy-settles a composerHeaders structural excess after one capture", async () => {
+    const fixture = await createFixture();
+    const databasePath = join(
+      fixture.paths.workspaceStorageRoot,
+      "workspace-a",
+      "state.vscdb",
+    );
+    await writeFixtureFile(
+      fixture.paths.workspaceStorageRoot,
+      "workspace-a/workspace.json",
+      JSON.stringify({ folder: "file:///workspace-a" }),
+    );
+    await createWorkspaceDatabase(databasePath, "local");
+    addComposerHeadersTable(databasePath);
+    const database = new sqlite.DatabaseSync(databasePath);
+    const insert = database.prepare(
+      `INSERT INTO composerHeaders(
+        composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+        isSubagent, recency, checkpointAt, value
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    database.exec("BEGIN");
+    for (let index = 0; index < 4_800; index += 1) {
+      insert.run(`composer-${index}`, "workspace-a", 1, 2, 0, 0, 0, 0, "{}");
+    }
+    database.exec("COMMIT");
+    database.close();
+    let reads = 0;
+    const adapter = new WorkspaceStorageAdapter(
+      fixture.paths,
+      {},
+      undefined,
+      EMPTY_IGNORE_MATCHER,
+      false,
+      { onFileRead: () => { reads += 1; } },
+    );
+
+    const first = await adapter.scan({});
+    const second = await adapter.scan({});
+
+    expect(first.snapshots).toEqual([]);
+    expect(second.snapshots).toEqual([]);
+    expect(reads).toBe(1);
+    expect(adapter.oversizedSnapshotSettlements(128 * 1024 * 1024)).toHaveLength(1);
+  });
+
   it("captures a consistent state.vscdb snapshot while the source is open", async () => {
     const fixture = await createFixture();
     const relativePath = "workspace-a/state.vscdb";

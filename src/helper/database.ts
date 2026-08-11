@@ -7,7 +7,7 @@ import {
 } from "../platform/sqlite";
 import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, posix, win32 } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   BACKUP_DIRECTORY,
   CURSOR_USER_RULES_KEY,
@@ -19,6 +19,7 @@ import type { HelperChange, HelperRequest } from "./types";
 import { enforceBackupRetention } from "./backupRetention";
 import {
   ensureDirectory,
+  assertSafeIdentifier,
   isMissingPathError,
   pathExists,
   readJsonFile,
@@ -26,35 +27,61 @@ import {
 } from "../platform/files";
 import {
   bubbleKeyRange,
+  isPortableChatSnapshotV2,
   parsePortableChatSnapshot,
+  portableChatCoreHash,
+  type PortableAgentKvPayload,
   type PortableChatSnapshot,
+  type PortableChatSnapshotV2,
   type PortableKvRow,
 } from "../chat/stateVscdb";
+import { updatePortableComposerHeaderHash } from "../chat/headerCanonical";
 import {
+  DEFAULT_BROKEN_CHAT_INSPECTION_LIMITS,
   auditChatReferences,
-  isAutomaticChatRepairMetadata,
-  readPortableChatSnapshot,
+  readPortableChatSnapshotBounded,
 } from "../chat/repair";
 import {
-  discoverWorkspaces,
+  lookupWorkspaceIdentityReferences,
   resolveTargetWorkspace,
+  type WorkspaceIdentity,
 } from "../chat/workspace";
 import {
   normalizeProfile,
   parsePortableProfiles,
   type PortableProfile,
 } from "../resources/profiles";
-import { semanticHash } from "../resources/jsonc";
-import { canonicalBytes, sha256 } from "../protocol/canonical";
+import {
+  assertBoundedJsoncStructure,
+  semanticHash,
+} from "../resources/jsonc";
+import {
+  inspectSqliteValue,
+  readSqliteValue,
+} from "../resources/boundedScan";
+import {
+  canonicalBytes,
+  canonicalJson,
+  compareCodeUnits,
+  sha256,
+} from "../protocol/canonical";
+import {
+  effectiveSourceDeviceId,
+  effectiveSyncOrigin,
+} from "../sync/versionPolicy";
 import {
   isIgnoredUiStateKey,
   isPolicyExcludedUiStateKey,
   isSecurityDeniedUiStateKey,
   normalizeIgnoredUiStateKeys,
+  MAX_TARGET_STORAGE_MARKER_BYTES,
   parseTargetStorageMarker,
+  serializeTargetStorageMarker,
 } from "../resources/uiStatePolicy";
 import type { IgnoreMatcher } from "../resources/ignorePatterns";
 import { isRemoteTargetsKey } from "../resources/remoteTargets";
+
+const MAX_STORED_PROFILE_MANIFEST_BYTES = 8 * 1024 * 1024;
 
 export interface PreparedHelperChange {
   change: HelperChange;
@@ -71,6 +98,11 @@ export interface DatabaseApplyResult {
   retainedLocal: string[];
   /** What the next scan of those resources will hash to. */
   retainedLocalHashes: Record<string, string>;
+  /**
+   * Blob-only enrichment core shortcut: the verified source-equal hash, or
+   * null when the preserved local core is partial or divergent.
+   */
+  localChatCoreHashes: Record<string, string | null>;
 }
 
 interface RestoreJournal {
@@ -758,9 +790,13 @@ async function recoverRestoreJournal(
 async function preflightGlobalChanges(
   request: HelperRequest,
   prepared: PreparedHelperChange[],
-): Promise<Awaited<ReturnType<typeof discoverWorkspaces>>> {
+): Promise<WorkspaceIdentity[]> {
   const localWorkspaces = prepared.some((item) => item.change.kind === "chat")
-    ? await discoverWorkspaces(request.paths)
+    ? await lookupWorkspaceIdentityReferences(
+        request.paths,
+        preparedWorkspaceIds(prepared, "chat"),
+        request.workspaceMappings,
+      )
     : [];
   for (const item of prepared) {
     if (
@@ -781,6 +817,124 @@ async function preflightGlobalChanges(
     }
   }
   return localWorkspaces;
+}
+
+function* preparedWorkspaceIds(
+  prepared: readonly PreparedHelperChange[],
+  kind: "chat" | "workspace-storage",
+): Iterable<string> {
+  for (const item of prepared) {
+    if (item.change.kind !== kind) {
+      continue;
+    }
+    const workspaceId = item.change.metadata?.workspaceId;
+    if (typeof workspaceId === "string") {
+      yield workspaceId;
+      continue;
+    }
+    if (kind === "chat" && item.content !== undefined) {
+      const payloadWorkspaceId = portableChatWorkspaceId(item.content);
+      if (payloadWorkspaceId !== null && payloadWorkspaceId !== undefined) {
+        yield payloadWorkspaceId;
+      }
+    }
+  }
+}
+
+/**
+ * Reads only the small header workspace ID from a retained chat Buffer. This
+ * preserves legacy events whose metadata omitted workspaceId without parsing
+ * and retaining a second potentially 32 MiB chat object graph in preflight.
+ */
+function portableChatWorkspaceId(
+  content: Buffer,
+): string | null | undefined {
+  const key = Buffer.from("workspaceId", "ascii");
+  for (let index = 0; index < content.length; index += 1) {
+    if (content[index] !== 0x22) {
+      continue;
+    }
+    const start = index + 1;
+    let escaped = false;
+    let end = start;
+    for (; end < content.length; end += 1) {
+      const byte = content[end];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (byte === 0x5c) {
+        escaped = true;
+        continue;
+      }
+      if (byte === 0x22) {
+        break;
+      }
+    }
+    if (end >= content.length) {
+      return undefined;
+    }
+    index = end;
+    if (
+      end - start !== key.length ||
+      !content.subarray(start, end).equals(key)
+    ) {
+      continue;
+    }
+    let cursor = end + 1;
+    while (cursor < content.length && isJsonWhitespace(content[cursor]!)) {
+      cursor += 1;
+    }
+    if (content[cursor] !== 0x3a) {
+      continue;
+    }
+    cursor += 1;
+    while (cursor < content.length && isJsonWhitespace(content[cursor]!)) {
+      cursor += 1;
+    }
+    if (content.subarray(cursor, cursor + 4).toString("ascii") === "null") {
+      return null;
+    }
+    if (content[cursor] !== 0x22) {
+      return undefined;
+    }
+    const valueStart = cursor;
+    escaped = false;
+    cursor += 1;
+    for (; cursor < content.length; cursor += 1) {
+      const byte = content[cursor];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (byte === 0x5c) {
+        escaped = true;
+        continue;
+      }
+      if (byte !== 0x22) {
+        continue;
+      }
+      if (cursor - valueStart > 1024) {
+        return undefined;
+      }
+      try {
+        const value = JSON.parse(
+          content.subarray(valueStart, cursor + 1).toString("utf8"),
+        ) as unknown;
+        return typeof value === "string"
+          ? assertSafeIdentifier(value, "workspace ID")
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
+function isJsonWhitespace(byte: number): boolean {
+  return byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d;
 }
 
 /**
@@ -808,6 +962,8 @@ type ChangeOutcome =
        * other's next publish forever.
        */
       retainedLocalHash?: string;
+      /** Blob-only enrichment kept this exact local core instead of the tip's. */
+      localChatCoreHash?: string | null;
     }
   | { status: "ignored" }
   /**
@@ -815,7 +971,11 @@ type ChangeOutcome =
    * accounted for so it stops being pending — the same shape the ignored
    * extension and the retained tombstone branches use in `resourceApply`.
    */
-  | { status: "retained-local"; reason: string }
+  | {
+      status: "retained-local";
+      reason: string;
+      localChatCoreHash?: string | null;
+    }
   | { status: "skipped"; reason: string }
   | { status: "failed"; reason: string };
 
@@ -823,7 +983,7 @@ function applyPreparedChanges(
   database: DatabaseSync,
   request: HelperRequest,
   prepared: PreparedHelperChange[],
-  localWorkspaces: Awaited<ReturnType<typeof discoverWorkspaces>>,
+  localWorkspaces: WorkspaceIdentity[],
   heartbeat: () => void = () => {},
   localDeviceId?: string,
 ): {
@@ -832,14 +992,17 @@ function applyPreparedChanges(
   failureByResourceId: Record<string, string>;
   retainedLocal: string[];
   retainedLocalHashes: Record<string, string>;
+  localChatCoreHashes: Record<string, string | null>;
 } {
   const applied: string[] = [];
   const skipped: string[] = [];
   const failureByResourceId: Record<string, string> = {};
   const retainedLocal: string[] = [];
   const retainedLocalHashes: Record<string, string> = {};
+  const localChatCoreHashes: Record<string, string | null> = {};
   const marker: MarkerState = {
-    entries: readTargetMarker(database),
+    entries: null,
+    serialized: null,
     dirty: false,
   };
   const ignoredUiStateKeys = normalizeIgnoredUiStateKeys(
@@ -882,9 +1045,15 @@ function applyPreparedChanges(
         retainedLocal.push(item.change.resourceId);
         retainedLocalHashes[item.change.resourceId] = outcome.retainedLocalHash;
       }
+      if (outcome.localChatCoreHash !== undefined) {
+        localChatCoreHashes[item.change.resourceId] = outcome.localChatCoreHash;
+      }
     } else if (outcome.status === "retained-local") {
       skipped.push(`${item.change.resourceId}: ${outcome.reason}`);
       applied.push(item.change.resourceId);
+      if (outcome.localChatCoreHash !== undefined) {
+        localChatCoreHashes[item.change.resourceId] = outcome.localChatCoreHash;
+      }
     } else if (outcome.status === "skipped") {
       skipped.push(`${item.change.resourceId}: ${outcome.reason}`);
     } else if (outcome.status === "failed") {
@@ -896,12 +1065,17 @@ function applyPreparedChanges(
   // Rewriting an untouched marker would replace a NULL or absent row with the
   // literal "{}" on every apply, including batches that never read UI state.
   if (marker.dirty) {
+    if (marker.entries === null) {
+      throw new Error("Dirty target marker state was never loaded.");
+    }
+    const serializedMarker =
+      marker.serialized ?? serializeTargetStorageMarker(marker.entries);
     database
       .prepare(
         `INSERT INTO ItemTable(key, value) VALUES (?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       )
-      .run(TARGET_STORAGE_MARKER, JSON.stringify(marker.entries));
+      .run(TARGET_STORAGE_MARKER, serializedMarker);
   }
   return {
     applied,
@@ -909,6 +1083,7 @@ function applyPreparedChanges(
     failureByResourceId,
     retainedLocal,
     retainedLocalHashes,
+    localChatCoreHashes,
   };
 }
 
@@ -916,7 +1091,7 @@ function applyPreparedChange(
   database: DatabaseSync,
   request: HelperRequest,
   item: PreparedHelperChange,
-  localWorkspaces: Awaited<ReturnType<typeof discoverWorkspaces>>,
+  localWorkspaces: WorkspaceIdentity[],
   marker: MarkerState,
   ignoredUiStateKeys: IgnoreMatcher,
   localDeviceId?: string,
@@ -929,24 +1104,52 @@ function applyPreparedChange(
     if (content === undefined) {
       throw new Error(`Chat payload is missing: ${change.resourceId}`);
     }
-    const automaticRepair = isAutomaticChatRepairMetadata(change.metadata);
+    const automaticRepair =
+      effectiveSyncOrigin(change.metadata) === "automatic-chat-repair";
+    const agentKvEnrichment = isAgentKvEnrichmentMetadata(change.metadata);
     let snapshot: PortableChatSnapshot;
     try {
-      if (automaticRepair && sha256(content) !== change.semanticHash) {
-        throw new Error("Automatic chat repair payload hash does not match its event.");
+      if (
+        (automaticRepair || agentKvEnrichment) &&
+        sha256(content) !== change.semanticHash
+      ) {
+        throw new Error(
+          automaticRepair
+            ? "Automatic chat repair payload hash does not match its event."
+            : "Chat enrichment payload hash does not match its event.",
+        );
       }
       snapshot = parsePortableChatSnapshot(content);
       if (change.resourceId !== `chat/${snapshot.composerId}`) {
         throw new Error(`Chat payload does not match ${change.resourceId}.`);
       }
+      if (agentKvEnrichment) {
+        if (!isPortableChatSnapshotV2(snapshot)) {
+          throw new Error("Chat enrichment requires a schema v2 snapshot.");
+        }
+        if (!metadataBoolean(change.metadata, "agentKvEnrichmentAppliesCore")) {
+          return applyAgentKvEnrichment(
+            database,
+            request,
+            localWorkspaces,
+            snapshot,
+            change.metadata,
+            change.semanticHash,
+          );
+        }
+      }
       if (automaticRepair) {
-        const repairOriginDeviceId = metadataString(
+        const repairOriginDeviceId = assertSafeIdentifier(
+          metadataString(change.metadata, "repairOriginDeviceId"),
+          "repair origin device ID",
+        );
+        const effectiveSource = effectiveSourceDeviceId(
           change.metadata,
-          "repairOriginDeviceId",
+          change.sourceDeviceId,
         );
         if (
-          change.sourceDeviceId === undefined ||
-          repairOriginDeviceId !== change.sourceDeviceId
+          effectiveSource === undefined ||
+          repairOriginDeviceId !== effectiveSource
         ) {
           throw new Error(
             "Automatic chat repair origin does not match its trusted event device.",
@@ -981,8 +1184,13 @@ function applyPreparedChange(
     if (sourceWorkspaceId === null) {
       // A workspace-less composer round-trips as workspace-less; there is
       // nothing to map and no local workspace it belongs to.
-      upsertChat(database, snapshot, null);
-      return chatAppliedOutcome(change.semanticHash, snapshot, null);
+      const writtenHash = upsertChat(
+        database,
+        snapshot,
+        null,
+        request.syncOptions.maxPayloadBytes,
+      );
+      return chatAppliedOutcome(change.semanticHash, writtenHash);
     }
     const sourceWorkspaceUri = metadataStringOrNull(
       change.metadata,
@@ -1003,11 +1211,21 @@ function applyPreparedChange(
       // at the same path the chat is already where Cursor will look for it.
       // Writing a workspace ID that names nothing local is a state Cursor
       // already handles: it is what a deleted workspace folder leaves behind.
-      upsertChat(database, snapshot, sourceWorkspaceId);
-      return chatAppliedOutcome(change.semanticHash, snapshot, sourceWorkspaceId);
+      const writtenHash = upsertChat(
+        database,
+        snapshot,
+        sourceWorkspaceId,
+        request.syncOptions.maxPayloadBytes,
+      );
+      return chatAppliedOutcome(change.semanticHash, writtenHash);
     }
-    upsertChat(database, snapshot, targetWorkspaceId);
-    return chatAppliedOutcome(change.semanticHash, snapshot, targetWorkspaceId);
+    const writtenHash = upsertChat(
+      database,
+      snapshot,
+      targetWorkspaceId,
+      request.syncOptions.maxPayloadBytes,
+    );
+    return chatAppliedOutcome(change.semanticHash, writtenHash);
   }
 
   if (
@@ -1052,12 +1270,38 @@ function applyPreparedChange(
           "UI state key is ignored on this device; remove it from cursorSettingSync.ignoredUiStateKeys to accept changes for it",
       };
     }
+    const markerEntries =
+      marker.entries ?? (marker.entries = readTargetMarker(database));
+    let nextMarker:
+      | { entries: Record<string, number>; serialized: string }
+      | null = null;
+    if (change.operation === "delete" && Object.hasOwn(markerEntries, key)) {
+      const entries = Object.assign(
+        Object.create(null) as Record<string, number>,
+        markerEntries,
+      );
+      delete entries[key];
+      nextMarker = {
+        entries,
+        serialized: serializeTargetStorageMarker(entries),
+      };
+    } else if (
+      change.operation !== "delete" &&
+      metadataBoolean(change.metadata, "registeredUserTarget") &&
+      markerEntries[key] !== USER_STORAGE_TARGET
+    ) {
+      const entries = Object.assign(
+        Object.create(null) as Record<string, number>,
+        markerEntries,
+      );
+      entries[key] = USER_STORAGE_TARGET;
+      nextMarker = {
+        entries,
+        serialized: serializeTargetStorageMarker(entries),
+      };
+    }
     if (change.operation === "delete") {
       database.prepare("DELETE FROM ItemTable WHERE key = ?").run(key);
-      if (Object.hasOwn(marker.entries, key)) {
-        delete marker.entries[key];
-        marker.dirty = true;
-      }
     } else {
       if (content === undefined) {
         throw new Error(`UI state payload is missing: ${change.resourceId}`);
@@ -1068,13 +1312,11 @@ function applyPreparedChange(
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
         )
         .run(key, uiStateValue(change.metadata, content));
-      if (
-        metadataBoolean(change.metadata, "registeredUserTarget") &&
-        marker.entries[key] !== USER_STORAGE_TARGET
-      ) {
-        marker.entries[key] = USER_STORAGE_TARGET;
-        marker.dirty = true;
-      }
+    }
+    if (nextMarker !== null) {
+      marker.entries = nextMarker.entries;
+      marker.serialized = nextMarker.serialized;
+      marker.dirty = true;
     }
     return { status: "applied" };
   }
@@ -1095,12 +1337,26 @@ function applyPreparedChange(
       profiles,
       request.paths.profilesRoot,
     );
+    const serializedProfiles = JSON.stringify(stored);
+    if (stored.length > 1_000) {
+      throw new Error("Updated stored profile manifest exceeds its entry limit.");
+    }
+    if (
+      Buffer.byteLength(serializedProfiles, "utf8") >
+      MAX_STORED_PROFILE_MANIFEST_BYTES
+    ) {
+      throw new Error("Updated stored profile manifest exceeds its byte limit.");
+    }
+    assertBoundedJsoncStructure(
+      serializedProfiles,
+      "Updated stored profile manifest",
+    );
     database
       .prepare(
         `INSERT INTO ItemTable(key, value) VALUES (?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       )
-      .run("userDataProfiles", JSON.stringify(stored));
+      .run("userDataProfiles", serializedProfiles);
     // The merge is union-only, so a manifest with local-only profiles hashes
     // differently from the published one. The next scan reads exactly what
     // was written: recording that hash keeps the union from being republished
@@ -1129,18 +1385,150 @@ function applyPreparedChange(
  */
 function chatAppliedOutcome(
   publishedHash: string,
-  snapshot: ReturnType<typeof parsePortableChatSnapshot>,
-  writtenWorkspaceId: string | null,
+  writtenHash: string,
 ): ChangeOutcome {
-  const written = canonicalBytes({
-    ...snapshot,
-    header: { ...snapshot.header, workspaceId: writtenWorkspaceId },
-  });
-  const writtenHash = sha256(written);
   return {
     status: "applied",
     ...(writtenHash === publishedHash ? {} : { retainedLocalHash: writtenHash }),
   };
+}
+
+function updatePortableAgentKvHash(
+  hash: ReturnType<typeof createHash>,
+  payload: PortableAgentKvPayload,
+  writtenValueTypes: readonly ("text" | "blob")[],
+): void {
+  hash.update('{"blobs":[');
+  updatePortableRowsHash(hash, payload.blobs, writtenValueTypes);
+  hash.update('],"missingIds":[');
+  updateCanonicalStringArrayHash(hash, payload.missingIds);
+  hash.update('],"referencedIds":[');
+  updateCanonicalStringArrayHash(hash, payload.referencedIds);
+  hash.update("]}");
+}
+
+function updatePortableRowsHash(
+  hash: ReturnType<typeof createHash>,
+  rows: readonly PortableKvRow[],
+  writtenValueTypes: readonly NonNullable<PortableKvRow["valueType"]>[],
+): void {
+  if (rows.length !== writtenValueTypes.length) {
+    throw new Error("Chat write normalization does not match its rows.");
+  }
+  for (let index = 0; index < rows.length; index += 1) {
+    if (index > 0) {
+      hash.update(",");
+    }
+    updatePortableRowHash(
+      hash,
+      rows[index]!,
+      writtenValueTypes[index]!,
+    );
+  }
+}
+
+function updatePortableRowHash(
+  hash: ReturnType<typeof createHash>,
+  row: PortableKvRow,
+  writtenValueType: NonNullable<PortableKvRow["valueType"]>,
+): void {
+  hash.update('{"key":');
+  hash.update(canonicalJson(row.key));
+  // Canonical Base64 contains no JSON escape characters. Stream the existing
+  // string directly instead of JSON.stringify allocating an equally large one.
+  hash.update(',"valueBase64":"');
+  hash.update(row.valueBase64);
+  hash.update('","valueType":');
+  hash.update(canonicalJson(writtenValueType));
+  hash.update("}");
+}
+
+function updateCanonicalStringArrayHash(
+  hash: ReturnType<typeof createHash>,
+  values: readonly string[],
+): void {
+  for (let index = 0; index < values.length; index += 1) {
+    if (index > 0) {
+      hash.update(",");
+    }
+    hash.update(canonicalJson(values[index]!));
+  }
+}
+
+/**
+ * Applies a repository-tip enrichment without rolling a locally pruned or
+ * independently growing conversation back to the repository's core rows.
+ * The synthetic event exists only to carry newly recovered content-addressed
+ * blobs. A wholly absent chat may still be materialized, because there is no
+ * local core whose shape could be lost.
+ */
+function applyAgentKvEnrichment(
+  database: DatabaseSync,
+  request: HelperRequest,
+  localWorkspaces: WorkspaceIdentity[],
+  snapshot: PortableChatSnapshotV2,
+  sourceMetadata: Record<string, JsonValue> | undefined,
+  publishedHash: string,
+): ChangeOutcome {
+  const presence = chatRowPresence(database, snapshot.composerId);
+  if (presence.header || presence.composerData || presence.bubble) {
+    const current = readSyntheticApplyLocalChat(
+      database,
+      request,
+      snapshot.composerId,
+      "Chat enrichment",
+    );
+    const sourceCoreHash = portableChatCoreHash(snapshot);
+    const observedLocalCoreHash =
+      current === null ? null : portableChatCoreHash(current);
+    // Persisting a divergent local hash as an exact-observation shortcut would
+    // hide same-count/same-timestamp core edits forever. Only an identical core
+    // is safe to remember. A pruned B111 copy remains protected by its lower
+    // bubble count, while an equal-count divergence is deliberately re-read
+    // and republished on the next deep verification pass.
+    const localChatCoreHash =
+      observedLocalCoreHash === sourceCoreHash ? sourceCoreHash : null;
+    // Blob-only enrichment never serializes a written chat snapshot. Building
+    // an "effective" payload here would Base64-encode every hash-valid local
+    // blob only to discard it, multiplying peak memory for large conversations.
+    const result = upsertAgentKvBlobs(
+      database,
+      snapshot.agentKv,
+      request.syncOptions.maxPayloadBytes,
+    );
+    return result.changed > 0
+      ? { status: "applied", localChatCoreHash }
+      : {
+          status: "retained-local",
+          reason:
+            "the local conversation core was preserved and every supplied agentKv blob was already valid",
+          localChatCoreHash,
+        };
+  }
+
+  const sourceWorkspaceId = snapshot.header.workspaceId;
+  const targetWorkspaceId =
+    sourceWorkspaceId === null
+      ? null
+      : resolveTargetWorkspace(
+          sourceWorkspaceId,
+          metadataStringOrNull(sourceMetadata, "workspaceUri"),
+          localWorkspaces,
+          request.workspaceMappings,
+        ) ?? sourceWorkspaceId;
+  const writtenHash = upsertChat(
+    database,
+    snapshot,
+    targetWorkspaceId,
+    request.syncOptions.maxPayloadBytes,
+  );
+  return chatAppliedOutcome(publishedHash, writtenHash);
+}
+
+function isAgentKvEnrichmentMetadata(
+  metadata: Record<string, JsonValue> | undefined,
+): boolean {
+  return effectiveSyncOrigin(metadata) === "agent-kv-enrichment";
 }
 
 /**
@@ -1158,7 +1546,7 @@ function chatAppliedOutcome(
 function repairUnavailableChatBubbles(
   database: DatabaseSync,
   request: HelperRequest,
-  localWorkspaces: Awaited<ReturnType<typeof discoverWorkspaces>>,
+  localWorkspaces: WorkspaceIdentity[],
   source: PortableChatSnapshot,
   sourceMetadata: Record<string, JsonValue> | undefined,
   expectedFingerprint: string,
@@ -1173,7 +1561,12 @@ function repairUnavailableChatBubbles(
   ) {
     throw new Error("The automatic repair payload is not a complete conversation.");
   }
-  const current = readPortableChatSnapshot(database, source.composerId);
+  const current = readSyntheticApplyLocalChat(
+    database,
+    request,
+    source.composerId,
+    "Automatic chat repair",
+  );
   if (current === null) {
     const presence = chatRowPresence(database, source.composerId);
     if (localDeviceId === repairOriginDeviceId) {
@@ -1196,8 +1589,18 @@ function repairUnavailableChatBubbles(
         request.workspaceMappings,
       ) ?? sourceWorkspaceId;
     }
-    upsertChat(database, source, targetWorkspaceId);
-    const materialized = readPortableChatSnapshot(database, source.composerId);
+    const writtenHash = upsertChat(
+      database,
+      source,
+      targetWorkspaceId,
+      request.syncOptions.maxPayloadBytes,
+    );
+    const materialized = readSyntheticApplyLocalChat(
+      database,
+      request,
+      source.composerId,
+      "Automatic chat repair",
+    );
     if (materialized === null) {
       throw new Error("The complete repair snapshot could not be materialized.");
     }
@@ -1208,16 +1611,66 @@ function repairUnavailableChatBubbles(
     ) {
       throw new Error("The materialized repair snapshot is incomplete.");
     }
-    return chatAppliedOutcome(publishedHash, source, targetWorkspaceId);
+    return chatAppliedOutcome(publishedHash, writtenHash);
   }
   const currentAudit = auditChatReferences(current);
   if (currentAudit.status !== "known") {
     throw new Error(`Automatic chat repair is ambiguous: ${currentAudit.reason}.`);
   }
+  const sourceRows = new Map(source.bubbles.map((row) => [row.key, row]));
+  const currentRows = new Map(current.bubbles.map((row) => [row.key, row]));
   if (currentAudit.unavailableBubbleKeys.length === 0) {
+    let addedBubbleCount = 0;
+    if (
+      canonicalBytes(current.composerData).equals(
+        canonicalBytes(source.composerData),
+      )
+    ) {
+      const insert = database.prepare(
+        "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+      );
+      for (const [key, row] of sourceRows) {
+        if (currentRows.has(key)) {
+          continue;
+        }
+        insert.run(key, portableKvValue(row));
+        currentRows.set(key, row);
+        addedBubbleCount += 1;
+      }
+    }
+    let addedAgentKvCount = 0;
+    if (isPortableChatSnapshotV2(source)) {
+      const result = upsertAgentKvBlobs(
+        database,
+        source.agentKv,
+        request.syncOptions.maxPayloadBytes,
+      );
+      addedAgentKvCount = result.changed;
+    }
+    if (addedBubbleCount > 0 || addedAgentKvCount > 0) {
+      const updated = readSyntheticApplyLocalChat(
+        database,
+        request,
+        source.composerId,
+        "Automatic chat repair",
+      );
+      if (updated === null) {
+        throw new Error("The chat disappeared while its repair was being applied.");
+      }
+      const sourceCoreHash = portableChatCoreHash(source);
+      const localChatCoreHash =
+        portableChatCoreHash(updated) === sourceCoreHash ? sourceCoreHash : null;
+      return { status: "applied", localChatCoreHash };
+    }
+    const sourceCoreHash = portableChatCoreHash(source);
+    const localChatCoreHash =
+      portableChatCoreHash(current) === sourceCoreHash ? sourceCoreHash : null;
     return {
       status: "retained-local",
-      reason: "the local conversation is already complete",
+      reason: isPortableChatSnapshotV2(source)
+        ? "the local conversation is already complete and every supplied repair row was already valid"
+        : "the local conversation is already complete",
+      localChatCoreHash,
     };
   }
   const isOrigin = localDeviceId === repairOriginDeviceId;
@@ -1237,8 +1690,6 @@ function repairUnavailableChatBubbles(
         : "The peer conversation has different composerData and was left unchanged.",
     );
   }
-  const sourceRows = new Map(source.bubbles.map((row) => [row.key, row]));
-  const currentRows = new Map(current.bubbles.map((row) => [row.key, row]));
   const insert = database.prepare(
     "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
   );
@@ -1260,8 +1711,26 @@ function repairUnavailableChatBubbles(
     } else {
       insert.run(key, value);
     }
+    currentRows.set(key, recovered);
   }
-  const repaired = readPortableChatSnapshot(database, source.composerId);
+  // The repair event's bubbleCount describes the trusted historical union,
+  // not just the currently referenced damaged rows. Materialize every absent
+  // source row additively so projection learning cannot mistake the next local
+  // messages for pruning until it catches up with a larger synthetic count.
+  // Existing rows, including inert/orphan rows, are never overwritten.
+  for (const [key, row] of sourceRows) {
+    if (currentRows.has(key)) {
+      continue;
+    }
+    insert.run(key, portableKvValue(row));
+    currentRows.set(key, row);
+  }
+  const repaired = readSyntheticApplyLocalChat(
+    database,
+    request,
+    source.composerId,
+    "Automatic chat repair",
+  );
   if (repaired === null) {
     throw new Error("The chat disappeared while its repair was being applied.");
   }
@@ -1272,10 +1741,54 @@ function repairUnavailableChatBubbles(
   ) {
     throw new Error("Automatic chat repair did not satisfy every live reference.");
   }
+  if (isPortableChatSnapshotV2(source)) {
+    upsertAgentKvBlobs(
+      database,
+      source.agentKv,
+      request.syncOptions.maxPayloadBytes,
+    );
+  }
+  const sourceCoreHash = portableChatCoreHash(source);
+  const localChatCoreHash =
+    portableChatCoreHash(repaired) === sourceCoreHash ? sourceCoreHash : null;
   // Existing conversations are never made to pretend that their complete
   // local form byte-matches the originating device. The next scan is allowed
   // to publish any surviving local divergence on top of the repair event.
-  return { status: "applied" };
+  return {
+    status: "applied",
+    localChatCoreHash,
+  };
+}
+
+/**
+ * Synthetic chat recipes inspect the live core before deciding what they may
+ * add. Keep that inspection below the repair command's 64 MiB safety policy
+ * and below the repository's configured one-payload policy. The bounded
+ * reader performs its aggregate SQLite metadata preflight before returning
+ * any bubble value; a rejected change is rolled back by the caller's per-item
+ * savepoint and remains queued with this reason visible to the user.
+ */
+function readSyntheticApplyLocalChat(
+  database: DatabaseSync,
+  request: HelperRequest,
+  composerId: string,
+  recipe: "Automatic chat repair" | "Chat enrichment",
+): PortableChatSnapshot | null {
+  const limit = Math.min(
+    DEFAULT_BROKEN_CHAT_INSPECTION_LIMITS.maxRetainedBytes,
+    request.syncOptions.maxPayloadBytes,
+  );
+  const result = readPortableChatSnapshotBounded(database, composerId, limit);
+  if (result.status === "known") {
+    return result.snapshot;
+  }
+  if (result.limitReached) {
+    throw new Error(
+      `${recipe} deferred: the local conversation exceeds the bounded ` +
+        `${limit}-byte inspection limit; no database rows were changed.`,
+    );
+  }
+  return null;
 }
 
 function chatRowPresence(
@@ -1331,15 +1844,51 @@ function upsertChat(
   database: DatabaseSync,
   snapshot: ReturnType<typeof parsePortableChatSnapshot>,
   workspaceId: string | null,
-): void {
+  maxAgentKvBytes: number,
+): string {
+  // Hash the normalized rows while they are written. This mirrors what the
+  // next live scanner will observe without re-reading the database or building
+  // a second whole-chat canonical buffer.
+  const hash = createHash("sha256");
+  hash.update("{");
+  if (isPortableChatSnapshotV2(snapshot)) {
+    const agentKvResult = upsertAgentKvBlobs(
+      database,
+      snapshot.agentKv,
+      maxAgentKvBytes,
+    );
+    hash.update('"agentKv":');
+    updatePortableAgentKvHash(
+      hash,
+      snapshot.agentKv,
+      agentKvResult.writtenValueTypes,
+    );
+    hash.update(",");
+  }
+
   const insertKv = database.prepare(
     `INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
   );
-  insertKv.run(snapshot.composerData.key, portableKvValue(snapshot.composerData));
-  for (const bubble of snapshot.bubbles) {
-    insertKv.run(bubble.key, portableKvValue(bubble));
+  const orderedBubbles = portableRowsInDatabaseOrder(snapshot.bubbles);
+  hash.update('"bubbles":[');
+  for (let index = 0; index < orderedBubbles.length; index += 1) {
+    const bubble = orderedBubbles[index]!;
+    const write = portableKvWrite(bubble);
+    insertKv.run(bubble.key, write.value);
+    if (index > 0) {
+      hash.update(",");
+    }
+    updatePortableRowHash(hash, bubble, write.valueType);
   }
+  hash.update('],"composerData":');
+  const composerDataWrite = portableKvWrite(snapshot.composerData);
+  insertKv.run(snapshot.composerData.key, composerDataWrite.value);
+  updatePortableRowHash(
+    hash,
+    snapshot.composerData,
+    composerDataWrite.valueType,
+  );
   // Bubbles present here and absent from the snapshot are LEFT ALONE.
   //
   // This used to delete them, on the rule that a message removed on the source
@@ -1385,24 +1934,202 @@ function upsertChat(
       header.checkpointAt,
       header.value,
     );
+
+  hash.update(',"composerId":');
+  hash.update(canonicalJson(snapshot.composerId));
+  hash.update(',"header":');
+  // Use only columns actually written to composerHeaders. Incoming snapshots
+  // may contain forward fields that this Cursor database cannot preserve.
+  updatePortableComposerHeaderHash(hash, {
+    checkpointAt: header.checkpointAt,
+    composerId: header.composerId,
+    createdAt: header.createdAt,
+    isArchived: header.isArchived,
+    isSubagent: header.isSubagent,
+    lastUpdatedAt: header.lastUpdatedAt,
+    recency: header.recency,
+    value: header.value,
+    workspaceId,
+  });
+  hash.update(',"schemaVersion":');
+  hash.update(String(snapshot.schemaVersion));
+  hash.update("}");
+  return hash.digest("hex");
 }
 
-function portableKvValue(row: PortableKvRow): string | Buffer | null {
+function portableRowsInDatabaseOrder(
+  rows: readonly PortableKvRow[],
+): readonly PortableKvRow[] {
+  for (let index = 1; index < rows.length; index += 1) {
+    if (compareCodeUnits(rows[index - 1]!.key, rows[index]!.key) > 0) {
+      return [...rows].sort((left, right) =>
+        compareCodeUnits(left.key, right.key),
+      );
+    }
+  }
+  return rows;
+}
+
+/**
+ * Inserts absent content-addressed blobs and repairs rows whose bytes no
+ * longer match their key. A row that already hashes to its ID is immutable:
+ * even a different but equivalent SQLite TEXT/BLOB representation from the
+ * incoming payload must not overwrite it.
+ */
+function upsertAgentKvBlobs(
+  database: DatabaseSync,
+  payload: PortableAgentKvPayload,
+  maxIncomingBytes: number,
+): { changed: number; writtenValueTypes: ("text" | "blob")[] } {
+  const readMetadata = database.prepare(
+    "SELECT typeof(value) AS valueType, " +
+      "length(CAST(value AS BLOB)) AS valueBytes " +
+      "FROM cursorDiskKV WHERE key = ?",
+  );
+  const readValue = database.prepare(
+    "SELECT value, typeof(value) AS valueType FROM cursorDiskKV " +
+      "WHERE key = ? AND typeof(value) = ? " +
+      "AND length(CAST(value AS BLOB)) = ?",
+  );
+  const write = database.prepare(
+    "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?) " +
+      "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  );
+  let changed = 0;
+  const writtenValueTypes: ("text" | "blob")[] = [];
+  for (const incoming of payload.blobs) {
+    const id = incoming.key.slice("agentKv:blob:".length);
+    const incomingBytes = decodedBase64ByteLength(incoming.valueBase64);
+    const validExisting = readValidExistingAgentKvBlob(
+      readMetadata,
+      readValue,
+      incoming.key,
+      id,
+      Math.min(maxIncomingBytes, incomingBytes),
+    );
+    if (validExisting !== null) {
+      writtenValueTypes.push(validExisting.valueType);
+      continue;
+    }
+    const incomingWrite = portableKvWrite(incoming);
+    if (
+      incomingWrite.valueType !== "text" &&
+      incomingWrite.valueType !== "blob"
+    ) {
+      throw new Error("agentKv blobs must use TEXT or BLOB storage.");
+    }
+    write.run(incoming.key, incomingWrite.value);
+    writtenValueTypes.push(incomingWrite.valueType);
+    changed += 1;
+  }
+  // `missingIds` describe bytes unavailable to the publishing device. Rows
+  // already present locally stay in SQLite, but ordinary apply deliberately
+  // does not read/Base64-copy them into an effective payload. The live scan's
+  // bounded enrichment path owns discovering and publishing that richer form.
+  return { changed, writtenValueTypes };
+}
+
+interface ValidExistingAgentKvBlob {
+  valueType: "text" | "blob";
+}
+
+function readValidExistingAgentKvBlob(
+  metadataStatement: ReturnType<DatabaseSync["prepare"]>,
+  valueStatement: ReturnType<DatabaseSync["prepare"]>,
+  key: string,
+  id: string,
+  maxBytes: number,
+): ValidExistingAgentKvBlob | null {
+  const metadata = metadataStatement.get(key) as
+    | { valueType?: unknown; valueBytes?: unknown }
+    | undefined;
+  if (
+    metadata === undefined ||
+    (metadata.valueType !== "text" && metadata.valueType !== "blob") ||
+    typeof metadata.valueBytes !== "number" ||
+    !Number.isSafeInteger(metadata.valueBytes) ||
+    metadata.valueBytes < 0 ||
+    metadata.valueBytes > maxBytes
+  ) {
+    return null;
+  }
+  const row = valueStatement.get(
+    key,
+    metadata.valueType,
+    metadata.valueBytes,
+  ) as { value?: SqliteStorageValue; valueType?: unknown } | undefined;
+  return validExistingAgentKvBlob(id, row);
+}
+
+function validExistingAgentKvBlob(
+  id: string,
+  row: { value?: SqliteStorageValue; valueType?: unknown } | undefined,
+): ValidExistingAgentKvBlob | null {
+  if (row === undefined) {
+    return null;
+  }
+  let bytes: Uint8Array;
+  let valueType: "text" | "blob";
+  if (row.valueType === "text" && typeof row.value === "string") {
+    bytes = Buffer.from(row.value, "utf8");
+    valueType = "text";
+  } else if (row.valueType === "blob" && row.value instanceof Uint8Array) {
+    // Hash node:sqlite's returned bytes directly. Buffer.from(row.value)
+    // duplicates a potentially very large blob before the hash sees it.
+    bytes = row.value;
+    valueType = "blob";
+  } else {
+    return null;
+  }
+  if (sha256(bytes) !== id) {
+    return null;
+  }
+  return { valueType };
+}
+
+function decodedBase64ByteLength(value: string): number {
+  if (value.length === 0) {
+    return 0;
+  }
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+  return (value.length / 4) * 3 - padding;
+}
+
+interface PortableKvWrite {
+  value: string | Buffer | null;
+  valueType: NonNullable<PortableKvRow["valueType"]>;
+}
+
+function portableKvWrite(row: PortableKvRow): PortableKvWrite {
   // node:sqlite binds a JS null to SQL NULL, so a captured NULL is restored
   // exactly instead of becoming an empty string or a zero-length blob.
   if (row.valueType === "null") {
-    return null;
+    if (row.valueBase64.length !== 0) {
+      throw new Error("A NULL cursorDiskKV row cannot contain encoded bytes.");
+    }
+    return { value: null, valueType: "null" };
   }
   const value = Buffer.from(row.valueBase64, "base64");
   if (row.valueType === "blob") {
-    return value;
+    return { value, valueType: "blob" };
   }
   if (row.valueType === "text") {
-    return value.toString("utf8");
+    const text = value.toString("utf8");
+    if (!Buffer.from(text, "utf8").equals(value)) {
+      throw new Error("A TEXT cursorDiskKV row is not valid UTF-8.");
+    }
+    return { value: text, valueType: "text" };
   }
   // cursorDiskKV chat values are TEXT in practice; snapshots published before
   // valueType existed decode to TEXT only when the decode is lossless.
-  return legacyStorageValue(value);
+  const legacy = legacyStorageValue(value);
+  return typeof legacy === "string"
+    ? { value: legacy, valueType: "text" }
+    : { value: legacy, valueType: "blob" };
+}
+
+function portableKvValue(row: PortableKvRow): string | Buffer | null {
+  return portableKvWrite(row).value;
 }
 
 function legacyStorageValue(content: Buffer): string | Buffer {
@@ -1448,11 +2175,21 @@ function mergeStoredProfiles(
   database: DatabaseSync,
   incoming: PortableProfile[],
   profilesRoot: string,
+  onValueRead?: () => void,
 ): Array<Record<string, unknown>> {
-  const row = database
-    .prepare("SELECT value FROM ItemTable WHERE key = ?")
-    .get("userDataProfiles") as { value?: SqliteStorageValue } | undefined;
-  const current = parseStoredProfileArray(row?.value);
+  const metadata = inspectSqliteValue(database, "userDataProfiles");
+  if (
+    metadata.byteLength !== null &&
+    metadata.byteLength > MAX_STORED_PROFILE_MANIFEST_BYTES
+  ) {
+    throw new Error(
+      `Stored profile manifest is ${metadata.byteLength} bytes, above the ${MAX_STORED_PROFILE_MANIFEST_BYTES}-byte read limit.`,
+    );
+  }
+  onValueRead?.();
+  const current = parseStoredProfileArray(
+    readSqliteValue(database, "userDataProfiles"),
+  );
   const positions = new Map<string, number>();
   current.forEach((profile, index) => {
     const id = storedProfileId(profile);
@@ -1494,6 +2231,10 @@ function parseStoredProfileArray(
   if (text.trim().length === 0) {
     return [];
   }
+  if (Buffer.byteLength(text, "utf8") > MAX_STORED_PROFILE_MANIFEST_BYTES) {
+    throw new Error("Stored profile manifest exceeds its byte limit.");
+  }
+  assertBoundedJsoncStructure(text, "Stored profile manifest");
   const parsed = JSON.parse(text) as unknown;
   if (!Array.isArray(parsed) || parsed.length > 1_000) {
     throw new Error("Stored profile manifest is invalid.");
@@ -1521,18 +2262,33 @@ function storedProfileId(profile: Record<string, unknown>): string | null {
 }
 
 interface MarkerState {
-  entries: Record<string, number>;
+  entries: Record<string, number> | null;
+  serialized: string | null;
   dirty: boolean;
 }
 
-function readTargetMarker(database: DatabaseSync): Record<string, number> {
-  const row = database
-    .prepare("SELECT value FROM ItemTable WHERE key = ?")
-    .get(TARGET_STORAGE_MARKER) as
-    | { value?: SqliteStorageValue }
-    | undefined;
-  return parseTargetStorageMarker(row?.value);
+function readTargetMarker(
+  database: DatabaseSync,
+  onValueRead?: () => void,
+): Record<string, number> {
+  const metadata = inspectSqliteValue(database, TARGET_STORAGE_MARKER);
+  if (
+    metadata.byteLength !== null &&
+    metadata.byteLength > MAX_TARGET_STORAGE_MARKER_BYTES
+  ) {
+    throw new Error(
+      `Target storage marker is ${metadata.byteLength} bytes, above the ${MAX_TARGET_STORAGE_MARKER_BYTES}-byte read limit.`,
+    );
+  }
+  onValueRead?.();
+  return parseTargetStorageMarker(readSqliteValue(database, TARGET_STORAGE_MARKER));
 }
+
+/** Narrow preflight seams; callbacks fire only immediately before body SELECT. */
+export const __testing = Object.freeze({
+  mergeStoredProfiles,
+  readTargetMarker,
+});
 
 function assertGlobalSchema(
   database: DatabaseSync,

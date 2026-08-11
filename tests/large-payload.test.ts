@@ -10,7 +10,10 @@ vi.mock("vscode", () => ({
 }));
 
 import { EventReconciler } from "../src/protocol/reconciler";
-import { autoMergeConflicts } from "../src/sync/manager";
+import {
+  autoMergeConflicts,
+  settleOversizedSnapshots,
+} from "../src/sync/manager";
 import { SyncRepository } from "../src/protocol/repository";
 import {
   canonicalBytes,
@@ -18,7 +21,14 @@ import {
   sha256,
 } from "../src/protocol/canonical";
 import { parsePortableChatSnapshot } from "../src/chat/stateVscdb";
-import type { EventProducer, SyncConflict } from "../src/types";
+import { oversizedPayloadWarning } from "../src/sync/versionPolicy";
+import { publishWarningSource } from "../src/sync/warningLog";
+import type { ResourceAdapter } from "../src/resources/resource";
+import type {
+  EventProducer,
+  ResourceSnapshot,
+  SyncConflict,
+} from "../src/types";
 
 const PASSPHRASE = "a sufficiently long test passphrase";
 const PRODUCER: EventProducer = {
@@ -41,6 +51,10 @@ const COMPOSER = "026e7136-6ca9-4847-9328-6fc5a697c651";
  * showed up in production.
  */
 const OVERFLOWING_BYTES = 5 * 1024 * 1024;
+// Still produces >4 MiB individual Base64 fields (the historical recursive
+// validator failure), while both tips together remain below the fixed 32 MiB
+// interactive auto-merge budget.
+const CHAT_OVERFLOWING_BYTES = 3 * 1024 * 1024;
 
 function incompressible(bytes: number): Buffer {
   return randomBytes(bytes);
@@ -109,11 +123,17 @@ describe("large payloads through the repository", () => {
     // and autoMergeConflicts, and took the whole cycle down on every poll.
     await withRepository(async (repository) => {
       const resourceId = `chat/${COMPOSER}`;
+      // b1 is the same immutable message on both sides. Generating this inside
+      // `bigChat` accidentally made it two random same-key rows, which is an
+      // ambiguous conflict rather than an additive-union scenario.
+      const sharedBody = incompressible(CHAT_OVERFLOWING_BYTES).toString(
+        "base64",
+      );
       for (const [side, extra] of [
         ["a", "b2"],
         ["b", "b3"],
       ] as const) {
-        const content = bigChat(side, extra);
+        const content = bigChat(side, extra, sharedBody);
         await repository.publish(
           [
             {
@@ -146,7 +166,7 @@ describe("large payloads through the repository", () => {
         `bubbleId:${COMPOSER}:b3`,
       ]);
     });
-  });
+  }, 15_000);
 });
 
 describe("autoMergeConflicts error containment", () => {
@@ -195,6 +215,65 @@ describe("autoMergeConflicts error containment", () => {
   });
 });
 
+describe("oversized adapter settlement warnings", () => {
+  it("keeps the exact warning while the adapter runs, without re-supplying bytes", () => {
+    const maxPayloadBytes = 100;
+    const snapshot: ResourceSnapshot = {
+      resourceId: `chat/${COMPOSER}`,
+      kind: "chat",
+      content: Buffer.alloc(101),
+      semanticHash: "oversized-semantic-hash",
+    };
+    const settle = vi.fn(() => true);
+    const adapter: ResourceAdapter = {
+      id: "state-vscdb-chat",
+      kinds: ["chat"],
+      appliesWhileRunning: false,
+      scan: async () => ({ snapshots: [], deletions: [], warnings: [] }),
+      apply: async () => {},
+      settleOversizedSnapshot: settle,
+      oversizedSnapshotSettlements: () => [
+        {
+          resourceId: snapshot.resourceId,
+          semanticHash: snapshot.semanticHash,
+          byteLength: snapshot.content.byteLength,
+          maxPayloadBytes,
+        },
+      ],
+    };
+    const source = publishWarningSource(adapter.id);
+    const warning = oversizedPayloadWarning(
+      snapshot.resourceId,
+      snapshot.content.byteLength,
+      maxPayloadBytes,
+    );
+
+    expect(
+      settleOversizedSnapshots(
+        [adapter],
+        [adapter.id],
+        [snapshot],
+        maxPayloadBytes,
+      ).get(source),
+    ).toEqual([warning]);
+    expect(settle).toHaveBeenCalledOnce();
+
+    // The next observation carries only the lightweight settlement. An
+    // adapter that did not run does not overwrite its standing warning bucket.
+    expect(
+      settleOversizedSnapshots(
+        [adapter],
+        [adapter.id],
+        [],
+        maxPayloadBytes,
+      ).get(source),
+    ).toEqual([warning]);
+    expect(
+      settleOversizedSnapshots([adapter], [], [], maxPayloadBytes),
+    ).toEqual(new Map());
+  });
+});
+
 function chatSnapshot(bubbles: Array<[string, string]>, lastUpdatedAt: number): Buffer {
   return canonicalBytes({
     schemaVersion: 1,
@@ -224,8 +303,7 @@ function chatSnapshot(bubbles: Array<[string, string]>, lastUpdatedAt: number): 
 }
 
 /** A snapshot whose own payload is past the old validator's breaking point. */
-function bigChat(side: string, extraBubble: string): Buffer {
-  const body = incompressible(OVERFLOWING_BYTES).toString("base64");
+function bigChat(side: string, extraBubble: string, body: string): Buffer {
   return chatSnapshot(
     [
       ["b1", body],

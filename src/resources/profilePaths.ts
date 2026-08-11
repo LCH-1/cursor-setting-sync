@@ -1,5 +1,4 @@
 import { join, relative } from "node:path";
-import { readdir } from "node:fs/promises";
 import type { CursorPaths } from "../platform/paths";
 import {
   assertSafeIdentifier,
@@ -7,6 +6,11 @@ import {
   normalizeResourcePath,
   pathExists,
 } from "../platform/files";
+import {
+  AUXILIARY_DIRECTORY_MATCHES_PER_SCAN,
+  AUXILIARY_DIRECTORY_WORK_ITEMS_PER_SCAN,
+  BoundedFileTreeWalker,
+} from "../chat/boundedFileTree";
 
 export interface ProfileResourcePaths {
   profileId: string;
@@ -19,35 +23,129 @@ export interface ProfileResourcePaths {
   mcp: string;
 }
 
-export async function discoverProfileResourcePaths(
-  paths: CursorPaths,
-): Promise<ProfileResourcePaths[]> {
-  const profiles: ProfileResourcePaths[] = [
-    createProfilePaths("default", paths.userDataRoot),
-  ];
-  if (!(await pathExists(paths.profilesRoot))) {
-    return profiles;
+export interface ProfileResourcePathPage {
+  profiles: ProfileResourcePaths[];
+  complete: boolean;
+  workItems: number;
+  retainedPathCount: number;
+}
+
+/**
+ * Stateful, fixed-memory enumeration of the default profile and top-level
+ * `User/profiles/*` directories. Call `restart()` only after a completed
+ * sweep; callers retain at most the returned page, never the whole profile
+ * population.
+ */
+export class ProfileResourcePathPager {
+  private readonly walker = new BoundedFileTreeWalker();
+  private started = false;
+  private defaultPending = true;
+  private completed = false;
+
+  restart(): void {
+    this.started = true;
+    this.defaultPending = true;
+    this.completed = false;
   }
-  await assertSafeRelativePathOnDisk(
-    paths.userDataRoot,
-    normalizeResourcePath(relative(paths.userDataRoot, paths.profilesRoot)),
-    { finalType: "directory" },
-  );
-  const entries = await readdir(paths.profilesRoot, { withFileTypes: true });
-  for (const entry of entries) {
-    if (entry.isDirectory() && !entry.isSymbolicLink()) {
-      try {
-        profiles.push(createProfilePaths(entry.name, join(paths.profilesRoot, entry.name)));
-      } catch {
-        // One "New folder" or Syncthing conflict directory under User/profiles
-        // is not a profile; throwing here disabled the entire settings and
-        // profile-files scans, wholesale, on every cycle until it was deleted.
-        // Cursor itself would never read such a directory either - skipping it
-        // synchronizes exactly what Cursor sees.
+
+  get active(): boolean {
+    return this.started && !this.completed;
+  }
+
+  /** Closes the resumable native profile-directory cursor, if one is open. */
+  async dispose(): Promise<void> {
+    await this.walker.clear();
+    this.started = false;
+    this.defaultPending = true;
+    this.completed = false;
+  }
+
+  async advance(
+    paths: CursorPaths,
+    options: {
+      maxProfiles?: number;
+      maxWorkItems?: number;
+    } = {},
+  ): Promise<ProfileResourcePathPage> {
+    if (!this.started) {
+      this.restart();
+    }
+    if (this.completed) {
+      return {
+        profiles: [],
+        complete: true,
+        workItems: 0,
+        retainedPathCount: 0,
+      };
+    }
+    const maxProfiles =
+      options.maxProfiles ?? AUXILIARY_DIRECTORY_MATCHES_PER_SCAN;
+    const maxWorkItems =
+      options.maxWorkItems ?? AUXILIARY_DIRECTORY_WORK_ITEMS_PER_SCAN;
+    assertPositiveLimit(maxProfiles, "Profile page");
+    assertPositiveLimit(maxWorkItems, "Profile enumeration work");
+    const profiles: ProfileResourcePaths[] = [];
+    if (this.defaultPending) {
+      profiles.push(createProfilePaths("default", paths.userDataRoot));
+      this.defaultPending = false;
+      if (profiles.length >= maxProfiles) {
+        return {
+          profiles,
+          complete: false,
+          workItems: 0,
+          retainedPathCount: this.walker.retainedPathCount(paths.profilesRoot),
+        };
       }
     }
+    if (!(await pathExists(paths.profilesRoot))) {
+      this.completed = true;
+      return {
+        profiles,
+        complete: true,
+        workItems: 1,
+        retainedPathCount: 0,
+      };
+    }
+    await assertSafeRelativePathOnDisk(
+      paths.userDataRoot,
+      normalizeResourcePath(relative(paths.userDataRoot, paths.profilesRoot)),
+      { finalType: "directory" },
+    );
+    const page = await this.walker.advance(paths.profilesRoot, {
+      maxWorkItems,
+      maxMatches: 1,
+      maxDirectoryMatches: maxProfiles - profiles.length,
+      includeFile: () => false,
+      includeDirectory: (_path, relativePath) => {
+        if (relativePath.includes("/") || relativePath.includes("\\")) {
+          return false;
+        }
+        try {
+          assertValidProfileId(relativePath);
+          return true;
+        } catch {
+          // Cursor ignores conflict/temporary directory names as profiles.
+          return false;
+        }
+      },
+      descendIntoDirectory: () => false,
+    });
+    for (const directory of page.directories) {
+      const profileId = normalizeResourcePath(
+        relative(paths.profilesRoot, directory),
+      );
+      profiles.push(createProfilePaths(profileId, directory));
+    }
+    if (page.complete) {
+      this.completed = true;
+    }
+    return {
+      profiles,
+      complete: page.complete,
+      workItems: page.workItems,
+      retainedPathCount: page.retainedPathCount,
+    };
   }
-  return profiles.sort((left, right) => left.profileId.localeCompare(right.profileId));
 }
 
 export function profilePathById(paths: CursorPaths, profileId: string): ProfileResourcePaths {
@@ -73,4 +171,10 @@ function createProfilePaths(profileId: string, root: string): ProfileResourcePat
     prompts: join(root, "prompts"),
     mcp: join(root, "mcp.json"),
   };
+}
+
+function assertPositiveLimit(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} limit must be a positive integer.`);
+  }
 }

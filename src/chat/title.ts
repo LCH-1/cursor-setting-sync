@@ -1,3 +1,7 @@
+import { buffersFitJsonStructureBudget } from "../protocol/jsonStructure";
+
+const CHAT_HEADER_TITLE_MAX_SOURCE_CHARS = 64 * 1024;
+
 /**
  * Reads the conversation name Cursor stores inside `composerHeaders.value`.
  *
@@ -7,6 +11,12 @@
  */
 export function chatHeaderTitle(value: unknown): string | null {
   if (typeof value !== "string") {
+    return null;
+  }
+  if (value.length > CHAT_HEADER_TITLE_MAX_SOURCE_CHARS) {
+    return null;
+  }
+  if (!buffersFitJsonStructureBudget([value])) {
     return null;
   }
   let parsed: unknown;

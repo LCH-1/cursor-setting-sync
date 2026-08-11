@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { chatHeaderTitle, chatSnapshotTitle } from "../src/chat/title";
 import {
   buildRestoreKindChoices,
@@ -290,6 +290,27 @@ describe("Cursor conversation title metadata", () => {
     expect(chatHeaderTitle("{not valid JSON")).toBeNull();
     expect(chatHeaderTitle(JSON.stringify({ subtitle: "No name" }))).toBeNull();
     expect(chatHeaderTitle(null)).toBeNull();
+  });
+
+  it("refuses structurally hostile header JSON before parsing it", () => {
+    const hostile = `{"name":"hidden","items":[${"0,".repeat(65_536)}0]}`;
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      expect(chatHeaderTitle(hostile)).toBeNull();
+      expect(parse).not.toHaveBeenCalled();
+    } finally {
+      parse.mockRestore();
+    }
+  });
+
+  it("refuses a huge bare title before parsing or normalizing the full value", () => {
+    const parse = vi.spyOn(JSON, "parse");
+    try {
+      expect(chatHeaderTitle("x".repeat(64 * 1024 + 1))).toBeNull();
+      expect(parse).not.toHaveBeenCalled();
+    } finally {
+      parse.mockRestore();
+    }
   });
 
   it("clips long titles and extracts the title again from an old chat payload", () => {

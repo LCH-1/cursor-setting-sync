@@ -1,5 +1,4 @@
 import { basename } from "node:path";
-import type { SqliteStorageValue } from "../platform/sqlite";
 import { openDatabase, sqliteStorageText } from "../platform/sqlite";
 import type {
   JsonValue,
@@ -7,9 +6,31 @@ import type {
   ResourceScanResult,
 } from "../types";
 import type { CursorPaths } from "../platform/paths";
-import { serializeCanonical, semanticHash } from "./jsonc";
-import type { ResourceAdapter, ResourceApplyInput } from "./resource";
+import {
+  assertBoundedJsoncStructure,
+  serializeCanonical,
+  semanticHash,
+} from "./jsonc";
+import type {
+  OversizedSnapshotSettlement,
+  ResourceAdapter,
+  ResourceApplyInput,
+  ResourceScanStatus,
+} from "./resource";
 import { assertValidProfileId } from "./profilePaths";
+import { DEFAULT_MAX_PAYLOAD_MIB } from "../constants";
+import {
+  GENERAL_MAX_RESOURCE_BYTES,
+  GENERAL_MAX_RETAINED_BYTES_PER_SCAN,
+  OversizedSqliteValueError,
+  generalOversizedObservation,
+  generalOversizedWarning,
+  generalResourceLimit,
+  inspectSqliteValue,
+  readSqliteValue,
+  sqliteDatabaseTimestamp,
+  type GeneralOversizedObservation,
+} from "./boundedScan";
 
 export interface PortableProfile {
   id: string;
@@ -18,20 +39,87 @@ export interface PortableProfile {
   useDefaultFlags?: Record<string, boolean>;
 }
 
+export interface ProfilesAdapterOptions {
+  onValueRead?: () => void;
+  forceVerificationResourceIds?: ReadonlySet<string>;
+}
+
 export class ProfilesAdapter implements ResourceAdapter {
   readonly id = "profiles";
   readonly kinds = ["profile"] as const;
   readonly appliesWhileRunning = false;
 
-  constructor(private readonly paths: CursorPaths) {}
+  private maxPayloadBytes = DEFAULT_MAX_PAYLOAD_MIB * 1024 * 1024;
+  private lastScanStatus: ResourceScanStatus = {
+    complete: true,
+    deferredResourceIds: [],
+  };
+  private oversized: GeneralOversizedObservation | null = null;
 
-  async scan(_known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
+  constructor(
+    private readonly paths: CursorPaths,
+    private readonly options: ProfilesAdapterOptions = {},
+  ) {}
+
+  setMaxPayloadBytes(maxPayloadBytes: number): void {
+    generalResourceLimit(maxPayloadBytes);
+    if (this.maxPayloadBytes !== maxPayloadBytes) {
+      this.maxPayloadBytes = maxPayloadBytes;
+      this.oversized = null;
+    }
+  }
+
+  scanStatus(): ResourceScanStatus {
+    return this.lastScanStatus;
+  }
+
+  oversizedSnapshotSettlements(
+    _maxPayloadBytes: number,
+  ): readonly OversizedSnapshotSettlement[] {
+    return this.oversized === null ? [] : [this.oversized];
+  }
+
+  async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
+    const resourceId = "profile/manifest";
+    const databaseTimestamp = await sqliteDatabaseTimestamp(
+      this.paths.globalDatabase,
+    );
+    if (
+      databaseTimestamp !== null &&
+      !this.options.forceVerificationResourceIds?.has(resourceId) &&
+      known[resourceId]?.sourceTimestamp === databaseTimestamp
+    ) {
+      this.lastScanStatus = { complete: true, deferredResourceIds: [] };
+      return { snapshots: [], deletions: [], warnings: [] };
+    }
     let profiles: PortableProfile[];
+    const limit = Math.min(
+      generalResourceLimit(this.maxPayloadBytes),
+      GENERAL_MAX_RETAINED_BYTES_PER_SCAN,
+    );
     try {
-      profiles = this.readPortableProfiles();
+      profiles = this.readPortableProfiles(limit);
     } catch (error) {
+      if (error instanceof OversizedSqliteValueError) {
+        this.oversized = generalOversizedObservation(
+          resourceId,
+          `${databaseTimestamp ?? "missing"}:${error.byteLength}`,
+          error.byteLength,
+          this.maxPayloadBytes,
+        );
+        this.lastScanStatus = { complete: true, deferredResourceIds: [] };
+        return {
+          snapshots: [],
+          deletions: [],
+          warnings: [generalOversizedWarning("Profile manifest", this.oversized)],
+        };
+      }
       // Publishing an empty manifest here would delete every profile on the
       // other PCs, so an unreadable manifest publishes nothing at all.
+      this.lastScanStatus = {
+        complete: false,
+        deferredResourceIds: [resourceId],
+      };
       return {
         snapshots: [],
         deletions: [],
@@ -43,14 +131,36 @@ export class ProfilesAdapter implements ResourceAdapter {
       };
     }
     const value = profiles as unknown as JsonValue;
+    const content = serializeCanonical(value);
+    if (content.byteLength > limit) {
+      this.oversized = generalOversizedObservation(
+        resourceId,
+        `${databaseTimestamp ?? "missing"}:${content.byteLength}`,
+        content.byteLength,
+        this.maxPayloadBytes,
+      );
+      this.lastScanStatus = { complete: true, deferredResourceIds: [] };
+      return {
+        snapshots: [],
+        deletions: [],
+        warnings: [generalOversizedWarning("Profile manifest", this.oversized)],
+      };
+    }
+    this.oversized = null;
+    this.lastScanStatus = { complete: true, deferredResourceIds: [] };
     return {
       snapshots: [
         {
-          resourceId: "profile/manifest",
+          resourceId,
           kind: "profile",
-          content: serializeCanonical(value),
+          content,
           semanticHash: semanticHash(value),
-          metadata: { count: profiles.length },
+          metadata: {
+            count: profiles.length,
+            ...(databaseTimestamp === null
+              ? {}
+              : { lastUpdatedAt: databaseTimestamp }),
+          },
         },
       ],
       deletions: [],
@@ -62,19 +172,36 @@ export class ProfilesAdapter implements ResourceAdapter {
     throw new Error("Profile manifests must be applied by the offline helper.");
   }
 
-  private readPortableProfiles(): PortableProfile[] {
-    return readPortableProfiles(this.paths.globalDatabase);
+  private readPortableProfiles(maxBytes: number): PortableProfile[] {
+    return readPortableProfiles(
+      this.paths.globalDatabase,
+      maxBytes,
+      this.options.onValueRead,
+    );
   }
 }
 
-export function readPortableProfiles(databasePath: string): PortableProfile[] {
+export function readPortableProfiles(
+  databasePath: string,
+  maxBytes = GENERAL_MAX_RESOURCE_BYTES,
+  onValueRead?: () => void,
+): PortableProfile[] {
   const database = openDatabase(databasePath, { readOnly: true });
   try {
     database.exec("PRAGMA query_only=ON");
-    const row = database
-      .prepare("SELECT value FROM ItemTable WHERE key = ?")
-      .get("userDataProfiles") as { value?: SqliteStorageValue } | undefined;
-    const raw = row?.value;
+    const metadata = inspectSqliteValue(database, "userDataProfiles");
+    if (
+      metadata.byteLength !== null &&
+      metadata.byteLength > maxBytes
+    ) {
+      throw new OversizedSqliteValueError(
+        "userDataProfiles",
+        metadata.byteLength,
+        maxBytes,
+      );
+    }
+    onValueRead?.();
+    const raw = readSqliteValue(database, "userDataProfiles");
     // A NULL manifest means "no profiles", exactly like an absent row. This
     // path never writes, so the NULL is left untouched on disk.
     if (raw === undefined || raw === null) {
@@ -84,8 +211,9 @@ export function readPortableProfiles(databasePath: string): PortableProfile[] {
     if (text.trim().length === 0) {
       return [];
     }
+    assertBoundedJsoncStructure(text, "userDataProfiles");
     const parsed = JSON.parse(text) as unknown;
-    if (!Array.isArray(parsed)) {
+    if (!Array.isArray(parsed) || parsed.length > 100) {
       throw new Error("userDataProfiles is not an array.");
     }
     return parsed
@@ -97,7 +225,9 @@ export function readPortableProfiles(databasePath: string): PortableProfile[] {
 }
 
 export function parsePortableProfiles(content: Buffer): PortableProfile[] {
-  const value = JSON.parse(content.toString("utf8")) as unknown;
+  const source = content.toString("utf8");
+  assertBoundedJsoncStructure(source, "Portable profile manifest");
+  const value = JSON.parse(source) as unknown;
   if (!Array.isArray(value) || value.length > 100) {
     throw new Error("Portable profile manifest is invalid.");
   }

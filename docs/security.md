@@ -31,12 +31,14 @@ File resources are handled differently: explicitly synchronized settings and MCP
 - Cursor user files are limited to explicit MCP, CLI configuration, commands, skills, and rules locations.
 - Transcripts are limited to supported files under `agent-transcripts`.
 - Chat stores are limited to `store.db` under `chats` or `acp-sessions`.
+- Composer snapshots contain only their typed header, `composerData`, every same-composer `bubbleId:` row (including inert historical rows retained to prevent data loss), and exact-key content-addressed `agentKv:blob:` graph rows referenced by the current or merged chat payload. Every blob key must equal the SHA-256 digest of its bytes before capture, merge, or apply; unrelated global blobs are never prefix-scanned into a payload.
 - Workspace storage payloads are limited to portable logical rows read from `state.vscdb`, `notepads.json`, and regular files below `images/` inside a validated workspace ID.
 - `workspace.json` is parsed read-only for workspace identity and URI metadata and is never written by synchronization.
 - Workspace-storage WAL/SHM/journal files, backups, browser-session data, retrieval data, debugger data, and unknown extension directories are rejected by the allowlist.
 - Mapped workspace IDs are canonicalized to one resource identity, and workspace-storage deletions never remove local files on another PC.
 - Resource IDs, kinds, profile IDs, metadata paths, and payload-internal paths must agree.
 - Event, object, compressed, plaintext, and apply-batch sizes are bounded.
+- Continuation traversal is also bounded by graph nodes, retained bytes, protobuf depth, and the number of new graphs captured per scan. SQLite value length is checked before an oversized blob is materialized.
 
 ## Cross-version safety
 

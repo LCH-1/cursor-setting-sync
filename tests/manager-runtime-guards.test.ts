@@ -14,11 +14,19 @@ const gitRuntime = vi.hoisted(() => ({
 
 vi.mock("vscode", () => ({
   extensions: { all: [] },
+  ProgressLocation: { Notification: 1 },
   workspace: {
     registerTextDocumentContentProvider: () => ({ dispose: () => undefined }),
+    openTextDocument: async (input: unknown) => input,
   },
   window: {
+    withProgress: async (
+      _options: unknown,
+      task: (progress: { report(value: unknown): void }) => Promise<unknown>,
+    ) => task({ report: () => undefined }),
     showWarningMessage: async () => undefined,
+    showInformationMessage: async () => undefined,
+    showTextDocument: async () => undefined,
   },
 }));
 
@@ -40,8 +48,14 @@ import {
   SyncManager,
   backgroundGitPullDue,
   markSuppressedSnapshotProjection,
+  pendingHelperBatch,
+  projectionOverlayForBoundedScan,
   withRequiredFileLock,
 } from "../src/sync/manager";
+import {
+  MAX_HELPER_APPLY_WORK_BYTES,
+  MAX_RUNNING_APPLY_PAYLOAD_BYTES,
+} from "../src/constants";
 import { StateVscdbChatAdapter } from "../src/chat/stateVscdb";
 import type { ExtensionConfiguration } from "../src/config";
 import { GitError } from "../src/platform/git";
@@ -49,6 +63,7 @@ import { acquireFileLock } from "../src/platform/lock";
 import type { FileLock } from "../src/platform/lock";
 import type { CursorPaths } from "../src/platform/paths";
 import { sha256 } from "../src/protocol/canonical";
+import { LocalStateStore } from "../src/protocol/localState";
 import { EventReconciler } from "../src/protocol/reconciler";
 import { SyncRepository } from "../src/protocol/repository";
 import type { ResourceAdapter } from "../src/resources/resource";
@@ -86,6 +101,355 @@ afterEach(async () => {
       }),
     ),
   );
+});
+
+describe("pending helper request work envelope", () => {
+  it("keeps one individually oversized change visible while paging a small sibling", () => {
+    const oversized = helperTip(
+      "settings/default/oversized",
+      "a".repeat(64),
+      MAX_HELPER_APPLY_WORK_BYTES + 1,
+    );
+    const small = helperTip(
+      "settings/default/small",
+      "b".repeat(64),
+      1024,
+    );
+    const repository = {
+      state: {
+        pendingDatabaseChanges: [oversized.pending, small.pending],
+        tips: {
+          [oversized.pending.resourceId]: [oversized.tip],
+          [small.pending.resourceId]: [small.tip],
+        },
+      },
+    } as unknown as SyncRepository;
+
+    const batch = pendingHelperBatch(repository);
+
+    expect(batch.changes.map((change) => change.resourceId)).toEqual([
+      oversized.pending.resourceId,
+      small.pending.resourceId,
+    ]);
+    expect(batch.deferredForBatchLimit).toBe(0);
+  });
+
+  it("defers aggregate overflow and caps one request at 256 metadata items", () => {
+    const entries = Array.from({ length: 300 }, (_, index) =>
+      helperTip(
+        `settings/default/key-${index}`,
+        index.toString(16).padStart(64, "0"),
+        256 * 1024,
+      ),
+    );
+    const repository = {
+      state: {
+        pendingDatabaseChanges: entries.map((entry) => entry.pending),
+        tips: Object.fromEntries(
+          entries.map((entry) => [entry.pending.resourceId, [entry.tip]]),
+        ),
+      },
+    } as unknown as SyncRepository;
+
+    const batch = pendingHelperBatch(repository);
+
+    expect(batch.changes.length).toBeLessThanOrEqual(256);
+    expect(
+      batch.changes.reduce(
+        (sum, change) => sum + (change.payload?.plainBytes ?? 0),
+        0,
+      ),
+    ).toBeLessThanOrEqual(MAX_HELPER_APPLY_WORK_BYTES);
+    expect(batch.deferredForBatchLimit).toBeGreaterThan(0);
+  });
+});
+
+describe("running ordinary apply drift guard", () => {
+  it("preflights oversized live payloads, keeps their block stable, and applies a small sibling", async () => {
+    const apply = vi.fn(async () => undefined);
+    const adapter: ResourceAdapter = {
+      id: "bounded-live-settings",
+      kinds: ["settings"],
+      appliesWhileRunning: true,
+      scanStatus: () => ({ complete: true, deferredResourceIds: [] }),
+      scan: async () => ({ snapshots: [], deletions: [], warnings: [] }),
+      apply,
+    };
+    const fixture = await createSyncHarness(adapter);
+    fixture.repository.setMaxPayloadBytes(64 * 1024 * 1024);
+    const oversized = namedSettingsSnapshot(
+      "settings/default/oversized-live",
+      "oversized",
+    );
+    const small = namedSettingsSnapshot(
+      "settings/default/small-live",
+      "small",
+    );
+    await fixture.repository.publish([oversized, small], []);
+    await reconcileAndPersist(fixture.repository);
+    const oversizedTip = fixture.repository.state.tips[
+      oversized.resourceId
+    ]![0]!;
+    const smallTip = fixture.repository.state.tips[small.resourceId]![0]!;
+    if (oversizedTip.payload === undefined) {
+      throw new Error("expected oversized live payload metadata");
+    }
+    oversizedTip.payload.plainBytes =
+      MAX_RUNNING_APPLY_PAYLOAD_BYTES + 1;
+    for (const snapshot of [oversized, small]) {
+      fixture.repository.state.projections[snapshot.resourceId] = {
+        resourceId: snapshot.resourceId,
+        kind: "settings",
+        semanticHash: sha256(Buffer.from(`known-${snapshot.resourceId}`)),
+        versionId: null,
+      };
+    }
+    const projections = [oversizedTip, smallTip].map((tip) => ({
+      resourceId:
+        tip === oversizedTip ? oversized.resourceId : small.resourceId,
+      tip: { ...tip, deviceId: "remote-device" },
+      changed: true,
+    }));
+    type LiveProjection = (typeof projections)[number];
+    const internals = fixture.manager as unknown as {
+      configuration: { autoApplyFiles: boolean };
+      applyProjections(
+        repository: SyncRepository,
+        projections: LiveProjection[],
+        localSnapshots: Map<string, ReturnType<typeof namedSettingsSnapshot>>,
+        manual: boolean,
+      ): Promise<boolean>;
+      applyPendingRunningResources(repository: SyncRepository): Promise<void>;
+    };
+    internals.configuration.autoApplyFiles = true;
+    const readObject = vi.spyOn(fixture.repository, "readObject");
+
+    await expect(
+      internals.applyProjections(
+        fixture.repository,
+        projections,
+        new Map(),
+        false,
+      ),
+    ).resolves.toBe(true);
+
+    expect(readObject).toHaveBeenCalledOnce();
+    expect(readObject).toHaveBeenCalledWith(smallTip.payload);
+    expect(apply).toHaveBeenCalledOnce();
+    const pending = fixture.repository.state.pendingDatabaseChanges;
+    expect(pending).toHaveLength(1);
+    const firstReason = pending[0]?.blockedReason;
+    expect(firstReason).toContain("live-apply memory limit");
+    expect(firstReason).toContain("32.0 MiB live-apply memory limit");
+    expect(firstReason).toContain("Reduce or replace the source payload");
+    expect(firstReason).toContain("was not read");
+
+    readObject.mockClear();
+    await internals.applyPendingRunningResources(fixture.repository);
+    await internals.applyPendingRunningResources(fixture.repository);
+
+    expect(readObject).not.toHaveBeenCalled();
+    expect(apply).toHaveBeenCalledOnce();
+    expect(
+      fixture.repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBe(firstReason);
+    await fixture.manager.shutdown();
+  });
+
+  it("queues an incoming setting when its bounded local scan is incomplete", async () => {
+    let complete = false;
+    const apply = vi.fn(async () => undefined);
+    const adapter: ResourceAdapter = {
+      id: "bounded-settings",
+      kinds: ["settings"],
+      appliesWhileRunning: true,
+      scanStatus: () => ({
+        complete,
+        deferredResourceIds: ["settings-profile/default"],
+      }),
+      scan: async () => ({ snapshots: [], deletions: [], warnings: [] }),
+      apply,
+    };
+    const fixture = await createSyncHarness(adapter);
+    const remote = settingsSnapshot("remote");
+    const published = await fixture.repository.publish([remote], []);
+    await reconcileAndPersist(fixture.repository);
+    const storedTip = fixture.repository.state.tips[remote.resourceId]![0]!;
+    const knownHash = sha256(Buffer.from("known", "utf8"));
+    fixture.repository.state.projections[remote.resourceId] = {
+      resourceId: remote.resourceId,
+      kind: "settings",
+      semanticHash: knownHash,
+      versionId: null,
+    };
+    const projection = {
+      resourceId: remote.resourceId,
+      tip: { ...storedTip, deviceId: "remote-device" },
+      changed: true,
+    };
+    const internals = fixture.manager as unknown as {
+      applyProjections(
+        repository: SyncRepository,
+        projections: Array<typeof projection>,
+        localSnapshots: Map<string, ReturnType<typeof settingsSnapshot>>,
+        manual: boolean,
+        deferredAdapterIds?: ReadonlySet<string>,
+      ): Promise<boolean>;
+    };
+
+    await expect(
+      internals.applyProjections(
+        fixture.repository,
+        [projection],
+        new Map(),
+        true,
+      ),
+    ).resolves.toBe(true);
+
+    expect(published.eventHash).toBe(storedTip.eventHash);
+    expect(apply).not.toHaveBeenCalled();
+    expect(fixture.repository.state.pendingDatabaseChanges).toHaveLength(1);
+    await expect(
+      internals.applyProjections(
+        fixture.repository,
+        [projection],
+        new Map(),
+        true,
+      ),
+    ).resolves.toBe(false);
+    complete = true;
+    await expect(
+      internals.applyProjections(
+        fixture.repository,
+        [projection],
+        new Map(),
+        true,
+        new Set([adapter.id]),
+      ),
+    ).resolves.toBe(false);
+    expect(apply).not.toHaveBeenCalled();
+    await expect(
+      internals.applyProjections(
+        fixture.repository,
+        [projection],
+        new Map(),
+        true,
+      ),
+    ).resolves.toBe(true);
+    expect(apply).toHaveBeenCalledOnce();
+    expect(fixture.repository.state.pendingDatabaseChanges).toEqual([]);
+    await fixture.manager.shutdown();
+  });
+
+  it("queues an ordinary successor over an unpublished local edit", async () => {
+    const local = settingsSnapshot("local edit");
+    const apply = vi.fn(async () => undefined);
+    const adapter: ResourceAdapter = {
+      id: "edited-settings",
+      kinds: ["settings"],
+      appliesWhileRunning: true,
+      scanStatus: () => ({ complete: true, deferredResourceIds: [] }),
+      scan: async () => ({ snapshots: [local], deletions: [], warnings: [] }),
+      apply,
+    };
+    const fixture = await createSyncHarness(adapter);
+    const remote = settingsSnapshot("remote");
+    await fixture.repository.publish([remote], []);
+    await reconcileAndPersist(fixture.repository);
+    const storedTip = fixture.repository.state.tips[remote.resourceId]![0]!;
+    fixture.repository.state.projections[remote.resourceId] = {
+      resourceId: remote.resourceId,
+      kind: "settings",
+      semanticHash: sha256(Buffer.from("known", "utf8")),
+      versionId: null,
+    };
+    const projection = {
+      resourceId: remote.resourceId,
+      tip: { ...storedTip, deviceId: "remote-device" },
+      changed: true,
+    };
+    const internals = fixture.manager as unknown as {
+      applyProjections(
+        repository: SyncRepository,
+        projections: Array<typeof projection>,
+        localSnapshots: Map<string, ReturnType<typeof settingsSnapshot>>,
+        manual: boolean,
+      ): Promise<void>;
+    };
+
+    await internals.applyProjections(
+      fixture.repository,
+      [projection],
+      new Map(),
+      true,
+    );
+
+    expect(apply).not.toHaveBeenCalled();
+    expect(fixture.repository.state.pendingDatabaseChanges).toHaveLength(1);
+    await fixture.manager.shutdown();
+  });
+});
+
+describe("resource adapter lifecycle", () => {
+  it("waits for an active scan before disposing a replaced generation and disposes shutdown generation once", async () => {
+    let announceScan!: () => void;
+    const scanStarted = new Promise<void>((resolve) => {
+      announceScan = resolve;
+    });
+    let releaseScan!: () => void;
+    const scanHeld = new Promise<void>((resolve) => {
+      releaseScan = resolve;
+    });
+    const oldDispose = vi.fn(async () => undefined);
+    const replacementDispose = vi.fn(async () => undefined);
+    const oldAdapter: ResourceAdapter = {
+      id: "held-settings",
+      kinds: ["settings"],
+      appliesWhileRunning: true,
+      scan: vi.fn(async () => {
+        announceScan();
+        await scanHeld;
+        return { snapshots: [], deletions: [], warnings: [] };
+      }),
+      apply: async () => undefined,
+      dispose: oldDispose,
+    };
+    const replacement: ResourceAdapter = {
+      id: "replacement-settings",
+      kinds: ["settings"],
+      appliesWhileRunning: true,
+      scan: async () => ({ snapshots: [], deletions: [], warnings: [] }),
+      apply: async () => undefined,
+      dispose: replacementDispose,
+    };
+    const fixture = await createSyncHarness(oldAdapter);
+    const internals = fixture.manager as unknown as {
+      createAdapters(): ResourceAdapter[];
+      refreshAdapters(): Promise<void>;
+    };
+    internals.createAdapters = vi.fn(() => [replacement]);
+
+    try {
+      const cycle = fixture.manager.syncNow(true);
+      await scanStarted;
+      const refresh = internals.refreshAdapters();
+      await Promise.resolve();
+
+      expect(oldDispose).not.toHaveBeenCalled();
+      releaseScan();
+      await Promise.all([cycle, refresh]);
+      expect(oldDispose).toHaveBeenCalledTimes(1);
+      expect(replacementDispose).not.toHaveBeenCalled();
+
+      await fixture.manager.shutdown();
+      await fixture.manager.shutdown();
+      expect(oldDispose).toHaveBeenCalledTimes(1);
+      expect(replacementDispose).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseScan();
+      await fixture.manager.shutdown();
+    }
+  });
 });
 
 describe("repository open locking", () => {
@@ -160,7 +524,7 @@ describe("repository open locking", () => {
 });
 
 describe("multi-window deferred repository activation", () => {
-  it("keeps a standby window lightweight and preserves its local queued status", async () => {
+  it("keeps a standby window from reading, parsing, or serializing local state", async () => {
     const fixture = await createDeferredManagerFixture(true);
     const roleLock = await acquireFileLock(
       join(fixture.extensionStorage, "background-role.lock"),
@@ -174,15 +538,27 @@ describe("multi-window deferred repository activation", () => {
       SyncRepository.prototype,
       "ensureInitialized",
     );
+    const openDeferred = vi.spyOn(
+      SyncRepository,
+      "openDeferredWithMasterKey",
+    );
+    const loadLocalState = vi.spyOn(LocalStateStore.prototype, "load");
+    const loadOrCreateLocalState = vi.spyOn(
+      LocalStateStore.prototype,
+      "loadOrCreate",
+    );
+    const saveLocalState = vi.spyOn(LocalStateStore.prototype, "save");
 
     try {
       await fixture.manager.initialize();
 
-      const opened = fixture.openedRepository();
-      expect(opened).not.toBeNull();
-      expect(opened?.isInitialized).toBe(false);
+      expect(fixture.openedRepository()).toBeNull();
+      expect(openDeferred).not.toHaveBeenCalled();
+      expect(loadLocalState).not.toHaveBeenCalled();
+      expect(loadOrCreateLocalState).not.toHaveBeenCalled();
+      expect(saveLocalState).not.toHaveBeenCalled();
       expect(ensureInitialized).not.toHaveBeenCalled();
-      expect(fixture.lastStatus()).toBe("pending-restart");
+      expect(fixture.lastStatus()).toBe("up-to-date");
     } finally {
       await syncLock?.release();
       await roleLock?.release();
@@ -200,15 +576,107 @@ describe("multi-window deferred repository activation", () => {
       SyncRepository.prototype,
       "ensureInitialized",
     );
+    const openDeferred = vi.spyOn(
+      SyncRepository,
+      "openDeferredWithMasterKey",
+    );
+    const loadLocalState = vi.spyOn(LocalStateStore.prototype, "load");
+    const loadOrCreateLocalState = vi.spyOn(
+      LocalStateStore.prototype,
+      "loadOrCreate",
+    );
 
     try {
       await fixture.manager.initialize();
+      expect(openDeferred).not.toHaveBeenCalled();
+      expect(loadLocalState).not.toHaveBeenCalled();
+      expect(loadOrCreateLocalState).not.toHaveBeenCalled();
       expect(ensureInitialized).not.toHaveBeenCalled();
 
       await fixture.manager.syncNow(true);
 
+      expect(openDeferred).toHaveBeenCalledOnce();
+      expect(loadLocalState).not.toHaveBeenCalled();
+      expect(loadOrCreateLocalState).toHaveBeenCalledOnce();
       expect(ensureInitialized).toHaveBeenCalledOnce();
       expect(fixture.openedRepository()?.isInitialized).toBe(true);
+    } finally {
+      await roleLock?.release();
+      await fixture.manager.shutdown();
+    }
+  });
+
+  it("hydrates a standby repository before collecting conflict selections", async () => {
+    const fixture = await createDeferredManagerFixture();
+    const roleLock = await acquireFileLock(
+      join(fixture.extensionStorage, "background-role.lock"),
+    );
+    expect(roleLock).not.toBeNull();
+    const openDeferred = vi.spyOn(
+      SyncRepository,
+      "openDeferredWithMasterKey",
+    );
+    const ensureInitialized = vi.spyOn(
+      SyncRepository.prototype,
+      "ensureInitialized",
+    );
+    const collectSelections = vi.fn(async (repository: SyncRepository) => {
+      expect(repository.isInitialized).toBe(true);
+      return { selections: [], deferred: ["test conflict remains deferred"] };
+    });
+    const internals = fixture.manager as unknown as {
+      conflicts: ConflictController;
+    };
+    internals.conflicts = {
+      collectSelections,
+    } as unknown as ConflictController;
+
+    try {
+      await fixture.manager.initialize();
+      expect(fixture.openedRepository()).toBeNull();
+
+      await fixture.manager.prepareForRepositoryCommand();
+      expect(fixture.openedRepository()?.isInitialized).toBe(false);
+      await fixture.manager.resolveConflicts();
+
+      expect(openDeferred).toHaveBeenCalledOnce();
+      expect(ensureInitialized).toHaveBeenCalledOnce();
+      expect(collectSelections).toHaveBeenCalledOnce();
+    } finally {
+      await roleLock?.release();
+      await fixture.manager.shutdown();
+    }
+  });
+
+  it("hydrates a standby repository before rendering diagnostics", async () => {
+    const fixture = await createDeferredManagerFixture(true);
+    const roleLock = await acquireFileLock(
+      join(fixture.extensionStorage, "background-role.lock"),
+    );
+    expect(roleLock).not.toBeNull();
+    const openDeferred = vi.spyOn(
+      SyncRepository,
+      "openDeferredWithMasterKey",
+    );
+    const ensureInitialized = vi.spyOn(
+      SyncRepository.prototype,
+      "ensureInitialized",
+    );
+
+    try {
+      await fixture.manager.initialize();
+      expect(fixture.openedRepository()).toBeNull();
+
+      await fixture.manager.prepareForRepositoryCommand();
+      expect(fixture.openedRepository()?.isInitialized).toBe(false);
+      await fixture.manager.showDiagnostics();
+
+      expect(openDeferred).toHaveBeenCalledOnce();
+      expect(ensureInitialized).toHaveBeenCalledOnce();
+      expect(fixture.openedRepository()?.isInitialized).toBe(true);
+      expect(
+        fixture.openedRepository()?.state.pendingDatabaseChanges,
+      ).toHaveLength(1);
     } finally {
       await roleLock?.release();
       await fixture.manager.shutdown();
@@ -234,9 +702,10 @@ describe("multi-window deferred repository activation", () => {
 
     try {
       // This window owns the background role, but the first cycle cannot take
-      // sync.lock. The launch offer must stay armed against uninitialized state.
+      // sync.lock. The launch offer must stay armed against placeholder state.
       await fixture.manager.initialize();
       expect(fixture.openedRepository()?.isInitialized).toBe(false);
+      expect(fixture.lastStatus()).toBe("syncing");
       await syncLock?.release();
       syncLock = null;
       internals.offerQueuedApply = offerQueuedApply;
@@ -265,15 +734,27 @@ describe("multi-window deferred repository activation", () => {
       SyncRepository.prototype,
       "ensureInitialized",
     );
+    const openDeferred = vi.spyOn(
+      SyncRepository,
+      "openDeferredWithMasterKey",
+    );
+    const loadOrCreateLocalState = vi.spyOn(
+      LocalStateStore.prototype,
+      "loadOrCreate",
+    );
 
     try {
       await fixture.manager.initialize();
+      expect(openDeferred).not.toHaveBeenCalled();
+      expect(loadOrCreateLocalState).not.toHaveBeenCalled();
       expect(ensureInitialized).not.toHaveBeenCalled();
       await roleLock?.release();
       roleLock = null;
 
       await fixture.manager.configurationChanged();
 
+      expect(openDeferred).toHaveBeenCalledOnce();
+      expect(loadOrCreateLocalState).toHaveBeenCalledOnce();
       expect(ensureInitialized).toHaveBeenCalledOnce();
       expect(fixture.openedRepository()?.isInitialized).toBe(true);
     } finally {
@@ -420,6 +901,57 @@ describe("background Git pull throttling", () => {
 });
 
 describe("background Git commit gating", () => {
+  it("reuses reconciliation and skips state persistence on a second idle poll", async () => {
+    const fixture = await createSyncHarness(settingsAdapter("14"));
+    const local = settingsSnapshot("14");
+    await fixture.repository.publish([local], []);
+    await reconcileAndPersist(fixture.repository);
+    const tip = fixture.repository.state.tips[local.resourceId]![0]!;
+    fixture.repository.state.projections[local.resourceId] = {
+      resourceId: local.resourceId,
+      kind: local.kind,
+      semanticHash: local.semanticHash,
+      versionId: tip.versionId,
+      ...(tip.payload === undefined
+        ? {}
+        : { payloadObjectId: tip.payload.objectId }),
+    };
+    const lastSyncAt = "2026-07-25T01:02:03.000Z";
+    fixture.repository.state.lastSyncAt = lastSyncAt;
+    await fixture.repository.saveState();
+    await fixture.repository.writeAck();
+    setRecentGitProbe(fixture, T0);
+    const reconcile = vi.spyOn(EventReconciler.prototype, "reconcile");
+    const saveState = vi.spyOn(fixture.repository, "saveState");
+
+    await fixture.performSync(false, "all");
+    await fixture.performSync(false, "all");
+
+    expect(reconcile).toHaveBeenCalledTimes(1);
+    expect(saveState).toHaveBeenCalledTimes(1);
+    expect(fixture.repository.state.lastSyncAt).toBe(lastSyncAt);
+    await fixture.manager.shutdown();
+  });
+
+  it("keeps the post-publish reconciliation cache hot on the next poll", async () => {
+    const fixture = await createSyncHarness(settingsAdapter("14"));
+    await fixture.repository.writeAck();
+    setRecentGitProbe(fixture, T0);
+    const reconcile = vi.spyOn(EventReconciler.prototype, "reconcile");
+    const saveState = vi.spyOn(fixture.repository, "saveState");
+
+    await fixture.performSync(false, "all");
+    expect(await fixture.repository.countEvents()).toBe(1);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(saveState).toHaveBeenCalledTimes(1);
+
+    await fixture.performSync(false, "all");
+
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    expect(saveState).toHaveBeenCalledTimes(1);
+    await fixture.manager.shutdown();
+  });
+
   it("does not run git add/push for a throttled no-op poll", async () => {
     const fixture = await createSyncHarness();
     const now = vi.spyOn(Date, "now").mockReturnValue(T0);
@@ -765,6 +1297,165 @@ describe("suppressed local snapshot metadata", () => {
   });
 });
 
+describe("queued chat final core verification", () => {
+  it("copies only touched projections from a large known-state map", () => {
+    const projections: Record<string, LocalProjection> = {};
+    for (let index = 0; index < 100_000; index += 1) {
+      const resourceId = `chat/${index.toString().padStart(12, "0")}`;
+      projections[resourceId] = {
+        resourceId,
+        kind: "chat",
+        semanticHash: "a".repeat(64),
+        versionId: null,
+      };
+    }
+    const target = "chat/000000099999";
+    const sourceReads: string[] = [];
+    const guarded = new Proxy(projections, {
+      get(source, property, receiver) {
+        if (typeof property === "string") {
+          sourceReads.push(property);
+        }
+        return Reflect.get(source, property, receiver) as unknown;
+      },
+      ownKeys() {
+        throw new Error("bounded projection view enumerated the full state");
+      },
+    });
+
+    const overlay = projectionOverlayForBoundedScan(guarded);
+    const learned = overlay[target];
+    expect(learned?.resourceId).toBe(target);
+    learned!.sourceBubbleCount = 7;
+
+    expect(projections[target]?.sourceBubbleCount).toBeUndefined();
+    expect(sourceReads).toEqual([target]);
+    expect(Object.keys(overlay)).toEqual([target]);
+  });
+
+  it("captures and blocks a same-count same-timestamp local edit before offline apply", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-manager-chat-final-verify-"),
+    );
+    temporaryRoots.push(temporaryRoot);
+    const globalDatabase = join(temporaryRoot, "state.vscdb");
+    const database = new DatabaseSync(globalDatabase);
+    database.exec(
+      "CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
+    );
+    database.exec(
+      `CREATE TABLE composerHeaders (
+        composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER,
+        lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER,
+        recency INTEGER, checkpointAt INTEGER, value TEXT
+      )`,
+    );
+    const composerId = "00000000-0000-4000-8000-0000000000fa";
+    database
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'workspace-a', 1, ?, 0, 0, 0, 0, '{}')`,
+      )
+      .run(composerId, T0);
+    database
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`composerData:${composerId}`, "{}");
+    database
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(`bubbleId:${composerId}:b0`, '{"text":"base"}');
+    database.close();
+    const paths = {
+      appRoot: temporaryRoot,
+      globalDatabase,
+      workspaceStorageRoot: join(temporaryRoot, "workspaceStorage"),
+      profilesRoot: join(temporaryRoot, "profiles"),
+      cursorHome: join(temporaryRoot, ".cursor"),
+      cursorExtensionsManifest: join(
+        temporaryRoot,
+        ".cursor",
+        "extensions",
+        "extensions.json",
+      ),
+      extensionStorage: join(temporaryRoot, "storage"),
+      helperScript: join(temporaryRoot, "helper.js"),
+    } as CursorPaths;
+    const baseline = (await new StateVscdbChatAdapter(paths).scan({}))
+      .snapshots[0]!;
+    const repository = await SyncRepository.create(
+      join(temporaryRoot, "repository"),
+      paths.extensionStorage,
+      "a sufficiently long test passphrase",
+      4 * 1024 * 1024,
+      {
+        extensionVersion: "0.0.63",
+        cursorVersion: "3.15.6",
+        vscodeVersion: "1.125.0",
+      },
+    );
+    const baseEvent = await repository.publish([baseline], []);
+    await reconcileAndPersist(repository);
+    const baseTip = repository.state.tips[baseline.resourceId]![0]!;
+    const remoteContent = Buffer.from("remote queued chat", "utf8");
+    await repository.publish(
+      [
+        {
+          ...baseline,
+          content: remoteContent,
+          semanticHash: sha256(remoteContent),
+          parents: [`${baseEvent.eventHash}#0`],
+        },
+      ],
+      [],
+    );
+    await reconcileAndPersist(repository);
+    const remoteTip = repository.state.tips[baseline.resourceId]![0]!;
+    repository.state.projections[baseline.resourceId] = {
+      resourceId: baseline.resourceId,
+      kind: "chat",
+      semanticHash: baseline.semanticHash,
+      versionId: baseTip.versionId,
+      ...(baseTip.payload === undefined
+        ? {}
+        : { payloadObjectId: baseTip.payload.objectId }),
+      sourceTimestamp: T0,
+      sourceBubbleCount: 1,
+      sourceChatCoreHash: baseline.metadata?.chatCoreHash as string,
+    };
+    repository.state.pendingDatabaseChanges.push({
+      resourceId: baseline.resourceId,
+      kind: "chat",
+      eventHash: remoteTip.eventHash,
+      changeIndex: remoteTip.changeIndex,
+    });
+    const edit = new DatabaseSync(globalDatabase);
+    edit
+      .prepare("UPDATE cursorDiskKV SET value = ? WHERE key = ?")
+      .run('{"text":"last-millisecond local edit"}', `bubbleId:${composerId}:b0`);
+    edit.close();
+    const manager = createManager({
+      paths,
+      configuration: {
+        maxPayloadBytes: 4 * 1024 * 1024,
+      } as ExtensionConfiguration,
+    });
+    const internals = manager as unknown as {
+      protectQueuedChatsBeforeOfflineApply(
+        repository: SyncRepository,
+      ): Promise<void>;
+    };
+
+    await internals.protectQueuedChatsBeforeOfflineApply(repository);
+
+    expect(await repository.countEvents()).toBe(3);
+    expect(
+      repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toContain("local edit");
+    manager.dispose();
+  });
+});
+
 describe("automatic checkpoint maintenance", () => {
   it("lets a young checkpoint age before folding newer changes", async () => {
     const temporaryRoot = await mkdtemp(
@@ -908,6 +1599,7 @@ async function createDeferredManagerFixture(
   const status = {
     log: vi.fn(),
     setStatus,
+    show: vi.fn(),
   } as unknown as StatusController;
   const configuration = {
     repositoryPath: repository.root,
@@ -936,13 +1628,13 @@ async function createDeferredManagerFixture(
   const internals = manager as unknown as {
     repository: SyncRepository | null;
     consumeHelperResults(): Promise<void>;
-    refreshAdapters(): void;
+    refreshAdapters(): Promise<void>;
     startFinalizer(): Promise<void>;
     startBackgroundRuntime(): void;
     offerQueuedApply(): Promise<void>;
   };
   internals.consumeHelperResults = vi.fn(async () => undefined);
-  internals.refreshAdapters = vi.fn();
+  internals.refreshAdapters = vi.fn(async () => undefined);
   internals.startFinalizer = vi.fn(async () => undefined);
   internals.startBackgroundRuntime = vi.fn();
   internals.offerQueuedApply = vi.fn(async () => undefined);
@@ -981,6 +1673,8 @@ async function createSyncHarness(
       gitSync: true,
       enabled: true,
       repositoryPath: repository.root,
+      repositoryId: repository.repository.repositoryId,
+      getMasterKey: vi.fn(async () => Buffer.from(repository.masterKey)),
       maxPayloadBytes: 4 * 1024 * 1024,
       autoApplyFiles: false,
       applyOnShutdown: false,
@@ -1066,12 +1760,58 @@ function conflictTip(
 }
 
 function settingsSnapshot(value: string) {
+  return namedSettingsSnapshot("settings/default/editor.fontSize", value);
+}
+
+function namedSettingsSnapshot(resourceId: string, value: string) {
   const content = Buffer.from(value, "utf8");
   return {
-    resourceId: "settings/default/editor.fontSize",
+    resourceId,
     kind: "settings" as const,
     content,
     semanticHash: sha256(content),
+  };
+}
+
+function helperTip(
+  resourceId: string,
+  eventHash: string,
+  plainBytes: number,
+): {
+  pending: {
+    eventHash: string;
+    changeIndex: number;
+    resourceId: string;
+    kind: "settings";
+  };
+  tip: ResourceTip;
+} {
+  const deviceId = "remote-device";
+  return {
+    pending: {
+      eventHash,
+      changeIndex: 0,
+      resourceId,
+      kind: "settings",
+    },
+    tip: {
+      versionId: `${eventHash}#0`,
+      eventHash,
+      changeIndex: 0,
+      kind: "settings",
+      lamport: 1,
+      deviceId,
+      operation: "put",
+      semanticHash: eventHash,
+      payload: {
+        deviceId,
+        objectId: eventHash,
+        compressedBytes: 1,
+        plainBytes,
+      },
+      parents: [],
+      metadata: { profileId: "default", key: resourceId.split("/").at(-1) ?? "" },
+    },
   };
 }
 

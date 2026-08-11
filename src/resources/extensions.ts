@@ -2,13 +2,11 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join, relative } from "node:path";
 import { stat } from "node:fs/promises";
-import type { SqliteStorageValue } from "../platform/sqlite";
 import { openDatabase, sqliteStorageText } from "../platform/sqlite";
 import { existsSync } from "node:fs";
 import type {
   JsonValue,
   LocalProjection,
-  ResourceDeletion,
   ResourceScanResult,
   ResourceSnapshot,
 } from "../types";
@@ -20,12 +18,33 @@ import {
   readFileWithinRoot,
 } from "../platform/files";
 import { sha256 } from "../protocol/canonical";
-import { semanticHash, serializeCanonical } from "./jsonc";
-import type { ResourceAdapter, ResourceApplyInput } from "./resource";
+import {
+  assertBoundedJsoncStructure,
+  serializeCanonical,
+} from "./jsonc";
+import type {
+  OversizedSnapshotSettlement,
+  ResourceAdapter,
+  ResourceApplyInput,
+  ResourceScanStatus,
+} from "./resource";
 import { readPortableProfiles } from "./profiles";
 import { EXTENSION_ID } from "../constants";
 import type { IgnoreMatcher } from "./ignorePatterns";
 import { createIgnoreMatcher } from "./ignorePatterns";
+import { DEFAULT_MAX_PAYLOAD_MIB } from "../constants";
+import {
+  GENERAL_MAX_RESOURCES_PER_SCAN,
+  GENERAL_MAX_RETAINED_BYTES_PER_SCAN,
+  OversizedSqliteValueError,
+  generalOversizedObservation,
+  generalOversizedWarning,
+  generalResourceLimit,
+  inspectSqliteValue,
+  readSqliteValue,
+  rememberGeneralOversizedObservation,
+  type GeneralOversizedObservation,
+} from "./boundedScan";
 
 /**
  * Extension identifiers compare case-insensitively, so both the configured
@@ -49,7 +68,7 @@ interface ExtensionDesiredState {
   pinned: boolean;
 }
 
-interface ExtensionMetadata {
+export interface ExtensionMetadata {
   preRelease: boolean;
   pinned: boolean;
 }
@@ -60,6 +79,34 @@ interface ProfileScanMemo {
   registryMtimeMs: number | null;
   installed: Array<{ id: string; version: string }>;
   disabled: Set<string>;
+  identifierBytes: number;
+}
+
+export const MAX_EXTENSION_MANIFEST_BYTES =
+  GENERAL_MAX_RETAINED_BYTES_PER_SCAN;
+export const MAX_EXTENSION_IDENTIFIERS = 16_384;
+const MAX_EXTENSION_IDENTIFIER_BYTES = 512;
+const MAX_EXTENSION_MEMO_IDENTIFIERS = 16_384;
+const MAX_EXTENSION_COLLECTION_IDENTIFIER_BYTES = 2 * 1024 * 1024;
+const MAX_EXTENSION_MEMO_IDENTIFIER_BYTES = 4 * 1024 * 1024;
+
+export interface ExtensionsAdapterOptions {
+  maxProfilesPerScan?: number;
+  maxResourcesPerScan?: number;
+  maxRetainedBytesPerScan?: number;
+  onManifestRead?: () => void;
+  onDisabledValueRead?: (profileId: string) => void;
+  scanIntervalMs?: number;
+  now?: () => number;
+  /** Narrow test seam; production uses Cursor's Electron-as-node CLI. */
+  listInstalledExtensions?: (
+    profileName: string | null,
+  ) => Promise<Array<{ id: string; version: string }>>;
+}
+
+interface ExtensionProfile {
+  id: string;
+  name: string;
 }
 
 export class ExtensionsAdapter implements ResourceAdapter {
@@ -73,38 +120,148 @@ export class ExtensionsAdapter implements ResourceAdapter {
   // without touching the main file), or the profile's own extension registry
   // changed since the previous scan.
   private readonly scanMemo = new Map<string, ProfileScanMemo>();
+  private scanMemoIdentifiers = 0;
+  private scanMemoIdentifierBytes = 0;
+  private extensionMetadataMemo: {
+    size: number;
+    mtimeMs: number;
+    value: Map<string, ExtensionMetadata>;
+    identifierBytes: number;
+  } | null = null;
+  private maxPayloadBytes = DEFAULT_MAX_PAYLOAD_MIB * 1024 * 1024;
+  private lastScanStatus: ResourceScanStatus = {
+    complete: true,
+    deferredResourceIds: [],
+  };
+  private readonly oversized = new Map<string, GeneralOversizedObservation>();
+  private oversizedOverflow = false;
+  /** Finite generation: one profile remains selected until its page is acked. */
+  private profileSweep: ExtensionProfile[] | null = null;
+  private profileSweepIndex = 0;
+  private profileSweepManifestUnreadable = false;
+  private readonly failedProfileIds = new Set<string>();
+  private nextSweepAt = 0;
+  private progressRevision = 0;
+  private lastEmittedPageFingerprint: string | null = null;
+  private profileSweepRetryOnly = false;
 
   constructor(
     private readonly paths: CursorPaths,
     private readonly ignoredExtensions: IgnoreMatcher,
+    private readonly options: ExtensionsAdapterOptions = {},
   ) {}
+
+  setMaxPayloadBytes(maxPayloadBytes: number): void {
+    generalResourceLimit(maxPayloadBytes);
+    if (this.maxPayloadBytes !== maxPayloadBytes) {
+      this.maxPayloadBytes = maxPayloadBytes;
+      this.oversized.clear();
+      this.oversizedOverflow = false;
+      this.profileSweep = null;
+      this.profileSweepIndex = 0;
+      this.nextSweepAt = 0;
+    }
+  }
+
+  scanStatus(): ResourceScanStatus {
+    return this.lastScanStatus;
+  }
+
+  oversizedSnapshotSettlements(
+    _maxPayloadBytes: number,
+  ): readonly OversizedSnapshotSettlement[] {
+    return [...this.oversized.values()];
+  }
 
   async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
     const snapshots: ResourceSnapshot[] = [];
     const warnings: string[] = [];
-    const current = new Set<string>();
-    const scannedProfiles = new Set<string>();
-    const metadata = await this.readExtensionMetadata();
+    const deferred = new Set<string>();
+    const now = (this.options.now ?? Date.now)();
+    if (this.profileSweep === null && now < this.nextSweepAt) {
+      this.lastScanStatus = {
+        complete: !this.oversizedOverflow,
+        deferredResourceIds: this.oversizedOverflow
+          ? ["extension-scope/untracked-oversized-resources"]
+          : [],
+        progressToken: this.progressRevision,
+      };
+      return { snapshots: [], deletions: [], warnings: [] };
+    }
+    if (this.profileSweep === null) {
+      // Rebuild exact oversized protections only under the incomplete full
+      // profile sweep that follows. This is also the recovery point for a
+      // prior bounded-registry overflow.
+      this.oversized.clear();
+      this.oversizedOverflow = false;
+    }
+    let metadata: Map<string, ExtensionMetadata>;
+    try {
+      metadata = await this.readExtensionMetadata();
+    } catch (error) {
+      this.lastScanStatus = {
+        complete: false,
+        deferredResourceIds: ["extension/manifest"],
+        progressToken: this.progressRevision,
+      };
+      return {
+        snapshots: [],
+        deletions: [],
+        warnings: [
+          `Unable to read extension metadata: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ],
+      };
+    }
     const manifestMtimeMs = await mtimeOrNull(this.paths.cursorExtensionsManifest);
+    const resourceLimit = generalResourceLimit(this.maxPayloadBytes);
+    const extensionStateLimit = Math.min(
+      resourceLimit,
+      MAX_EXTENSION_MANIFEST_BYTES,
+    );
+    const maxResources =
+      this.options.maxResourcesPerScan ?? GENERAL_MAX_RESOURCES_PER_SCAN;
+    const retainedLimit =
+      this.options.maxRetainedBytesPerScan ??
+      GENERAL_MAX_RETAINED_BYTES_PER_SCAN;
+    let retainedBytes = 0;
+    let materialized = 0;
     // An unreadable profile manifest must degrade to "default profile only"
     // instead of taking down extension sync entirely. Profiles missing from
     // the list are also absent from scannedProfiles, so findDeletions
     // suppresses their deletions rather than uninstalling them elsewhere.
-    let declaredProfiles: Array<{ id: string; name: string }> = [];
-    try {
-      declaredProfiles = readPortableProfiles(this.paths.globalDatabase).map(
-        (profile) => ({ id: profile.id, name: profile.name }),
-      );
-    } catch (error) {
-      warnings.push(
-        `Unable to enumerate profiles: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+    if (this.profileSweep === null) {
+      let declaredProfiles: ExtensionProfile[] = [];
+      this.profileSweepManifestUnreadable = false;
+      try {
+        declaredProfiles = readPortableProfiles(
+          this.paths.globalDatabase,
+          MAX_EXTENSION_MANIFEST_BYTES,
+        ).map((profile) => ({ id: profile.id, name: profile.name }));
+      } catch (error) {
+        this.profileSweepManifestUnreadable = true;
+        warnings.push(
+          `Unable to enumerate profiles: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      this.profileSweep = [
+        { id: "default", name: "Default" },
+        ...declaredProfiles,
+      ];
+      this.profileSweepIndex = 0;
+      this.profileSweepRetryOnly = false;
+      this.progressRevision += 1;
+      this.lastEmittedPageFingerprint = null;
     }
-    const profiles = [{ id: "default", name: "Default" }, ...declaredProfiles];
+    const profile = this.profileSweep[this.profileSweepIndex];
+    const selectedProfiles = profile === undefined ? [] : [profile];
+    let profileFailed = false;
+    let profileNeedsRetry = false;
 
-    for (const profile of profiles) {
+    for (const profile of selectedProfiles) {
       try {
         const databaseMtimeMs = await databaseMtimeOrNull(
           profileDatabasePath(this.paths, profile.id),
@@ -129,28 +286,56 @@ export class ExtensionsAdapter implements ResourceAdapter {
           memo.manifestMtimeMs === manifestMtimeMs &&
           memo.registryMtimeMs === registryMtimeMs
         ) {
+          this.scanMemo.delete(profile.id);
+          this.scanMemo.set(profile.id, memo);
           installed = memo.installed;
           if (memo.databaseMtimeMs === databaseMtimeMs) {
             disabled = memo.disabled;
           } else {
-            disabled = readDisabledExtensions(this.paths, profile.id);
+            disabled = readDisabledExtensions(
+              this.paths,
+              profile.id,
+              extensionStateLimit,
+              this.options.onDisabledValueRead,
+            );
             memo.databaseMtimeMs = databaseMtimeMs;
+            this.scanMemoIdentifiers -= memo.disabled.size;
+            this.scanMemoIdentifierBytes -= identifierBytes(memo.disabled);
             memo.disabled = disabled;
+            memo.identifierBytes =
+              installedIdentifierBytes(memo.installed) +
+              identifierBytes(disabled);
+            this.scanMemoIdentifiers += disabled.size;
+            this.scanMemoIdentifierBytes += identifierBytes(disabled);
+            this.enforceScanMemoLimit(profile.id);
           }
         } else {
-          installed = await this.listInstalledExtensions(
-            profile.id === "default" ? null : profile.name,
+          installed = await (
+            this.options.listInstalledExtensions ??
+            ((profileName) => this.listInstalledExtensions(profileName))
+          )(profile.id === "default" ? null : profile.name);
+          disabled = readDisabledExtensions(
+            this.paths,
+            profile.id,
+            extensionStateLimit,
+            this.options.onDisabledValueRead,
           );
-          disabled = readDisabledExtensions(this.paths, profile.id);
-          this.scanMemo.set(profile.id, {
+          this.rememberProfileScan(profile.id, {
             manifestMtimeMs,
             databaseMtimeMs,
             registryMtimeMs,
             installed,
             disabled,
+            identifierBytes:
+              installedIdentifierBytes(installed) + identifierBytes(disabled),
           });
         }
-        scannedProfiles.add(profile.id);
+        const sourceTimestamp = Math.max(
+          ...[manifestMtimeMs, databaseMtimeMs, registryMtimeMs].filter(
+            (value): value is number => value !== null,
+          ),
+          0,
+        );
         for (const entry of installed) {
           const id = entry.id.toLowerCase();
           if (
@@ -169,12 +354,51 @@ export class ExtensionsAdapter implements ResourceAdapter {
           };
           const value = desired as unknown as JsonValue;
           const resourceId = extensionResourceId(profile.id, id);
-          current.add(resourceId);
+          const content = serializeCanonical(value);
+          const desiredSemanticHash = sha256(content);
+          if (projectionMatchesSemantic(known[resourceId], desiredSemanticHash)) {
+            this.oversized.delete(resourceId);
+            continue;
+          }
+          if (materialized >= maxResources) {
+            deferred.add(resourceId);
+            profileNeedsRetry = true;
+            continue;
+          }
+          if (content.byteLength > resourceLimit) {
+            const observation = generalOversizedObservation(
+              resourceId,
+              `${sourceTimestamp}:${content.byteLength}`,
+              content.byteLength,
+              this.maxPayloadBytes,
+            );
+            const remembered = rememberGeneralOversizedObservation(
+              this.oversized,
+              observation,
+            );
+            if (!remembered) {
+              this.oversizedOverflow = true;
+              // Overflow protects the whole kind. Advance this finite profile
+              // sweep instead of repeatedly enumerating an unbounded prefix.
+              break;
+            }
+            warnings.push(generalOversizedWarning("Extension", observation));
+            continue;
+          }
+          if (
+            snapshots.length > 0 &&
+            retainedBytes + content.byteLength > retainedLimit
+          ) {
+            deferred.add(resourceId);
+            profileNeedsRetry = true;
+            continue;
+          }
+          materialized += 1;
           snapshots.push({
             resourceId,
             kind: "extension",
-            content: serializeCanonical(value),
-            semanticHash: semanticHash(value),
+            content,
+            semanticHash: desiredSemanticHash,
             metadata: {
               profileId: profile.id,
               profileName: profile.name,
@@ -183,8 +407,15 @@ export class ExtensionsAdapter implements ResourceAdapter {
               enabled: desired.enabled,
               preRelease: desired.preRelease,
               pinned: desired.pinned,
+              ...(sourceTimestamp > 0
+                ? { lastUpdatedAt: sourceTimestamp }
+                : {}),
             },
           });
+          retainedBytes += content.byteLength;
+          deferred.add(resourceId);
+          profileNeedsRetry = true;
+          this.oversized.delete(resourceId);
         }
       } catch (error) {
         warnings.push(
@@ -192,24 +423,136 @@ export class ExtensionsAdapter implements ResourceAdapter {
             error instanceof Error ? error.message : String(error)
           }`,
         );
+        deferred.add(`extension-profile/${encodeURIComponent(profile.id)}`);
+        this.failedProfileIds.add(profile.id);
+        profileFailed = true;
       }
     }
 
+    if (this.profileSweepManifestUnreadable) {
+      deferred.add("extension-profiles/manifest");
+    }
+    const shouldAdvanceProfile =
+      profile !== undefined && (profileFailed || !profileNeedsRetry);
+    if (profile !== undefined && !profileFailed && !profileNeedsRetry) {
+      this.failedProfileIds.delete(profile.id);
+    }
+    if (snapshots.length > 0) {
+      const fingerprint = snapshots
+        .map((snapshot) => `${snapshot.resourceId}:${snapshot.semanticHash}`)
+        .join("\0");
+      if (fingerprint !== this.lastEmittedPageFingerprint) {
+        this.progressRevision += 1;
+        this.lastEmittedPageFingerprint = fingerprint;
+      }
+    }
+    if (shouldAdvanceProfile && this.profileSweep !== null) {
+      this.profileSweepIndex += 1;
+      if (!this.profileSweepRetryOnly) {
+        this.progressRevision += 1;
+      }
+      this.lastEmittedPageFingerprint = null;
+      if (this.profileSweepIndex >= this.profileSweep.length) {
+        const retryProfiles = this.profileSweep.filter((candidate) =>
+          this.failedProfileIds.has(candidate.id),
+        );
+        if (retryProfiles.length > 0) {
+          if (!this.profileSweepRetryOnly) {
+            this.progressRevision += 1;
+          }
+          this.profileSweep = retryProfiles;
+          this.profileSweepIndex = 0;
+          this.profileSweepRetryOnly = true;
+          for (const retry of retryProfiles) {
+            deferred.add(
+              `extension-profile/${encodeURIComponent(retry.id)}`,
+            );
+          }
+        } else {
+          this.profileSweep = null;
+          this.profileSweepIndex = 0;
+          this.profileSweepRetryOnly = false;
+          this.progressRevision += 1;
+          this.nextSweepAt = this.profileSweepManifestUnreadable
+            ? 0
+            : now + (this.options.scanIntervalMs ?? 30_000);
+        }
+      } else {
+        deferred.add(
+          `extension-profile/${encodeURIComponent(
+            this.profileSweep[this.profileSweepIndex]!.id,
+          )}`,
+        );
+      }
+    }
+
+    if (this.oversizedOverflow) {
+      deferred.add("extension-scope/untracked-oversized-resources");
+    }
+    this.lastScanStatus = {
+      complete: deferred.size === 0,
+      deferredResourceIds: [...deferred].sort((left, right) =>
+        left.localeCompare(right),
+      ),
+      progressToken: this.progressRevision,
+    };
     return {
       snapshots,
-      deletions: findDeletions(
-        known,
-        current,
-        new Map(profiles.map((profile) => [profile.id, profile.name])),
-        scannedProfiles,
-        this.ignoredExtensions,
-      ),
+      // A bounded per-profile page does not retain an all-profile installed
+      // set, so absence cannot safely originate an uninstall tombstone.
+      deletions: [],
       warnings,
     };
   }
 
   async apply(_input: ResourceApplyInput): Promise<void> {
     throw new Error("Extension state must be applied by the offline helper.");
+  }
+
+  private rememberProfileScan(profileId: string, memo: ProfileScanMemo): void {
+    const previous = this.scanMemo.get(profileId);
+    if (previous !== undefined) {
+      this.scanMemoIdentifiers -=
+        previous.installed.length + previous.disabled.size;
+      this.scanMemoIdentifierBytes -= previous.identifierBytes;
+      this.scanMemo.delete(profileId);
+    }
+    const identifiers = memo.installed.length + memo.disabled.size;
+    if (
+      identifiers > MAX_EXTENSION_MEMO_IDENTIFIERS ||
+      memo.identifierBytes > MAX_EXTENSION_MEMO_IDENTIFIER_BYTES
+    ) {
+      return;
+    }
+    this.scanMemo.set(profileId, memo);
+    this.scanMemoIdentifiers += identifiers;
+    this.scanMemoIdentifierBytes += memo.identifierBytes;
+    this.enforceScanMemoLimit(profileId);
+  }
+
+  private enforceScanMemoLimit(retainProfileId: string): void {
+    while (
+      this.scanMemoIdentifiers + (this.extensionMetadataMemo?.value.size ?? 0) >
+        MAX_EXTENSION_MEMO_IDENTIFIERS ||
+      this.scanMemoIdentifierBytes +
+          (this.extensionMetadataMemo?.identifierBytes ?? 0) >
+        MAX_EXTENSION_MEMO_IDENTIFIER_BYTES
+    ) {
+      const oldest = this.scanMemo.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      const removed = this.scanMemo.get(oldest);
+      this.scanMemo.delete(oldest);
+      if (removed !== undefined) {
+        this.scanMemoIdentifiers -=
+          removed.installed.length + removed.disabled.size;
+        this.scanMemoIdentifierBytes -= removed.identifierBytes;
+      }
+      if (oldest === retainProfileId) {
+        break;
+      }
+    }
   }
 
   private async listInstalledExtensions(
@@ -223,77 +566,169 @@ export class ExtensionsAdapter implements ResourceAdapter {
       process.execPath,
       [join(this.paths.appRoot, "out", "cli.js"), ...args],
       {
-      windowsHide: true,
-      timeout: 60_000,
-      maxBuffer: 10 * 1024 * 1024,
+        windowsHide: true,
+        timeout: 60_000,
+        maxBuffer: MAX_EXTENSION_MANIFEST_BYTES,
         env: {
           ...process.env,
           ELECTRON_RUN_AS_NODE: "1",
         },
       },
     );
-    return stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0)
-      .map((line) => {
-        const separator = line.lastIndexOf("@");
-        if (separator <= 0) {
-          return { id: line, version: "latest" };
-        }
-        return {
-          id: line.slice(0, separator),
-          version: line.slice(separator + 1),
-        };
-      });
+    if (Buffer.byteLength(stdout, "utf8") > MAX_EXTENSION_MANIFEST_BYTES) {
+      throw new Error("Installed extension listing exceeds its byte limit.");
+    }
+    const installed: Array<{ id: string; version: string }> = [];
+    let identifierByteCount = 0;
+    let start = 0;
+    for (let index = 0; index <= stdout.length; index += 1) {
+      if (index < stdout.length && stdout[index] !== "\n") {
+        continue;
+      }
+      const line = stdout
+        .slice(start, index)
+        .replace(/\r$/, "")
+        .trim();
+      start = index + 1;
+      if (line.length === 0) {
+        continue;
+      }
+      if (
+        installed.length >= MAX_EXTENSION_IDENTIFIERS ||
+        Buffer.byteLength(line, "utf8") > MAX_EXTENSION_IDENTIFIER_BYTES
+      ) {
+        throw new Error("Installed extension listing exceeds its entry limit.");
+      }
+      const separator = line.lastIndexOf("@");
+      const entry =
+        separator <= 0
+          ? { id: line, version: "latest" }
+          : {
+              id: line.slice(0, separator),
+              version: line.slice(separator + 1),
+            };
+      identifierByteCount +=
+        Buffer.byteLength(entry.id, "utf8") +
+        Buffer.byteLength(entry.version, "utf8");
+      if (identifierByteCount > MAX_EXTENSION_COLLECTION_IDENTIFIER_BYTES) {
+        throw new Error("Installed extension listing exceeds its identifier byte limit.");
+      }
+      installed.push(entry);
+    }
+    return installed;
   }
 
   private async readExtensionMetadata(): Promise<Map<string, ExtensionMetadata>> {
-    const result = new Map<string, ExtensionMetadata>();
     if (!(await pathExists(this.paths.cursorExtensionsManifest))) {
-      return result;
+      this.extensionMetadataMemo = null;
+      return new Map();
     }
-    const parsed = JSON.parse(
-      (
-        await readFileWithinRoot(
-          this.paths.cursorHome,
-          normalizeResourcePath(
-            relative(
-              this.paths.cursorHome,
-              this.paths.cursorExtensionsManifest,
-            ),
-          ),
-        )
-      ).toString("utf8"),
-    ) as unknown;
-    if (!Array.isArray(parsed)) {
-      return result;
+    const manifestInfo = await stat(this.paths.cursorExtensionsManifest);
+    if (
+      this.extensionMetadataMemo?.size === manifestInfo.size &&
+      this.extensionMetadataMemo.mtimeMs === manifestInfo.mtimeMs
+    ) {
+      return this.extensionMetadataMemo.value;
     }
-    for (const item of parsed) {
-      if (item === null || typeof item !== "object") {
-        continue;
-      }
-      const record = item as Record<string, unknown>;
-      const identifier = record.identifier;
-      const id =
-        identifier !== null && typeof identifier === "object"
-          ? (identifier as Record<string, unknown>).id
-          : undefined;
-      if (typeof id !== "string") {
-        continue;
-      }
-      const itemMetadata =
-        record.metadata !== null && typeof record.metadata === "object"
-          ? (record.metadata as Record<string, unknown>)
-          : {};
-      result.set(id.toLowerCase(), {
-        preRelease:
-          itemMetadata.isPreReleaseVersion === true || record.preRelease === true,
-        pinned: itemMetadata.pinned === true || record.pinned === true,
-      });
+    const manifestLimit = Math.min(
+      generalResourceLimit(this.maxPayloadBytes),
+      MAX_EXTENSION_MANIFEST_BYTES,
+    );
+    if (manifestInfo.size > manifestLimit) {
+      throw new Error(
+        `Extension manifest is ${manifestInfo.size} bytes, above the ${manifestLimit}-byte read limit.`,
+      );
     }
+    const result = await readBoundedExtensionManifestMetadata(
+      this.paths,
+      manifestLimit,
+      this.options.onManifestRead,
+    );
+    this.extensionMetadataMemo = {
+      size: manifestInfo.size,
+      mtimeMs: manifestInfo.mtimeMs,
+      value: result,
+      identifierBytes: identifierBytes(result.keys()),
+    };
+    this.enforceScanMemoLimit("");
     return result;
   }
+}
+
+export async function readBoundedExtensionManifestMetadata(
+  paths: CursorPaths,
+  maxBytes = MAX_EXTENSION_MANIFEST_BYTES,
+  onManifestRead?: () => void,
+): Promise<Map<string, ExtensionMetadata>> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error("Extension manifest read limit must be positive.");
+  }
+  const limit = Math.min(maxBytes, MAX_EXTENSION_MANIFEST_BYTES);
+  const info = await stat(paths.cursorExtensionsManifest);
+  if (!info.isFile() || info.size > limit) {
+    throw new Error(
+      `Extension manifest is ${info.size} bytes, above the ${limit}-byte read limit.`,
+    );
+  }
+  onManifestRead?.();
+  const source = (
+    await readFileWithinRoot(
+      paths.cursorHome,
+      normalizeResourcePath(
+        relative(paths.cursorHome, paths.cursorExtensionsManifest),
+      ),
+      limit,
+    )
+  ).toString("utf8");
+  assertBoundedJsonCollection(
+    source,
+    MAX_EXTENSION_IDENTIFIERS,
+    "Extension manifest",
+  );
+  assertBoundedJsoncStructure(source, "Extension manifest");
+  const parsed = JSON.parse(source) as unknown;
+  const result = new Map<string, ExtensionMetadata>();
+  let identifierByteCount = 0;
+  if (!Array.isArray(parsed)) {
+    return result;
+  }
+  if (parsed.length > MAX_EXTENSION_IDENTIFIERS) {
+    throw new Error("Extension manifest exceeds its entry limit.");
+  }
+  for (const item of parsed) {
+    if (item === null || typeof item !== "object") {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const identifier = record.identifier;
+    const id =
+      identifier !== null && typeof identifier === "object"
+        ? (identifier as Record<string, unknown>).id
+        : undefined;
+    if (typeof id !== "string") {
+      continue;
+    }
+    if (Buffer.byteLength(id, "utf8") > MAX_EXTENSION_IDENTIFIER_BYTES) {
+      throw new Error("Extension manifest contains an oversized identifier.");
+    }
+    identifierByteCount += Buffer.byteLength(id, "utf8");
+    if (identifierByteCount > MAX_EXTENSION_COLLECTION_IDENTIFIER_BYTES) {
+      throw new Error("Extension manifest exceeds its identifier byte limit.");
+    }
+    const itemMetadata =
+      record.metadata !== null && typeof record.metadata === "object"
+        ? (record.metadata as Record<string, unknown>)
+        : {};
+    result.set(id.toLowerCase(), {
+      preRelease:
+        itemMetadata.isPreReleaseVersion === true || record.preRelease === true,
+      pinned: itemMetadata.pinned === true || record.pinned === true,
+    });
+    if (result.size > MAX_EXTENSION_IDENTIFIERS) {
+      throw new Error("Extension manifest exceeds its identifier limit.");
+    }
+  }
+  return result;
 }
 
 function profileDatabasePath(paths: CursorPaths, profileId: string): string {
@@ -322,7 +757,12 @@ async function databaseMtimeOrNull(path: string): Promise<number | null> {
   return wal === null ? main : Math.max(main, wal);
 }
 
-function readDisabledExtensions(paths: CursorPaths, profileId: string): Set<string> {
+function readDisabledExtensions(
+  paths: CursorPaths,
+  profileId: string,
+  maxBytes: number,
+  onValueRead?: (profileId: string) => void,
+): Set<string> {
   const databasePath = profileDatabasePath(paths, profileId);
   if (!existsSync(databasePath)) {
     return new Set();
@@ -330,12 +770,17 @@ function readDisabledExtensions(paths: CursorPaths, profileId: string): Set<stri
   const database = openDatabase(databasePath, { readOnly: true });
   try {
     database.exec("PRAGMA query_only=ON");
-    const row = database
-      .prepare("SELECT value FROM ItemTable WHERE key = ?")
-      .get("extensionsIdentifiers/disabled") as
-      | { value?: SqliteStorageValue }
-      | undefined;
-    const raw = row?.value;
+    const key = "extensionsIdentifiers/disabled";
+    const metadata = inspectSqliteValue(database, key);
+    if (metadata.byteLength !== null && metadata.byteLength > maxBytes) {
+      throw new OversizedSqliteValueError(
+        `${profileId}:${key}`,
+        metadata.byteLength,
+        maxBytes,
+      );
+    }
+    onValueRead?.(profileId);
+    const raw = readSqliteValue(database, key);
     // A NULL disabled list means "nothing is disabled", exactly like an
     // absent row; this path is read-only so the NULL stays on disk.
     if (raw === undefined || raw === null) {
@@ -345,82 +790,125 @@ function readDisabledExtensions(paths: CursorPaths, profileId: string): Set<stri
     if (text.trim().length === 0) {
       return new Set();
     }
+    assertBoundedJsonCollection(
+      text,
+      MAX_EXTENSION_IDENTIFIERS,
+      `Disabled extension list for ${profileId}`,
+    );
+    assertBoundedJsoncStructure(
+      text,
+      `Disabled extension list for ${profileId}`,
+    );
     const parsed = JSON.parse(text) as unknown;
     if (!Array.isArray(parsed)) {
       return new Set();
     }
-    return new Set(
-      parsed
-        .map((item) => {
-          if (typeof item === "string") {
-            return item;
-          }
-          if (item !== null && typeof item === "object") {
-            return (item as Record<string, unknown>).id;
-          }
-          return undefined;
-        })
-        .filter((id): id is string => typeof id === "string")
-        .map((id) => id.toLowerCase()),
-    );
+    if (parsed.length > MAX_EXTENSION_IDENTIFIERS) {
+      throw new Error("Disabled extension list exceeds its entry limit.");
+    }
+    const disabled = new Set<string>();
+    let identifierByteCount = 0;
+    for (const item of parsed) {
+      const id =
+        typeof item === "string"
+          ? item
+          : item !== null && typeof item === "object"
+            ? (item as Record<string, unknown>).id
+            : undefined;
+      if (typeof id !== "string") {
+        continue;
+      }
+      if (Buffer.byteLength(id, "utf8") > MAX_EXTENSION_IDENTIFIER_BYTES) {
+        throw new Error("Disabled extension list contains an oversized ID.");
+      }
+      identifierByteCount += Buffer.byteLength(id, "utf8");
+      if (identifierByteCount > MAX_EXTENSION_COLLECTION_IDENTIFIER_BYTES) {
+        throw new Error(
+          "Disabled extension list exceeds its identifier byte limit.",
+        );
+      }
+      disabled.add(id.toLowerCase());
+      if (disabled.size > MAX_EXTENSION_IDENTIFIERS) {
+        throw new Error("Disabled extension list exceeds its identifier limit.");
+      }
+    }
+    return disabled;
   } finally {
     database.close();
   }
-}
-
-function findDeletions(
-  known: Record<string, LocalProjection>,
-  current: Set<string>,
-  profileNames: Map<string, string>,
-  scannedProfiles: Set<string>,
-  ignoredExtensions: IgnoreMatcher,
-): ResourceDeletion[] {
-  return Object.values(known)
-    .filter((projection) => {
-      if (
-        projection.kind !== "extension" ||
-        current.has(projection.resourceId)
-      ) {
-        return false;
-      }
-      const parsed = parseExtensionResourceId(projection.resourceId);
-      return (
-        scannedProfiles.has(parsed.profileId) &&
-        !ignoredExtensions.matches(parsed.extensionId.toLowerCase()) &&
-        parsed.extensionId.toLowerCase() !== EXTENSION_ID.toLowerCase()
-      );
-    })
-    .map((projection) => {
-      const { profileId, extensionId } = parseExtensionResourceId(
-        projection.resourceId,
-      );
-      return {
-        resourceId: projection.resourceId,
-        kind: "extension",
-        semanticHash: sha256(`deleted:${projection.resourceId}`),
-        metadata: {
-          profileId,
-          profileName: profileNames.get(profileId) ?? profileId,
-          extensionId,
-        },
-      };
-    });
 }
 
 function extensionResourceId(profileId: string, extensionId: string): string {
   return `extension/${encodeURIComponent(profileId)}/${encodeURIComponent(extensionId)}`;
 }
 
-function parseExtensionResourceId(resourceId: string): {
-  profileId: string;
-  extensionId: string;
-} {
-  const [, profileId, extensionId] = resourceId.split("/");
-  if (profileId === undefined || extensionId === undefined) {
-    throw new Error(`Invalid extension resource ID: ${resourceId}`);
+function identifierBytes(values: Iterable<string>): number {
+  let total = 0;
+  for (const value of values) {
+    total += Buffer.byteLength(value, "utf8");
   }
-  return {
-    profileId: decodeURIComponent(profileId),
-    extensionId: decodeURIComponent(extensionId),
-  };
+  return total;
+}
+
+function installedIdentifierBytes(
+  values: Iterable<{ id: string; version: string }>,
+): number {
+  let total = 0;
+  for (const value of values) {
+    total +=
+      Buffer.byteLength(value.id, "utf8") +
+      Buffer.byteLength(value.version, "utf8");
+  }
+  return total;
+}
+
+function projectionMatchesSemantic(
+  projection: LocalProjection | undefined,
+  semanticHash: string,
+): boolean {
+  return (
+    projection?.semanticHash === semanticHash ||
+    projection?.retainedLocalHash === semanticHash
+  );
+}
+
+function assertBoundedJsonCollection(
+  source: string,
+  maxEntries: number,
+  label: string,
+): void {
+  let depth = 0;
+  let separators = 0;
+  let inString = false;
+  let escaped = false;
+  for (const character of source) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (character === '"') {
+      inString = true;
+      continue;
+    }
+    if (character === "[" || character === "{") {
+      depth += 1;
+      continue;
+    }
+    if (character === "]" || character === "}") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (character === "," && depth === 1) {
+      separators += 1;
+      if (separators >= maxEntries) {
+        throw new Error(`${label} exceeds its ${maxEntries}-entry limit.`);
+      }
+    }
+  }
 }

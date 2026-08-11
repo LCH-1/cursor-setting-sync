@@ -4,6 +4,7 @@ import {
   readFile,
   rename,
   rm,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -14,6 +15,28 @@ import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import type { StoredEvent, StoredObject } from "../src/types";
 
 describe("repository stream rollback protection", () => {
+  it("preserves the projections generation across an unchanged refresh", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-setting-sync-refresh-identity-"),
+    );
+    try {
+      const repository = await SyncRepository.create(
+        join(temporaryRoot, "repository"),
+        join(temporaryRoot, "storage"),
+        "a sufficiently long test passphrase",
+        1024 * 1024,
+        producer,
+      );
+      const projections = repository.state.projections;
+
+      await repository.refreshState();
+
+      expect(repository.state.projections).toBe(projections);
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   it("does not decrease its own head when a previously published tail disappears", async () => {
     const temporaryRoot = await mkdtemp(
       join(tmpdir(), "cursor-setting-sync-rollback-"),
@@ -174,6 +197,88 @@ describe("repository stream rollback protection", () => {
       );
       await expect(reader.listEvents()).rejects.toThrow(
         /Event envelope is invalid/i,
+      );
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds an object envelope from its authenticated compressed size", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-setting-sync-object-bound-"),
+    );
+    try {
+      const repositoryRoot = join(temporaryRoot, "repository");
+      const repository = await SyncRepository.create(
+        repositoryRoot,
+        join(temporaryRoot, "storage"),
+        "a sufficiently long test passphrase",
+        1024 * 1024,
+        producer,
+      );
+      await repository.publish(
+        [snapshot("settings/default/editor.fontSize", "14")],
+        [],
+      );
+      const reference = (await repository.listEvents())[0]?.manifest.changes[0]
+        ?.payload;
+      expect(reference).toBeDefined();
+      if (reference === undefined) {
+        throw new Error("Test repository did not publish its payload.");
+      }
+      const objectPath = join(
+        repositoryRoot,
+        "devices",
+        reference.deviceId,
+        "blobs",
+        "sha256",
+        reference.objectId.slice(0, 2),
+        `${reference.objectId}.cso`,
+      );
+      await writeFile(objectPath, "");
+      await truncate(objectPath, 2 * 1024 * 1024);
+
+      await expect(repository.readObject(reference)).rejects.toThrow(
+        /Object envelope exceeds its size limit/i,
+      );
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds an event through the opened handle before parsing it", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-setting-sync-event-bound-"),
+    );
+    try {
+      const repositoryRoot = join(temporaryRoot, "repository");
+      const repository = await SyncRepository.create(
+        repositoryRoot,
+        join(temporaryRoot, "storage-writer"),
+        "a sufficiently long test passphrase",
+        1024 * 1024,
+        producer,
+      );
+      const published = await repository.publish(
+        [snapshot("settings/default/editor.fontSize", "14")],
+        [],
+      );
+      expect(published.eventPath).not.toBeNull();
+      if (published.eventPath === null) {
+        throw new Error("Test repository did not publish an event.");
+      }
+      await truncate(published.eventPath, 9 * 1024 * 1024);
+      const reader = await SyncRepository.openWithMasterKey(
+        repositoryRoot,
+        join(temporaryRoot, "storage-reader"),
+        repository.repository,
+        Buffer.from(repository.masterKey),
+        1024 * 1024,
+        producer,
+      );
+
+      await expect(reader.listEvents()).rejects.toThrow(
+        /exceeds its size limit/i,
       );
     } finally {
       await rm(temporaryRoot, { recursive: true, force: true });

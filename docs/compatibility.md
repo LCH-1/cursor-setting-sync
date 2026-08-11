@@ -45,6 +45,8 @@ Workspace `state.vscdb` additionally requires `ItemTable(key, value)` and `curso
 
 Every nullable `composerHeaders` column and every `cursorDiskKV` chat value is transported with its SQLite storage class, so SQL `NULL` round-trips as `NULL` instead of becoming `0` or the text `null`. A client older than the `null` storage class rejects such a chat snapshot rather than applying a coerced value.
 
+Portable Composer chat schema v2 additionally carries the reachable `agentKv:blob:<sha256>` continuation graph referenced by supported top-level `conversationState` fields in `composerData` and bubble rows, together with authenticated graph references retained by chat merges. Keys, hashes, reference partitions, counts, and byte limits are validated before apply. Version 0.0.62 and earlier can neither produce nor consume this graph and safely defer a v2 payload instead of applying only its legacy portion; legacy rows that already exist locally remain visible. Update every PC to 0.0.63 before relying on a restored conversation for continued prompting.
+
 If these checks fail, file synchronization remains active while profile, UI-state, extension-state, workspace storage, and database-backed chat resources are deferred. Diagnostics explain the failed capability or schema check.
 
 ## Portable resources

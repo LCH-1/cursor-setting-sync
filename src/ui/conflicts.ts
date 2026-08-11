@@ -16,6 +16,14 @@ import {
   renderNotepadsPreview,
 } from "./notepadPreview";
 
+/**
+ * Conflict resolution runs in the live extension host and repository payload
+ * policy can be as high as 512 MiB. Keep the materialized source page fixed:
+ * publishing may allocate compression/encryption copies in addition to these
+ * buffers, but later selections are not read until the current page is gone.
+ */
+const CONFLICT_RESOLUTION_MAX_RETAINED_BYTES = 32 * 1024 * 1024;
+
 export interface ConflictResolutionResult {
   resolved: number;
   deferred: string[];
@@ -134,7 +142,41 @@ export class ConflictController
     selections: ConflictSelection[],
   ): Promise<ConflictResolutionResult> {
     const deferred: string[] = [];
-    const pending: PendingResolution[] = [];
+    let pending: PendingResolution[] = [];
+    let pendingBytes = 0;
+    let resolved = 0;
+    const resolvedAt = new Date().toISOString();
+    const flushPending = async (): Promise<void> => {
+      if (pending.length === 0) {
+        return;
+      }
+      // Drop the controller's references before awaiting repository work. The
+      // local `batch` remains bounded, and the next page cannot be read until
+      // this function returns.
+      const batch = pending;
+      pending = [];
+      pendingBytes = 0;
+      if (await publishBatch(repository, batch)) {
+        for (const item of batch) {
+          item.conflict.resolvedAt = resolvedAt;
+          resolved += 1;
+        }
+        return;
+      }
+      // One resolution the repository refuses -- a payload over the configured
+      // repository limit is the realistic case -- must not cost the other
+      // resolutions already admitted to this bounded page.
+      for (const item of batch) {
+        if (await publishBatch(repository, [item])) {
+          item.conflict.resolvedAt = resolvedAt;
+          resolved += 1;
+        } else {
+          deferred.push(
+            `${item.conflict.resourceId}: ${item.failure ?? "The resolution could not be published."}`,
+          );
+        }
+      }
+    };
     for (const selection of selections) {
       const conflict = repository.state.conflicts.find(
         (candidate) =>
@@ -157,6 +199,21 @@ export class ConflictController
         continue;
       }
       try {
+        const declaredBytes = resolutionSourceBytes(selection);
+        if (declaredBytes > CONFLICT_RESOLUTION_MAX_RETAINED_BYTES) {
+          deferred.push(
+            `${selection.resourceId}: The selected conflict payload is ${declaredBytes} bytes and exceeds the fixed ${CONFLICT_RESOLUTION_MAX_RETAINED_BYTES}-byte live resolution work limit. The conflict remains unchanged; reduce or restore this resource separately before resolving it.`,
+          );
+          continue;
+        }
+        if (
+          pending.length > 0 &&
+          (pending.length >= MAX_EVENT_CHANGES ||
+            pendingBytes + declaredBytes >
+              CONFLICT_RESOLUTION_MAX_RETAINED_BYTES)
+        ) {
+          await flushPending();
+        }
         const input =
           selection.tip === null
             ? localContentAsPublishInput(selection.resourceId, selection.live)
@@ -166,38 +223,21 @@ export class ConflictController
                 selection.tip,
               );
         pending.push({ conflict, ...input });
+        pendingBytes += declaredBytes;
+        if (
+          pending.length >= MAX_EVENT_CHANGES ||
+          pendingBytes >= CONFLICT_RESOLUTION_MAX_RETAINED_BYTES
+        ) {
+          await flushPending();
+        }
       } catch (error) {
         deferred.push(`${selection.resourceId}: ${messageOf(error)}`);
       }
     }
-    // Published in batches rather than one event per conflict. Resolving 36
-    // conflicts used to append 36 events to the repository, each of which every
-    // other device then had to fetch, decrypt and reconcile.
-    let resolved = 0;
-    const resolvedAt = new Date().toISOString();
-    for (const batch of batches(pending, MAX_EVENT_CHANGES)) {
-      if (await publishBatch(repository, batch)) {
-        for (const item of batch) {
-          item.conflict.resolvedAt = resolvedAt;
-          resolved += 1;
-        }
-        continue;
-      }
-      // One resolution the repository refuses — a payload over the size limit is
-      // the realistic case — must not cost every other resolution in the batch.
-      // Batching is an efficiency measure, so it falls back to the granularity
-      // this used to have rather than failing at its own granularity.
-      for (const item of batch) {
-        if (await publishBatch(repository, [item])) {
-          item.conflict.resolvedAt = resolvedAt;
-          resolved += 1;
-        } else {
-          deferred.push(
-            `${item.conflict.resourceId}: ${item.failure ?? "The resolution could not be published."}`,
-          );
-        }
-      }
-    }
+    // Published in bounded batches rather than one event per conflict.
+    // Resolving 36 tiny conflicts still appends one event, while large inputs
+    // are released page by page instead of all remaining live in `pending`.
+    await flushPending();
     await repository.saveState();
     return { resolved, deferred };
   }
@@ -219,10 +259,14 @@ export class ConflictController
     ) => Promise<ResourceSnapshot | undefined>,
   ): Promise<CollectedConflictSelections> {
     const chosen = new Map<string, ConflictSelection>();
+    const deferredConflictIds = new Set<string>();
     const deferred: string[] = [];
+    let retainedLiveBytes = 0;
     for (;;) {
       const remaining = views.filter(
-        (view) => !chosen.has(view.conflict.conflictId),
+        (view) =>
+          !chosen.has(view.conflict.conflictId) &&
+          !deferredConflictIds.has(view.conflict.conflictId),
       );
       if (remaining.length === 0) {
         break;
@@ -264,6 +308,19 @@ export class ConflictController
         liveSnapshot,
       );
       if (selection !== null) {
+        const liveBytes = selection.live?.content.byteLength ?? 0;
+        if (
+          liveBytes > CONFLICT_RESOLUTION_MAX_RETAINED_BYTES ||
+          retainedLiveBytes + liveBytes >
+            CONFLICT_RESOLUTION_MAX_RETAINED_BYTES
+        ) {
+          deferredConflictIds.add(picked.action.view.conflict.conflictId);
+          deferred.push(
+            `${picked.action.view.conflict.resourceId}: Keeping unpublished local content would exceed the fixed ${CONFLICT_RESOLUTION_MAX_RETAINED_BYTES}-byte live resolution work limit. This conflict remains unchanged; resolve it separately.`,
+          );
+          continue;
+        }
+        retainedLiveBytes += liveBytes;
         chosen.set(picked.action.view.conflict.conflictId, selection);
       }
     }
@@ -572,14 +629,22 @@ function selectionFor(
   };
 }
 
-function* batches<T>(items: readonly T[], size: number): Generator<T[]> {
-  for (let index = 0; index < items.length; index += size) {
-    yield items.slice(index, index + size);
-  }
-}
-
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Authenticated/plain source bytes retained if this selection is materialized. */
+function resolutionSourceBytes(selection: ConflictSelection): number {
+  if (selection.tip === null) {
+    return selection.live?.content.byteLength ?? 0;
+  }
+  if (selection.tip.operation === "delete") {
+    return 0;
+  }
+  if (selection.tip.payload === undefined) {
+    throw new Error(`Conflict tip payload is missing: ${selection.tip.versionId}`);
+  }
+  return selection.tip.payload.plainBytes;
 }
 
 function localContentAsPublishInput(
@@ -654,6 +719,9 @@ async function tipContent(
   if (tip.payload === undefined) {
     return "[Payload missing]\n";
   }
+  if (tip.payload.plainBytes > PREVIEW_BYTE_LIMIT) {
+    return `[Payload is ${tip.payload.plainBytes} bytes; preview omitted]\n`;
+  }
   let content: Buffer;
   try {
     content = await repository.readObject(tip.payload);
@@ -662,7 +730,7 @@ async function tipContent(
     // sides that remain readable instead of failing the whole flow.
     return "[Payload content is unavailable; it may have been compacted]\n";
   }
-  if (content.byteLength > 1024 * 1024) {
+  if (content.byteLength > PREVIEW_BYTE_LIMIT) {
     return `[Payload is ${content.byteLength} bytes; preview omitted]\n`;
   }
   const text = content.toString("utf8");

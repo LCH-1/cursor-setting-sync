@@ -17,6 +17,7 @@ import {
   CHECKPOINT_ENVELOPE_VERSION,
   CHECKPOINT_EXTENSION,
   CHECKPOINTED_EVENT_PROTOCOL_VERSION,
+  MAX_CHECKPOINT_MARKER_PAYLOAD_BYTES,
   MAX_CHECKPOINT_FILE_BYTES,
   PROTOCOL_VERSION,
 } from "../src/constants";
@@ -658,6 +659,142 @@ describe("repository checkpoints", () => {
       expect(markerChange?.resourceId).toBe("settings/default/editor.tabSize");
       expect(markerChange?.semanticHash).toBe(sha256(Buffer.from("2", "utf8")));
       expect(markerChange?.metadata?.syncOrigin).toBe("checkpoint-marker");
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("skips an oversized declared marker payload before reading it and selects a later bounded tip", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-setting-sync-marker-oversized-fallback-"),
+    );
+    try {
+      const repository = await createRepository(temporaryRoot);
+      await repository.publish(
+        [
+          snapshot("settings/default/a-large", "large"),
+          snapshot("settings/default/z-bounded", "bounded"),
+        ],
+        [],
+      );
+      await adoptTips(repository);
+      await repository.createCheckpoint(true);
+      const oversized =
+        repository.state.tips["settings/default/a-large"]?.[0]?.payload;
+      const bounded =
+        repository.state.tips["settings/default/z-bounded"]?.[0]?.payload;
+      if (oversized === undefined || bounded === undefined) {
+        throw new Error("Test repository did not adopt both tip payloads.");
+      }
+      oversized.plainBytes = MAX_CHECKPOINT_MARKER_PAYLOAD_BYTES + 1;
+      const readObject = vi.spyOn(repository, "readObject");
+
+      const result = await repository.pruneWithGates({
+        reconciledWithoutWarnings: true,
+        overrideAgeGate: true,
+      });
+
+      expect(result.status).toBe("pruned");
+      expect(readObject).toHaveBeenCalledTimes(1);
+      expect(readObject).toHaveBeenCalledWith(bounded);
+      const marker = (await repository.listEvents()).find(
+        (event) => event.eventHash === result.markerEventHash,
+      );
+      expect(marker?.manifest.changes[0]?.resourceId).toBe(
+        "settings/default/z-bounded",
+      );
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to a tombstone without reading an oversized marker payload", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-setting-sync-marker-oversized-tombstone-"),
+    );
+    try {
+      const repository = await createRepository(temporaryRoot);
+      await repository.publish(
+        [snapshot("settings/default/a-large", "large")],
+        [
+          {
+            resourceId: "settings/default/z-deleted",
+            kind: "settings",
+            semanticHash: sha256(Buffer.from("deleted", "utf8")),
+          },
+        ],
+      );
+      await adoptTips(repository);
+      await repository.createCheckpoint(true);
+      const oversized =
+        repository.state.tips["settings/default/a-large"]?.[0]?.payload;
+      if (oversized === undefined) {
+        throw new Error("Test repository did not adopt the put tip payload.");
+      }
+      oversized.plainBytes = MAX_CHECKPOINT_MARKER_PAYLOAD_BYTES + 1;
+      const readObject = vi.spyOn(repository, "readObject");
+
+      const result = await repository.pruneWithGates({
+        reconciledWithoutWarnings: true,
+        overrideAgeGate: true,
+      });
+
+      expect(result.status).toBe("pruned");
+      expect(readObject).not.toHaveBeenCalled();
+      const marker = (await repository.listEvents()).find(
+        (event) => event.eventHash === result.markerEventHash,
+      );
+      expect(marker?.manifest.changes[0]).toMatchObject({
+        resourceId: "settings/default/z-deleted",
+        operation: "delete",
+      });
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("aborts visibly without reading or deleting when every marker payload is oversized", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-setting-sync-marker-oversized-abort-"),
+    );
+    try {
+      const repository = await createRepository(temporaryRoot);
+      await repository.publish(
+        [snapshot("settings/default/a-large", "large")],
+        [],
+      );
+      await adoptTips(repository);
+      await repository.createCheckpoint(true);
+      const oversized =
+        repository.state.tips["settings/default/a-large"]?.[0]?.payload;
+      if (oversized === undefined) {
+        throw new Error("Test repository did not adopt the tip payload.");
+      }
+      oversized.plainBytes = MAX_CHECKPOINT_MARKER_PAYLOAD_BYTES + 1;
+      const readObject = vi.spyOn(repository, "readObject");
+      const publish = vi.spyOn(repository, "publish");
+      const eventRoot = join(
+        temporaryRoot,
+        "repository",
+        "devices",
+        repository.state.device.deviceId,
+        "events",
+      );
+      const eventFilesBefore = (await readdir(eventRoot)).sort();
+
+      const result = await repository.pruneWithGates({
+        reconciledWithoutWarnings: true,
+        overrideAgeGate: true,
+      });
+
+      expect(result.status).toBe("aborted");
+      expect(result.reason).toContain("fixed 32 MiB in-process limit");
+      expect(result.reason).toContain("skipped without reading");
+      expect(result.eventsDeleted).toBe(0);
+      expect(result.markerEventHash).toBeNull();
+      expect(readObject).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+      expect((await readdir(eventRoot)).sort()).toEqual(eventFilesBefore);
     } finally {
       await rm(temporaryRoot, { recursive: true, force: true });
     }

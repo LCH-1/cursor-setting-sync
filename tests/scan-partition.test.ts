@@ -137,6 +137,117 @@ describe("per-adapter scan partitioning", () => {
       "state-vscdb-chat",
     ]);
   });
+
+  it("caps retained snapshots across adapters and rotates deferred work", async () => {
+    const makeSnapshot = (id: string): ResourceSnapshot => ({
+      resourceId: `settings/default/${id}`,
+      kind: "settings",
+      content: Buffer.alloc(6, id.charCodeAt(0)),
+      semanticHash: id.repeat(64).slice(0, 64),
+    });
+    const adapters = ["a", "b", "c"].map((id) =>
+      produces(id, ["settings"], () => [makeSnapshot(id)]),
+    );
+    let cursor: string | null = null;
+    const observed = new Set<string>();
+
+    for (let cycle = 0; cycle < 3; cycle += 1) {
+      const result = await scanAdapters(
+        adapters,
+        KNOWN,
+        "all",
+        NO_KINDS,
+        undefined,
+        { maxRetainedBytes: 10, startAfterAdapterId: cursor },
+      );
+      expect(result.retainedSnapshotBytes).toBeLessThanOrEqual(10);
+      expect(
+        result.snapshots.reduce(
+          (total, snapshot) => total + snapshot.content.byteLength,
+          0,
+        ),
+      ).toBe(result.retainedSnapshotBytes);
+      result.snapshots.forEach((snapshot) => observed.add(snapshot.resourceId));
+      cursor = result.cursorAfterAdapterId;
+    }
+
+    expect(observed).toEqual(
+      new Set(["settings/default/a", "settings/default/b", "settings/default/c"]),
+    );
+  });
+
+  it("drops tombstones from incomplete or manager-deferred adapter scans", async () => {
+    let complete = false;
+    const incomplete = adapter("incomplete", ["settings"], async () => ({
+      snapshots: [],
+      deletions: [
+        {
+          resourceId: "settings/default/missing",
+          kind: "settings",
+          semanticHash: "d".repeat(64),
+        },
+      ],
+      warnings: [],
+    }));
+    incomplete.scanStatus = () => ({
+      complete,
+      deferredResourceIds: ["settings/default/missing"],
+    });
+
+    const partial = await scanAdapters(
+      [incomplete],
+      KNOWN,
+      "all",
+      NO_KINDS,
+    );
+    expect(partial.deletions).toEqual([]);
+    expect(partial.deferredAdapterIds).toEqual(new Set(["incomplete"]));
+
+    const managerDeferred = adapter("manager-deferred", ["settings"], async () => ({
+      snapshots: [
+        {
+          resourceId: "settings/default/one",
+          kind: "settings",
+          content: Buffer.alloc(6),
+          semanticHash: "1".repeat(64),
+        },
+        {
+          resourceId: "settings/default/two",
+          kind: "settings",
+          content: Buffer.alloc(6),
+          semanticHash: "2".repeat(64),
+        },
+      ],
+      deletions: [
+        {
+          resourceId: "settings/default/missing",
+          kind: "settings",
+          semanticHash: "d".repeat(64),
+        },
+      ],
+      warnings: [],
+    }));
+    const bounded = await scanAdapters(
+      [managerDeferred],
+      KNOWN,
+      "all",
+      NO_KINDS,
+      undefined,
+      { maxRetainedBytes: 10 },
+    );
+    expect(bounded.retainedSnapshotBytes).toBe(6);
+    expect(bounded.deletions).toEqual([]);
+    expect(bounded.deferredAdapterIds).toEqual(new Set(["manager-deferred"]));
+
+    complete = true;
+    const settled = await scanAdapters(
+      [incomplete],
+      KNOWN,
+      "all",
+      NO_KINDS,
+    );
+    expect(settled.deletions).toHaveLength(1);
+  });
 });
 
 describe("publish warnings against the standing warning registry", () => {

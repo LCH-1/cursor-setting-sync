@@ -8,14 +8,29 @@ import type {
   ResourceTip,
 } from "../types";
 import type { SyncRepository } from "../protocol/repository";
+import { classifyLegacyCheckpointMarker } from "../protocol/checkpointMarker";
 import { MAX_EVENT_CHANGES } from "../constants";
 import { PUBLISH_WARNING_SOURCE } from "./warningLog";
+import { assertSafeIdentifier } from "../platform/files";
 
 export function shouldPublishSnapshot(
   projection: LocalProjection | undefined,
   snapshot: ResourceSnapshot,
   tips: ResourceTip[],
 ): boolean {
+  if (snapshot.metadata?.syncOrigin === "agent-kv-recapture") {
+    // A helper-applied legacy/incomplete automatic repair can have byte-for-
+    // byte the same core and graph envelope as its repair tip. Reassert it
+    // once as an ordinary local capture so later DB generations can use the
+    // normal enrichment pipeline. A prior ordinary reassert with these exact
+    // bytes is already the acknowledgement and must not be duplicated.
+    return !tips.some(
+      (tip) =>
+        tip.operation === "put" &&
+        tip.semanticHash === snapshot.semanticHash &&
+        effectiveSyncOrigin(tip.metadata) !== "automatic-chat-repair",
+    );
+  }
   if (
     projection !== undefined &&
     [
@@ -72,6 +87,7 @@ export function isSyntheticTip(tip: ResourceTip): boolean {
     tip.metadata?.syncOrigin === "auto-merge" ||
     tip.metadata?.syncOrigin === "version-restore" ||
     tip.metadata?.syncOrigin === "automatic-chat-repair" ||
+    tip.metadata?.syncOrigin === "agent-kv-enrichment" ||
     tip.metadata?.syncOrigin === "checkpoint-marker"
   );
 }
@@ -86,16 +102,123 @@ export function effectiveVersionProducer(
   metadata: Record<string, JsonValue> | undefined,
   producer: EventProducer | undefined,
 ): EventProducer | undefined {
+  const checkpointMarker = metadata?.syncOrigin === "checkpoint-marker";
+  if (checkpointMarker) {
+    const checkpointed = parseEventProducer(metadata.checkpointedProducer);
+    if (checkpointed !== undefined && producer !== undefined) {
+      return {
+        extensionVersion: producer.extensionVersion,
+        cursorVersion: checkpointed.cursorVersion,
+        vscodeVersion: checkpointed.vscodeVersion,
+      };
+    }
+    const legacyKind = classifyLegacyCheckpointMarker(metadata);
+    if (legacyKind === "ordinary") {
+      // v0.0.59's marker manifest is the only authenticated compatibility
+      // datum left for an ordinary database tip. Grandfather that exact shape;
+      // partial new provenance and every legacy special recipe stay closed.
+      return producer;
+    }
+    if (
+      legacyKind === "automatic-chat-repair" ||
+      legacyKind === "ambiguous-special"
+    ) {
+      return undefined;
+    }
+  }
+  const effectiveOrigin = effectiveSyncOrigin(metadata);
+  if (effectiveOrigin === "agent-kv-enrichment") {
+    const original = parseEventProducer(metadata?.originalProducer);
+    if (original === undefined || producer === undefined) {
+      // The enriched payload is schema v2, so an absent enrichment-event
+      // producer must fail closed rather than masquerade as its legacy source.
+      return undefined;
+    }
+    return {
+      // The extension version gates the NEW v2 envelope. Cursor/VS Code gate
+      // the unchanged database core copied from the source tip. Taking all
+      // three fields from either producer would respectively let an old build
+      // parse v2, or launder a newer Cursor database core through this device.
+      extensionVersion: producer.extensionVersion,
+      cursorVersion: original.cursorVersion,
+      vscodeVersion: original.vscodeVersion,
+    };
+  }
   // A version-restore republishes old content under the restoring device's
   // producer; the database version gate must keep judging the ORIGINAL
   // producer so a restore cannot launder a newer-version change.
-  if (metadata?.syncOrigin === "version-restore") {
-    const original = parseEventProducer(metadata.originalProducer);
+  if (effectiveOrigin === "version-restore") {
+    const original = parseEventProducer(metadata?.originalProducer);
     if (original !== undefined) {
-      return original;
+      return checkpointMarker
+        ? producer === undefined
+          ? undefined
+          : {
+              extensionVersion: producer.extensionVersion,
+              cursorVersion: original.cursorVersion,
+              vscodeVersion: original.vscodeVersion,
+            }
+        : original;
     }
   }
+  // Old enrichment/restore markers can still prove their core producer through
+  // `originalProducer` in the branches above. An ordinary or automatic-repair
+  // marker without checkpointed producer provenance must not inherit the
+  // checkpointing machine's older Cursor version and bypass the DB gate.
+  if (checkpointMarker) {
+    return undefined;
+  }
   return producer;
+}
+
+/**
+ * The semantic recipe a synthetic payload must use when it is applied.
+ * Checkpoint pruning re-asserts repository bytes under `checkpoint-marker`,
+ * but that transport marker must not erase blob-only enrichment or additive
+ * automatic-repair semantics and turn them into an ordinary core overwrite.
+ */
+export function effectiveSyncOrigin(
+  metadata: Record<string, JsonValue> | undefined,
+): string | undefined {
+  const direct = metadata?.syncOrigin;
+  if (typeof direct !== "string") {
+    return undefined;
+  }
+  if (direct !== "checkpoint-marker") {
+    return direct;
+  }
+  if (typeof metadata?.checkpointedSyncOrigin === "string") {
+    return metadata.checkpointedSyncOrigin;
+  }
+  const legacyKind = classifyLegacyCheckpointMarker(metadata);
+  return legacyKind === "automatic-chat-repair" ||
+    legacyKind === "agent-kv-enrichment" ||
+    legacyKind === "version-restore"
+    ? legacyKind
+    : direct;
+}
+
+/**
+ * Source device whose authenticated content a helper recipe is allowed to
+ * act for. A checkpoint event's own device only reasserted repository bytes;
+ * the marker metadata carries the original source across marker generations.
+ */
+export function effectiveSourceDeviceId(
+  metadata: Record<string, JsonValue> | undefined,
+  directSourceDeviceId: string | undefined,
+): string | undefined {
+  const candidate =
+    metadata?.syncOrigin === "checkpoint-marker"
+      ? metadata.checkpointedSourceDeviceId
+      : directSourceDeviceId;
+  if (typeof candidate !== "string") {
+    return undefined;
+  }
+  try {
+    return assertSafeIdentifier(candidate, "repair source device ID");
+  } catch {
+    return undefined;
+  }
 }
 
 export function parseEventProducer(

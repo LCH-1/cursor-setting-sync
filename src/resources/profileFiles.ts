@@ -1,8 +1,8 @@
 import { basename, relative } from "node:path";
+import { stat } from "node:fs/promises";
 import type {
   JsonValue,
   LocalProjection,
-  ResourceDeletion,
   ResourceKind,
   ResourceScanResult,
   ResourceSnapshot,
@@ -10,7 +10,6 @@ import type {
 import type { CursorPaths } from "../platform/paths";
 import {
   assertSafeRelativePath,
-  listFilesRecursively,
   normalizeResourcePath,
   pathExists,
   readFileWithinRoot,
@@ -18,10 +17,35 @@ import {
   writeFileAtomicWithinRoot,
 } from "../platform/files";
 import { sha256 } from "../protocol/canonical";
-import type { ResourceAdapter, ResourceApplyInput } from "./resource";
+import type {
+  OversizedSnapshotSettlement,
+  ResourceAdapter,
+  ResourceApplyInput,
+  ResourceScanStatus,
+} from "./resource";
 import { isDeletion } from "./resource";
 import { parseJsonc } from "./jsonc";
-import { discoverProfileResourcePaths, profilePathById } from "./profilePaths";
+import {
+  ProfileResourcePathPager,
+  profilePathById,
+  type ProfileResourcePaths,
+} from "./profilePaths";
+import { DEFAULT_MAX_PAYLOAD_MIB } from "../constants";
+import {
+  GENERAL_MAX_RESOURCES_PER_SCAN,
+  GENERAL_MAX_RETAINED_BYTES_PER_SCAN,
+  generalOversizedObservation,
+  generalOversizedWarning,
+  generalResourceLimit,
+  rememberGeneralOversizedObservation,
+  type GeneralOversizedObservation,
+} from "./boundedScan";
+import {
+  AUXILIARY_DIRECTORY_MATCHES_PER_SCAN,
+  AUXILIARY_DIRECTORY_WORK_ITEMS_PER_SCAN,
+  BoundedFileTreeWalker,
+  type BoundedFileTreeStat,
+} from "../chat/boundedFileTree";
 
 interface ProfileFileCandidate {
   kind: ResourceKind;
@@ -29,6 +53,49 @@ interface ProfileFileCandidate {
   path: string;
   relativePath: string;
   validateJsonc: boolean;
+}
+
+interface ProfileFileMemo {
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  /** Optional body cache; identity and hash remain useful when it is omitted. */
+  content?: Buffer;
+  semanticHash: string;
+}
+
+const MAX_PROFILE_FILE_MEMO_ENTRIES = 64;
+const MAX_PROFILE_FILE_MEMO_BYTES = GENERAL_MAX_RETAINED_BYTES_PER_SCAN;
+export const PROFILE_HELPER_DIRECTORY_WORK_ITEMS_PER_SCAN = 512;
+
+export interface ProfileFilesAdapterOptions {
+  maxResourcesPerScan?: number;
+  maxRetainedBytesPerScan?: number;
+  maxMetadataChecksPerScan?: number;
+  metadataIntervalMs?: number;
+  maxEnumerationScopesPerScan?: number;
+  maxEnumerationWorkItemsPerScan?: number;
+  maxEnumerationMatchesPerScan?: number;
+  enumerationIntervalMs?: number;
+  now?: () => number;
+  onFileRead?: (path: string) => void;
+  onMetadataCheck?: (path: string) => void;
+  onScopeEnumerate?: (scope: string) => void;
+  /** Narrow fixed-envelope test seam. */
+  onEnumerationPage?: (page: {
+    workItems: number;
+    matches: number;
+    retainedPathCount: number;
+  }) => void;
+  /** Narrow fixed-envelope test seam. */
+  onPendingDescriptorCount?: (count: number) => void;
+  forceVerificationResourceIds?: ReadonlySet<string>;
+}
+
+interface ActiveProfileEnumeration {
+  profile: ProfileResourcePaths;
+  fixedIndex: number;
+  scopeIndex: number;
 }
 
 export class ProfileFilesAdapter implements ResourceAdapter {
@@ -42,53 +109,297 @@ export class ProfileFilesAdapter implements ResourceAdapter {
   ] as const;
   readonly appliesWhileRunning = true;
 
-  constructor(private readonly paths: CursorPaths) {}
+  private maxPayloadBytes = DEFAULT_MAX_PAYLOAD_MIB * 1024 * 1024;
+  private lastScanStatus: ResourceScanStatus = {
+    complete: true,
+    deferredResourceIds: [],
+  };
+  private readonly oversized = new Map<string, GeneralOversizedObservation>();
+  private oversizedOverflow = false;
+  private readonly pendingCandidates = new Map<string, ProfileFileCandidate>();
+  /** Failed candidates retry independently so discovery always has a page. */
+  private readonly failedCandidates = new Map<string, ProfileFileCandidate>();
+  private failedCandidateOverflow = false;
+  private readonly scanMemo = new Map<string, ProfileFileMemo>();
+  private scanMemoBytes = 0;
+  private readonly fileTreeWalker = new BoundedFileTreeWalker();
+  private readonly profilePager = new ProfileResourcePathPager();
+  private readonly profileQueue: ProfileResourcePaths[] = [];
+  private activeProfile: ActiveProfileEnumeration | null = null;
+  private enumerationActive = false;
+  private nextEnumerationAt = 0;
+  private progressRevision = 0;
+  private enumerationFailure = false;
+
+  constructor(
+    private readonly paths: CursorPaths,
+    private readonly options: ProfileFilesAdapterOptions = {},
+  ) {}
+
+  setMaxPayloadBytes(maxPayloadBytes: number): void {
+    generalResourceLimit(maxPayloadBytes);
+    if (this.maxPayloadBytes !== maxPayloadBytes) {
+      this.maxPayloadBytes = maxPayloadBytes;
+      this.oversized.clear();
+      this.oversizedOverflow = false;
+    }
+  }
+
+  scanStatus(): ResourceScanStatus {
+    return this.lastScanStatus;
+  }
+
+  oversizedSnapshotSettlements(
+    _maxPayloadBytes: number,
+  ): readonly OversizedSnapshotSettlement[] {
+    return [...this.oversized.values()];
+  }
+
+  /** Closes both resumable directory cursors owned by this adapter. */
+  async dispose(): Promise<void> {
+    await Promise.all([
+      this.fileTreeWalker.clear(),
+      this.profilePager.dispose(),
+    ]);
+  }
 
   async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
     const snapshots: ResourceSnapshot[] = [];
     const warnings: string[] = [];
-    const current = new Set<string>();
-    const unscannedScopes = new Set<string>();
-    const scannedProfiles = new Set<string>();
-    for (const candidate of await this.discoverCandidates(
-      warnings,
-      unscannedScopes,
-      scannedProfiles,
-    )) {
-      const resourceId = resourceIdFor(candidate);
-      current.add(resourceId);
-      try {
-        const content = await readFileWithinRoot(
-          this.paths.userDataRoot,
-          normalizeResourcePath(
-            relative(this.paths.userDataRoot, candidate.path),
-          ),
+    const now = (this.options.now ?? Date.now)();
+    if (!this.enumerationActive && now >= this.nextEnumerationAt) {
+      this.beginEnumeration();
+    }
+    const resourceLimit = generalResourceLimit(this.maxPayloadBytes);
+    const maxResources =
+      this.options.maxResourcesPerScan ?? GENERAL_MAX_RESOURCES_PER_SCAN;
+    const retainedLimit =
+      this.options.maxRetainedBytesPerScan ??
+      GENERAL_MAX_RETAINED_BYTES_PER_SCAN;
+    const maxPending = Math.max(
+      1,
+      Math.min(
+        this.options.maxEnumerationMatchesPerScan ??
+          AUXILIARY_DIRECTORY_MATCHES_PER_SCAN,
+        AUXILIARY_DIRECTORY_MATCHES_PER_SCAN,
+      ),
+    );
+    this.promoteFailedCandidate(maxPending);
+    const budget = {
+      workItems:
+        this.options.maxEnumerationWorkItemsPerScan ??
+        AUXILIARY_DIRECTORY_WORK_ITEMS_PER_SCAN,
+      metadataChecks: Math.max(
+        1,
+        this.options.maxMetadataChecksPerScan ?? 64,
+      ),
+    };
+    const processed = new Set<string>();
+    let retainedBytes = 0;
+    let verifiedBytes = 0;
+    let materialized = 0;
+    let canContinue = true;
+    while (canContinue) {
+      canContinue = false;
+      if (
+        this.enumerationActive &&
+        this.pendingCandidates.size < maxPending &&
+        budget.workItems > 0
+      ) {
+        const before = this.pendingCandidates.size;
+        await this.discoverIntoPending(
+          known,
+          warnings,
+          maxPending,
+          budget,
+          now,
         );
-        if (candidate.validateJsonc) {
-          parseJsonc(content.toString("utf8"), candidate.path);
-        }
-        snapshots.push({
-          resourceId,
-          kind: candidate.kind,
-          content,
-          semanticHash: sha256(content),
-          metadata: {
-            profileId: candidate.profileId,
-            relativePath: candidate.relativePath,
-          },
-        });
-      } catch (error) {
-        warnings.push(error instanceof Error ? error.message : String(error));
+        canContinue ||= this.pendingCandidates.size > before;
       }
+      for (const [resourceId, candidate] of this.pendingCandidates) {
+        if (processed.has(resourceId) || budget.metadataChecks <= 0) {
+          continue;
+        }
+        processed.add(resourceId);
+        budget.metadataChecks -= 1;
+        try {
+          this.options.onMetadataCheck?.(candidate.path);
+          const info = await stat(candidate.path);
+          if (!info.isFile()) {
+            throw new Error(`Profile resource is not a file: ${candidate.path}`);
+          }
+          const cached = this.scanMemo.get(resourceId);
+          if (
+            cached !== undefined &&
+            cached.size === info.size &&
+            cached.mtimeMs === info.mtimeMs &&
+            cached.ctimeMs === info.ctimeMs &&
+            !this.options.forceVerificationResourceIds?.has(resourceId) &&
+            projectionMatchesSemantic(known[resourceId], cached.semanticHash)
+          ) {
+            this.scanMemo.delete(resourceId);
+            this.scanMemo.set(resourceId, cached);
+            this.pendingCandidates.delete(resourceId);
+            this.failedCandidates.delete(resourceId);
+            this.progressRevision += 1;
+            this.oversized.delete(resourceId);
+            canContinue = true;
+            continue;
+          }
+          if (info.size > resourceLimit) {
+            if (
+              !rememberGeneralOversizedObservation(
+                this.oversized,
+                generalOversizedObservation(
+                resourceId,
+                `${info.size}:${info.mtimeMs}`,
+                info.size,
+                this.maxPayloadBytes,
+              ),
+              )
+            ) {
+              this.oversizedOverflow = true;
+            }
+            this.pendingCandidates.delete(resourceId);
+            this.failedCandidates.delete(resourceId);
+            this.progressRevision += 1;
+            canContinue = true;
+            continue;
+          }
+          let content: Buffer;
+          let semantic: string;
+          if (
+            cached !== undefined &&
+            cached.size === info.size &&
+            cached.mtimeMs === info.mtimeMs &&
+            cached.ctimeMs === info.ctimeMs &&
+            cached.content !== undefined
+          ) {
+            this.scanMemo.delete(resourceId);
+            this.scanMemo.set(resourceId, cached);
+            content = cached.content;
+            semantic = cached.semanticHash;
+          } else {
+            if (
+              verifiedBytes > 0 &&
+              verifiedBytes + info.size > retainedLimit
+            ) {
+              continue;
+            }
+            this.options.onFileRead?.(candidate.path);
+            content = await readFileWithinRoot(
+              this.paths.userDataRoot,
+              normalizeResourcePath(
+                relative(this.paths.userDataRoot, candidate.path),
+              ),
+              resourceLimit,
+            );
+            verifiedBytes += content.byteLength;
+            semantic = sha256(content);
+            this.rememberFile(resourceId, {
+              size: info.size,
+              mtimeMs: info.mtimeMs,
+              ctimeMs: info.ctimeMs,
+              content,
+              semanticHash: semantic,
+            });
+          }
+          if (projectionMatchesSemantic(known[resourceId], semantic)) {
+            this.pendingCandidates.delete(resourceId);
+            this.failedCandidates.delete(resourceId);
+            this.progressRevision += 1;
+            this.oversized.delete(resourceId);
+            canContinue = true;
+            continue;
+          }
+          if (
+            materialized >= maxResources ||
+            (snapshots.length > 0 && retainedBytes + info.size > retainedLimit)
+          ) {
+            continue;
+          }
+          materialized += 1;
+          if (candidate.validateJsonc) {
+            parseJsonc(content.toString("utf8"), candidate.path);
+          }
+          snapshots.push({
+            resourceId,
+            kind: candidate.kind,
+            content,
+            semanticHash: semantic,
+            metadata: {
+              profileId: candidate.profileId,
+              relativePath: candidate.relativePath,
+              lastUpdatedAt: info.mtimeMs,
+              sourceFileSize: info.size,
+              sourceFileCtimeMs: info.ctimeMs,
+            },
+          });
+          retainedBytes += content.byteLength;
+          this.failedCandidates.delete(resourceId);
+          // Kept pending until `known` acknowledges the emitted timestamp.
+          this.oversized.delete(resourceId);
+        } catch (error) {
+          this.pendingCandidates.delete(resourceId);
+          this.rememberFailedCandidate(resourceId, candidate, maxPending);
+          canContinue = true;
+          warnings.push(error instanceof Error ? error.message : String(error));
+        }
+      }
+      this.options.onPendingDescriptorCount?.(
+        this.pendingCandidates.size + this.failedCandidates.size,
+      );
+      if (
+        canContinue &&
+        budget.metadataChecks > 0 &&
+        materialized < maxResources &&
+        this.pendingCandidates.size < maxPending
+      ) {
+        continue;
+      }
+      break;
+    }
+    const metadataDeferred = new Set([
+      ...this.pendingCandidates.keys(),
+      ...this.failedCandidates.keys(),
+    ]);
+    this.lastScanStatus = {
+      complete:
+        metadataDeferred.size === 0 &&
+        !this.failedCandidateOverflow &&
+        !this.oversizedOverflow &&
+        !this.enumerationFailure &&
+        !this.enumerationActive,
+      deferredResourceIds: [
+        ...metadataDeferred,
+        ...(this.failedCandidateOverflow
+          ? ["profile-file-scope/untracked-read-failures"]
+          : []),
+        ...(this.oversizedOverflow
+          ? ["profile-file-scope/untracked-oversized-resources"]
+          : []),
+        ...(this.enumerationFailure
+          ? ["profile-file-scope/unreadable-root"]
+          : []),
+        ...(this.enumerationActive
+          ? [
+              `profile-file-scope/${encodeURIComponent(
+                this.currentEnumerationScope(),
+              )}`,
+            ]
+          : []),
+      ],
+      progressToken:
+        this.progressRevision + this.fileTreeWalker.progressToken(),
+    };
+    for (const observation of this.oversized.values()) {
+      warnings.push(generalOversizedWarning("Profile file", observation));
     }
     return {
       snapshots,
-      deletions: this.findDeletions(
-        known,
-        current,
-        unscannedScopes,
-        scannedProfiles,
-      ),
+      // A bounded streaming walk cannot retain a stable whole-tree absence
+      // proof. Preserve peer files rather than publishing destructive guesses.
+      deletions: [],
       warnings,
     };
   }
@@ -110,6 +421,9 @@ export class ProfileFilesAdapter implements ResourceAdapter {
       await removeFileWithinRoot(this.paths.userDataRoot, targetFromUserData);
       return;
     }
+    if (input.content.byteLength > generalResourceLimit(this.maxPayloadBytes)) {
+      throw new Error(`Profile file exceeds the automatic apply work limit: ${input.resourceId}`);
+    }
     if (["keybindings", "snippet", "task", "mcp"].includes(input.kind)) {
       parseJsonc(input.content.toString("utf8"), input.resourceId);
     }
@@ -120,111 +434,267 @@ export class ProfileFilesAdapter implements ResourceAdapter {
     );
   }
 
-  private async discoverCandidates(
+  private beginEnumeration(): void {
+    this.enumerationActive = true;
+    this.profilePager.restart();
+    this.profileQueue.length = 0;
+    this.activeProfile = null;
+    this.failedCandidateOverflow = false;
+    this.enumerationFailure = false;
+    this.oversized.clear();
+    this.oversizedOverflow = false;
+  }
+
+  private promoteFailedCandidate(maxPending: number): void {
+    if (this.pendingCandidates.size >= maxPending) {
+      return;
+    }
+    const next = this.failedCandidates.entries().next().value;
+    if (next === undefined) {
+      return;
+    }
+    const [resourceId, candidate] = next;
+    this.failedCandidates.delete(resourceId);
+    this.pendingCandidates.set(resourceId, candidate);
+  }
+
+  private rememberFailedCandidate(
+    resourceId: string,
+    candidate: ProfileFileCandidate,
+    maxPending: number,
+  ): void {
+    this.failedCandidates.delete(resourceId);
+    while (this.failedCandidates.size >= maxPending) {
+      const oldest = this.failedCandidates.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.failedCandidates.delete(oldest);
+      this.failedCandidateOverflow = true;
+    }
+    this.failedCandidates.set(resourceId, candidate);
+  }
+
+  private async discoverIntoPending(
+    known: Readonly<Record<string, LocalProjection>>,
     warnings: string[],
-    unscannedScopes: Set<string>,
-    scannedProfiles: Set<string> = new Set(),
-  ): Promise<ProfileFileCandidate[]> {
-    const candidates: ProfileFileCandidate[] = [];
-    for (const profile of await discoverProfileResourcePaths(this.paths)) {
-      // Recorded even when the profile has no files: absence from discovery
-      // is what must NOT read as deletion.
-      scannedProfiles.add(profile.profileId);
-      const singleFiles: Array<{
+    maxPending: number,
+    budget: { workItems: number },
+    now: number,
+  ): Promise<void> {
+    while (
+      this.enumerationActive &&
+      this.pendingCandidates.size < maxPending &&
+      budget.workItems > 0
+    ) {
+      if (this.activeProfile === null) {
+        if (this.profileQueue.length === 0) {
+          const maxScopes = this.options.maxEnumerationScopesPerScan ?? 16;
+          const page = await this.profilePager.advance(this.paths, {
+            maxProfiles: Math.max(1, Math.floor(maxScopes / 2)),
+            maxWorkItems: budget.workItems,
+          });
+          budget.workItems -= page.workItems;
+          this.progressRevision += page.workItems;
+          this.options.onEnumerationPage?.({
+            workItems: page.workItems,
+            matches: page.profiles.length,
+            retainedPathCount: page.retainedPathCount,
+          });
+          this.profileQueue.push(...page.profiles);
+          if (this.profileQueue.length === 0) {
+            if (page.complete) {
+              this.finishEnumeration(now);
+            }
+            return;
+          }
+        }
+        this.activeProfile = {
+          profile: this.profileQueue.shift()!,
+          fixedIndex: 0,
+          scopeIndex: 0,
+        };
+        this.progressRevision += 1;
+      }
+      const active = this.activeProfile;
+      const fixed: Array<{
         kind: ResourceKind;
         path: string;
         validateJsonc: boolean;
       }> = [
-        { kind: "keybindings", path: profile.keybindings, validateJsonc: true },
-        { kind: "task", path: profile.tasks, validateJsonc: true },
-        { kind: "mcp", path: profile.mcp, validateJsonc: true },
+        {
+          kind: "keybindings",
+          path: active.profile.keybindings,
+          validateJsonc: true,
+        },
+        { kind: "task", path: active.profile.tasks, validateJsonc: true },
+        { kind: "mcp", path: active.profile.mcp, validateJsonc: true },
       ];
-      for (const file of singleFiles) {
+      if (active.fixedIndex < fixed.length) {
+        const file = fixed[active.fixedIndex]!;
+        active.fixedIndex += 1;
+        this.progressRevision += 1;
         if (await pathExists(file.path)) {
-          candidates.push({
+          this.addPendingCandidate({
             ...file,
-            profileId: profile.profileId,
+            profileId: active.profile.profileId,
             relativePath: basename(file.path),
           });
         }
+        continue;
       }
-      let snippetPaths: string[] = [];
-      try {
-        snippetPaths = await listFilesRecursively(profile.snippets);
-      } catch (error) {
-        warnings.push(error instanceof Error ? error.message : String(error));
-        unscannedScopes.add(scanScope("snippet", profile.profileId));
-      }
-      for (const path of snippetPaths) {
-        if (/\.(json|code-snippets)$/i.test(path)) {
-          candidates.push({
-            kind: "snippet",
-            profileId: profile.profileId,
-            path,
-            relativePath: normalizeResourcePath(relative(profile.snippets, path)),
-            validateJsonc: true,
+      const scopes: Array<{
+        kind: "snippet" | "prompt";
+        root: string;
+        validateJsonc: boolean;
+      }> = [
+        {
+          kind: "snippet",
+          root: active.profile.snippets,
+          validateJsonc: true,
+        },
+        {
+          kind: "prompt",
+          root: active.profile.prompts,
+          validateJsonc: false,
+        },
+      ];
+      if (active.scopeIndex < scopes.length) {
+        const scope = scopes[active.scopeIndex]!;
+        try {
+          this.options.onScopeEnumerate?.(
+            scanScope(scope.kind, active.profile.profileId),
+          );
+          const page = await this.fileTreeWalker.advance(scope.root, {
+            maxWorkItems: budget.workItems,
+            maxMatches: maxPending - this.pendingCandidates.size,
+            includeFile: (path, relativePath, observed) => {
+              if (
+                scope.kind === "snippet" &&
+                !/\.(json|code-snippets)$/i.test(path)
+              ) {
+                return false;
+              }
+              const candidate: ProfileFileCandidate = {
+                kind: scope.kind,
+                profileId: active.profile.profileId,
+                path,
+                relativePath: normalizeResourcePath(relativePath),
+                validateJsonc: scope.validateJsonc,
+              };
+              const resourceId = resourceIdFor(candidate);
+              if (
+                !this.options.forceVerificationResourceIds?.has(resourceId) &&
+                projectionMatchesFileIdentity(known[resourceId], observed)
+              ) {
+                this.oversized.delete(resourceId);
+                return false;
+              }
+              return true;
+            },
           });
+          budget.workItems -= page.workItems;
+          this.options.onEnumerationPage?.({
+            workItems: page.workItems,
+            matches: page.files.length,
+            retainedPathCount: page.retainedPathCount,
+          });
+          for (const path of page.files) {
+            this.addPendingCandidate({
+              kind: scope.kind,
+              profileId: active.profile.profileId,
+              path,
+              relativePath: normalizeResourcePath(
+                relative(scope.root, path),
+              ),
+              validateJsonc: scope.validateJsonc,
+            });
+          }
+          if (page.complete) {
+            active.scopeIndex += 1;
+            this.progressRevision += 1;
+            continue;
+          }
+          return;
+        } catch (error) {
+          warnings.push(error instanceof Error ? error.message : String(error));
+          this.enumerationFailure = true;
+          active.scopeIndex += 1;
+          this.progressRevision += 1;
+          continue;
         }
       }
-      let promptPaths: string[] = [];
-      try {
-        promptPaths = await listFilesRecursively(profile.prompts);
-      } catch (error) {
-        warnings.push(error instanceof Error ? error.message : String(error));
-        unscannedScopes.add(scanScope("prompt", profile.profileId));
-      }
-      for (const path of promptPaths) {
-        candidates.push({
-          kind: "prompt",
-          profileId: profile.profileId,
-          path,
-          relativePath: normalizeResourcePath(relative(profile.prompts, path)),
-          validateJsonc: false,
-        });
+      this.activeProfile = null;
+      this.progressRevision += 1;
+      if (
+        this.profileQueue.length === 0 &&
+        !this.profilePager.active
+      ) {
+        this.finishEnumeration(now);
       }
     }
-    return candidates;
   }
 
-  private findDeletions(
-    known: Record<string, LocalProjection>,
-    current: Set<string>,
-    unscannedScopes: ReadonlySet<string>,
-    scannedProfiles: ReadonlySet<string>,
-  ): ResourceDeletion[] {
-    return Object.values(known)
-      .filter(
-        (projection) =>
-          this.kinds.includes(
-            projection.kind as (typeof this.kinds)[number],
-          ) &&
-          !current.has(projection.resourceId) &&
-          // The guard settings.ts and extensions.ts always had: a profile
-          // absent from discovery - deleted here, or a junction discovery
-          // skips - must not tombstone every keybinding, snippet, task and
-          // prompt it ever had, unlinking them live on every other machine.
-          scannedProfiles.has(
-            parseResourceId(projection.resourceId).profileId,
-          ) &&
-          !unscannedScopes.has(
-            scanScope(
-              projection.kind,
-              parseResourceId(projection.resourceId).profileId,
-            ),
-          ),
-      )
-      .map((projection) => {
-        const parsed = parseResourceId(projection.resourceId);
-        return {
-          resourceId: projection.resourceId,
-          kind: projection.kind,
-          semanticHash: sha256(`deleted:${projection.resourceId}`),
-          metadata: {
-            profileId: parsed.profileId,
-            relativePath: parsed.relativePath,
-          },
-        };
-      });
+  private addPendingCandidate(candidate: ProfileFileCandidate): void {
+    this.pendingCandidates.set(resourceIdFor(candidate), candidate);
+  }
+
+  private rememberFile(resourceId: string, memo: ProfileFileMemo): void {
+    const previous = this.scanMemo.get(resourceId);
+    if (previous !== undefined) {
+      this.scanMemoBytes -= previous.content?.byteLength ?? 0;
+      this.scanMemo.delete(resourceId);
+    }
+    const content = memo.content;
+    const retained =
+      content !== undefined && content.byteLength <= MAX_PROFILE_FILE_MEMO_BYTES
+        ? memo
+        : {
+            size: memo.size,
+            mtimeMs: memo.mtimeMs,
+            ctimeMs: memo.ctimeMs,
+            semanticHash: memo.semanticHash,
+          };
+    const retainedBytes = retained.content?.byteLength ?? 0;
+    while (
+      this.scanMemo.size >= MAX_PROFILE_FILE_MEMO_ENTRIES ||
+      this.scanMemoBytes + retainedBytes > MAX_PROFILE_FILE_MEMO_BYTES
+    ) {
+      const oldest = this.scanMemo.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      const removed = this.scanMemo.get(oldest);
+      this.scanMemo.delete(oldest);
+      if (removed !== undefined) {
+        this.scanMemoBytes -= removed.content?.byteLength ?? 0;
+      }
+    }
+    this.scanMemo.set(resourceId, retained);
+    this.scanMemoBytes += retainedBytes;
+  }
+
+  private finishEnumeration(now: number): void {
+    this.enumerationActive = false;
+    this.progressRevision += 1;
+    const metadataInterval = this.options.metadataIntervalMs ?? 30 * 1000;
+    const enumerationInterval =
+      this.options.enumerationIntervalMs ?? 5 * 60 * 1000;
+    this.nextEnumerationAt =
+      now + Math.min(metadataInterval, enumerationInterval);
+  }
+
+  private currentEnumerationScope(): string {
+    const active = this.activeProfile;
+    if (active === null) {
+      return "profiles";
+    }
+    return active.scopeIndex === 0
+      ? `profile/${active.profile.profileId}`
+      : scanScope(
+          active.scopeIndex === 1 ? "snippet" : "prompt",
+          active.profile.profileId,
+        );
   }
 }
 
@@ -259,18 +729,29 @@ function resourceIdFor(candidate: ProfileFileCandidate): string {
   )}`;
 }
 
-function parseResourceId(resourceId: string): {
-  profileId: string;
-  relativePath: string;
-} {
-  const [, profileId, relativePath] = resourceId.split("/");
-  if (profileId === undefined || relativePath === undefined) {
-    throw new Error(`Invalid profile resource ID: ${resourceId}`);
-  }
-  return {
-    profileId: decodeURIComponent(profileId),
-    relativePath: decodeURIComponent(relativePath),
-  };
+function projectionMatchesSemantic(
+  projection: LocalProjection | undefined,
+  semanticHash: string,
+): boolean {
+  return (
+    projection?.semanticHash === semanticHash ||
+    projection?.retainedLocalHash === semanticHash
+  );
+}
+
+function projectionMatchesFileIdentity(
+  projection: LocalProjection | undefined,
+  observed: BoundedFileTreeStat,
+): boolean {
+  return (
+    projection !== undefined &&
+    typeof observed.size === "number" &&
+    typeof observed.mtimeMs === "number" &&
+    typeof observed.ctimeMs === "number" &&
+    projection.sourceFileSize === observed.size &&
+    projection.sourceTimestamp === observed.mtimeMs &&
+    projection.sourceFileCtimeMs === observed.ctimeMs
+  );
 }
 
 function rootForKind(

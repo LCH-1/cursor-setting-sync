@@ -2,6 +2,28 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.63] - 2026-08-11
+
+### Added
+
+- **Composer conversations now carry the content-addressed continuation data Cursor needs to submit the next turn.** In addition to the visible header, `composerData`, and `bubbleId:` rows, the portable v2 chat payload includes every reachable, available, hash-verified `agentKv:blob:` row and explicitly records unavailable IDs. The target inserts only missing or corrupt blobs and never replaces a hash-valid local copy.
+- **Existing conversations published by 0.0.62 and earlier can be enriched without rolling their visible history back.** A healthy source PC attaches its validated blob graph to the exact current repository tip, preserving a newer target PC's prompts, error bubbles, title, and conversation body byte for byte. `Repair Unavailable Chats` also audits continuation roots and, when the synchronized copy is not yet complete, gives count-only instructions to run **Sync Now** first on a PC where the chat still continues.
+
+### Fixed
+
+- **Chats restored from another PC no longer fail the next prompt with `Conversation data missing`.** Older releases synchronized all legacy message rows but omitted Cursor's separate continuation blob graph, so a conversation could render perfectly while the server rejected it with dozens or hundreds of missing blobs. Chat capture, merge, apply, automatic repair, and metadata acknowledgement now preserve the graph consistently, and a previously applied complete tip can be re-queued if its local blobs are later lost.
+- **Large or malformed continuation graphs cannot turn chat polling into an unbounded CPU/RAM scan.** Background capture is limited to two new graphs per scan, 4,096 nodes and 32 MiB per chat; protobuf candidate discovery is bounded before allocation, oversized SQLite rows are rejected by length before their value is materialized, and incomplete work falls back to the legacy core for later bounded enrichment. Transient SQLite read failures are retried instead of being cached as a successful no-op.
+- **Large chat histories now settle instead of being rebuilt on every poll.** Changed-body capture, bubble-count audits, and same-count deep verification advance through bounded round-robin batches; oversized chats are size-checked and hash-streamed without loading their full body, stable warnings remain visible without reopening SQLite, and the shutdown helper drains feasible local changes before applying incoming data.
+- **Large file trees and auxiliary Cursor stores no longer create one-poll memory or I/O spikes.** Transcript, chat-store, workspace image, profile, extension, settings, and Cursor user-file scans advance through bounded pages; file and SQLite sizes are checked before values cross into JavaScript, and stable idle scans reuse lightweight observations. A partial or failed local scan now blocks the matching incoming write instead of letting an unreadable or not-yet-published local edit be overwritten.
+- **Encrypted repository and offline-helper reads are bounded before allocation.** Object envelopes use the authenticated compressed size, event/checkpoint files use opened-handle limits that cannot be bypassed by a stat/read race, and helper applies retain at most one 32 MiB page while leaving later changes queued. A single larger payload is reported explicitly rather than silently starving smaller siblings.
+- **Synthetic chat metadata always describes the exact payload it accompanies.** Automatic merges, blob enrichment, and unavailable-message repair recompute schema, blob/reference/missing counts, and core hashes instead of inheriting stale fields that could suppress later verification.
+- **Opening many Cursor windows no longer duplicates the full synchronization state in every extension host.** A standby window does not open the repository or read, parse, stringify, or retain its local-state body. Only the elected owner or an explicit command opens the lightweight repository envelope on demand; its local-state body is initialized once after that window takes `sync.lock`.
+
+### Changed
+
+- The compatibility floor for v2 database-backed chat payloads is extension version `0.0.63`. Older clients safely defer those payloads until they are updated.
+- Bounded Cursor user-file, profile-file, settings, extension, and UI-state discovery is now additive-only. These fixed-memory pages cannot retain a stable identity set for an entire large or concurrently changing tree/marker, so they no longer originate deletion tombstones from absence in one page. Existing authenticated tombstones remain understood and can still be applied; this change only prevents a partial local walk from inventing a destructive deletion.
+
 ## [0.0.62] - 2026-08-08
 
 ### Fixed

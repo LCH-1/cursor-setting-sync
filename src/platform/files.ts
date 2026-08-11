@@ -14,6 +14,7 @@ import {
   unlink,
 } from "node:fs/promises";
 import type { Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -107,6 +108,43 @@ export async function readFileResilient(path: string): Promise<Buffer> {
 export async function readJsonFile<T>(path: string): Promise<T> {
   const content = await retryTransientRead(() => readFile(path, "utf8"));
   return JSON.parse(content) as T;
+}
+
+/**
+ * Reads an ordinary file through an opened-handle size bound.
+ *
+ * `stat()` followed by `readFile()` is not a memory bound: a cloud provider or
+ * another process can replace/grow the file between those calls and make
+ * `readFile()` allocate the new size. The opened descriptor is checked first,
+ * read positionally, and probed once past the observed end instead.
+ */
+export async function readFileBounded(
+  path: string,
+  maxBytes: number,
+): Promise<Buffer> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new Error("Bounded file read limit must be a non-negative integer.");
+  }
+  return retryTransientRead(async () => {
+    const handle = await open(path, "r");
+    try {
+      const opened = await handle.stat();
+      if (!opened.isFile()) {
+        throw new Error(`Expected a regular file: ${path}`);
+      }
+      return await readOpenedFileBounded(handle, opened.size, maxBytes, path);
+    } finally {
+      await handle.close();
+    }
+  });
+}
+
+export async function readJsonFileBounded<T>(
+  path: string,
+  maxBytes: number,
+): Promise<T> {
+  const content = await readFileBounded(path, maxBytes);
+  return JSON.parse(content.toString("utf8")) as T;
 }
 
 export async function writeJsonAtomic(
@@ -327,7 +365,15 @@ export async function readFileWithinRoot(
     if (maxBytes !== undefined && opened.size > maxBytes) {
       throw new Error(`Synchronized file exceeds its size limit: ${candidate}`);
     }
-    const content = await handle.readFile();
+    const content =
+      maxBytes === undefined
+        ? await handle.readFile()
+        : await readOpenedFileBounded(
+            handle,
+            opened.size,
+            maxBytes,
+            candidate,
+          );
     if (maxBytes !== undefined && content.byteLength > maxBytes) {
       throw new Error(`Synchronized file exceeds its size limit: ${candidate}`);
     }
@@ -343,6 +389,43 @@ export async function readFileWithinRoot(
   } finally {
     await handle.close();
   }
+}
+
+async function readOpenedFileBounded(
+  handle: FileHandle,
+  openedSize: number,
+  maxBytes: number,
+  candidate: string,
+): Promise<Buffer> {
+  if (
+    !Number.isSafeInteger(openedSize) ||
+    openedSize < 0 ||
+    openedSize > maxBytes
+  ) {
+    throw new Error(`Synchronized file exceeds its size limit: ${candidate}`);
+  }
+  const content = Buffer.allocUnsafe(openedSize);
+  let offset = 0;
+  while (offset < openedSize) {
+    const { bytesRead } = await handle.read(
+      content,
+      offset,
+      openedSize - offset,
+      offset,
+    );
+    if (bytesRead === 0) {
+      throw new Error(`Synchronized file changed while being read: ${candidate}`);
+    }
+    offset += bytesRead;
+  }
+  // A file can grow after the bounded stat but before/during the read.  Never
+  // ask readFile() to allocate that new size; one positional byte is enough to
+  // prove the observed bound no longer describes the file.
+  const probe = Buffer.allocUnsafe(1);
+  if ((await handle.read(probe, 0, 1, openedSize)).bytesRead !== 0) {
+    throw new Error(`Synchronized file changed while being read: ${candidate}`);
+  }
+  return content;
 }
 
 export async function writeFileAtomicWithinRoot(

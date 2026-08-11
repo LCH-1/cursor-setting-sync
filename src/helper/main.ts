@@ -14,14 +14,14 @@ import {
   FINALIZER_LOCK_TRUST_MS,
   APPLY_FAILURE_BLOCK_PREFIX,
   HELPER_REQUEST_VERSION,
-  MAX_APPLY_BATCH_BYTES,
-  REPOSITORY_FILE,
+  MAX_HELPER_APPLY_WORK_BYTES,
   RESTART_TO_APPLY_TITLE,
 } from "../constants";
 import { GLOBAL_DATABASE_KINDS } from "../types";
 import type {
-  RepositoryFile,
+  LocalProjection,
   ResourceDeletion,
+  ResourceKind,
   ResourceScanResult,
   ResourceSnapshot,
   ResourceTip,
@@ -34,29 +34,42 @@ import {
 } from "../platform/files";
 import { commitAndPush, isGitRepository, pullLatest } from "../platform/git";
 import { acquireFileLock, type FileLock } from "../platform/lock";
-import { SyncRepository } from "../protocol/repository";
+import {
+  readRepositoryManifest,
+  SyncRepository,
+} from "../protocol/repository";
+import { classifyLegacyCheckpointMarker } from "../protocol/checkpointMarker";
 import { EventReconciler, parentsForLocalChange } from "../protocol/reconciler";
 import type { ResourceProjection } from "../protocol/reconciler";
 import {
   absorbedCheckpointManifest,
+  effectiveSourceDeviceId,
+  effectiveSyncOrigin,
+  effectiveTipProducer,
   filterPublishableChanges,
-  isSyntheticTip,
+  oversizedPayloadWarning,
   publishInBatches,
+  shouldPublishSnapshot,
 } from "../sync/versionPolicy";
 import { canonicalBytes, sha256 } from "../protocol/canonical";
 import { StateVscdbChatAdapter } from "../chat/stateVscdb";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
 import {
-  discoverWorkspaces,
+  lookupWorkspaceIdentityReferences,
   resolveTargetWorkspace,
+  selectWorkspaceMappingsForReferences,
 } from "../chat/workspace";
 import {
   SettingsAdapter,
   createSettingsIgnoreMatcher,
 } from "../resources/settings";
-import { ProfileFilesAdapter } from "../resources/profileFiles";
 import {
+  PROFILE_HELPER_DIRECTORY_WORK_ITEMS_PER_SCAN,
+  ProfileFilesAdapter,
+} from "../resources/profileFiles";
+import {
+  CURSOR_HELPER_DIRECTORY_WORK_ITEMS_PER_SCAN,
   CursorUserFilesAdapter,
   normalizeIgnoredUserFiles,
 } from "../resources/cursorUserFiles";
@@ -69,7 +82,10 @@ import {
 } from "../resources/extensions";
 import { WorkspaceStorageAdapter } from "../resources/workspaceStorage";
 import { createIgnoreMatcher } from "../resources/ignorePatterns";
-import type { ResourceAdapter } from "../resources/resource";
+import {
+  disposeResourceAdapters,
+  type ResourceAdapter,
+} from "../resources/resource";
 import {
   applyGlobalDatabaseChanges,
   recoverInterruptedApplyJournals,
@@ -84,6 +100,14 @@ import {
 } from "./processListingCadence";
 
 const execFileAsync = promisify(execFile);
+const MAX_FINAL_EXPORT_CHAT_SCAN_PASSES = 32;
+const MAX_FINAL_EXPORT_PROFILE_SCAN_PASSES = 256;
+
+function finalExportPassLimit(adapter: ResourceAdapter): number {
+  return adapter.id === "settings" || adapter.id === "extensions"
+    ? MAX_FINAL_EXPORT_PROFILE_SCAN_PASSES
+    : MAX_FINAL_EXPORT_CHAT_SCAN_PASSES;
+}
 
 /**
  * Stamped once at process start so every result can say how long the offline
@@ -270,9 +294,7 @@ async function executeRequest(
     request.mode === "restore-backup"
       ? false
       : await beginGitTransport(request, gitWarnings);
-  const repositoryFile = await readJsonFile<RepositoryFile>(
-    join(request.repositoryRoot, REPOSITORY_FILE),
-  );
+  const repositoryFile = await readRepositoryManifest(request.repositoryRoot);
   const repository = await SyncRepository.openWithMasterKey(
     request.repositoryRoot,
     request.storageRoot,
@@ -338,7 +360,7 @@ async function executeRequest(
     );
   }
 
-  const exported = await exportFinalChanges(request, repository);
+  const exported = await exportFinalChanges(request, repository, heartbeat);
   // Everything that means a resource did NOT reach the repository: a git
   // transport failure, an adapter that threw during the shutdown scan, or a
   // snapshot dropped for exceeding the payload limit. These are reported apart
@@ -386,13 +408,37 @@ async function executeRequest(
   const requestedChanges = shutdownApply
     ? shutdownApplyBatch(repository, reconcileResult.projections)
     : request.changes;
-  const eligible = requestedChanges.filter((change) =>
-    isEligible(change, reconcileResult.projections, repository.state.conflicts),
+  const pageVerifiedChanges = intersectVerifiedApplyPage(
+    requestedChanges,
+    exported.verifiedApplyVersionIds,
+  );
+  const exportBlockReasons = new Map(
+    pageVerifiedChanges.flatMap((change) => {
+      const reason = finalExportApplyBlockReason(change, exported);
+      return reason === null ? [] : [[change.resourceId, reason] as const];
+    }),
+  );
+  for (const [resourceId, reason] of exportBlockReasons) {
+    warnings.push(`Applying ${resourceId} was deferred: ${reason}`);
+  }
+  const eligible = pageVerifiedChanges.filter(
+    (change) =>
+      !exportBlockReasons.has(change.resourceId) &&
+      isEligible(
+        change,
+        reconcileResult.projections,
+        repository.state.conflicts,
+      ),
   );
   const skipped = [
-    ...requestedChanges
+    ...pageVerifiedChanges
     .filter((change) => !eligible.includes(change))
-    .map((change) => `${change.resourceId}: superseded or conflicted`),
+    .map((change) => {
+      const exportBlock = exportBlockReasons.get(change.resourceId);
+      return exportBlock === undefined
+        ? `${change.resourceId}: superseded or conflicted`
+        : `${change.resourceId}: ${exportBlock}`;
+    }),
   ];
   const preparation = await prepareChanges(repository, eligible);
   skipped.push(...preparation.skipped);
@@ -422,6 +468,7 @@ async function executeRequest(
   const applied: string[] = [];
   const retainedLocal = new Set<string>();
   const globalRetainedHashes: Record<string, string> = {};
+  const globalLocalChatCoreHashes: Record<string, string | null> = {};
   const globalFailureByResourceId: Record<string, string> = {};
   if (globalPrepared.length > 0) {
     await ensureExclusiveAccess();
@@ -455,6 +502,10 @@ async function executeRequest(
       retainedLocal.add(resourceId);
     }
     Object.assign(globalRetainedHashes, globalResult.retainedLocalHashes);
+    Object.assign(
+      globalLocalChatCoreHashes,
+      globalResult.localChatCoreHashes,
+    );
   }
 
   const nonGlobalResult = await applyNonGlobalChanges(
@@ -484,6 +535,7 @@ async function executeRequest(
     applied,
     retainedLocal,
     { ...globalRetainedHashes, ...nonGlobalResult.retainedLocalHashes },
+    globalLocalChatCoreHashes,
     {
       ...preparation.failureByResourceId,
       ...globalFailureByResourceId,
@@ -550,10 +602,22 @@ async function finishGitTransport(
   }
 }
 
+interface FinalExportOutcome {
+  warnings: string[];
+  notices: string[];
+  /** Exact local resources whose current state was not safe to publish. */
+  protectedLocalResourceIds: string[];
+  /** Adapter kinds whose final local state could not be identified exactly. */
+  incompleteKinds: ResourceKind[];
+  /** Authenticated versions whose exact local targets this pass verified. */
+  verifiedApplyVersionIds: string[];
+}
+
 async function exportFinalChanges(
   request: HelperRequest,
   repository: SyncRepository,
-): Promise<{ warnings: string[]; notices: string[] }> {
+  heartbeat: () => void = () => {},
+): Promise<FinalExportOutcome> {
   const reconciler = new EventReconciler();
   const checkpoint = await absorbedCheckpointManifest(repository);
   const preResult = reconciler.reconcile(
@@ -561,22 +625,35 @@ async function exportFinalChanges(
     repository.state,
     checkpoint,
   );
+  const targetChanges = finalExportTargetPage(
+    request,
+    repository,
+    preResult.projections,
+  );
   const conflictedResources = new Set(
     repository.state.conflicts
       .filter((conflict) => conflict.resolvedAt === undefined)
       .map((conflict) => conflict.resourceId),
   );
   const protectedSyntheticResources = new Set(
-    preResult.projections
-      .filter(
-        (projection) =>
-          projection.changed && isSyntheticTip(projection.tip),
-      )
-      .map((projection) => projection.resourceId),
+    targetChanges
+      .filter((change) => isSyntheticChange(change))
+      .map((change) => change.resourceId),
+  );
+  const forceCoreVerificationResourceIds = targetChanges
+    .filter(
+      (change) => chatTipMayReplaceLocalCore(change),
+    )
+    .map((change) => change.resourceId);
+  // A queued incoming tip may overwrite a local edit whose mtime was restored
+  // by a copy/sync tool. Timestamp and persisted file identity shortcuts are
+  // disabled for these exact targets during the pre-apply export.
+  const forceTargetVerificationResourceIds = new Set(
+    targetChanges.map((change) => change.resourceId),
   );
   const workspaceMappings = await resolveWorkspaceStorageMappings(
     request,
-    preResult.projections,
+    targetChanges,
   );
   const adapters: ResourceAdapter[] = [
     new SettingsAdapter(
@@ -584,15 +661,28 @@ async function exportFinalChanges(
       createSettingsIgnoreMatcher(request.syncOptions.ignoredSettings),
       createSettingsIgnoreMatcher(request.syncOptions.machineScopedSettings),
     ),
-    new ProfileFilesAdapter(request.paths),
+    new ProfileFilesAdapter(request.paths, {
+      forceVerificationResourceIds: forceTargetVerificationResourceIds,
+      maxEnumerationWorkItemsPerScan:
+        PROFILE_HELPER_DIRECTORY_WORK_ITEMS_PER_SCAN,
+    }),
     new CursorUserFilesAdapter(
       request.paths,
       normalizeIgnoredUserFiles(request.syncOptions.ignoredUserFiles ?? []),
+      process.platform,
+      {
+        maxEnumerationWorkItemsPerScan:
+          CURSOR_HELPER_DIRECTORY_WORK_ITEMS_PER_SCAN,
+        forceVerificationResourceIds: forceTargetVerificationResourceIds,
+      },
     ),
-    new ProfilesAdapter(request.paths),
+    new ProfilesAdapter(request.paths, {
+      forceVerificationResourceIds: forceTargetVerificationResourceIds,
+    }),
     new UiStateAdapter(
       request.paths,
       normalizeIgnoredUiStateKeys(request.syncOptions.ignoredUiStateKeys ?? []),
+      { forceVerificationResourceIds: forceTargetVerificationResourceIds },
     ),
     new ExtensionsAdapter(
       request.paths,
@@ -606,16 +696,31 @@ async function exportFinalChanges(
         workspaceMappings,
         request.syncOptions.maxPayloadBytes,
         createIgnoreMatcher(request.syncOptions.ignoredWorkspaces ?? []),
+        false,
+        { forceVerificationResourceIds: forceTargetVerificationResourceIds },
       ),
     );
   }
+  let stateChatAdapter: StateVscdbChatAdapter | null = null;
   if (request.syncOptions.syncChat) {
+    stateChatAdapter = new StateVscdbChatAdapter(request.paths, {
+      // A fresh shutdown helper must verify changed headers and message counts,
+      // but it must not start the extension host's periodic equal-count sweep
+      // from zero on every launch. That full sweep is stateful polling work.
+      periodicDeepVerification: false,
+      forceCoreVerificationResourceIds,
+    });
     adapters.push(
-      new StateVscdbChatAdapter(request.paths),
-      new ChatTranscriptsAdapter(request.paths),
-      new StoreDbChatAdapter(request.paths),
+      stateChatAdapter,
+      new ChatTranscriptsAdapter(request.paths, {
+        forceVerificationResourceIds: forceTargetVerificationResourceIds,
+      }),
+      new StoreDbChatAdapter(request.paths, {
+        forceVerificationResourceIds: forceTargetVerificationResourceIds,
+      }),
     );
   }
+  try {
   const snapshots: ResourceSnapshot[] = [];
   const deletions: ResourceDeletion[] = [];
   const warnings: string[] = [];
@@ -624,82 +729,184 @@ async function exportFinalChanges(
   // not saved to the repository". They are re-derived on every run and none of
   // them is a failure.
   const notices: string[] = [];
+  const protectedLocalResourceIds = new Set<string>();
+  const incompleteKinds = new Set<ResourceKind>();
+  const publishedEventHashes = new Set<string>();
   for (const adapter of adapters) {
-    let result: ResourceScanResult;
-    try {
-      result = await adapter.scan(repository.state.projections);
-    } catch (error) {
-      // One failing adapter must not abort the whole shutdown export.
-      warnings.push(
-        `${adapter.id}: ${error instanceof Error ? error.message : String(error)}`,
+    adapter.setMaxPayloadBytes?.(request.syncOptions.maxPayloadBytes);
+    const drainsBounded = typeof adapter.scanStatus === "function";
+    let scanKnown = drainsBounded
+      ? localProjectionOverlay(repository.state.projections)
+      : repository.state.projections;
+    const passLimit = drainsBounded ? finalExportPassLimit(adapter) : 1;
+    let pass = 0;
+    let lastProgressToken: number | undefined;
+    let stagnantPasses = 0;
+    while (true) {
+      pass += 1;
+      let result: ResourceScanResult;
+      try {
+        result = await adapter.scan(scanKnown);
+      } catch (error) {
+        // One failing adapter must not abort the whole shutdown export, but an
+        // incoming write of that kind cannot safely follow an unknown final
+        // local observation in the same helper run.
+        warnings.push(
+          `${adapter.id}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        for (const kind of adapter.kinds) {
+          incompleteKinds.add(kind);
+        }
+        break;
+      }
+      warnings.push(...result.warnings);
+      notices.push(...(result.notices ?? []));
+      const prepared = prepareFinalExportScanChanges(
+        result,
+        scanKnown,
+        repository,
+        conflictedResources,
+        protectedSyntheticResources,
       );
-      continue;
+
+      // The configured chat adapter normally settles oversized snapshots
+      // inside scan() so they never consume the 8 MiB retained-result budget.
+      // Keep the external hook as a fail-safe for any adapter that returns one.
+      for (const snapshot of result.snapshots) {
+        if (
+          snapshot.content.byteLength > request.syncOptions.maxPayloadBytes &&
+          adapter.settleOversizedSnapshot?.(
+            snapshot,
+            request.syncOptions.maxPayloadBytes,
+          ) === true
+        ) {
+          protectedLocalResourceIds.add(snapshot.resourceId);
+        }
+      }
+      for (
+        const settlement of
+        adapter.oversizedSnapshotSettlements?.(
+          request.syncOptions.maxPayloadBytes,
+        ) ?? []
+      ) {
+        protectedLocalResourceIds.add(settlement.resourceId);
+        warnings.push(
+          settlement.warning ??
+            oversizedPayloadWarning(
+              settlement.resourceId,
+              settlement.byteLength,
+              settlement.maxPayloadBytes,
+            ),
+        );
+      }
+
+      if (!drainsBounded) {
+        snapshots.push(...prepared.snapshots);
+        deletions.push(...prepared.deletions);
+        break;
+      }
+
+      // Publish each bounded chat result before asking the same stateful
+      // adapter for another page. This releases payload buffers between passes
+      // and lets the provisional `known` view acknowledge returned snapshots;
+      // otherwise pendingSnapshots makes scanStatus incomplete forever.
+      const publishable = filterPublishableChanges(
+        prepared.snapshots,
+        prepared.deletions,
+        request.syncOptions.maxPayloadBytes,
+      );
+      warnings.push(...publishable.warnings);
+      for (const eventHash of await publishInBatches(
+        repository,
+        publishable.snapshots,
+        publishable.deletions,
+      )) {
+        publishedEventHashes.add(eventHash);
+      }
+      const status = adapter.scanStatus?.();
+      const progressToken = status?.progressToken;
+      const progressAware = progressToken !== undefined;
+      const nextPageKnown = progressAware
+        ? localProjectionOverlay(repository.state.projections)
+        : scanKnown;
+      for (const snapshot of result.snapshots) {
+        const provisional = provisionalLocalProjection(
+          snapshot,
+          scanKnown[snapshot.resourceId],
+        );
+        if (progressAware) {
+          repository.state.projections[snapshot.resourceId] = provisional;
+        } else {
+          nextPageKnown[snapshot.resourceId] = provisional;
+        }
+      }
+      for (const deletion of result.deletions) {
+        const provisional = provisionalLocalProjection(
+          deletion,
+          scanKnown[deletion.resourceId],
+        );
+        if (progressAware) {
+          repository.state.projections[deletion.resourceId] = provisional;
+        } else {
+          nextPageKnown[deletion.resourceId] = provisional;
+        }
+      }
+
+      if (status === undefined || status.complete) {
+        if (adapter === stateChatAdapter) {
+          rememberLearnedChatProjectionSources(
+            repository.state.projections,
+            scanKnown,
+          );
+        }
+        break;
+      }
+      if (progressAware) {
+        const tokenAdvanced =
+          lastProgressToken === undefined ||
+          progressToken > lastProgressToken;
+        lastProgressToken = progressToken;
+        stagnantPasses = tokenAdvanced ? 0 : stagnantPasses + 1;
+        if (stagnantPasses < MAX_FINAL_EXPORT_CHAT_SCAN_PASSES) {
+          // Only the just-published page is needed to acknowledge the next
+          // scan. Rebuilding the lazy overlay here prevents a 100k tree drain
+          // from retaining 100k provisional projections.
+          scanKnown = nextPageKnown;
+          heartbeat();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          continue;
+        }
+      } else if (pass < passLimit) {
+        continue;
+      }
+      for (const resourceId of status.deferredResourceIds) {
+        protectedLocalResourceIds.add(resourceId);
+      }
+      // A bounded enumeration can know that an unvisited directory exists
+      // without knowing the resource IDs it contains.  Exact deferred IDs are
+      // still useful diagnostics, but after the finite helper drain every kind
+      // owned by that adapter must fail closed for this run.
+      for (const kind of adapter.kinds) {
+        incompleteKinds.add(kind);
+      }
+      warnings.push(
+        `The final ${adapter.id} export remained incomplete after ${
+          progressAware
+            ? `${stagnantPasses} consecutive no-progress passes`
+            : `${passLimit} bounded passes`
+        }; ${
+          status.deferredResourceIds.length === 0
+            ? "incoming changes of this kind"
+            : `${status.deferredResourceIds.length} deferred local resource(s)`
+        } will not be applied in this helper run.`,
+      );
+      if (adapter === stateChatAdapter) {
+        rememberLearnedChatProjectionSources(
+          repository.state.projections,
+          scanKnown,
+        );
+      }
     }
-    warnings.push(...result.warnings);
-    notices.push(...(result.notices ?? []));
-    snapshots.push(
-      ...result.snapshots.filter(
-        (snapshot) => {
-          if (conflictedResources.has(snapshot.resourceId)) {
-            return false;
-          }
-          if (protectedSyntheticResources.has(snapshot.resourceId)) {
-            return false;
-          }
-          const projection = repository.state.projections[snapshot.resourceId];
-          if (
-            projection !== undefined &&
-            [
-              "chat",
-              "chat-transcript",
-              "chat-store",
-              "workspace-storage",
-              "profile",
-              "extension",
-            ].includes(projection.kind) &&
-            projection.retainedLocalHash === snapshot.semanticHash
-          ) {
-            return false;
-          }
-          if (
-            (repository.state.tips[snapshot.resourceId] ?? []).some(
-              (tip) =>
-                tip.operation === "put" &&
-                tip.semanticHash === snapshot.semanticHash,
-            )
-          ) {
-            return false;
-          }
-          return projection?.semanticHash !== snapshot.semanticHash;
-        },
-      ).map((snapshot) => ({
-        ...snapshot,
-        parents: parentsForLocalChange(
-          repository.state.projections[snapshot.resourceId],
-          repository.state.tips[snapshot.resourceId] ?? [],
-        ),
-      })),
-    );
-    deletions.push(
-      ...result.deletions.filter(
-        (deletion) =>
-          !conflictedResources.has(deletion.resourceId) &&
-          !protectedSyntheticResources.has(deletion.resourceId) &&
-          !(repository.state.tips[deletion.resourceId] ?? []).some(
-            (tip) =>
-              tip.operation === "delete" &&
-              tip.semanticHash === deletion.semanticHash,
-          ) &&
-          repository.state.projections[deletion.resourceId]?.semanticHash !==
-          deletion.semanticHash,
-      ).map((deletion) => ({
-        ...deletion,
-        parents: parentsForLocalChange(
-          repository.state.projections[deletion.resourceId],
-          repository.state.tips[deletion.resourceId] ?? [],
-        ),
-      })),
-    );
   }
   // This is the ONLY path that backs up workspaceStorage, so it must survive an
   // oversized or oversized-in-count batch instead of losing the whole export.
@@ -711,11 +918,13 @@ async function exportFinalChanges(
     request.syncOptions.maxPayloadBytes,
   );
   warnings.push(...publishable.warnings);
-  const publishedEventHashes = await publishInBatches(
+  for (const eventHash of await publishInBatches(
     repository,
     publishable.snapshots,
     publishable.deletions,
-  );
+  )) {
+    publishedEventHashes.add(eventHash);
+  }
   const result = reconciler.reconcile(
     await repository.listReconciliationEvents(checkpoint),
     repository.state,
@@ -743,35 +952,302 @@ async function exportFinalChanges(
         ...(typeof projection.tip.metadata?.lastUpdatedAt === "number"
           ? { sourceTimestamp: projection.tip.metadata.lastUpdatedAt }
           : {}),
+        ...(validFileSize(projection.tip.metadata?.sourceFileSize)
+          ? { sourceFileSize: projection.tip.metadata.sourceFileSize }
+          : {}),
+        ...(validFileTime(projection.tip.metadata?.sourceFileCtimeMs)
+          ? { sourceFileCtimeMs: projection.tip.metadata.sourceFileCtimeMs }
+          : {}),
+        ...(isChatCoreHash(projection.tip.metadata?.chatCoreHash)
+          ? { sourceChatCoreHash: projection.tip.metadata.chatCoreHash }
+          : {}),
+        ...(isChatCoreHash(projection.tip.metadata?.headerFingerprint)
+          ? {
+              sourceHeaderFingerprint:
+                projection.tip.metadata.headerFingerprint,
+            }
+          : {}),
       };
     }
   }
   await repository.saveState();
   await repository.writeAck();
-  return { warnings, notices };
+  return {
+    warnings: [...new Set(warnings)],
+    notices: [...new Set(notices)],
+    protectedLocalResourceIds: [...protectedLocalResourceIds].sort(),
+    incompleteKinds: [...incompleteKinds].sort(),
+    verifiedApplyVersionIds: targetChanges.map(helperChangeVersionId),
+  };
+  } finally {
+    // A bounded scan normally finishes by closing its last directory. Error,
+    // no-progress, and pass-limit exits do not, so the one-shot helper must
+    // retire every adapter generation explicitly before its process can linger.
+    await disposeResourceAdapters(adapters);
+  }
+}
+
+function helperChangeVersionId(change: HelperChange): string {
+  return `${change.eventHash}#${change.changeIndex}`;
+}
+
+function intersectVerifiedApplyPage(
+  changes: readonly HelperChange[],
+  verifiedVersionIds: readonly string[],
+): HelperChange[] {
+  const verified = new Set(verifiedVersionIds);
+  return changes.filter((change) =>
+    verified.has(helperChangeVersionId(change)),
+  );
+}
+
+function prepareFinalExportScanChanges(
+  result: ResourceScanResult,
+  known: Readonly<Record<string, LocalProjection>>,
+  repository: SyncRepository,
+  conflictedResources: ReadonlySet<string>,
+  protectedSyntheticResources: ReadonlySet<string>,
+): { snapshots: ResourceSnapshot[]; deletions: ResourceDeletion[] } {
+  const snapshots = result.snapshots
+    .filter((snapshot) => {
+      if (conflictedResources.has(snapshot.resourceId)) {
+        return false;
+      }
+      const projection = known[snapshot.resourceId];
+      if (
+        protectedSyntheticResources.has(snapshot.resourceId) &&
+        projection !== undefined &&
+        (projection.semanticHash === snapshot.semanticHash ||
+          projection.retainedLocalHash === snapshot.semanticHash)
+      ) {
+        // The synthetic tip is still waiting to apply and this is merely the
+        // same pre-apply local form the projection already describes. Do not
+        // publish it on top of the queued operation. A genuinely newer local
+        // snapshot is different from both hashes and must be published now;
+        // otherwise the same shutdown would apply the stale synthetic tip and
+        // overwrite an edit made after it was queued.
+        return false;
+      }
+      return shouldPublishSnapshot(
+        projection,
+        snapshot,
+        repository.state.tips[snapshot.resourceId] ?? [],
+      );
+    })
+    .map((snapshot) => ({
+      ...snapshot,
+      parents: parentsForLocalChange(
+        repository.state.projections[snapshot.resourceId],
+        repository.state.tips[snapshot.resourceId] ?? [],
+      ),
+    }));
+  const deletions = result.deletions
+    .filter(
+      (deletion) => {
+        if (conflictedResources.has(deletion.resourceId)) {
+          return false;
+        }
+        const projection = known[deletion.resourceId];
+        if (
+          protectedSyntheticResources.has(deletion.resourceId) &&
+          projection !== undefined &&
+          (projection.semanticHash === deletion.semanticHash ||
+            projection.retainedLocalHash === deletion.semanticHash)
+        ) {
+          return false;
+        }
+        return (
+          !(repository.state.tips[deletion.resourceId] ?? []).some(
+          (tip) =>
+            tip.operation === "delete" &&
+            tip.semanticHash === deletion.semanticHash,
+          ) && projection?.semanticHash !== deletion.semanticHash
+        );
+      },
+    )
+    .map((deletion) => ({
+      ...deletion,
+      parents: parentsForLocalChange(
+        repository.state.projections[deletion.resourceId],
+        repository.state.tips[deletion.resourceId] ?? [],
+      ),
+    }));
+  return { snapshots, deletions };
+}
+
+function localProjectionOverlay(
+  projections: Readonly<Record<string, LocalProjection>>,
+): Record<string, LocalProjection> {
+  const overlay = Object.create(null) as Record<string, LocalProjection>;
+  return new Proxy(overlay, {
+    get(target, property, receiver) {
+      if (typeof property !== "string") {
+        return Reflect.get(target, property, receiver) as unknown;
+      }
+      if (Object.hasOwn(target, property)) {
+        return target[property];
+      }
+      const source = projections[property];
+      if (source === undefined) {
+        return undefined;
+      }
+      // Adapters treat `known` as read-only. Returning the base projection
+      // directly keeps a settings page that checks 4k old keys from cloning
+      // all 4k into the overlay; only explicit page ACK writes enter `target`.
+      return source;
+    },
+    has(target, property) {
+      return (
+        Reflect.has(target, property) ||
+        (typeof property === "string" && projections[property] !== undefined)
+      );
+    },
+    // Object.keys/entries intentionally expose only the bounded touched delta;
+    // adapters must never turn a page lookup into an O(all projections) copy.
+    ownKeys: (target) => Reflect.ownKeys(target),
+    getOwnPropertyDescriptor(target, property) {
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+}
+
+function provisionalLocalProjection(
+  change: ResourceSnapshot | ResourceDeletion,
+  previous: LocalProjection | undefined,
+): LocalProjection {
+  return {
+    resourceId: change.resourceId,
+    kind: change.kind,
+    semanticHash: change.semanticHash,
+    versionId: previous?.versionId ?? null,
+    ...(previous?.payloadObjectId === undefined
+      ? {}
+      : { payloadObjectId: previous.payloadObjectId }),
+    ...(typeof change.metadata?.lastUpdatedAt === "number"
+      ? { sourceTimestamp: change.metadata.lastUpdatedAt }
+      : {}),
+    ...(validFileSize(change.metadata?.sourceFileSize)
+      ? { sourceFileSize: change.metadata.sourceFileSize }
+      : {}),
+    ...(validFileTime(change.metadata?.sourceFileCtimeMs)
+      ? { sourceFileCtimeMs: change.metadata.sourceFileCtimeMs }
+      : {}),
+    ...(typeof change.metadata?.bubbleCount === "number"
+      ? { sourceBubbleCount: change.metadata.bubbleCount }
+      : {}),
+    ...(isChatCoreHash(change.metadata?.chatCoreHash)
+      ? { sourceChatCoreHash: change.metadata.chatCoreHash }
+      : {}),
+    ...(isChatCoreHash(change.metadata?.headerFingerprint)
+      ? { sourceHeaderFingerprint: change.metadata.headerFingerprint }
+      : {}),
+  };
+}
+
+function rememberLearnedChatProjectionSources(
+  persistent: Record<string, LocalProjection>,
+  observed: Readonly<Record<string, LocalProjection>>,
+): void {
+  for (const [resourceId, projection] of Object.entries(observed)) {
+    const target = persistent[resourceId];
+    if (
+      target?.kind !== "chat" ||
+      projection.kind !== "chat" ||
+      target.semanticHash !== projection.semanticHash
+    ) {
+      continue;
+    }
+    if (projection.sourceTimestamp !== undefined) {
+      target.sourceTimestamp = projection.sourceTimestamp;
+    }
+    if (projection.sourceBubbleCount !== undefined) {
+      target.sourceBubbleCount = projection.sourceBubbleCount;
+    }
+    if (projection.sourceChatCoreHash !== undefined) {
+      target.sourceChatCoreHash = projection.sourceChatCoreHash;
+    }
+    if (projection.sourceHeaderFingerprint !== undefined) {
+      target.sourceHeaderFingerprint = projection.sourceHeaderFingerprint;
+    }
+    if (projection.requiresAgentKvRecapture === true) {
+      target.requiresAgentKvRecapture = true;
+    }
+  }
+}
+
+function chatTipMayReplaceLocalCore(
+  tip: Pick<ResourceTip, "kind" | "operation" | "metadata">,
+): boolean {
+  if (tip.kind !== "chat") {
+    return false;
+  }
+  if (tip.operation === "delete") {
+    return true;
+  }
+  const origin = effectiveSyncOrigin(tip.metadata);
+  if (origin === "automatic-chat-repair") {
+    return false;
+  }
+  if (origin === "agent-kv-enrichment") {
+    return tip.metadata?.agentKvEnrichmentAppliesCore === true;
+  }
+  return true;
+}
+
+function isSyntheticChange(change: HelperChange): boolean {
+  const origin = change.metadata?.syncOrigin;
+  return (
+    origin === "conflict-resolution" ||
+    origin === "auto-merge" ||
+    origin === "version-restore" ||
+    origin === "automatic-chat-repair" ||
+    origin === "agent-kv-enrichment" ||
+    origin === "checkpoint-marker"
+  );
+}
+
+function finalExportApplyBlockReason(
+  change: Pick<HelperChange, "resourceId" | "kind">,
+  outcome: Pick<
+    FinalExportOutcome,
+    "protectedLocalResourceIds" | "incompleteKinds"
+  >,
+): string | null {
+  if (outcome.protectedLocalResourceIds.includes(change.resourceId)) {
+    return "the exact final local resource was oversized or remained budget-deferred, so the queued incoming change was left untouched";
+  }
+  if (outcome.incompleteKinds.includes(change.kind)) {
+    return "the final local scan for this resource kind was incomplete, so the queued incoming change was left untouched";
+  }
+  return null;
 }
 
 async function resolveWorkspaceStorageMappings(
   request: HelperRequest,
-  projections: Array<{ tip: ResourceTip }>,
+  changes: readonly HelperChange[],
 ): Promise<Record<string, string>> {
-  const mappings = Object.assign(
-    Object.create(null) as Record<string, string>,
+  const workspaceIds = [...workspaceChangeIds(changes)];
+  const mappings = selectWorkspaceMappingsForReferences(
+    workspaceIds,
     request.workspaceMappings,
   );
   if (!request.syncOptions.syncWorkspaceStorage) {
     return mappings;
   }
-  const localWorkspaces = await discoverWorkspaces(request.paths);
-  for (const { tip } of projections) {
-    if (tip.kind !== "workspace-storage" || tip.operation === "delete") {
+  const localWorkspaces = await lookupWorkspaceIdentityReferences(
+    request.paths,
+    workspaceIds,
+    mappings,
+  );
+  for (const change of changes) {
+    if (change.kind !== "workspace-storage" || change.operation === "delete") {
       continue;
     }
-    const sourceWorkspaceId = tip.metadata?.workspaceId;
+    const sourceWorkspaceId = change.metadata?.workspaceId;
     if (typeof sourceWorkspaceId !== "string") {
       continue;
     }
-    const sourceWorkspaceUri = tip.metadata?.workspaceUri;
+    const sourceWorkspaceUri = change.metadata?.workspaceUri;
     const resolved = resolveTargetWorkspace(
       sourceWorkspaceId,
       typeof sourceWorkspaceUri === "string" ? sourceWorkspaceUri : null,
@@ -783,6 +1259,67 @@ async function resolveWorkspaceStorageMappings(
     }
   }
   return mappings;
+}
+
+function* workspaceChangeIds(
+  changes: readonly HelperChange[],
+): Iterable<string> {
+  for (const change of changes) {
+    if (change.kind !== "workspace-storage" || change.operation === "delete") {
+      continue;
+    }
+    const workspaceId = change.metadata?.workspaceId;
+    if (typeof workspaceId === "string") {
+      yield workspaceId;
+    }
+  }
+}
+
+function finalExportTargetPage(
+  request: HelperRequest,
+  repository: SyncRepository,
+  projections: ResourceProjection[],
+): HelperChange[] {
+  if (request.mode === "apply-and-restart") {
+    return boundedHelperTargetPage(request.changes);
+  }
+  if (
+    request.mode === "final-export" &&
+    request.syncOptions.applyOnShutdown !== false
+  ) {
+    return boundedHelperTargetPage(
+      shutdownApplyBatch(repository, projections),
+    );
+  }
+  return [];
+}
+
+/** Mirrors the buffers `prepareChanges` can retain, without reading payloads. */
+function boundedHelperTargetPage(
+  changes: readonly HelperChange[],
+): HelperChange[] {
+  const selected: HelperChange[] = [];
+  let totalBytes = 0;
+  for (const change of changes) {
+    if (selected.length >= 256) {
+      break;
+    }
+    if (change.operation === "put") {
+      const declaredBytes = change.payload?.plainBytes;
+      if (
+        !Number.isSafeInteger(declaredBytes) ||
+        declaredBytes === undefined ||
+        declaredBytes < 0 ||
+        declaredBytes > MAX_HELPER_APPLY_WORK_BYTES ||
+        totalBytes + declaredBytes > MAX_HELPER_APPLY_WORK_BYTES
+      ) {
+        continue;
+      }
+      totalBytes += declaredBytes;
+    }
+    selected.push(change);
+  }
+  return selected;
 }
 
 export async function prepareChanges(
@@ -797,7 +1334,8 @@ export async function prepareChanges(
   const skipped: string[] = [];
   const failureByResourceId: Record<string, string> = {};
   let totalBytes = 0;
-  const batchLimit = MAX_APPLY_BATCH_BYTES;
+  let preparedCount = 0;
+  const batchLimit = MAX_HELPER_APPLY_WORK_BYTES;
   for (const change of changes) {
     if (change.operation === "put") {
       if (change.payload === undefined) {
@@ -806,6 +1344,23 @@ export async function prepareChanges(
         const message = "the event carries no payload reference";
         skipped.push(`${change.resourceId}: ${message}`);
         failureByResourceId[change.resourceId] = message;
+        continue;
+      }
+      const declaredBytes = change.payload.plainBytes;
+      if (
+        !Number.isSafeInteger(declaredBytes) ||
+        declaredBytes < 0 ||
+        declaredBytes > batchLimit
+      ) {
+        const message = `the authenticated payload size ${declaredBytes} exceeds the fixed ${batchLimit} byte helper work limit`;
+        skipped.push(`${change.resourceId}: ${message}`);
+        failureByResourceId[change.resourceId] = message;
+        continue;
+      }
+      if (preparedCount >= 256 || totalBytes + declaredBytes > batchLimit) {
+        skipped.push(
+          `${change.resourceId}: deferred to a later bounded helper apply page; it stays queued`,
+        );
         continue;
       }
       let content: Buffer;
@@ -836,18 +1391,21 @@ export async function prepareChanges(
         failureByResourceId[change.resourceId] = message;
         continue;
       }
-      totalBytes += content.byteLength;
-      if (totalBytes > batchLimit) {
-        throw new Error(
-          `Helper apply batch exceeds ${batchLimit} bytes; apply fewer changes at once.`,
-        );
-      }
+      totalBytes += declaredBytes;
       prepared.push({
         change,
         content,
       });
+      preparedCount += 1;
     } else {
+      if (preparedCount >= 256) {
+        skipped.push(
+          `${change.resourceId}: deferred to a later bounded helper apply page; it stays queued`,
+        );
+        continue;
+      }
       prepared.push({ change });
+      preparedCount += 1;
     }
   }
   return { prepared, skipped, failureByResourceId };
@@ -864,8 +1422,9 @@ export async function prepareChanges(
  *
  * Mirrors `pendingHelperBatch` in the extension host: blocked entries are
  * skipped, entries whose tip is gone are skipped, and the batch stops at the
- * same byte ceiling so one shutdown cannot be asked to hold half a gigabyte of
- * payloads in memory. Whatever does not fit stays queued for the next quit.
+ * same fixed work ceiling so one shutdown cannot retain hundreds of MiB of
+ * payload buffers while their appliers allocate parse/SQLite copies. Whatever
+ * does not fit stays queued for the next pass.
  */
 function shutdownApplyBatch(
   repository: SyncRepository,
@@ -889,7 +1448,11 @@ function shutdownApplyBatch(
     }
     const tip = projection.tip;
     const payloadBytes = tip.payload?.plainBytes ?? 0;
-    if (totalBytes + payloadBytes > MAX_APPLY_BATCH_BYTES) {
+    if (
+      changes.length >= 256 ||
+      (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES &&
+        totalBytes + payloadBytes > MAX_HELPER_APPLY_WORK_BYTES)
+    ) {
       continue;
     }
     const change: HelperChange = {
@@ -908,7 +1471,9 @@ function shutdownApplyBatch(
       change.metadata = tip.metadata;
     }
     changes.push(change);
-    totalBytes += payloadBytes;
+    if (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES) {
+      totalBytes += payloadBytes;
+    }
   }
   return changes;
 }
@@ -951,34 +1516,92 @@ function isEligible(
   ) {
     return false;
   }
+  if (
+    tip.metadata?.syncOrigin === "checkpoint-marker" &&
+    (typeof change.sourceDeviceId !== "string" ||
+      tip.deviceId !== change.sourceDeviceId ||
+      !validCheckpointMarkerProvenance(tip))
+  ) {
+    return false;
+  }
 
   // A helper request is a local hand-off file, not the authenticated event.
   // Re-bind automatic repair authority to the freshly reconciled projection
   // before allowing the request metadata to reach the database layer.
   const requestedAutomatic =
-    change.metadata?.syncOrigin === "automatic-chat-repair";
+    effectiveSyncOrigin(change.metadata) === "automatic-chat-repair";
   const projectedAutomatic =
-    tip.metadata?.syncOrigin === "automatic-chat-repair";
+    effectiveSyncOrigin(tip.metadata) === "automatic-chat-repair";
   if (requestedAutomatic || projectedAutomatic) {
     const requestedOrigin = change.metadata?.repairOriginDeviceId;
+    const requestedSource = effectiveSourceDeviceId(
+      change.metadata,
+      change.sourceDeviceId,
+    );
+    const projectedSource = effectiveSourceDeviceId(
+      tip.metadata,
+      tip.deviceId,
+    );
     return (
       requestedAutomatic &&
       projectedAutomatic &&
       typeof change.sourceDeviceId === "string" &&
       tip.deviceId === change.sourceDeviceId &&
       typeof requestedOrigin === "string" &&
-      tip.metadata?.repairOriginDeviceId === requestedOrigin
+      tip.metadata?.repairOriginDeviceId === requestedOrigin &&
+      requestedSource !== undefined &&
+      projectedSource === requestedSource &&
+      requestedOrigin === requestedSource
     );
   }
   return true;
 }
 
-function markAppliedProjections(
+function validCheckpointMarkerProvenance(tip: ResourceTip): boolean {
+  const legacyKind = classifyLegacyCheckpointMarker(tip.metadata);
+  if (legacyKind !== null) {
+    // v0.0.59 always emitted one real parent but did not copy its version into
+    // metadata. Only its exact ordinary shape is grandfathered. Repair,
+    // enrichment, and restore recipes need the new source/version provenance
+    // (or a later marker that safely reconstructed it) before the helper may
+    // write database state.
+    return (
+      legacyKind === "ordinary" &&
+      tip.parents.length === 1 &&
+      /^[a-f0-9]{64}#\d+$/.test(tip.parents[0] ?? "") &&
+      effectiveTipProducer(tip) !== undefined
+    );
+  }
+  const checkpointedVersionId = tip.metadata?.checkpointedVersionId;
+  return (
+    typeof checkpointedVersionId === "string" &&
+    /^[a-f0-9]{64}#\d+$/.test(checkpointedVersionId) &&
+    tip.parents.length === 1 &&
+    tip.parents[0] === checkpointedVersionId &&
+    effectiveSourceDeviceId(tip.metadata, tip.deviceId) !== undefined &&
+    effectiveTipProducer(tip) !== undefined
+  );
+}
+
+/** Narrow seams for authenticated helper/final-export regressions. */
+export const __testing = Object.freeze({
+  boundedHelperTargetPage,
+  exportFinalChanges,
+  finalExportTargetPage,
+  intersectVerifiedApplyPage,
+  finalExportApplyBlockReason,
+  isEligible,
+  rememberLearnedChatProjectionSources,
+  shutdownApplyBatch,
+});
+
+export function markAppliedProjections(
   repository: SyncRepository,
   eligible: HelperChange[],
   appliedResourceIds: string[],
   retainedLocalResourceIds: ReadonlySet<string>,
   retainedLocalHashes: Readonly<Record<string, string>> = {},
+  localChatCoreHashes: Readonly<Record<string, string | null>> = {},
   failureByResourceId: Readonly<Record<string, string>> = {},
 ): void {
   const applied = new Set(appliedResourceIds);
@@ -987,6 +1610,18 @@ function markAppliedProjections(
       continue;
     }
     const previous = repository.state.projections[change.resourceId];
+    const hasLocalChatCoreHash = Object.hasOwn(
+      localChatCoreHashes,
+      change.resourceId,
+    );
+    const localChatCoreHash = localChatCoreHashes[change.resourceId];
+    const requiresAgentKvRecapture =
+      change.kind === "chat" &&
+      effectiveSyncOrigin(change.metadata) === "automatic-chat-repair" &&
+      !(
+        change.metadata?.chatSnapshotSchemaVersion === 2 &&
+        change.metadata.agentKvMissingCount === 0
+      );
     repository.state.projections[change.resourceId] = {
       resourceId: change.resourceId,
       kind: change.kind,
@@ -1000,6 +1635,16 @@ function markAppliedProjections(
         : {}),
       ...(typeof change.metadata?.lastUpdatedAt === "number"
         ? { sourceTimestamp: change.metadata.lastUpdatedAt }
+        : {}),
+      ...(hasLocalChatCoreHash
+        ? isChatCoreHash(localChatCoreHash)
+          ? { sourceChatCoreHash: localChatCoreHash }
+          : {}
+        : isChatCoreHash(change.metadata?.chatCoreHash)
+          ? { sourceChatCoreHash: change.metadata.chatCoreHash }
+          : {}),
+      ...(requiresAgentKvRecapture
+        ? { requiresAgentKvRecapture: true }
         : {}),
       ...(retainedLocalResourceIds.has(change.resourceId)
         ? {
@@ -1028,6 +1673,18 @@ function markAppliedProjections(
     }
     pending.blockedReason = `${APPLY_FAILURE_BLOCK_PREFIX}: ${failure} Run "${RESTART_TO_APPLY_TITLE}" to try it again.`;
   }
+}
+
+function isChatCoreHash(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function validFileSize(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function validFileTime(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 async function assertRuntimeVersion(request: HelperRequest): Promise<void> {

@@ -35,43 +35,72 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     status,
     conflicts,
   );
+  const repositoryCommand =
+    (run: (activeManager: SyncManager) => Promise<void>) => async () => {
+      const activeManager = manager;
+      if (activeManager === null) {
+        return;
+      }
+      await activeManager.prepareForRepositoryCommand();
+      await run(activeManager);
+    };
 
   context.subscriptions.push(
     status,
     conflicts,
     manager,
     registerCommand("cursorSync.setup", () => manager?.setup()),
-    registerCommand("cursorSync.syncNow", () => manager?.syncNowCommand()),
-    registerCommand("cursorSync.restartToApply", () =>
-      manager?.restartToApply(),
+    registerCommand(
+      "cursorSync.syncNow",
+      repositoryCommand((activeManager) => activeManager.syncNowCommand()),
     ),
-    registerCommand("cursorSync.resolveConflicts", () =>
-      manager?.resolveConflicts(),
+    registerCommand(
+      "cursorSync.restartToApply",
+      repositoryCommand((activeManager) => activeManager.restartToApply()),
     ),
-    registerCommand("cursorSync.restoreVersion", () =>
-      manager?.restoreVersion(),
+    registerCommand(
+      "cursorSync.resolveConflicts",
+      repositoryCommand((activeManager) => activeManager.resolveConflicts()),
     ),
-    registerCommand("cursorSync.repairUnavailableChats", () =>
-      manager?.repairUnavailableChats(),
+    registerCommand(
+      "cursorSync.restoreVersion",
+      repositoryCommand((activeManager) => activeManager.restoreVersion()),
     ),
-    registerCommand("cursorSync.showDiagnostics", () =>
-      manager?.showDiagnostics(),
+    registerCommand(
+      "cursorSync.repairUnavailableChats",
+      repositoryCommand((activeManager) =>
+        activeManager.repairUnavailableChats(),
+      ),
     ),
-    registerCommand("cursorSync.restoreBackup", () =>
-      manager?.restoreBackup(),
+    registerCommand(
+      "cursorSync.showDiagnostics",
+      repositoryCommand((activeManager) => activeManager.showDiagnostics()),
     ),
-    registerCommand("cursorSync.forgetDevice", () => manager?.forgetDevice()),
-    registerCommand("cursorSync.repositoryUsage", () =>
-      manager?.showRepositoryUsage(),
+    registerCommand(
+      "cursorSync.restoreBackup",
+      repositoryCommand((activeManager) => activeManager.restoreBackup()),
     ),
-    registerCommand("cursorSync.compactRepository", () =>
-      manager?.compactRepository(),
+    registerCommand(
+      "cursorSync.forgetDevice",
+      repositoryCommand((activeManager) => activeManager.forgetDevice()),
     ),
-    registerCommand("cursorSync.checkpointRepository", () =>
-      manager?.checkpointRepository(),
+    registerCommand(
+      "cursorSync.repositoryUsage",
+      repositoryCommand((activeManager) => activeManager.showRepositoryUsage()),
     ),
-    registerCommand("cursorSync.archiveRepository", () =>
-      manager?.archiveRepository(),
+    registerCommand(
+      "cursorSync.compactRepository",
+      repositoryCommand((activeManager) => activeManager.compactRepository()),
+    ),
+    registerCommand(
+      "cursorSync.checkpointRepository",
+      repositoryCommand((activeManager) =>
+        activeManager.checkpointRepository(),
+      ),
+    ),
+    registerCommand(
+      "cursorSync.archiveRepository",
+      repositoryCommand((activeManager) => activeManager.archiveRepository()),
     ),
     registerCommand("cursorSync.disconnect", () => manager?.disconnect()),
     vscode.workspace.onDidChangeConfiguration((event) => {

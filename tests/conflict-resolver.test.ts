@@ -39,7 +39,11 @@ vi.mock("vscode", () => ({
 import { EventReconciler, compareTips } from "../src/protocol/reconciler";
 import { ConflictController, tipForChoice } from "../src/ui/conflicts";
 import type { ConflictView } from "../src/ui/conflictSummary";
-import { describeConflict, describeValue } from "../src/ui/conflictSummary";
+import {
+  PREVIEW_BYTE_LIMIT,
+  describeConflict,
+  describeValue,
+} from "../src/ui/conflictSummary";
 import { SyncRepository } from "../src/protocol/repository";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import type {
@@ -145,6 +149,30 @@ describe("conflict resolver overview", () => {
     });
   });
 
+  it("omits oversized diff sides before reading either payload", async () => {
+    await withConflicts(async (repository) => {
+      for (const tips of Object.values(repository.state.tips)) {
+        for (const candidate of tips) {
+          expect(candidate.payload).toBeDefined();
+          if (candidate.payload !== undefined) {
+            candidate.payload.plainBytes = PREVIEW_BYTE_LIMIT + 1;
+          }
+        }
+      }
+      const readObject = vi.spyOn(repository, "readObject");
+      answers.push(choose("Setting: editor.fontSize"));
+      answers.push(escape); // leave the individual conflict unchanged
+      answers.push(escape); // leave the overview
+
+      await new ConflictController().collectSelections(repository);
+
+      expect(readObject).not.toHaveBeenCalled();
+      expect(
+        executed.filter((call) => call.command === "vscode.diff"),
+      ).toHaveLength(1);
+    });
+  });
+
   it("keeps decisions already made when the user backs out", async () => {
     await withConflicts(async (repository) => {
       answers.push(choose("Setting: editor.fontSize"));
@@ -158,6 +186,71 @@ describe("conflict resolver overview", () => {
       expect(collected.selections[0]?.tip?.deviceId).toBe(
         repository.state.device.deviceId,
       );
+    });
+  });
+
+  it("bounds unpublished local buffers while collecting many decisions", async () => {
+    await withConflicts(async (repository) => {
+      const twentyMiB = Buffer.alloc(20 * 1024 * 1024, 0x41);
+      const liveSnapshot = async (
+        resourceId: string,
+      ): Promise<ResourceSnapshot> => ({
+        resourceId,
+        kind: "settings",
+        content: twentyMiB,
+        semanticHash: sha256(twentyMiB),
+      });
+      answers.push(choose("Setting: editor.fontSize"));
+      answers.push(choose("Keep what is on this PC"));
+      answers.push(choose("Setting: workbench.colorTheme"));
+      answers.push(choose("Keep what is on this PC"));
+      answers.push(choose("Keep the version written later everywhere"));
+      const controller = new ConflictController();
+
+      const collected = await controller.collectSelections(
+        repository,
+        () => null,
+        liveSnapshot,
+      );
+
+      const liveSelections = collected.selections.filter(
+        (selection) => selection.tip === null,
+      );
+      expect(liveSelections).toHaveLength(1);
+      expect(
+        liveSelections.reduce(
+          (total, selection) =>
+            total + (selection.live?.content.byteLength ?? 0),
+          0,
+        ),
+      ).toBeLessThanOrEqual(32 * 1024 * 1024);
+      expect(collected.deferred).toHaveLength(1);
+      expect(collected.deferred[0]).toContain(
+        "settings/default/workbench.colorTheme",
+      );
+      const publish = vi
+        .spyOn(repository, "publish")
+        .mockImplementation(async (snapshots, deletions) => {
+          expect(
+            snapshots.reduce(
+              (total, snapshot) => total + snapshot.content.byteLength,
+              0,
+            ),
+          ).toBeLessThanOrEqual(32 * 1024 * 1024);
+          return {
+            eventHash: null,
+            eventPath: null,
+            changeCount: snapshots.length + deletions.length,
+          };
+        });
+
+      const applied = await controller.applySelections(
+        repository,
+        collected.selections,
+      );
+
+      expect(applied.resolved).toBe(2);
+      expect(publish).toHaveBeenCalledOnce();
     });
   });
 
@@ -253,6 +346,67 @@ describe("conflict resolver overview", () => {
       expect(applied.resolved).toBe(KEYS.length - 1);
       expect(applied.deferred).toHaveLength(1);
       expect(applied.deferred[0]).toContain(doomed?.resourceId ?? "");
+    });
+  });
+
+  it("publishes bounded pages before reading later tips and never reads an oversized tip", async () => {
+    await withConflicts(async (repository) => {
+      answers.push(choose("Keep the version written later everywhere"));
+      const controller = new ConflictController();
+      const collected = await controller.collectSelections(repository);
+      expect(collected.selections).toHaveLength(3);
+
+      const selected = collected.selections.map((selection) => {
+        expect(selection.tip?.payload).toBeDefined();
+        return selection.tip as ResourceTip & {
+          payload: NonNullable<ResourceTip["payload"]>;
+        };
+      });
+      const twentyMiB = 20 * 1024 * 1024;
+      selected[0]!.payload.plainBytes = twentyMiB;
+      selected[1]!.payload.plainBytes = 33 * 1024 * 1024;
+      selected[2]!.payload.plainBytes = twentyMiB;
+      const order: string[] = [];
+      const readObject = vi
+        .spyOn(repository, "readObject")
+        .mockImplementation(async () => {
+          order.push("read");
+          return canonicalBytes(16);
+        });
+      const publish = vi
+        .spyOn(repository, "publish")
+        .mockImplementation(async (snapshots, deletions) => {
+          order.push(
+            `publish:${snapshots
+              .map((snapshot) => snapshot.resourceId)
+              .concat(deletions.map((deletion) => deletion.resourceId))
+              .join(",")}`,
+          );
+          return {
+            eventHash: null,
+            eventPath: null,
+            changeCount: snapshots.length + deletions.length,
+          };
+        });
+
+      const applied = await controller.applySelections(
+        repository,
+        collected.selections,
+      );
+
+      expect(applied.resolved).toBe(2);
+      expect(applied.deferred).toHaveLength(1);
+      expect(applied.deferred[0]).toContain(
+        collected.selections[1]?.resourceId ?? "missing",
+      );
+      expect(readObject).toHaveBeenCalledTimes(2);
+      expect(publish).toHaveBeenCalledTimes(2);
+      expect(order).toEqual([
+        "read",
+        `publish:${collected.selections[0]?.resourceId}`,
+        "read",
+        `publish:${collected.selections[2]?.resourceId}`,
+      ]);
     });
   });
 

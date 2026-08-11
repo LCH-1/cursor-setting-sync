@@ -11,8 +11,11 @@ import {
   COMMAND_LOCK_WAIT_MS,
   CONFLICT_APPLY_LOCK_WAIT_MS,
   CONFLICTED_REPUBLISH_INTERVAL_MS,
+  CHECKPOINT_EXTENSION,
+  EVENT_EXTENSION,
   LOCK_SKIP_REMINDER_MS,
-  MAX_APPLY_BATCH_BYTES,
+  MAX_HELPER_APPLY_WORK_BYTES,
+  MAX_RUNNING_APPLY_PAYLOAD_BYTES,
   QUIT_START_GRACE_MS,
   REPOSITORY_FILE,
   RESTART_TO_APPLY_COMMAND,
@@ -31,7 +34,6 @@ import type {
   LocalProjection,
   MergeOutcome,
   PendingDatabaseChange,
-  RepositoryFile,
   ResourceChange,
   ResourceDeletion,
   ResourceKind,
@@ -78,7 +80,10 @@ import {
   isDatabaseBackedKind,
 } from "../platform/compatibility";
 import type { ExtensionConfiguration } from "../config";
-import { SyncRepository } from "../protocol/repository";
+import {
+  readRepositoryManifest,
+  SyncRepository,
+} from "../protocol/repository";
 import type {
   CheckpointCreateResult,
   PruneResult,
@@ -88,12 +93,14 @@ import {
   EventReconciler,
   compareTips,
   parentsForLocalChange,
+  type ReconcileResult,
   type ResourceProjection,
 } from "../protocol/reconciler";
-import type {
-  ResourceAdapter,
-  ResourceApplyInput,
-  ResourceApplyResult,
+import {
+  disposeResourceAdapters,
+  type ResourceAdapter,
+  type ResourceApplyInput,
+  type ResourceApplyResult,
 } from "../resources/resource";
 import {
   DEFAULT_IGNORED_SETTINGS,
@@ -135,16 +142,32 @@ import {
 } from "../resources/ignorePatterns";
 import {
   StateVscdbChatAdapter,
+  isPortableChatSnapshotV2,
   isSyncableComposerId,
   parsePortableChatSnapshot,
+  portableChatCoreHash,
+  type PortableAgentKvPayload,
   type PortableKvRow,
 } from "../chat/stateVscdb";
-import { mergeChatSnapshotBuffers } from "../chat/chatMerge";
+import { AGENT_KV_BLOB_PREFIX } from "../chat/agentKv";
+import {
+  CHAT_AUTO_MERGE_MAX_WORK_BYTES,
+  extractBoundedChatCoreAgentKvRoots,
+  mergeChatSnapshotBuffers,
+} from "../chat/chatMerge";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
-import { chatSnapshotTitle } from "../chat/title";
+import { chatHeaderTitle, chatSnapshotTitle } from "../chat/title";
 import {
+  buildChatTipEnrichmentCandidateIndex,
+  enrichCurrentChatTipsFromLiveDatabase,
+  type ChatTipEnrichmentCandidate,
+  type ChatTipEnrichmentCursor,
+} from "../chat/enrichment";
+import {
+  DEFAULT_BROKEN_CHAT_INSPECTION_LIMITS,
   buildChatRepairSnapshot,
+  inspectBrokenCursorChatContinuations,
   inspectBrokenCursorChats,
   isAutomaticChatRepairMetadata,
   type BrokenChatObservation,
@@ -185,6 +208,7 @@ import {
 import { mergeJsoncBuffers, parseJsonc } from "../resources/jsonc";
 import { mergeTextBuffers } from "../resources/text";
 import { canonicalBytes, sha256 } from "../protocol/canonical";
+import { buffersFitJsonStructureBudget } from "../protocol/jsonStructure";
 import {
   isRepositoryPayloadFile,
   repositoryPayloadFileName,
@@ -195,6 +219,7 @@ import {
 } from "./repositoryWatcher";
 import {
   absorbedCheckpointManifest,
+  effectiveSyncOrigin,
   effectiveTipProducer,
   effectiveVersionProducer,
   filterPublishableChanges,
@@ -230,6 +255,10 @@ import {
 
 const LAST_HELPER_BACKUPS_KEY = "lastHelperBackups";
 const ALWAYS_RELEVANT_FINALIZER = (): boolean => true;
+const LIVE_APPLY_PAYLOAD_BLOCK_PREFIX =
+  "This resource exceeds the live apply memory limit";
+const HISTORY_PREVIEW_MAX_PAYLOAD_BYTES = 1024 * 1024;
+const RESTORE_VERSION_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
 /**
  * Git repositories need a remote probe because a fetch does not produce a
  * filesystem event until it updates the worktree. Doing that probe on every
@@ -259,7 +288,7 @@ interface PlannedChatRepair {
   expectedTipIds: string[];
   fingerprint: string;
   /** Newest-first trusted candidates through and including the complete source. */
-  candidateVersionIds: string[];
+  candidateVersions: Array<{ versionId: string; plainBytes: number }>;
   sourceVersionId: string;
   repairedBubbleCount: number;
 }
@@ -317,6 +346,8 @@ export function backgroundGitPullDue(
 export interface AdapterScanIndex {
   snapshots: Map<string, ResourceSnapshot>;
   deletions: Map<string, ResourceDeletion>;
+  complete: boolean;
+  deferredResourceIds: Set<string>;
 }
 
 export type SyntheticApplyDecision =
@@ -329,7 +360,23 @@ export class SyncManager implements vscode.Disposable {
   private masterKey: Buffer | null = null;
   /** Invalidates a configured deferred-open that a newer lifecycle won. */
   private configuredOpenGeneration = 0;
+  /**
+   * Coalesces leadership and command activation for one configured repository.
+   * A manual command can arrive while the elected background window is still
+   * unlocking; without this seam both paths read and parse the same (possibly
+   * very large) local-state file before one of them loses the generation race.
+   */
+  private configuredOpenInFlight: {
+    root: string;
+    repositoryId: string | null;
+    promise: Promise<boolean>;
+  } | null = null;
   private adapters: ResourceAdapter[] = [];
+  /** Active operations that may still hold one adapter generation's cursors. */
+  private adapterUseCount = 0;
+  private readonly adapterUseIdleResolvers: Array<() => void> = [];
+  /** Blocks new users while queued adapter generations are being retired. */
+  private adapterReplacementBarrier: Promise<void> | null = null;
   private repositoryWatcher: RepositoryWatcher | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
   private chatPollTimer: NodeJS.Timeout | null = null;
@@ -351,7 +398,7 @@ export class SyncManager implements vscode.Disposable {
     runCycle: async (manual, scope) => {
       const startedAt = Date.now();
       try {
-        await this.performSync(manual, scope);
+        await this.withAdapterUse(() => this.performSync(manual, scope));
       } finally {
         const took = Date.now() - startedAt;
         if (took >= SLOW_SYNC_CYCLE_MS) {
@@ -444,6 +491,30 @@ export class SyncManager implements vscode.Disposable {
    */
   private queuedApplyDeclined = false;
   private automaticMaintenanceAt = 0;
+  /** Round-robin and no-op suppression for the bounded v1 -> v2 chat sweep. */
+  private chatTipEnrichmentCursor: ChatTipEnrichmentCursor = {
+    afterResourceId: null,
+  };
+  private readonly chatTipEnrichmentAttempts = new Map<string, string>();
+  private chatTipEnrichmentIndex: {
+    repository: SyncRepository;
+    sharedGraphGeneration: number;
+    candidates: ChatTipEnrichmentCandidate[];
+  } | null = null;
+  private readonly eventReconciler = new EventReconciler();
+  private readonly adapterScanCursorByScope = new Map<SyncScope, string>();
+  /**
+   * Reconciliation is a graph compile over the complete accepted event log.
+   * Keep the exact result while neither the authenticated shared graph nor
+   * local state changed; an idle poll can then avoid iterating thousands of
+   * immutable events merely to rebuild the same tips and conflicts.
+   */
+  private reconciliationCache: {
+    repository: SyncRepository;
+    sharedGraphGeneration: number;
+    reconciliationInputGeneration: number;
+    result: ReconcileResult;
+  } | null = null;
   private maintenanceRequested = false;
   private largeFileCheckAt = 0;
   private disposed = false;
@@ -461,6 +532,11 @@ export class SyncManager implements vscode.Disposable {
     this.backgroundCoordinator = new BackgroundCoordinator({
       acquire: () => acquireFileLock(this.backgroundRoleLockPath()),
       activate: async (runInitialSync, isCurrent) => {
+        // Standby windows deliberately carry no SyncRepository. Only the
+        // elected owner pays for reading, parsing and hashing local state.
+        if (!(await this.ensureConfiguredRepositoryOpen()) || !isCurrent()) {
+          return;
+        }
         // The shutdown finalizer is machine-wide too. Only the elected window
         // replaces it, avoiding one cancel/wait/spawn sequence per open window.
         await this.startFinalizer(isCurrent);
@@ -512,9 +588,10 @@ export class SyncManager implements vscode.Disposable {
       this.status.setStatus("locked");
       return;
     }
-    if (!(await this.openConfiguredRepository(masterKey))) {
-      return;
-    }
+    // This is only an availability check. Holding the decoded key or opening
+    // local state in every restored Cursor window defeats leader election's
+    // memory bound; the elected owner (or an explicit command) opens later.
+    masterKey.fill(0);
     if (!this.configuration.enabled) {
       // Configured, unlocked, and deliberately paused. Leaving the constructor
       // default in place made the status bar read "Setup" on every restart and
@@ -528,7 +605,7 @@ export class SyncManager implements vscode.Disposable {
   }
 
   async configurationChanged(): Promise<void> {
-    this.refreshAdapters();
+    await this.refreshAdapters();
     if (this.repository !== null) {
       this.syncRepositoryLimit(this.repository);
     }
@@ -706,7 +783,7 @@ export class SyncManager implements vscode.Disposable {
       this.disconnectMarkerPath(this.repository.repository.repositoryId),
       { force: true },
     ).catch(() => {});
-    this.refreshAdapters();
+    await this.refreshAdapters();
     await this.withProgress("Cursor Setting Sync: Setup", async (report) => {
       if (await this.gitModeFor(root)) {
         report("Committing the initial repository...");
@@ -1015,16 +1092,19 @@ export class SyncManager implements vscode.Disposable {
     // folder - green check mark and all - after the user was told the device
     // had disconnected. The marker is checked at the top of every sync cycle
     // and before every finalizer arm; Setup removes it on reconnect.
-    if (this.repository !== null) {
+    const repositoryId =
+      this.repository?.repository.repositoryId ??
+      this.configuration.repositoryId;
+    if (repositoryId !== null) {
       await writeJsonAtomic(
-        this.disconnectMarkerPath(this.repository.repository.repositoryId),
+        this.disconnectMarkerPath(repositoryId),
         { disconnectedAt: new Date().toISOString(), pid: process.pid },
       ).catch(() => {});
     }
     this.repository = null;
     this.masterKey?.fill(0);
     this.masterKey = null;
-    this.adapters = [];
+    await this.replaceAdapters([]);
     this.warnings.clear();
     // Everything else that describes the departed repository goes with it: a
     // helper failure, notices, and a declined offer all prescribe actions
@@ -1044,7 +1124,20 @@ export class SyncManager implements vscode.Disposable {
     manual = true,
     scope: SyncScope = "all",
   ): Promise<void> {
+    if (manual) {
+      await this.ensureConfiguredRepositoryOpen();
+    }
     await this.cycles.request(manual, scope);
+  }
+
+  /**
+   * Opens a configured repository for an explicit command in a standby
+   * window. Commands that inspect mutable repository state still initialize
+   * it under their normal command lock; this method only removes the eager
+   * activation cost while keeping command entry points uniform.
+   */
+  async prepareForRepositoryCommand(): Promise<void> {
+    await this.ensureConfiguredRepositoryOpen();
   }
 
   /**
@@ -1197,12 +1290,16 @@ export class SyncManager implements vscode.Disposable {
             phase(report, "Reading the queue...");
             await repository.refreshState();
             phase(report, "Writing what can be applied while Cursor runs...");
-            await this.applyPendingRunningResources(repository);
+            await this.withAdapterUse(() =>
+              this.applyPendingRunningResources(repository),
+            );
             // The user asked for this apply, so the previous one's failures get
             // another try. The helper blocks what it could not write so the
             // OFFER stops repeating on its own; deliberately running the
             // command is the retry, and it re-blocks anything that fails again.
             this.clearApplyFailureBlocks(repository);
+            phase(report, "Verifying queued conversations...");
+            await this.protectQueuedChatsBeforeOfflineApply(repository);
             phase(report, "Checking workspace mappings...");
             await this.ensureWorkspaceMappings(repository);
             // Both of the above only touched memory. Everything else that
@@ -1398,7 +1495,9 @@ export class SyncManager implements vscode.Disposable {
     this.repository = null;
     this.masterKey?.fill(0);
     this.masterKey = null;
-    this.adapters = [];
+    // This can run inside performSync, whose adapter-use lease is still held.
+    // Queue retirement now and let the cycle release that lease on return.
+    void this.replaceAdapters([]);
     this.warnings.clear();
     this.helperFailure = null;
     this.notices.clear();
@@ -1445,15 +1544,15 @@ export class SyncManager implements vscode.Disposable {
         // "unconfigured".
         try {
           const root = this.configuration.repositoryPath;
-          const masterKey = await this.configuration.getMasterKey();
-          if (root !== null && masterKey !== null) {
-            if (await this.openConfiguredRepository(masterKey)) {
-              await this.startWatching(true);
-              this.status.log(
-                "Reconnected after another window's Setup; synchronization resumed in this window.",
-              );
-              return;
-            }
+          if (
+            root !== null &&
+            (await this.ensureConfiguredRepositoryOpen())
+          ) {
+            await this.startWatching(true);
+            this.status.log(
+              "Reconnected after another window's Setup; synchronization resumed in this window.",
+            );
+            return;
           }
         } catch (error) {
           this.status.log(
@@ -1582,7 +1681,7 @@ export class SyncManager implements vscode.Disposable {
     );
     try {
       await this.openGitWindow(repository);
-      await repository.refreshState();
+      await repository.refreshState({ forceAudit: true });
     } finally {
       await refreshLock.release();
     }
@@ -1681,10 +1780,11 @@ export class SyncManager implements vscode.Disposable {
 
   /**
    * Repairs every conversation whose live composerData references bubble rows
-   * that are no longer present. There is deliberately no per-chat or
-   * per-version picker: trusted history supplies only the missing rows, while
-   * the live header, composerData and every existing message remain
-   * authoritative.
+   * that are no longer present, and diagnoses the separate case where the
+   * renderable rows exist but Cursor's reachable continuation graph does not.
+   * There is deliberately no per-chat or per-version picker: trusted history supplies
+   * only missing rows, while continuation damage is either applied from an
+   * already-queued complete v2 tip or left untouched with recovery guidance.
    */
   async repairUnavailableChats(): Promise<void> {
     const repository = this.requireRepository();
@@ -1699,6 +1799,26 @@ export class SyncManager implements vscode.Disposable {
       return;
     }
     assertCompatibleForDatabaseWrite(this.compatibility);
+    const chatRepairInspectionLimits = {
+      // A portable repair candidate is fully materialized in the extension
+      // host. Refuse one item at the smaller of the command RAM bound and the
+      // repository's publish policy; a snapshot that cannot be published must
+      // never be built merely to discover that fact afterwards.
+      maxRetainedBytes: Math.min(
+        DEFAULT_BROKEN_CHAT_INSPECTION_LIMITS.maxRetainedBytes,
+        repository.maxPayloadBytes,
+      ),
+    };
+    const repairHistorySourceByteLimit = Math.min(
+      MAX_CHAT_REPAIR_HISTORY_SOURCE_BYTES,
+      repository.maxPayloadBytes,
+    );
+    const repairHistoryAggregateByteLimit =
+      MAX_CHAT_REPAIR_HISTORY_AGGREGATE_BYTES;
+    const repairOutputByteLimit = Math.min(
+      MAX_CHAT_REPAIR_OUTPUT_AGGREGATE_BYTES,
+      repository.maxPayloadBytes,
+    );
 
     // The live database walk can take minutes on a multi-gigabyte state.vscdb
     // and does not touch repository state. Keep it outside sync.lock so other
@@ -1707,19 +1827,253 @@ export class SyncManager implements vscode.Disposable {
       "Cursor Setting Sync",
       async (report) => {
         report("Checking which chat messages are unavailable...");
-        return inspectBrokenCursorChats(this.paths);
+        return inspectBrokenCursorChats(this.paths, {
+          limits: chatRepairInspectionLimits,
+        });
       },
     );
     const observations = inspection.broken;
+    const bubbleIncompleteDetail = chatRepairDeferredInspectionDetail(
+      inspection.deferredBrokenChats,
+      inspection.oversizedChats,
+      inspection.snapshotByteLimit,
+      inspection.limitReached,
+    );
     if (observations.length === 0) {
-      void vscode.window.showInformationMessage(
-        `Checked ${inspection.examinedChats} Cursor conversations. No referenced chat messages are unavailable.`,
+      // A chat can render every legacy bubble and still be impossible to
+      // continue because pre-v2 sync omitted Cursor's content-addressed
+      // conversation graph. Run this second, more expensive pass only after
+      // the legacy repair path has proved there are no bubble repairs to plan.
+      const continuationInspection = await this.withProgress(
+        "Cursor Setting Sync",
+        async (report) => {
+          report("Checking chat continuation data...");
+          return inspectBrokenCursorChatContinuations(this.paths, {
+            limits: {
+              maxSnapshotBytesPerChat:
+                chatRepairInspectionLimits.maxRetainedBytes,
+            },
+          });
+        },
       );
+      const continuationDamage = continuationInspection.broken;
+      const incompleteDetail = [
+        bubbleIncompleteDetail,
+        continuationAuditIncompleteDetail(
+          continuationInspection.unknownChats,
+          continuationInspection.limitReached,
+        ),
+      ]
+        .filter((detail) => detail.length > 0)
+        .join(" ");
+      if (continuationDamage.length === 0) {
+        if (
+          bubbleIncompleteDetail.length > 0 ||
+          continuationInspection.unknownChats > 0 ||
+          continuationInspection.limitReached
+        ) {
+          void vscode.window.showWarningMessage(
+            `No definite unavailable chat data was found after checking ${inspection.examinedChats} message bodies and ${continuationInspection.examinedChats} continuation records. ${incompleteDetail} Nothing was changed, and this is not an all-clear result.`,
+          );
+          return;
+        }
+        void vscode.window.showInformationMessage(
+          `Checked ${inspection.examinedChats} Cursor conversation message bodies and ${continuationInspection.auditedChats} continuation records. No referenced chat message rows or reachable continuation blobs are unavailable.`,
+        );
+        return;
+      }
+
+      const completePendingResourceIds = new Set<string>();
+      const oversizedContinuationSourceResourceIds = new Set<string>();
+      const continuationSourceLock = await this.withProgress(
+        "Cursor Setting Sync",
+        async (report) => {
+          report("Checking synchronized continuation recovery data...");
+          return this.takeCommandLock(repository, report);
+        },
+      );
+      try {
+        await this.openGitWindow(repository);
+        await repository.refreshState();
+        const checkpoint = await absorbedCheckpointManifest(repository);
+        const freshState = structuredClone(repository.state);
+        const reconciliation = new EventReconciler().reconcile(
+          await repository.listEvents(),
+          freshState,
+          checkpoint,
+        );
+        if (reconciliation.warnings.length === 0) {
+          Object.assign(repository.state, freshState);
+          for (const observation of continuationDamage) {
+            const currentTips =
+              repository.state.tips[observation.resourceId] ?? [];
+            const tip = currentTips.length === 1 ? currentTips[0] : undefined;
+            if (
+              tip === undefined ||
+              tip.kind !== "chat" ||
+              tip.operation !== "put" ||
+              tip.payload === undefined ||
+              tip.metadata?.chatSnapshotSchemaVersion !== 2 ||
+              tip.metadata?.agentKvMissingCount !== 0 ||
+              this.resourceApplyBlockReason(tip) !== null
+            ) {
+              continue;
+            }
+            const declaredSourceBytes = tip.payload.plainBytes;
+            if (
+              !Number.isSafeInteger(declaredSourceBytes) ||
+              declaredSourceBytes < 0 ||
+              declaredSourceBytes > repairHistorySourceByteLimit
+            ) {
+              // The payload reference is authenticated by its event. Gate on
+              // that declaration before tryReadVersion decrypts/allocates a
+              // potentially repository-sized complete-v2 snapshot.
+              oversizedContinuationSourceResourceIds.add(
+                observation.resourceId,
+              );
+              continue;
+            }
+            try {
+              const source = await repository.tryReadVersion(tip.versionId);
+              if (
+                source === null ||
+                source.content === null ||
+                source.change.resourceId !== observation.resourceId ||
+                source.change.kind !== "chat" ||
+                source.change.operation !== "put" ||
+                source.change.semanticHash !== tip.semanticHash ||
+                sha256(source.content) !== source.change.semanticHash ||
+                databaseApplyBlockReason(
+                  "chat",
+                  effectiveVersionProducer(
+                    source.change.metadata,
+                    source.producer,
+                  ),
+                  this.compatibility,
+                ) !== null
+              ) {
+                continue;
+              }
+              const snapshot = parsePortableChatSnapshot(source.content);
+              if (
+                snapshot.composerId !== observation.composerId ||
+                !isPortableChatSnapshotV2(snapshot) ||
+                snapshot.agentKv.missingIds.length !== 0
+              ) {
+                continue;
+              }
+              const sourceOrigin = effectiveSyncOrigin(source.change.metadata);
+              if (
+                sourceOrigin !== "agent-kv-enrichment" &&
+                sourceOrigin !== "automatic-chat-repair"
+              ) {
+                const declaredCoreHash = source.change.metadata?.chatCoreHash;
+                if (
+                  typeof declaredCoreHash !== "string" ||
+                  declaredCoreHash !== observation.chatCoreHash ||
+                  declaredCoreHash !== portableChatCoreHash(snapshot)
+                ) {
+                  continue;
+                }
+              }
+              const materializedIds = new Set(
+                snapshot.agentKv.blobs.map((blob) =>
+                  blob.key.slice(AGENT_KV_BLOB_PREFIX.length),
+                ),
+              );
+              if (
+                !observation.unavailableRootIds.every((id) =>
+                  materializedIds.has(id),
+                )
+              ) {
+                continue;
+              }
+              queuePending(repository, {
+                resourceId: observation.resourceId,
+                tip,
+                changed: true,
+              });
+              completePendingResourceIds.add(observation.resourceId);
+            } catch {
+              // A metadata claim without a readable, matching payload is not a
+              // recovery source. The source-PC guidance below remains safe.
+            }
+          }
+          if (completePendingResourceIds.size > 0) {
+            await repository.saveState();
+          }
+        } else {
+          this.status.log(
+            `Continuation recovery source check was deferred by repository stream warning: ${reconciliation.warnings[0]}`,
+          );
+        }
+      } finally {
+        await continuationSourceLock.release();
+      }
+      const unavailableRootCount = continuationDamage.reduce(
+        (total, observation) => total + observation.unavailableRootCount,
+        0,
+      );
+      const damageSummary = `${continuationDamage.length} Cursor conversation${
+        continuationDamage.length === 1 ? " has" : "s have"
+      } ${unavailableRootCount} unavailable continuation blob${
+        unavailableRootCount === 1 ? "" : "s"
+      }`;
+      if (completePendingResourceIds.size === continuationDamage.length) {
+        const restart = "Restart to Apply";
+        const choice = await vscode.window.showInformationMessage(
+          `${damageSummary}. Every affected conversation already has a complete synchronized v2 copy queued on this PC. Choose Restart to Apply to write it transactionally.${
+            incompleteDetail.length === 0 ? "" : ` ${incompleteDetail}`
+          }`,
+          restart,
+        );
+        if (choice === restart) {
+          await this.restartToApply();
+        }
+        return;
+      }
+
+      const lackingSourceCount =
+        continuationDamage.length - completePendingResourceIds.size;
+      const oversizedSourceDetail =
+        oversizedContinuationSourceResourceIds.size === 0
+          ? ""
+          : ` ${oversizedContinuationSourceResourceIds.size} synchronized complete-v2 source${
+              oversizedContinuationSourceResourceIds.size === 1 ? "" : "s"
+            } exceeded the bounded ${formatBytes(
+              repairHistorySourceByteLimit,
+            )} repair source limit (or lacked a trustworthy declared size) and ${
+              oversizedContinuationSourceResourceIds.size === 1 ? "was" : "were"
+            } not read.`;
+      const incompleteSourceWarning = `${damageSummary}. ${lackingSourceCount} affected conversation${
+          lackingSourceCount === 1 ? "" : "s"
+        } ${lackingSourceCount === 1 ? "does" : "do"} not have a complete synchronized v2 copy queued here: this PC and the synchronized legacy history lack the continuation blobs needed to resume ${
+          lackingSourceCount === 1 ? "it" : "them"
+        }. Nothing was changed.${oversizedSourceDetail} Update Cursor Setting Sync and run Sync Now on a PC where the affected chat still continues; then run Sync Now on this PC and choose Restart to Apply.${
+          incompleteDetail.length === 0 ? "" : ` ${incompleteDetail}`
+        }`;
+      if (completePendingResourceIds.size === 0) {
+        void vscode.window.showWarningMessage(incompleteSourceWarning);
+        return;
+      }
+      const restart = "Restart to Apply";
+      const choice = await vscode.window.showWarningMessage(
+        `${incompleteSourceWarning} ${completePendingResourceIds.size} other affected conversation${
+          completePendingResourceIds.size === 1 ? " already has" : "s already have"
+        } a verified complete v2 copy queued and can be applied now.`,
+        restart,
+      );
+      if (choice === restart) {
+        await this.restartToApply();
+      }
       return;
     }
 
+    const deferredInspectionDetail = bubbleIncompleteDetail;
+
     const plans: PlannedChatRepair[] = [];
     let alreadyQueued = 0;
+    const historyBudgetDeferredResourceIds = new Set<string>();
     let historyCheckpoint: CheckpointManifest | null;
     let acceptedHistoryEventHashes: Set<string>;
     const historyResourceIds = new Set<string>();
@@ -1829,21 +2183,45 @@ export class SyncManager implements vscode.Disposable {
       // conversation's complete history a temporary RAM copy.
       const unavailableKeys = new Set(observation.unavailableBubbleKeys);
       const newerPartialCandidates: ChatRepairCandidate[] = [];
-      let repair: Extract<
-        ReturnType<typeof buildChatRepairSnapshot>,
-        { status: "repairable" }
-      > | null = null;
-      for (const summary of histories.get(observation.resourceId) ?? []) {
-        if (
-          summary.kind !== "chat" ||
-          summary.operation !== "put" ||
+      const newerPartialVersions: Array<{
+        versionId: string;
+        plainBytes: number;
+      }> = [];
+      const compatibleHistory = (
+        histories.get(observation.resourceId) ?? []
+      ).filter(
+        (summary) =>
+          summary.kind === "chat" &&
+          summary.operation === "put" &&
           databaseApplyBlockReason(
             summary.kind,
             effectiveVersionProducer(summary.metadata, summary.producer),
             this.compatibility,
-          ) !== null
+          ) === null,
+      );
+      let retainedCandidateRows = 0;
+      let retainedCandidateBytes = 0;
+      let historyDeferred = false;
+      let repair: Extract<
+        ReturnType<typeof buildChatRepairSnapshot>,
+        { status: "repairable" }
+      > | null = null;
+      for (const summary of compatibleHistory) {
+        const sourcePlainBytes = summary.plainBytes;
+        if (
+          sourcePlainBytes === null ||
+          !Number.isSafeInteger(sourcePlainBytes) ||
+          sourcePlainBytes < 0 ||
+          sourcePlainBytes > repairHistorySourceByteLimit
         ) {
-          continue;
+          // Bound each sequential source, not the sum of sources already read
+          // and released. A 40 MiB partial followed by a 30 MiB partial and a
+          // 1 MiB complete source must be able to make progress without a
+          // persistent history cursor. The retained candidate union below is
+          // the aggregate that determines peak memory.
+          historyBudgetDeferredResourceIds.add(observation.resourceId);
+          historyDeferred = true;
+          break;
         }
         const data = await repository.tryReadVersion(summary.versionId);
         if (
@@ -1852,6 +2230,7 @@ export class SyncManager implements vscode.Disposable {
           data.change.resourceId !== observation.resourceId ||
           data.change.kind !== "chat" ||
           data.change.operation !== "put" ||
+          data.change.payload?.plainBytes !== sourcePlainBytes ||
           sha256(data.content) !== data.change.semanticHash
         ) {
           continue;
@@ -1866,15 +2245,40 @@ export class SyncManager implements vscode.Disposable {
           if (candidate === null) {
             continue;
           }
+          let candidateBytes =
+            Buffer.byteLength(summary.versionId, "utf8") + 64;
+          for (const row of candidate.snapshot.bubbles) {
+            candidateBytes += canonicalBytes(row).byteLength + 1;
+          }
+          if (
+            retainedCandidateRows + candidate.snapshot.bubbles.length >
+              MAX_CHAT_REPAIR_BUBBLE_ROWS ||
+            retainedCandidateBytes + candidateBytes >
+              repairHistoryAggregateByteLimit
+          ) {
+            historyBudgetDeferredResourceIds.add(observation.resourceId);
+            historyDeferred = true;
+            break;
+          }
+          retainedCandidateRows += candidate.snapshot.bubbles.length;
+          retainedCandidateBytes += candidateBytes;
           const candidateAlone = buildChatRepairSnapshot(
             observation.snapshot,
             [candidate],
           );
           if (candidateAlone.status !== "repairable") {
             newerPartialCandidates.push(candidate);
+            newerPartialVersions.push({
+              versionId: summary.versionId,
+              plainBytes: sourcePlainBytes,
+            });
             continue;
           }
           newerPartialCandidates.push(candidate);
+          newerPartialVersions.push({
+            versionId: summary.versionId,
+            plainBytes: sourcePlainBytes,
+          });
           const withNewerDisagreementCheck = buildChatRepairSnapshot(
             observation.snapshot,
             newerPartialCandidates,
@@ -1890,7 +2294,7 @@ export class SyncManager implements vscode.Disposable {
           // next trusted version may still contain every missing row.
         }
       }
-      if (repair === null) {
+      if (historyDeferred || repair === null) {
         continue;
       }
       plans.push({
@@ -1898,19 +2302,36 @@ export class SyncManager implements vscode.Disposable {
         label: chatRepairLabel(observation),
         expectedTipIds: tips.map((candidate) => candidate.versionId).sort(),
         fingerprint: observation.fingerprint,
-        candidateVersionIds: newerPartialCandidates.map(
-          (candidate) => candidate.versionId,
-        ),
+        candidateVersions: newerPartialVersions,
         sourceVersionId: repair.sourceVersionId,
         repairedBubbleCount: repair.repairedBubbleCount,
       });
     }
 
+    const historyBudgetDeferredDetail =
+      historyBudgetDeferredResourceIds.size === 0
+        ? ""
+        : `${historyBudgetDeferredResourceIds.size} damaged conversation${
+            historyBudgetDeferredResourceIds.size === 1 ? " was" : "s were"
+          } deferred because synchronized repair history exceeded the bounded ${formatBytes(
+            repairHistorySourceByteLimit,
+          )} per-source or ${formatBytes(
+            repairHistoryAggregateByteLimit,
+          )} retained-candidate memory limit. A source known from authenticated metadata to be oversized was not read; over-budget retained candidates were discarded. Nothing was changed for those conversations, and this is not an all-clear result.`;
+
     if (plans.length === 0) {
       if (alreadyQueued > 0) {
         const restart = "Restart to Apply";
         const choice = await vscode.window.showInformationMessage(
-          `${alreadyQueued} chat repair${alreadyQueued === 1 ? " is" : "s are"} already queued.`,
+          `${alreadyQueued} chat repair${alreadyQueued === 1 ? " is" : "s are"} already queued.${
+            deferredInspectionDetail.length === 0
+              ? ""
+              : ` ${deferredInspectionDetail}`
+          }${
+            historyBudgetDeferredDetail.length === 0
+              ? ""
+              : ` ${historyBudgetDeferredDetail}`
+          }`,
           restart,
         );
         if (choice === restart) {
@@ -1919,7 +2340,15 @@ export class SyncManager implements vscode.Disposable {
         return;
       }
       void vscode.window.showWarningMessage(
-        `Found ${observations.length} unavailable Cursor conversation${observations.length === 1 ? "" : "s"}, but no warning-free compatible stored version contains every missing message. Nothing was changed; Restore Version History remains available for manual recovery.`,
+        `Found ${observations.length} unavailable Cursor conversation${observations.length === 1 ? "" : "s"}, but no warning-free compatible stored version contains every missing message. Nothing was changed; Restore Version History remains available for manual recovery.${
+          deferredInspectionDetail.length === 0
+            ? ""
+            : ` ${deferredInspectionDetail}`
+        }${
+          historyBudgetDeferredDetail.length === 0
+            ? ""
+            : ` ${historyBudgetDeferredDetail}`
+        }`,
       );
       return;
     }
@@ -1944,6 +2373,14 @@ export class SyncManager implements vscode.Disposable {
           skipped <= 0
             ? ""
             : `\n\n${skipped} additional damaged conversation${skipped === 1 ? " has" : "s have"} no unambiguous synchronized source and will be left unchanged.`
+        }${
+          deferredInspectionDetail.length === 0
+            ? ""
+            : `\n\n${deferredInspectionDetail}`
+        }${
+          historyBudgetDeferredDetail.length === 0
+            ? ""
+            : `\n\n${historyBudgetDeferredDetail}`
         }\n\nOnly referenced missing or unreadable message rows are recovered. Existing valid messages, the live conversation header and composerData are not replaced. Cursor must be closed for the transactional write; a database backup is created first.`,
       },
       repairNow,
@@ -1957,12 +2394,24 @@ export class SyncManager implements vscode.Disposable {
     // repository lock while SQLite walks it. The originating offline helper
     // performs the definitive fingerprint check again in the write
     // transaction, so a chat changing after this read still fails closed.
+    const plannedResourceIds = new Set(
+      plans.map((plan) => plan.resourceId),
+    );
     const freshInspection = await this.withProgress(
       "Cursor Setting Sync",
       async (report) => {
         report("Rechecking unavailable chat messages...");
-        return inspectBrokenCursorChats(this.paths);
+        return inspectBrokenCursorChats(this.paths, {
+          resourceIds: plannedResourceIds,
+          limits: chatRepairInspectionLimits,
+        });
       },
+    );
+    const freshInspectionDetail = chatRepairFreshInspectionDetail(
+      freshInspection.deferredBrokenChats,
+      freshInspection.oversizedChats,
+      freshInspection.snapshotByteLimit,
+      freshInspection.limitReached,
     );
     const freshByResource = new Map(
       freshInspection.broken.map((observation) => [
@@ -2013,6 +2462,8 @@ export class SyncManager implements vscode.Disposable {
       }
       Object.assign(repository.state, freshState);
       const snapshots: ResourceSnapshot[] = [];
+      let retainedRepairOutputBytes = 0;
+      let confirmationBudgetDeferred = 0;
       for (const plan of plans) {
         const observation = freshByResource.get(plan.resourceId);
         const freshTips = repository.state.tips[plan.resourceId] ?? [];
@@ -2033,18 +2484,44 @@ export class SyncManager implements vscode.Disposable {
           changedWhileConfirming += 1;
           continue;
         }
+        let planHistoryFits = true;
+        for (const candidate of plan.candidateVersions) {
+          if (
+            !Number.isSafeInteger(candidate.plainBytes) ||
+            candidate.plainBytes < 0 ||
+            candidate.plainBytes > repairHistorySourceByteLimit
+          ) {
+            planHistoryFits = false;
+            break;
+          }
+        }
+        if (!planHistoryFits) {
+          // Preflight the complete plan before reading its first object. This
+          // avoids retaining a partial union after a source whose authenticated
+          // declared size can never fit the per-source work budget.
+          confirmationBudgetDeferred += 1;
+          changedWhileConfirming += 1;
+          continue;
+        }
         const candidates: ChatRepairCandidate[] = [];
-        const retainedRows = new Map<string, PortableKvRow>();
+        const retainedRows = createChatRepairBubbleAccumulator(
+          repairOutputByteLimit,
+        );
+        const retainedAgentKv = createChatRepairAgentKvAccumulator();
         const unavailableKeys = new Set(observation.unavailableBubbleKeys);
         let candidateInvalid = false;
-        for (const versionId of plan.candidateVersionIds) {
-          const source = await repository.tryReadVersion(versionId);
+        for (const candidateVersion of plan.candidateVersions) {
+          const source = await repository.tryReadVersion(
+            candidateVersion.versionId,
+          );
           if (
             source === null ||
             source.content === null ||
             source.change.resourceId !== plan.resourceId ||
             source.change.kind !== "chat" ||
             source.change.operation !== "put" ||
+            source.change.payload?.plainBytes !==
+              candidateVersion.plainBytes ||
             sha256(source.content) !== source.change.semanticHash ||
             databaseApplyBlockReason(
               "chat",
@@ -2062,7 +2539,7 @@ export class SyncManager implements vscode.Disposable {
             // Peak memory is therefore the final union plus one parsed payload,
             // not candidate count times the entire conversation size.
             const parsed = parseChatRepairCandidate(
-              versionId,
+              candidateVersion.versionId,
               source.content,
               observation,
               unavailableKeys,
@@ -2071,7 +2548,23 @@ export class SyncManager implements vscode.Disposable {
               candidateInvalid = true;
               break;
             }
-            retainNewestUsableChatRows(retainedRows, parsed.rows);
+            if (!retainNewestUsableChatRows(retainedRows, parsed.rows)) {
+              confirmationBudgetDeferred += 1;
+              candidateInvalid = true;
+              break;
+            }
+            if (
+              parsed.agentKv !== null &&
+              !retainChatRepairAgentKv(
+                retainedAgentKv,
+                parsed.agentKv,
+                retainedRows,
+              )
+            ) {
+              confirmationBudgetDeferred += 1;
+              candidateInvalid = true;
+              break;
+            }
             candidates.push(parsed.candidate);
           } catch {
             candidateInvalid = true;
@@ -2094,7 +2587,7 @@ export class SyncManager implements vscode.Disposable {
             versionId: decision.sourceVersionId,
             snapshot: {
               ...observation.snapshot,
-              bubbles: [...retainedRows.values()],
+              bubbles: [...retainedRows.rows.values()],
             },
           },
         ]);
@@ -2105,10 +2598,50 @@ export class SyncManager implements vscode.Disposable {
           changedWhileConfirming += 1;
           continue;
         }
-        const content = canonicalBytes(rebuilt.snapshot);
+        if (retainedAgentKv.sawV2) {
+          const coreRoots = extractBoundedChatCoreAgentKvRoots(
+            rebuilt.snapshot,
+          );
+          if (
+            coreRoots === null ||
+            !retainChatRepairAgentKv(
+              retainedAgentKv,
+              {
+                blobs: [],
+                referencedIds: coreRoots,
+                missingIds: coreRoots,
+              },
+              retainedRows,
+            )
+          ) {
+            if (coreRoots !== null) {
+              confirmationBudgetDeferred += 1;
+            }
+            changedWhileConfirming += 1;
+            continue;
+          }
+        }
+        const repairSnapshot = retainedAgentKv.sawV2
+          ? parsePortableChatSnapshot(
+              canonicalBytes({
+                ...rebuilt.snapshot,
+                schemaVersion: 2,
+                agentKv: materializeChatRepairAgentKv(retainedAgentKv),
+              }),
+            )
+          : rebuilt.snapshot;
+        const content = canonicalBytes(repairSnapshot);
+        if (
+          content.byteLength > repairOutputByteLimit ||
+          retainedRepairOutputBytes + content.byteLength >
+            MAX_CHAT_REPAIR_OUTPUT_AGGREGATE_BYTES
+        ) {
+          confirmationBudgetDeferred += 1;
+          changedWhileConfirming += 1;
+          continue;
+        }
+        retainedRepairOutputBytes += content.byteLength;
         const currentTip = freshTips[0];
-        const metadata = { ...(currentTip?.metadata ?? {}) };
-        delete metadata.title;
         snapshots.push({
           resourceId: plan.resourceId,
           kind: "chat",
@@ -2116,12 +2649,7 @@ export class SyncManager implements vscode.Disposable {
           semanticHash: sha256(content),
           parents: freshTips.map((tip) => tip.versionId),
           metadata: {
-            ...metadata,
-            composerId: observation.composerId,
-            workspaceId: observation.workspaceId,
-            lastUpdatedAt: observation.lastUpdatedAt,
-            bubbleCount: rebuilt.snapshot.bubbles.length,
-            ...(observation.title === null ? {} : { title: observation.title }),
+            ...chatMetadataForExactPayload(currentTip?.metadata, content),
             syncOrigin: "automatic-chat-repair",
             repairOriginDeviceId: repository.state.device.deviceId,
             repairFingerprint: observation.fingerprint,
@@ -2131,7 +2659,15 @@ export class SyncManager implements vscode.Disposable {
       }
       if (snapshots.length === 0) {
         void vscode.window.showWarningMessage(
-          "The damaged chats or synchronized versions changed while confirmation was open. Nothing was changed; run Repair Unavailable Chats again.",
+          `The damaged chats or synchronized versions changed while confirmation was open${
+            confirmationBudgetDeferred === 0
+              ? ""
+              : `, or ${confirmationBudgetDeferred} repair${confirmationBudgetDeferred === 1 ? " exceeded" : "s exceeded"} the bounded history/output memory limit`
+          }. Nothing was changed; run Repair Unavailable Chats again.${
+            freshInspectionDetail.length === 0
+              ? ""
+              : ` ${freshInspectionDetail}`
+          }`,
         );
         return;
       }
@@ -2150,6 +2686,9 @@ export class SyncManager implements vscode.Disposable {
 
     await this.syncNow(true);
     if (choice === repairNow) {
+      if (freshInspectionDetail.length > 0) {
+        void vscode.window.showWarningMessage(freshInspectionDetail);
+      }
       await this.restartToApply();
       return;
     }
@@ -2157,8 +2696,17 @@ export class SyncManager implements vscode.Disposable {
       `${publishedRepairResourceIds.length} chat repair${publishedRepairResourceIds.length === 1 ? " is" : "s are"} queued${
         changedWhileConfirming === 0
           ? "."
-          : `; ${changedWhileConfirming} changed during confirmation and was left untouched.`
-      } Run "Cursor Setting Sync: Restart to Apply" when you are ready to close Cursor and apply the transactional repair.`,
+          : `; ${changedWhileConfirming} changed or exceeded a bounded repair memory limit during confirmation and was left untouched.`
+      } Run "Cursor Setting Sync: Restart to Apply" when you are ready to close Cursor and apply the transactional repair.${
+        [
+          deferredInspectionDetail,
+          freshInspectionDetail,
+          historyBudgetDeferredDetail,
+        ]
+          .filter((detail) => detail.length > 0)
+          .map((detail) => ` ${detail}`)
+          .join("")
+      }`,
     );
   }
 
@@ -2418,6 +2966,14 @@ export class SyncManager implements vscode.Disposable {
     if (selectedVersion === undefined) {
       return;
     }
+    const restorePayloadBlock = restoreVersionPayloadBlockReason(
+      selectedVersion.summary,
+      repository.maxPayloadBytes,
+    );
+    if (restorePayloadBlock !== null) {
+      void vscode.window.showWarningMessage(restorePayloadBlock);
+      return;
+    }
     await this.showHistoryPreview(
       repository,
       resourceId,
@@ -2527,9 +3083,16 @@ export class SyncManager implements vscode.Disposable {
         data.change.metadata,
         data.producer ?? selectedVersion.summary.producer ?? tipProducer,
       );
-      const restoredChatTitle = selectedVersion.summary.kind === "chat"
-        ? chatSnapshotTitle(data.content)
-        : null;
+      const existingChatTitle =
+        typeof data.change.metadata?.title === "string"
+          ? data.change.metadata.title
+          : null;
+      const restoredChatTitle =
+        selectedVersion.summary.kind !== "chat"
+          ? null
+          : data.content.byteLength <= HISTORY_PREVIEW_MAX_PAYLOAD_BYTES
+            ? chatSnapshotTitle(data.content) ?? existingChatTitle
+            : existingChatTitle;
       const restoredMetadata = { ...(data.change.metadata ?? {}) };
       if (selectedVersion.summary.kind === "chat") {
         delete restoredMetadata.title;
@@ -2578,11 +3141,26 @@ export class SyncManager implements vscode.Disposable {
     try {
       const currentTip =
         tips.find((tip) => tip.operation === "put") ?? tips[0];
+      const currentFitsPreview =
+        currentTip !== undefined &&
+        declaredHistoryPreviewFits(
+          currentTip.operation,
+          currentTip.payload?.plainBytes ?? null,
+        );
       const current =
-        currentTip === undefined
+        currentTip === undefined ||
+        currentTip.operation === "delete" ||
+        !currentFitsPreview
           ? null
           : await repository.tryReadVersion(currentTip.versionId);
-      const selected = await repository.tryReadVersion(summary.versionId);
+      const selectedFitsPreview = declaredHistoryPreviewFits(
+        summary.operation,
+        summary.plainBytes,
+      );
+      const selected =
+        selectedFitsPreview && summary.operation !== "delete"
+        ? await repository.tryReadVersion(summary.versionId)
+        : null;
       // VS Code caches provider content per URI, so the version IDs are part
       // of the path; otherwise a second preview of the same resource would
       // show the first preview's cached documents.
@@ -2604,11 +3182,21 @@ export class SyncManager implements vscode.Disposable {
         currentUri.toString(),
         currentTip === undefined
           ? "[No current version]\n"
-          : historyPreviewText(currentTip.operation, current?.content ?? null),
+          : currentFitsPreview
+            ? historyPreviewText(
+                currentTip.operation,
+                current?.content ?? null,
+              )
+            : historyPreviewOmittedText(
+                currentTip.operation,
+                currentTip.payload?.plainBytes ?? null,
+              ),
       );
       this.historyDocuments.set(
         selectedUri.toString(),
-        historyPreviewText(summary.operation, selected?.content ?? null),
+        selectedFitsPreview
+          ? historyPreviewText(summary.operation, selected?.content ?? null)
+          : historyPreviewOmittedText(summary.operation, summary.plainBytes),
       );
       await vscode.commands.executeCommand(
         "vscode.diff",
@@ -2628,6 +3216,11 @@ export class SyncManager implements vscode.Disposable {
   }
 
   async showDiagnostics(): Promise<void> {
+    // A standby window has intentionally not loaded local state. Diagnostics
+    // is an explicit state-reading command, so hydrate its first snapshot
+    // under sync.lock instead of silently reporting a placeholder device and
+    // zero pending changes/conflicts.
+    await this.ensureRepositoryInitializedForRead();
     const repository = this.repository;
     const snapshot: DiagnosticSnapshot = {
       generatedAt: new Date().toISOString(),
@@ -3318,6 +3911,7 @@ export class SyncManager implements vscode.Disposable {
         // A failed final cycle already reported its own diagnostic. Teardown
         // must still release every in-process resource below.
       } finally {
+        await this.replaceAdapters([]);
         this.warnings.clear();
         this.historyPreviewRegistration.dispose();
         this.helper.dispose();
@@ -3326,6 +3920,79 @@ export class SyncManager implements vscode.Disposable {
       }
     })();
     return this.shutdownPromise;
+  }
+
+  private async reconcileCurrentRepository(
+    repository: SyncRepository,
+    checkpoint: CheckpointManifest | null,
+  ): Promise<ReconcileResult> {
+    const sharedGraphGeneration = repository.sharedGraphGeneration;
+    const reconciliationInputGeneration =
+      repository.reconciliationInputGeneration;
+    const cached = this.reconciliationCache;
+    if (
+      cached?.repository === repository &&
+      cached.sharedGraphGeneration === sharedGraphGeneration &&
+      cached.reconciliationInputGeneration === reconciliationInputGeneration
+    ) {
+      return cached.result;
+    }
+    const result = this.eventReconciler.reconcile(
+      await repository.listReconciliationEvents(checkpoint),
+      repository.state,
+      checkpoint,
+    );
+    this.reconciliationCache = {
+      repository,
+      sharedGraphGeneration,
+      reconciliationInputGeneration,
+      result,
+    };
+    return result;
+  }
+
+  private canReuseCurrentReconciliation(repository: SyncRepository): boolean {
+    const cached = this.reconciliationCache;
+    return (
+      cached?.repository === repository &&
+      cached.sharedGraphGeneration === repository.sharedGraphGeneration &&
+      cached.reconciliationInputGeneration ===
+        repository.reconciliationInputGeneration
+    );
+  }
+
+  private alignCurrentReconciliationCache(repository: SyncRepository): void {
+    const cached = this.reconciliationCache;
+    if (
+      cached?.repository === repository &&
+      cached.sharedGraphGeneration === repository.sharedGraphGeneration
+    ) {
+      cached.reconciliationInputGeneration =
+        repository.reconciliationInputGeneration;
+    }
+  }
+
+  private currentChatTipEnrichmentIndex(
+    repository: SyncRepository,
+  ): readonly ChatTipEnrichmentCandidate[] {
+    const sharedGraphGeneration = repository.sharedGraphGeneration;
+    const cached = this.chatTipEnrichmentIndex;
+    if (
+      cached?.repository === repository &&
+      cached.sharedGraphGeneration === sharedGraphGeneration
+    ) {
+      return cached.candidates;
+    }
+    const candidates = buildChatTipEnrichmentCandidateIndex(
+      repository.state.tips,
+    );
+    this.chatTipEnrichmentIndex = {
+      repository,
+      sharedGraphGeneration,
+      candidates,
+    };
+    this.chatTipEnrichmentCursor = { afterResourceId: null };
+    return candidates;
   }
 
   private async performSync(manual: boolean, scope: SyncScope): Promise<void> {
@@ -3367,7 +4034,17 @@ export class SyncManager implements vscode.Disposable {
       // The other holder may own the lock continuously, so this window would
       // otherwise keep displaying whatever it last computed — including a
       // stale "up-to-date" while conflicts are outstanding.
-      this.updateStatus(repository);
+      if (repository.isInitialized) {
+        this.updateStatus(repository);
+      } else {
+        // Envelope-only open carries a deliberately empty placeholder. Never
+        // turn that into a green zero-conflict/zero-queue claim merely because
+        // another window or helper still owns the initialization lock.
+        this.status.setStatus(
+          "syncing",
+          "Another Cursor window or the offline helper is synchronizing. Local repository state will load when the lock is available.",
+        );
+      }
       return;
     }
     const resumed = lockSkipResumedLine(this.lockSkip);
@@ -3378,10 +4055,10 @@ export class SyncManager implements vscode.Disposable {
     let failed = false;
     this.beginSyncIndicator();
     try {
-      // Configured windows load only atomic local state during activation.
-      // Checkpoint absorption and own-stream recovery can write that state, so
-      // the elected owner (or an explicit follower command) completes them
-      // only after taking the same machine-wide lock as the rest of the cycle.
+      // Deferred activation is envelope-only. The elected owner (or an
+      // explicit follower command) loads local state, absorbs checkpoints and
+      // recovers its own stream only after taking the same machine-wide lock
+      // as the rest of the cycle.
       await repository.ensureInitialized();
       // Inside the lock so two cycling windows do not both report - and both
       // delete - the same result. A helper that fails while Cursor is still
@@ -3396,18 +4073,20 @@ export class SyncManager implements vscode.Disposable {
       const gitActive = await this.openGitWindow(repository, manual);
       const probeAttempted =
         this.backgroundGitPullAttempt !== pullAttemptBefore;
-      await repository.refreshState();
+      await repository.refreshState({ forceAudit: manual });
       const checkpoint = await absorbedCheckpointManifest(repository);
-      const reconciler = new EventReconciler();
+      const initialReconciliationWasCached =
+        this.canReuseCurrentReconciliation(repository);
+      const pendingCountBefore =
+        repository.state.pendingDatabaseChanges.length;
       // Auto-merge runs on every cycle regardless of scope, so its bucket is
       // always observed, exactly like the reconciler's.
       const mergeWarnings: string[] = [];
       const noteMergeWarning = (warning: string): void => {
         mergeWarnings.push(warning);
       };
-      let preResult = reconciler.reconcile(
-        await repository.listReconciliationEvents(checkpoint),
-        repository.state,
+      let preResult = await this.reconcileCurrentRepository(
+        repository,
         checkpoint,
       );
       let autoMergedPublished = await autoMergeConflicts(
@@ -3420,11 +4099,78 @@ export class SyncManager implements vscode.Disposable {
         noteMergeWarning,
       );
       if (autoMergedPublished) {
-        preResult = reconciler.reconcile(
-          await repository.listReconciliationEvents(checkpoint),
-          repository.state,
+        preResult = await this.reconcileCurrentRepository(
+          repository,
           checkpoint,
         );
+      }
+      let agentKvEnrichedCount = 0;
+      if (
+        this.configuration.syncChat &&
+        this.compatibility.databaseCapabilities["global-chat"].available
+      ) {
+        try {
+          const enriched = await enrichCurrentChatTipsFromLiveDatabase(
+            repository,
+            this.paths.globalDatabase,
+            {
+              cursor: this.chatTipEnrichmentCursor,
+              candidateIndex: this.currentChatTipEnrichmentIndex(repository),
+              candidateGeneration: repository.sharedGraphGeneration,
+              maxPayloadBytes: repository.maxPayloadBytes,
+              attemptCache: this.chatTipEnrichmentAttempts,
+              forceRetry: manual,
+              tipAllowed: (tip) => this.resourceApplyBlockReason(tip) === null,
+            },
+          );
+          this.chatTipEnrichmentCursor = enriched.cursor;
+          agentKvEnrichedCount = enriched.published;
+          for (const warning of enriched.warnings) {
+            this.status.log(warning);
+          }
+          if (agentKvEnrichedCount > 0) {
+            preResult = await this.reconcileCurrentRepository(
+              repository,
+              checkpoint,
+            );
+            if (this.chatTipEnrichmentIndex?.repository === repository) {
+              const publishedResourceIds = new Set(
+                enriched.publishedResourceIds,
+              );
+              this.chatTipEnrichmentIndex.candidates =
+                this.chatTipEnrichmentIndex.candidates.filter(
+                  (candidate) =>
+                    !publishedResourceIds.has(candidate.resourceId),
+                );
+              const refreshedTips = Object.create(null) as Record<
+                string,
+                ResourceTip[]
+              >;
+              for (const resourceId of publishedResourceIds) {
+                refreshedTips[resourceId] =
+                  repository.state.tips[resourceId] ?? [];
+              }
+              // A partial enrichment remains eligible. Re-evaluate only the
+              // exact published IDs after reconciliation and append their new
+              // immutable tips; rebuilding/sorting every chat after each
+              // two-item migration batch would recreate the O(N) poll spike.
+              this.chatTipEnrichmentIndex.candidates.push(
+                ...buildChatTipEnrichmentCandidateIndex(refreshedTips),
+              );
+              this.chatTipEnrichmentIndex.sharedGraphGeneration =
+                repository.sharedGraphGeneration;
+            }
+          }
+        } catch (error) {
+          // Migration is opportunistic and must never stop ordinary settings,
+          // chat-core, or inbound synchronization. A changed DB generation or
+          // a manual sync retries it.
+          this.status.log(
+            `Agent blob enrichment was skipped: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
       const synthetic = await this.applySyntheticProjectionsBeforeScan(
         repository,
@@ -3432,9 +4178,8 @@ export class SyncManager implements vscode.Disposable {
       );
       const syntheticSkips = synthetic.driftSkipped;
       if (synthetic.changed) {
-        preResult = reconciler.reconcile(
-          await repository.listReconciliationEvents(checkpoint),
-          repository.state,
+        preResult = await this.reconcileCurrentRepository(
+          repository,
           checkpoint,
         );
       }
@@ -3447,6 +4192,7 @@ export class SyncManager implements vscode.Disposable {
         repository.state.projections,
         manual ? "all" : scope,
         requiredKinds,
+        repository.maxPayloadBytes,
       );
       const localSnapshots = new Map(
         scan.snapshots.map((snapshot) => [snapshot.resourceId, snapshot]),
@@ -3481,6 +4227,7 @@ export class SyncManager implements vscode.Disposable {
       // Without this, helper APPLY clock differences and unresolved conflicts
       // both caused a full re-read and re-hash on every poll forever.
       const published = new Set(changedSnapshots.map((s) => s.resourceId));
+      let suppressedProjectionChanged = false;
       for (const snapshot of scan.snapshots) {
         if (
           published.has(snapshot.resourceId) ||
@@ -3488,11 +4235,15 @@ export class SyncManager implements vscode.Disposable {
         ) {
           continue;
         }
-        markSuppressedSnapshotProjection(
-          repository.state.projections,
-          snapshot,
-          repository.state.tips[snapshot.resourceId] ?? [],
-        );
+        if (
+          markSuppressedSnapshotProjection(
+            repository.state.projections,
+            snapshot,
+            repository.state.tips[snapshot.resourceId] ?? [],
+          )
+        ) {
+          suppressedProjectionChanged = true;
+        }
       }
       const publishableSnapshots = changedSnapshots.map((snapshot) => ({
         ...snapshot,
@@ -3552,8 +4303,18 @@ export class SyncManager implements vscode.Disposable {
         repository.maxPayloadBytes,
         (snapshot) => this.publishWarningSourceFor(snapshot.kind),
       );
+      mergeWarningBuckets(
+        publishable,
+        settleOversizedSnapshots(
+          this.adapters,
+          scan.warningsBySource.keys(),
+          publishableSnapshots,
+          repository.maxPayloadBytes,
+        ),
+      );
       const publishedCount =
         publishable.snapshots.length + publishable.deletions.length;
+      const totalPublishedCount = publishedCount + agentKvEnrichedCount;
       // A publish failure must not stop this device from *receiving*. The
       // publish call used to sit in front of applyProjections, so one
       // unpublishable resource stopped every other device's changes from being
@@ -3580,11 +4341,7 @@ export class SyncManager implements vscode.Disposable {
       // seconds, in every open window.
       let result =
         publishedCount > 0
-          ? reconciler.reconcile(
-              await repository.listReconciliationEvents(checkpoint),
-              repository.state,
-              checkpoint,
-            )
+          ? await this.reconcileCurrentRepository(repository, checkpoint)
           : preResult;
       const postPublishAutoMerged = await autoMergeConflicts(
         repository,
@@ -3597,11 +4354,7 @@ export class SyncManager implements vscode.Disposable {
       );
       autoMergedPublished ||= postPublishAutoMerged;
       if (postPublishAutoMerged) {
-        result = reconciler.reconcile(
-          await repository.listReconciliationEvents(checkpoint),
-          repository.state,
-          checkpoint,
-        );
+        result = await this.reconcileCurrentRepository(repository, checkpoint);
       }
       // Warnings are deduped per source. A cycle that did not run an adapter
       // leaves that adapter's bucket untouched, so an alternating files/chat
@@ -3640,31 +4393,60 @@ export class SyncManager implements vscode.Disposable {
       })) {
         this.status.log(formatWarningLine(entry));
       }
-      prunePending(repository, result.projections);
-      await this.applyProjections(
+      const pendingPruned = prunePending(repository, result.projections);
+      const appliedProjectionStateChanged = await this.applyProjections(
         repository,
         result.projections,
         localSnapshots,
         manual,
+        scan.deferredAdapterIds,
+        scan.adapterIndexes,
       );
-      repository.state.lastSyncAt = new Date().toISOString();
-      repository.state.lastError = null;
-      await repository.saveState();
+      const successfulActivity =
+        manual ||
+        totalPublishedCount > 0 ||
+        autoMergedPublished ||
+        synthetic.changed ||
+        suppressedProjectionChanged ||
+        pendingPruned ||
+        appliedProjectionStateChanged ||
+        repository.state.pendingDatabaseChanges.length !== pendingCountBefore ||
+        repository.state.lastError !== null;
+      const stateNeedsPersist =
+        !initialReconciliationWasCached || successfulActivity;
+      if (stateNeedsPersist) {
+        // `lastSyncAt` is status metadata, not a 30-second heartbeat. Rewriting
+        // it on a truly idle poll forced a full local-state stringify/write
+        // and invalidated the graph cache forever. Record user-visible or
+        // state-changing work; a cache miss alone may only be the first
+        // compile of an otherwise unchanged repository.
+        if (successfulActivity) {
+          repository.state.lastSyncAt = new Date().toISOString();
+        }
+        repository.state.lastError = null;
+        await repository.saveState();
+        // Reconcile mutates streams/tips/conflicts, and successful projection
+        // handling above flips each cached `changed` item to false. Once that
+        // exact output is durable, the cached result belongs to the new local
+        // input generation; otherwise every real publish pays one redundant
+        // full graph compile on the following poll.
+        this.alignCurrentReconciliationCache(repository);
+      }
       const ackWritten = await repository.writeAck();
       if (
         manual ||
         probeAttempted ||
-        publishedCount > 0 ||
+        totalPublishedCount > 0 ||
         autoMergedPublished ||
         ackWritten
       ) {
         await this.commitGitWindow(
           gitActive,
           repository.root,
-          `sync(${repository.state.device.deviceId.slice(0, 8)}): ${publishedCount} change(s)`,
+          `sync(${repository.state.device.deviceId.slice(0, 8)}): ${totalPublishedCount} change(s)`,
         );
       }
-      if (gitActive && publishedCount > 0) {
+      if (gitActive && totalPublishedCount > 0) {
         await this.warnAboutLargeFiles(repository.root, true);
       }
       await this.noteMaintenanceNeed(repository, result.warnings);
@@ -3850,8 +4632,22 @@ export class SyncManager implements vscode.Disposable {
     known: Record<string, LocalProjection>,
     scope: SyncScope = "all",
     requiredKinds: ReadonlySet<ResourceKind> = new Set(),
+    maxPayloadBytes?: number,
   ): Promise<LocalScanResult> {
-    return scanAdapters(this.adapters, known, scope, requiredKinds);
+    const result = await scanAdapters(
+      this.adapters,
+      known,
+      scope,
+      requiredKinds,
+      maxPayloadBytes,
+      { startAfterAdapterId: this.adapterScanCursorByScope.get(scope) ?? null },
+    );
+    if (result.cursorAfterAdapterId === null) {
+      this.adapterScanCursorByScope.delete(scope);
+    } else {
+      this.adapterScanCursorByScope.set(scope, result.cursorAfterAdapterId);
+    }
+    return result;
   }
 
   private async applyProjections(
@@ -3859,8 +4655,11 @@ export class SyncManager implements vscode.Disposable {
     projections: ResourceProjection[],
     localSnapshots: Map<string, ResourceSnapshot>,
     manual: boolean,
-  ): Promise<void> {
+    deferredAdapterIds: ReadonlySet<string> = new Set(),
+    adapterScanIndexes: ReadonlyMap<string, AdapterScanIndex> = new Map(),
+  ): Promise<boolean> {
     const scannedByAdapter = new Map<string, AdapterScanIndex | null>();
+    let stateChanged = false;
     for (const projection of projections.filter((candidate) => candidate.changed)) {
       const tip = projection.tip;
       const local = localSnapshots.get(projection.resourceId);
@@ -3870,6 +4669,7 @@ export class SyncManager implements vscode.Disposable {
         local?.semanticHash === tip.semanticHash
       ) {
         markProjection(repository, projection, local);
+        stateChanged = true;
         continue;
       }
       if (
@@ -3879,6 +4679,7 @@ export class SyncManager implements vscode.Disposable {
         tip.operation === "delete"
       ) {
         markProjection(repository, projection, local);
+        stateChanged = true;
         continue;
       }
       if (isPolicyExcludedUiStateResource(projection.resourceId, tip.kind)) {
@@ -3891,43 +4692,78 @@ export class SyncManager implements vscode.Disposable {
             "each computer and is no longer synchronized.",
         );
         markProjection(repository, projection, local);
+        stateChanged = true;
         continue;
       }
       const blockedReason = this.resourceApplyBlockReason(tip);
       if (blockedReason !== null) {
-        queuePending(repository, projection, blockedReason);
+        if (queuePending(repository, projection, blockedReason)) {
+          stateChanged = true;
+        }
         continue;
       }
       const adapter = this.adapterFor(tip.kind);
       if (adapter.appliesWhileRunning && (this.configuration.autoApplyFiles || manual)) {
-        if (isSyntheticTip(tip) && local === undefined) {
-          // The adapter was not scanned this cycle, so the local state is
-          // unknown; a merge result must not overwrite unpublished edits.
-          const scanned = await this.scanAdapterForDrift(
-            adapter,
-            repository.state.projections,
-            scannedByAdapter,
-          );
-          const decision = syntheticApplyDecision(
-            scanned,
-            projection.resourceId,
-            tip,
-            repository.state.projections[projection.resourceId],
-          );
-          if (decision.action === "drift") {
-            queuePending(repository, projection);
-            continue;
+        const liveApplyBlock = runningApplyPayloadBlockReason(
+          projection.resourceId,
+          tip,
+          repository.maxPayloadBytes,
+        );
+        if (liveApplyBlock !== null) {
+          if (queuePending(repository, projection, liveApplyBlock)) {
+            stateChanged = true;
           }
-          if (decision.action === "already-applied") {
-            markProjection(repository, projection, decision.live);
-            continue;
-          }
+          continue;
         }
-        await this.applyProjectionGuarded(repository, adapter, projection);
+        // Every inbound live write, not only a synthetic merge, is checked
+        // against a bounded local observation. A scan failure/incomplete page
+        // or an unpublished edit must never be overwritten merely because the
+        // resource was not in this cycle's retained snapshot page.
+        const scanned =
+          local === undefined
+            ? (adapterScanIndexes.get(adapter.id) ??
+              (deferredAdapterIds.has(adapter.id)
+                ? incompleteScanIndex()
+                : await this.scanAdapterForDrift(
+                    adapter,
+                    repository.state.projections,
+                    scannedByAdapter,
+                  )))
+            : singleSnapshotScanIndex(local);
+        const decision = isSyntheticTip(tip)
+          ? syntheticApplyDecision(
+              scanned,
+              projection.resourceId,
+              tip,
+              repository.state.projections[projection.resourceId],
+            )
+          : ordinaryApplyDecision(
+              scanned,
+              projection.resourceId,
+              tip,
+              repository.state.projections[projection.resourceId],
+            );
+        if (decision.action === "drift") {
+          if (queuePending(repository, projection)) {
+            stateChanged = true;
+          }
+          continue;
+        }
+        if (decision.action === "already-applied") {
+          markProjection(repository, projection, decision.live);
+          stateChanged = true;
+          continue;
+        }
+        if (await this.applyProjectionGuarded(repository, adapter, projection)) {
+          stateChanged = true;
+        }
       } else {
-        queuePending(repository, projection);
+        if (queuePending(repository, projection)) {
+          stateChanged = true;
+        }
       }
     }
+    return stateChanged;
   }
 
   /**
@@ -4010,6 +4846,15 @@ export class SyncManager implements vscode.Disposable {
         queuePending(repository, projection);
         continue;
       }
+      const liveApplyBlock = runningApplyPayloadBlockReason(
+        projection.resourceId,
+        tip,
+        repository.maxPayloadBytes,
+      );
+      if (liveApplyBlock !== null) {
+        queuePending(repository, projection, liveApplyBlock);
+        continue;
+      }
       const scanned = await this.scanAdapterForDrift(
         adapter,
         repository.state.projections,
@@ -4045,13 +4890,25 @@ export class SyncManager implements vscode.Disposable {
     let scanned = cache.get(adapter.id);
     if (scanned === undefined) {
       try {
+        adapter.setMaxPayloadBytes?.(this.configuration.maxPayloadBytes);
         const result = await adapter.scan(known);
+        const status = adapter.scanStatus?.();
+        const settledOversized = adapter.oversizedSnapshotSettlements?.(
+          this.configuration.maxPayloadBytes,
+        ) ?? [];
         scanned = {
           snapshots: new Map(
             result.snapshots.map((snapshot) => [snapshot.resourceId, snapshot]),
           ),
           deletions: new Map(
             result.deletions.map((deletion) => [deletion.resourceId, deletion]),
+          ),
+          complete: status?.complete ?? true,
+          deferredResourceIds: new Set(
+            [
+              ...(status?.deferredResourceIds ?? []),
+              ...settledOversized.map((settlement) => settlement.resourceId),
+            ],
           ),
         };
       } catch (error) {
@@ -4073,7 +4930,12 @@ export class SyncManager implements vscode.Disposable {
     const pending = [...repository.state.pendingDatabaseChanges];
     const scannedByAdapter = new Map<string, AdapterScanIndex | null>();
     for (const item of pending) {
-      const tip = findTip(repository, item.eventHash, item.changeIndex);
+      const tip = findTip(
+        repository,
+        item.resourceId,
+        item.eventHash,
+        item.changeIndex,
+      );
       if (tip === undefined) {
         continue;
       }
@@ -4086,30 +4948,44 @@ export class SyncManager implements vscode.Disposable {
       if (!adapter.appliesWhileRunning) {
         continue;
       }
+      const liveApplyBlock = runningApplyPayloadBlockReason(
+        item.resourceId,
+        tip,
+        repository.maxPayloadBytes,
+      );
+      if (liveApplyBlock !== null) {
+        item.blockedReason = liveApplyBlock;
+        continue;
+      }
       const projection: ResourceProjection = {
         resourceId: item.resourceId,
         tip,
         changed: true,
       };
-      if (isSyntheticTip(tip)) {
-        const scanned = await this.scanAdapterForDrift(
-          adapter,
-          repository.state.projections,
-          scannedByAdapter,
-        );
-        const decision = syntheticApplyDecision(
-          scanned,
-          item.resourceId,
-          tip,
-          repository.state.projections[item.resourceId],
-        );
-        if (decision.action === "drift") {
-          continue;
-        }
-        if (decision.action === "already-applied") {
-          markProjection(repository, projection, decision.live);
-          continue;
-        }
+      const scanned = await this.scanAdapterForDrift(
+        adapter,
+        repository.state.projections,
+        scannedByAdapter,
+      );
+      const decision = isSyntheticTip(tip)
+        ? syntheticApplyDecision(
+            scanned,
+            item.resourceId,
+            tip,
+            repository.state.projections[item.resourceId],
+          )
+        : ordinaryApplyDecision(
+            scanned,
+            item.resourceId,
+            tip,
+            repository.state.projections[item.resourceId],
+          );
+      if (decision.action === "drift") {
+        continue;
+      }
+      if (decision.action === "already-applied") {
+        markProjection(repository, projection, decision.live);
+        continue;
       }
       const applied = await this.applyProjectionGuarded(
         repository,
@@ -4125,6 +5001,146 @@ export class SyncManager implements vscode.Disposable {
             candidate.eventHash !== item.eventHash ||
             candidate.changeIndex !== item.changeIndex,
         );
+    }
+    await repository.saveState();
+  }
+
+  /**
+   * Forces a bounded full-core observation of every queued chat immediately
+   * before the offline helper is allowed to overwrite the live database.
+   * Cursor can change a chat core without moving its timestamp or bubble
+   * count; the ordinary poll fast path cannot prove those bytes unchanged.
+   */
+  private async protectQueuedChatsBeforeOfflineApply(
+    repository: SyncRepository,
+  ): Promise<void> {
+    const queued = repository.state.pendingDatabaseChanges.filter(
+      (pending) => pending.kind === "chat" && pending.blockedReason === undefined,
+    );
+    if (queued.length === 0) {
+      return;
+    }
+    const targetIds = new Set(queued.map((pending) => pending.resourceId));
+    const scanKnown = projectionOverlayForBoundedScan(
+      repository.state.projections,
+    );
+    const adapter = new StateVscdbChatAdapter(this.paths, {
+      periodicDeepVerification: false,
+      forceCoreVerificationResourceIds: [...targetIds],
+    });
+    adapter.setMaxPayloadBytes(repository.maxPayloadBytes);
+    const verified = new Set<string>();
+    const block = (resourceId: string, detail: string): void => {
+      const pending = repository.state.pendingDatabaseChanges.find(
+        (item) => item.kind === "chat" && item.resourceId === resourceId,
+      );
+      if (pending !== undefined) {
+        pending.blockedReason = `${APPLY_FAILURE_BLOCK_PREFIX}: ${detail}`;
+      }
+    };
+    try {
+      for (let pass = 0; pass < 32 && verified.size < targetIds.size; pass += 1) {
+        const result = await adapter.scan(scanKnown);
+        for (const snapshot of result.snapshots) {
+          rememberTemporarySnapshotProjection(scanKnown, snapshot);
+          if (!targetIds.has(snapshot.resourceId)) {
+            continue;
+          }
+          const pending = repository.state.pendingDatabaseChanges.find(
+            (item) => item.kind === "chat" && item.resourceId === snapshot.resourceId,
+          );
+          const tip =
+            pending === undefined
+              ? undefined
+              : findTip(
+                  repository,
+                  pending.resourceId,
+                  pending.eventHash,
+                  pending.changeIndex,
+                );
+          const known = repository.state.projections[snapshot.resourceId];
+          if (tip === undefined) {
+            verified.add(snapshot.resourceId);
+            continue;
+          }
+          if (snapshot.semanticHash === tip.semanticHash) {
+            markProjection(
+              repository,
+              { resourceId: snapshot.resourceId, tip, changed: true },
+              snapshot,
+            );
+            verified.add(snapshot.resourceId);
+            continue;
+          }
+          if (
+            snapshot.semanticHash === known?.semanticHash ||
+            snapshot.semanticHash === known?.retainedLocalHash
+          ) {
+            verified.add(snapshot.resourceId);
+            continue;
+          }
+          try {
+            await repository.publish(
+              [
+                {
+                  ...snapshot,
+                  parents: parentsForLocalChange(
+                    known,
+                    repository.state.tips[snapshot.resourceId] ?? [],
+                  ),
+                },
+              ],
+              [],
+            );
+            block(
+              snapshot.resourceId,
+              `A local edit to ${snapshot.resourceId} was captured before the queued database write. Synchronize again and resolve the resulting conversation conflict before retrying Restart to Apply.`,
+            );
+          } catch (error) {
+            block(
+              snapshot.resourceId,
+              `The final local verification for ${snapshot.resourceId} could not be published: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+          verified.add(snapshot.resourceId);
+        }
+        for (const deletion of result.deletions) {
+          if (targetIds.has(deletion.resourceId)) {
+            verified.add(deletion.resourceId);
+          }
+        }
+        const status = adapter.scanStatus();
+        const deferred = new Set(status.deferredResourceIds);
+        for (const resourceId of targetIds) {
+          if (!verified.has(resourceId) && !deferred.has(resourceId)) {
+            verified.add(resourceId);
+          }
+        }
+        if (status.complete) {
+          break;
+        }
+      }
+    } catch (error) {
+      for (const resourceId of targetIds) {
+        if (!verified.has(resourceId)) {
+          block(
+            resourceId,
+            `The final local verification for ${resourceId} failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+    }
+    for (const resourceId of targetIds) {
+      if (!verified.has(resourceId)) {
+        block(
+          resourceId,
+          `The final local verification for ${resourceId} did not finish within the bounded scan. Retry after the current synchronization completes.`,
+        );
+      }
     }
     await repository.saveState();
   }
@@ -4166,7 +5182,12 @@ export class SyncManager implements vscode.Disposable {
       if (pending.kind !== "chat" && pending.kind !== "workspace-storage") {
         continue;
       }
-      const tip = findTip(repository, pending.eventHash, pending.changeIndex);
+      const tip = findTip(
+        repository,
+        pending.resourceId,
+        pending.eventHash,
+        pending.changeIndex,
+      );
       if (tip === undefined || tip.operation === "delete") {
         continue;
       }
@@ -4297,7 +5318,12 @@ export class SyncManager implements vscode.Disposable {
       if (pending.kind !== "chat" && pending.kind !== "workspace-storage") {
         continue;
       }
-      const tip = findTip(repository, pending.eventHash, pending.changeIndex);
+      const tip = findTip(
+        repository,
+        pending.resourceId,
+        pending.eventHash,
+        pending.changeIndex,
+      );
       if (
         tip?.metadata?.workspaceId !== sourceWorkspaceId ||
         this.resourceApplyBlockReason(tip) !== null
@@ -4391,21 +5417,23 @@ export class SyncManager implements vscode.Disposable {
     resourceId: string,
     kind: ResourceKind,
   ): Promise<ResourceSnapshot | undefined> {
-    const adapter = this.adapters.find((candidate) =>
-      candidate.kinds.includes(kind),
-    );
-    if (adapter === undefined || adapter.scanWhileRunning === false) {
-      return undefined;
-    }
-    try {
-      const scan = await adapter.scan({});
-      return scan.snapshots.find(
-        (snapshot) => snapshot.resourceId === resourceId,
+    return this.withAdapterUse(async () => {
+      const adapter = this.adapters.find((candidate) =>
+        candidate.kinds.includes(kind),
       );
-    } catch {
-      // Without a readable live snapshot the keep-local option is omitted.
-      return undefined;
-    }
+      if (adapter === undefined || adapter.scanWhileRunning === false) {
+        return undefined;
+      }
+      try {
+        const scan = await adapter.scan({});
+        return scan.snapshots.find(
+          (snapshot) => snapshot.resourceId === resourceId,
+        );
+      } catch {
+        // Without a readable live snapshot the keep-local option is omitted.
+        return undefined;
+      }
+    });
   }
 
   /**
@@ -4413,8 +5441,9 @@ export class SyncManager implements vscode.Disposable {
    * exists. Turning off chat sync or losing database compatibility removes
    * adapters, and nothing would ever clear their standing warnings again.
    */
-  private refreshAdapters(): void {
-    this.adapters = this.createAdapters();
+  private async refreshAdapters(): Promise<void> {
+    await this.replaceAdapters(this.createAdapters());
+    this.adapterScanCursorByScope.clear();
     this.warnings.retainSources(
       new Set([
         RECONCILER_WARNING_SOURCE,
@@ -4437,6 +5466,74 @@ export class SyncManager implements vscode.Disposable {
     this.notices.retainSources(
       new Set(this.adapters.map((adapter) => adapter.id)),
     );
+  }
+
+  /**
+   * Runs against one stable adapter generation. A replacement installs its
+   * barrier synchronously, so no new scan can enter between the idle check and
+   * disposal of the old generation.
+   */
+  private async withAdapterUse<T>(run: () => Promise<T>): Promise<T> {
+    while (this.adapterReplacementBarrier !== null) {
+      await this.adapterReplacementBarrier;
+    }
+    this.adapterUseCount += 1;
+    try {
+      return await run();
+    } finally {
+      this.adapterUseCount -= 1;
+      if (this.adapterUseCount === 0) {
+        for (const resolve of this.adapterUseIdleResolvers.splice(0)) {
+          resolve();
+        }
+      }
+    }
+  }
+
+  private waitForAdapterUsesToSettle(): Promise<void> {
+    return this.adapterUseCount === 0
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => {
+          this.adapterUseIdleResolvers.push(resolve);
+        });
+  }
+
+  /**
+   * Serializes generation swaps, waits for old scans/applies, then disposes
+   * every retired adapter exactly once. New users wait behind the whole queue.
+   */
+  private async replaceAdapters(next: ResourceAdapter[]): Promise<void> {
+    let releaseReplacement!: () => void;
+    const replacement = new Promise<void>((resolve) => {
+      releaseReplacement = resolve;
+    });
+    const predecessor = this.adapterReplacementBarrier;
+    const barrier = (predecessor ?? Promise.resolve()).then(() => replacement);
+    this.adapterReplacementBarrier = barrier;
+    try {
+      await predecessor;
+      await this.waitForAdapterUsesToSettle();
+      const previous = this.adapters;
+      const install = this.disposed ? [] : next;
+      this.adapters = install;
+      const retired = this.disposed ? [...previous, ...next] : previous;
+      try {
+        await disposeResourceAdapters(retired);
+      } catch (error) {
+        // Teardown remains best-effort across native close errors, but never
+        // silently: all disposers were attempted by disposeResourceAdapters.
+        this.status.log(
+          `Retiring resource adapters failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    } finally {
+      releaseReplacement();
+      if (this.adapterReplacementBarrier === barrier) {
+        this.adapterReplacementBarrier = null;
+      }
+    }
   }
 
   /**
@@ -4532,9 +5629,7 @@ export class SyncManager implements vscode.Disposable {
     }
     const generation = ++this.configuredOpenGeneration;
     await assertSafeRepositoryLocation(root, this.synchronizedSourceRoots());
-    const repositoryFile = await readJsonFile<RepositoryFile>(
-      join(root, REPOSITORY_FILE),
-    );
+    const repositoryFile = await readRepositoryManifest(root);
     if (
       expectedRepositoryId !== null &&
       repositoryFile.repositoryId !== expectedRepositoryId
@@ -4579,8 +5674,96 @@ export class SyncManager implements vscode.Disposable {
     this.masterKey?.fill(0);
     this.masterKey = openingKey;
     this.repository = opened;
-    this.refreshAdapters();
+    await this.refreshAdapters();
     return true;
+  }
+
+  /**
+   * Opens the currently configured repository at most once across overlapping
+   * leadership and command requests.
+   *
+   * The decoded key returned by configuration belongs to this attempt and is
+   * always wiped; openConfiguredRepository keeps its own private copy only if
+   * the same configuration is still current when the open completes.
+   */
+  private async ensureConfiguredRepositoryOpen(): Promise<boolean> {
+    const root = this.configuration.repositoryPath;
+    const expectedRepositoryId = this.configuration.repositoryId;
+    if (root === null || this.disposed) {
+      if (root === null) {
+        this.status.setStatus("unconfigured");
+      }
+      return false;
+    }
+    const current = this.repository;
+    if (
+      current !== null &&
+      current.root === root &&
+      (expectedRepositoryId === null ||
+        current.repository.repositoryId === expectedRepositoryId)
+    ) {
+      return true;
+    }
+
+    const pending = this.configuredOpenInFlight;
+    if (pending !== null) {
+      if (
+        pending.root === root &&
+        pending.repositoryId === expectedRepositoryId
+      ) {
+        return pending.promise;
+      }
+      // A configuration replacement can overlap an old unlock. Let the old
+      // attempt observe its generation mismatch, then open the new target.
+      await pending.promise.catch(() => {});
+      return this.ensureConfiguredRepositoryOpen();
+    }
+
+    const promise = (async (): Promise<boolean> => {
+      const masterKey = await this.configuration.getMasterKey();
+      if (masterKey === null) {
+        this.status.setStatus("locked");
+        return false;
+      }
+      try {
+        if (
+          this.configuration.repositoryPath !== root ||
+          this.configuration.repositoryId !== expectedRepositoryId
+        ) {
+          return false;
+        }
+        return await this.openConfiguredRepository(masterKey);
+      } finally {
+        masterKey.fill(0);
+      }
+    })();
+    const attempt = { root, repositoryId: expectedRepositoryId, promise };
+    this.configuredOpenInFlight = attempt;
+    try {
+      return await promise;
+    } finally {
+      if (this.configuredOpenInFlight === attempt) {
+        this.configuredOpenInFlight = null;
+      }
+    }
+  }
+
+  /** Completes a lazy command read under the same lock used by mutators. */
+  private async ensureRepositoryInitializedForRead(): Promise<void> {
+    if (!(await this.ensureConfiguredRepositoryOpen())) {
+      return;
+    }
+    const repository = this.repository;
+    if (repository === null || repository.isInitialized) {
+      return;
+    }
+    const lock = await this.takeCommandLock(repository);
+    try {
+      await this.openGitWindow(repository);
+      await repository.refreshState();
+    } finally {
+      await lock.release();
+    }
   }
 
   /**
@@ -4804,8 +5987,15 @@ export class SyncManager implements vscode.Disposable {
       return;
     }
     await this.backgroundCoordinator.start(runInitialSync);
-    if (!this.backgroundCoordinator.active && this.repository !== null) {
-      this.updateStatus(this.repository);
+    if (!this.backgroundCoordinator.active) {
+      if (this.repository?.isInitialized === true) {
+        this.updateStatus(this.repository);
+      } else {
+        this.status.setStatus(
+          "up-to-date",
+          "Another Cursor window owns background synchronization. Run Sync Now or another repository command to load state in this window.",
+        );
+      }
     }
   }
 
@@ -4830,12 +6020,21 @@ export class SyncManager implements vscode.Disposable {
         // watched tree, and the watcher reports them back. Reacting would run a
         // second full cycle - state reload, full reconcile, state writes, an
         // acks upload - for a change this device already applied.
-        if (
-          this.repository?.wroteRecently(
-            repositoryPayloadFileName(fileName),
-          ) === true
-        ) {
+        const payloadFileName = repositoryPayloadFileName(fileName);
+        if (this.repository?.wroteRecently(payloadFileName) === true) {
           return;
+        }
+        // A cloud client can hydrate or replace an immutable payload in place
+        // without changing its parent directory or device head metadata. The
+        // watcher is the authoritative signal for that case: make the next
+        // refresh re-authenticate event/checkpoint bytes instead of trusting
+        // the idle generation fingerprint forever.
+        const normalizedPayloadName = payloadFileName.toLowerCase();
+        if (
+          normalizedPayloadName.endsWith(EVENT_EXTENSION) ||
+          normalizedPayloadName.endsWith(CHECKPOINT_EXTENSION)
+        ) {
+          this.repository?.invalidateSharedGraphObservation();
         }
         if (this.watcherDebounce !== null) {
           clearTimeout(this.watcherDebounce);
@@ -5620,9 +6819,8 @@ export class SyncManager implements vscode.Disposable {
    * Pushes the current `cursorSettingSync.maxPayloadMiB` into the open
    * repository.
    *
-   * `configurationChanged` refreshes the adapters but never reopens the
-   * repository, and `openConfiguredRepository` is only reached from
-   * `initialize` and `setup`. Without this the repository kept enforcing
+   * `configurationChanged` refreshes the adapters but never reopens an
+   * already matching repository. Without this the repository kept enforcing
    * whatever the setting was when Cursor started, while every guard read the
    * setting live — so raising the limit (the remedy the oversized-payload
    * warning names) made the guard admit a payload `publish` then rejected, on
@@ -5672,6 +6870,13 @@ export type { SyncScope };
 export interface LocalScanResult {
   snapshots: ResourceSnapshot[];
   deletions: ResourceDeletion[];
+  /** Adapters whose absence cannot be interpreted as a clean local delete. */
+  deferredAdapterIds: Set<string>;
+  /** Last adapter attempted, used to rotate bounded retention fairly. */
+  cursorAfterAdapterId: string | null;
+  retainedSnapshotBytes: number;
+  /** Reuses the bounded scan for inbound drift checks without a second read. */
+  adapterIndexes: Map<string, AdapterScanIndex>;
   /**
    * Keyed by adapter id. Present and empty means the adapter ran and produced
    * nothing; absent means it did not run this cycle. The warning registry
@@ -5686,28 +6891,116 @@ export interface LocalScanResult {
   noticesBySource: Map<string, string[]>;
 }
 
+export const MAX_SYNC_SCAN_RETAINED_BYTES = 32 * 1024 * 1024;
+
+export interface ScanAdapterBudget {
+  maxRetainedBytes?: number;
+  startAfterAdapterId?: string | null;
+}
+
 export async function scanAdapters(
   adapters: readonly ResourceAdapter[],
   known: Record<string, LocalProjection>,
   scope: SyncScope,
   requiredKinds: ReadonlySet<ResourceKind>,
+  maxPayloadBytes?: number,
+  budget: ScanAdapterBudget = {},
 ): Promise<LocalScanResult> {
   const snapshots: ResourceSnapshot[] = [];
   const deletions: ResourceDeletion[] = [];
+  const deferredAdapterIds = new Set<string>();
+  const adapterIndexes = new Map<string, AdapterScanIndex>();
   const warningsBySource = new Map<string, string[]>();
   const noticesBySource = new Map<string, string[]>();
-  for (const adapter of adapters.filter((candidate) =>
+  const requestedRetainedBytes =
+    budget.maxRetainedBytes ?? MAX_SYNC_SCAN_RETAINED_BYTES;
+  const maxRetainedBytes =
+    Number.isSafeInteger(requestedRetainedBytes) && requestedRetainedBytes >= 0
+      ? Math.min(requestedRetainedBytes, MAX_SYNC_SCAN_RETAINED_BYTES)
+      : MAX_SYNC_SCAN_RETAINED_BYTES;
+  let retainedSnapshotBytes = 0;
+  let cursorAfterAdapterId: string | null = null;
+  const eligible = adapters.filter((candidate) =>
     shouldScanAdapter(candidate, scope, requiredKinds),
-  )) {
+  );
+  const previousIndex = eligible.findIndex(
+    (adapter) => adapter.id === budget.startAfterAdapterId,
+  );
+  const ordered =
+    previousIndex < 0
+      ? eligible
+      : [
+          ...eligible.slice(previousIndex + 1),
+          ...eligible.slice(0, previousIndex + 1),
+        ];
+  for (let index = 0; index < ordered.length; index += 1) {
+    const adapter = ordered[index];
+    if (adapter === undefined) {
+      continue;
+    }
+    if (retainedSnapshotBytes >= maxRetainedBytes) {
+      for (const deferred of ordered.slice(index)) {
+        deferredAdapterIds.add(deferred.id);
+      }
+      break;
+    }
+    cursorAfterAdapterId = adapter.id;
     // A failing adapter must not abort the whole cycle; deletions come only
     // from completed scans, so skipping the adapter is safe.
     try {
+      if (maxPayloadBytes !== undefined) {
+        adapter.setMaxPayloadBytes?.(maxPayloadBytes);
+      }
       const result = await adapter.scan(known);
-      snapshots.push(...result.snapshots);
-      deletions.push(...result.deletions);
+      const status = adapter.scanStatus?.();
+      let managerDeferred = false;
+      const retainedForAdapter: ResourceSnapshot[] = [];
+      const managerDeferredResourceIds = new Set<string>();
+      for (const snapshot of result.snapshots) {
+        if (
+          snapshot.content.byteLength >
+          maxRetainedBytes - retainedSnapshotBytes
+        ) {
+          managerDeferred = true;
+          managerDeferredResourceIds.add(snapshot.resourceId);
+          continue;
+        }
+        snapshots.push(snapshot);
+        retainedForAdapter.push(snapshot);
+        retainedSnapshotBytes += snapshot.content.byteLength;
+      }
+      const complete = status?.complete ?? true;
+      const safeDeletions =
+        complete && !managerDeferred ? result.deletions : [];
+      if (!complete || managerDeferred) {
+        deferredAdapterIds.add(adapter.id);
+      } else {
+        deletions.push(...safeDeletions);
+      }
+      adapterIndexes.set(adapter.id, {
+        snapshots: new Map(
+          retainedForAdapter.map((snapshot) => [snapshot.resourceId, snapshot]),
+        ),
+        deletions: new Map(
+          safeDeletions.map((deletion) => [deletion.resourceId, deletion]),
+        ),
+        complete: complete && !managerDeferred,
+        deferredResourceIds: new Set([
+          ...(status?.deferredResourceIds ?? []),
+          ...managerDeferredResourceIds,
+        ]),
+      });
       warningsBySource.set(adapter.id, [...result.warnings]);
       noticesBySource.set(adapter.id, [...(result.notices ?? [])]);
+      if (managerDeferred) {
+        for (const deferred of ordered.slice(index + 1)) {
+          deferredAdapterIds.add(deferred.id);
+        }
+        break;
+      }
     } catch (error) {
+      deferredAdapterIds.add(adapter.id);
+      adapterIndexes.set(adapter.id, incompleteScanIndex());
       warningsBySource.set(adapter.id, [
         `Adapter ${adapter.id} scan failed: ${
           error instanceof Error ? error.message : String(error)
@@ -5715,7 +7008,94 @@ export async function scanAdapters(
       ]);
     }
   }
-  return { snapshots, deletions, warningsBySource, noticesBySource };
+  return {
+    snapshots,
+    deletions,
+    deferredAdapterIds,
+    cursorAfterAdapterId,
+    retainedSnapshotBytes,
+    adapterIndexes,
+    warningsBySource,
+    noticesBySource,
+  };
+}
+
+/**
+ * Lets a stateful adapter forget the bytes of an exact snapshot that the
+ * repository policy deliberately rejected, while replaying a lightweight
+ * standing warning on later scans. Only adapters that actually ran may update
+ * their publish-warning bucket; partitioned polls must leave the other buckets
+ * untouched.
+ */
+export function settleOversizedSnapshots(
+  adapters: readonly ResourceAdapter[],
+  ranAdapterIds: Iterable<string>,
+  snapshots: readonly ResourceSnapshot[],
+  maxPayloadBytes: number,
+): Map<string, string[]> {
+  const ran = new Set(ranAdapterIds);
+  for (const snapshot of snapshots) {
+    if (snapshot.content.byteLength <= maxPayloadBytes) {
+      continue;
+    }
+    const owner = adapters.find((adapter) =>
+      adapter.kinds.includes(snapshot.kind),
+    );
+    if (owner !== undefined && ran.has(owner.id)) {
+      owner.settleOversizedSnapshot?.(snapshot, maxPayloadBytes);
+    }
+  }
+
+  const warningsBySource = new Map<string, string[]>();
+  for (const adapter of adapters) {
+    if (!ran.has(adapter.id)) {
+      continue;
+    }
+    const warnings = (
+      adapter.oversizedSnapshotSettlements?.(maxPayloadBytes) ?? []
+    )
+      .filter(
+        (settlement) =>
+          settlement.maxPayloadBytes <= maxPayloadBytes &&
+          settlement.byteLength > settlement.maxPayloadBytes,
+      )
+      .map((settlement) =>
+        settlement.warning ??
+        oversizedPayloadWarning(
+          settlement.resourceId,
+          settlement.byteLength,
+          settlement.maxPayloadBytes,
+        ),
+      );
+    if (warnings.length > 0) {
+      warningsBySource.set(publishWarningSource(adapter.id), [
+        ...new Set(warnings),
+      ]);
+    }
+  }
+  return warningsBySource;
+}
+
+function mergeWarningBuckets(
+  target: {
+    warnings: string[];
+    warningsBySource: Map<string, string[]>;
+  },
+  additions: ReadonlyMap<string, readonly string[]>,
+): void {
+  for (const [source, warnings] of additions) {
+    target.warningsBySource.set(source, [
+      ...new Set([...(target.warningsBySource.get(source) ?? []), ...warnings]),
+    ]);
+  }
+  target.warnings.splice(
+    0,
+    target.warnings.length,
+    ...new Set([
+      ...target.warnings,
+      ...[...additions.values()].flatMap((warnings) => [...warnings]),
+    ]),
+  );
 }
 
 /**
@@ -6017,6 +7397,8 @@ export function chatRepairCandidateForUnavailableRows(
 interface ParsedChatRepairCandidate {
   candidate: ChatRepairCandidate;
   rows: PortableKvRow[];
+  /** Shared only until this candidate has been folded into the bounded union. */
+  agentKv: PortableAgentKvPayload | null;
 }
 
 function parseChatRepairCandidate(
@@ -6038,23 +7420,212 @@ function parseChatRepairCandidate(
       },
     },
     rows: stored.bubbles,
+    agentKv: isPortableChatSnapshotV2(stored) ? stored.agentKv : null,
   };
 }
 
-/** Accumulates candidates in newest-first order using the repair union rule. */
+/**
+ * Repair history is an interactive, extension-host operation. The repository
+ * may accept payloads as large as 512 MiB, but decrypting and JSON-parsing one
+ * of those snapshots (or retaining a union of many smaller ones) has much
+ * larger in-memory amplification. Keep every sequential source and the
+ * retained candidate/output aggregates at the same fixed bound used by the
+ * live broken-chat inspection. Released source buffers are deliberately not
+ * accumulated: without a persistent cursor that would permanently starve an
+ * older complete source behind several individually bounded partial sources.
+ */
+const MAX_CHAT_REPAIR_HISTORY_SOURCE_BYTES = 64 * 1024 * 1024;
+const MAX_CHAT_REPAIR_HISTORY_AGGREGATE_BYTES = 64 * 1024 * 1024;
+const MAX_CHAT_REPAIR_OUTPUT_AGGREGATE_BYTES = 64 * 1024 * 1024;
+const MAX_CHAT_REPAIR_BUBBLE_ROWS = 250_000;
+const MIN_CHAT_REPAIR_PAYLOAD_HEADROOM_BYTES = 64 * 1024;
+
+interface ChatRepairBubbleAccumulator {
+  rows: Map<string, PortableKvRow>;
+  canonicalBytesByKey: Map<string, number>;
+  canonicalBytes: number;
+  /** Conservative canonical work retained by the v2 continuation union. */
+  agentCanonicalBytes: number;
+  maxCanonicalBytes: number;
+}
+
+/**
+ * Leaves room for the live header/composerData, JSON framing and (for v2)
+ * continuation graph. The exact completed payload is checked again before it
+ * is queued, while this earlier bound prevents a disjoint history union from
+ * consuming unbounded RAM just to discover that it cannot be published.
+ */
+function createChatRepairBubbleAccumulator(
+  maxPayloadBytes: number,
+): ChatRepairBubbleAccumulator {
+  const headroom = Math.min(
+    maxPayloadBytes,
+    Math.max(
+      MIN_CHAT_REPAIR_PAYLOAD_HEADROOM_BYTES,
+      Math.ceil(maxPayloadBytes / 10),
+    ),
+  );
+  return {
+    rows: new Map(),
+    canonicalBytesByKey: new Map(),
+    canonicalBytes: 0,
+    agentCanonicalBytes: 0,
+    maxCanonicalBytes: Math.max(0, maxPayloadBytes - headroom),
+  };
+}
+
+/**
+ * Accumulates one newest-first candidate atomically using the repair union
+ * rule. Row count and exact canonical row bytes are checked before the Map is
+ * mutated, so an oversized candidate cannot leave a partial trusted union for
+ * the subsequent repair decision.
+ */
 function retainNewestUsableChatRows(
-  retained: Map<string, PortableKvRow>,
+  retained: ChatRepairBubbleAccumulator,
   rows: readonly PortableKvRow[],
-): void {
+): boolean {
+  const updates: Array<{ row: PortableKvRow; canonicalBytes: number }> = [];
+  let nextCount = retained.rows.size;
+  let nextCanonicalBytes = retained.canonicalBytes;
   for (const row of rows) {
-    const existing = retained.get(row.key);
+    const existing = retained.rows.get(row.key);
     if (
       existing === undefined ||
       (!isUsableChatBubble(existing) && isUsableChatBubble(row))
     ) {
-      retained.set(row.key, row);
+      const rowCanonicalBytes = canonicalBytes(row).byteLength;
+      if (existing === undefined) {
+        nextCount += 1;
+      } else {
+        nextCanonicalBytes -=
+          retained.canonicalBytesByKey.get(row.key) ?? 0;
+      }
+      nextCanonicalBytes += rowCanonicalBytes;
+      if (
+        nextCount > MAX_CHAT_REPAIR_BUBBLE_ROWS ||
+        nextCanonicalBytes + retained.agentCanonicalBytes >
+          retained.maxCanonicalBytes
+      ) {
+        return false;
+      }
+      updates.push({ row, canonicalBytes: rowCanonicalBytes });
     }
   }
+  for (const update of updates) {
+    retained.rows.set(update.row.key, update.row);
+    retained.canonicalBytesByKey.set(
+      update.row.key,
+      update.canonicalBytes,
+    );
+  }
+  retained.canonicalBytes = nextCanonicalBytes;
+  return true;
+}
+
+/**
+ * Automatic bubble repair normally sees graphs produced by the bounded v2
+ * capture/enrichment paths (4,096 nodes / 32 MiB). Refuse an unexpectedly
+ * larger historical union instead of turning a command into unbounded RAM
+ * growth or publishing a truncated reachability partition.
+ */
+const MAX_CHAT_REPAIR_AGENT_KV_IDS = 4_096;
+const MAX_CHAT_REPAIR_AGENT_KV_BYTES = 32 * 1024 * 1024;
+
+interface ChatRepairAgentKvAccumulator {
+  sawV2: boolean;
+  blobs: Map<string, PortableKvRow>;
+  referencedIds: Set<string>;
+  blobBytes: number;
+}
+
+function createChatRepairAgentKvAccumulator(): ChatRepairAgentKvAccumulator {
+  return {
+    sawV2: false,
+    blobs: new Map(),
+    referencedIds: new Set(),
+    blobBytes: 0,
+  };
+}
+
+/**
+ * Folds one newest-first v2 graph into the repair graph without retaining the
+ * candidate's full snapshot. The check is atomic: an overflowing candidate
+ * leaves the accumulator unchanged and causes the repair to be deferred.
+ */
+function retainChatRepairAgentKv(
+  retained: ChatRepairAgentKvAccumulator,
+  incoming: PortableAgentKvPayload,
+  sharedBudget: ChatRepairBubbleAccumulator,
+): boolean {
+  const newReferencedIds = incoming.referencedIds.filter(
+    (id) => !retained.referencedIds.has(id),
+  );
+  if (
+    retained.referencedIds.size + newReferencedIds.length >
+    MAX_CHAT_REPAIR_AGENT_KV_IDS
+  ) {
+    return false;
+  }
+
+  const newBlobs = incoming.blobs.filter(
+    (blob) => !retained.blobs.has(blob.key),
+  );
+  const additionalBlobBytes = newBlobs.reduce(
+    (total, blob) => total + Buffer.byteLength(blob.valueBase64, "base64"),
+    0,
+  );
+  // Charge the retained Base64/key representation, not only decoded bytes.
+  // Referenced IDs can also appear in missingIds, so debit each new ID twice;
+  // later materialization may remove one occurrence but never increases this
+  // conservative bound.
+  const additionalCanonicalBytes =
+    newBlobs.reduce(
+      (total, blob) => total + canonicalBytes(blob).byteLength + 1,
+      0,
+    ) +
+    newReferencedIds.reduce(
+      (total, id) =>
+        total + 2 * Buffer.byteLength(JSON.stringify(id), "utf8") + 2,
+      0,
+    );
+  if (
+    retained.blobBytes + additionalBlobBytes >
+      MAX_CHAT_REPAIR_AGENT_KV_BYTES ||
+    sharedBudget.canonicalBytes +
+      sharedBudget.agentCanonicalBytes +
+      additionalCanonicalBytes >
+      sharedBudget.maxCanonicalBytes
+  ) {
+    return false;
+  }
+
+  retained.sawV2 = true;
+  for (const id of newReferencedIds) {
+    retained.referencedIds.add(id);
+  }
+  for (const blob of newBlobs) {
+    retained.blobs.set(blob.key, blob);
+  }
+  retained.blobBytes += additionalBlobBytes;
+  sharedBudget.agentCanonicalBytes += additionalCanonicalBytes;
+  return true;
+}
+
+function materializeChatRepairAgentKv(
+  retained: ChatRepairAgentKvAccumulator,
+): PortableAgentKvPayload {
+  const blobs = [...retained.blobs.values()].sort((left, right) =>
+    left.key < right.key ? -1 : left.key > right.key ? 1 : 0,
+  );
+  const referencedIds = [...retained.referencedIds].sort();
+  const materializedIds = new Set(
+    blobs.map((blob) => blob.key.slice(AGENT_KV_BLOB_PREFIX.length)),
+  );
+  return {
+    blobs,
+    referencedIds,
+    missingIds: referencedIds.filter((id) => !materializedIds.has(id)),
+  };
 }
 
 /** Mirrors the repair builder's lossless-JSON bubble validity check. */
@@ -6083,6 +7654,87 @@ function chatRepairLabel(observation: BrokenChatObservation): string {
   return workspace === undefined || workspace.length === 0
     ? `Cursor conversation ${observation.composerId.slice(0, 8)}`
     : `${workspace} · ${observation.composerId.slice(0, 8)}`;
+}
+
+function chatRepairDeferredInspectionDetail(
+  deferredBrokenChats: number,
+  oversizedChats: number,
+  snapshotByteLimit: number,
+  limitReached: boolean,
+): string {
+  if (deferredBrokenChats === 0 && oversizedChats === 0 && !limitReached) {
+    return "";
+  }
+  const detail: string[] = [];
+  if (deferredBrokenChats > 0 || (limitReached && oversizedChats === 0)) {
+    const deferred =
+      deferredBrokenChats === 0
+        ? "The audit reached its command memory safety limit before every damaged conversation could be retained."
+        : `${deferredBrokenChats} additional damaged conversation${
+            deferredBrokenChats === 1 ? " was" : "s were"
+          } deferred by the command memory safety limit.`;
+    detail.push(
+      `${deferred} Apply or otherwise resolve this batch, then run Repair Unavailable Chats again to inspect the next batch.`,
+    );
+  }
+  if (oversizedChats > 0) {
+    detail.push(
+      `${oversizedChats} conversation${oversizedChats === 1 ? "" : "s"} exceeded the hard ${formatBytes(snapshotByteLimit)} repair snapshot limit and ${oversizedChats === 1 ? "was" : "were"} not materialized or repaired automatically. Rerunning alone cannot make ${oversizedChats === 1 ? "it" : "them"} fit; use Restore Version History for manual recovery, or raise the repository payload limit when it is the smaller bound.`,
+    );
+  }
+  return detail.join(" ");
+}
+
+function chatRepairFreshInspectionDetail(
+  deferredBrokenChats: number,
+  oversizedChats: number,
+  snapshotByteLimit: number,
+  limitReached: boolean,
+): string {
+  if (deferredBrokenChats === 0 && oversizedChats === 0 && !limitReached) {
+    return "";
+  }
+  const detail: string[] = [];
+  if (deferredBrokenChats > 0 || (limitReached && oversizedChats === 0)) {
+    const deferred =
+      deferredBrokenChats === 0
+        ? "one or more planned damaged conversations"
+        : `${deferredBrokenChats} planned damaged conversation${
+            deferredBrokenChats === 1 ? "" : "s"
+          }`;
+    detail.push(
+      `The final memory-bounded recheck deferred ${deferred}; ${
+        deferredBrokenChats === 1 ? "it was" : "they were"
+      } left unchanged. Run Repair Unavailable Chats again to re-evaluate ${
+        deferredBrokenChats === 1 ? "it" : "them"
+      }.`,
+    );
+  }
+  if (oversizedChats > 0) {
+    detail.push(
+      `The final recheck found ${oversizedChats} planned conversation${oversizedChats === 1 ? "" : "s"} above the hard ${formatBytes(snapshotByteLimit)} repair snapshot limit; ${oversizedChats === 1 ? "it was" : "they were"} left unchanged without materializing the bubble values. Rerunning alone cannot repair ${oversizedChats === 1 ? "it" : "them"}; use Restore Version History for manual recovery.`,
+    );
+  }
+  return detail.join(" ");
+}
+
+function continuationAuditIncompleteDetail(
+  unknownChats: number,
+  limitReached: boolean,
+): string {
+  if (unknownChats === 0 && !limitReached) {
+    return "";
+  }
+  const unknown =
+    unknownChats === 0
+      ? ""
+      : `${unknownChats} continuation record${
+          unknownChats === 1 ? " was" : "s were"
+        } not safely readable`;
+  const bounded = limitReached
+    ? "the continuation audit also reached a safety bound before every conversation could be verified"
+    : "";
+  return `${[unknown, bounded].filter((detail) => detail.length > 0).join("; ")}.`;
 }
 
 /** "3m 12s", or "7s" under a minute. */
@@ -6448,13 +8100,83 @@ function historyPreviewText(
   if (content === null) {
     return "[Payload content is unavailable; it may have been compacted]\n";
   }
-  if (content.byteLength > 1024 * 1024) {
+  if (content.byteLength > HISTORY_PREVIEW_MAX_PAYLOAD_BYTES) {
     return `[Payload is ${content.byteLength} bytes; preview omitted]\n`;
   }
   const text = content.toString("utf8");
   return text.includes("\uFFFD")
     ? `[Binary payload]\n${content.toString("base64")}`
     : text;
+}
+
+function declaredHistoryPreviewFits(
+  operation: ResourceOperation,
+  plainBytes: number | null,
+): boolean {
+  return (
+    operation === "delete" ||
+    (typeof plainBytes === "number" &&
+      Number.isSafeInteger(plainBytes) &&
+      plainBytes >= 0 &&
+      plainBytes <= HISTORY_PREVIEW_MAX_PAYLOAD_BYTES)
+  );
+}
+
+function historyPreviewOmittedText(
+  operation: ResourceOperation,
+  plainBytes: number | null,
+): string {
+  if (operation === "delete") {
+    return "[Deleted]\n";
+  }
+  return typeof plainBytes === "number" &&
+    Number.isSafeInteger(plainBytes) &&
+    plainBytes >= 0
+    ? `[Payload is ${formatBytes(plainBytes)}; preview omitted before reading]\n`
+    : "[Payload preview omitted before reading because its declared size is missing or invalid]\n";
+}
+
+function restoreVersionPayloadBlockReason(
+  summary: ResourceVersionSummary,
+  repositoryMaxPayloadBytes: number,
+): string | null {
+  if (summary.operation === "delete") {
+    return null;
+  }
+  if (
+    !Number.isSafeInteger(repositoryMaxPayloadBytes) ||
+    repositoryMaxPayloadBytes <= 0
+  ) {
+    return (
+      "The repository payload policy is missing or invalid, so this version cannot be restored safely. " +
+      "Nothing was read or changed; correct cursorSettingSync.maxPayloadMiB and try again."
+    );
+  }
+  const plainBytes = summary.plainBytes;
+  const limit = Math.min(
+    repositoryMaxPayloadBytes,
+    RESTORE_VERSION_MAX_PAYLOAD_BYTES,
+  );
+  if (
+    typeof plainBytes === "number" &&
+    Number.isSafeInteger(plainBytes) &&
+    plainBytes >= 0 &&
+    plainBytes <= limit
+  ) {
+    return null;
+  }
+  const declared =
+    typeof plainBytes === "number" &&
+    Number.isSafeInteger(plainBytes) &&
+    plainBytes >= 0
+      ? formatBytes(plainBytes)
+      : "no trustworthy plaintext size";
+  return (
+    `The selected version declares ${declared}, above the bounded ${formatBytes(
+      limit,
+    )} restore limit (the lower of the repository payload policy and fixed interactive memory cap), or its declared size is invalid. ` +
+    "Nothing was read or changed; choose a smaller stored version."
+  );
 }
 
 export function syntheticApplyDecision(
@@ -6485,9 +8207,68 @@ export function syntheticApplyDecision(
       ? { action: "apply" }
       : { action: "drift" };
   }
+  if (!scanned.complete || scanned.deferredResourceIds.has(resourceId)) {
+    return { action: "drift" };
+  }
   // Neither a snapshot nor a deletion for a resource the projection expects
   // means the file failed scan validation; treat as drift, not clean.
   return known === undefined ? { action: "apply" } : { action: "drift" };
+}
+
+/**
+ * Drift decision for an ordinary replicated tip.
+ *
+ * A complete adapter scan may intentionally omit a known unchanged resource
+ * after proving its file/database identity. Unlike a synthetic merge, that is
+ * safe to replace with an ordinary remote successor. An incomplete scan is
+ * never such proof, even when the target is not one of the exact IDs a bounded
+ * enumerator already knows it deferred.
+ */
+export function ordinaryApplyDecision(
+  scanned: AdapterScanIndex | null,
+  resourceId: string,
+  tip: ResourceTip,
+  known: LocalProjection | undefined,
+): SyntheticApplyDecision {
+  if (scanned === null) {
+    return { action: "drift" };
+  }
+  const live = scanned.snapshots.get(resourceId);
+  if (live !== undefined) {
+    if (live.semanticHash === tip.semanticHash) {
+      return { action: "already-applied", live };
+    }
+    return live.semanticHash === known?.semanticHash
+      ? { action: "apply" }
+      : { action: "drift" };
+  }
+  const deletion = scanned.deletions.get(resourceId);
+  if (deletion !== undefined) {
+    return deletion.semanticHash === known?.semanticHash
+      ? { action: "apply" }
+      : { action: "drift" };
+  }
+  return scanned.complete && !scanned.deferredResourceIds.has(resourceId)
+    ? { action: "apply" }
+    : { action: "drift" };
+}
+
+function singleSnapshotScanIndex(snapshot: ResourceSnapshot): AdapterScanIndex {
+  return {
+    snapshots: new Map([[snapshot.resourceId, snapshot]]),
+    deletions: new Map(),
+    complete: true,
+    deferredResourceIds: new Set(),
+  };
+}
+
+function incompleteScanIndex(): AdapterScanIndex {
+  return {
+    snapshots: new Map(),
+    deletions: new Map(),
+    complete: false,
+    deferredResourceIds: new Set(),
+  };
 }
 
 export function parentsWithOwnConflictTips(
@@ -6593,6 +8374,47 @@ async function projectionInput(
 }
 
 /**
+ * Refuses a live extension-host materialization from authenticated manifest
+ * metadata before readObject allocates it. The change stays visibly queued so
+ * a source-device replacement below the fixed limit can supersede it; neither
+ * the extension host nor the similarly bounded helper promises to materialize
+ * this oversized version.
+ */
+function runningApplyPayloadBlockReason(
+  resourceId: string,
+  tip: ResourceTip,
+  repositoryMaxPayloadBytes: number,
+): string | null {
+  if (tip.operation === "delete") {
+    return null;
+  }
+  const limit = Math.min(
+    repositoryMaxPayloadBytes,
+    MAX_RUNNING_APPLY_PAYLOAD_BYTES,
+  );
+  const declaredBytes = tip.payload?.plainBytes;
+  if (
+    typeof declaredBytes === "number" &&
+    Number.isSafeInteger(declaredBytes) &&
+    declaredBytes >= 0 &&
+    declaredBytes <= limit
+  ) {
+    return null;
+  }
+  const declared =
+    typeof declaredBytes !== "number" ||
+    !Number.isSafeInteger(declaredBytes) ||
+    declaredBytes < 0
+      ? "no trustworthy plaintext size"
+      : formatBytes(declaredBytes);
+  return (
+    `${LIVE_APPLY_PAYLOAD_BLOCK_PREFIX}: ${resourceId} declares ${declared}, ` +
+    `above the bounded ${formatBytes(limit)} live-apply memory limit. ` +
+    "Reduce or replace the source payload below this fixed limit and synchronize again; this queued version was not read."
+  );
+}
+
+/**
  * Records a local snapshot that did not need a new event.
  *
  * Usually its bytes already match the projection. During an unresolved
@@ -6613,8 +8435,7 @@ export function markSuppressedSnapshotProjection(
     (current.semanticHash === snapshot.semanticHash ||
       current.retainedLocalHash === snapshot.semanticHash)
   ) {
-    rememberSnapshotSource(current, snapshot);
-    return true;
+    return rememberSnapshotSource(current, snapshot);
   }
   const matchingTip = tips
     .filter(
@@ -6641,28 +8462,150 @@ export function markSuppressedSnapshotProjection(
   return true;
 }
 
+function rememberTemporarySnapshotProjection(
+  projections: Record<string, LocalProjection>,
+  snapshot: ResourceSnapshot,
+): void {
+  const previous = projections[snapshot.resourceId];
+  projections[snapshot.resourceId] = {
+    resourceId: snapshot.resourceId,
+    kind: snapshot.kind,
+    semanticHash: snapshot.semanticHash,
+    versionId: previous?.versionId ?? null,
+    ...(previous?.payloadObjectId === undefined
+      ? {}
+      : { payloadObjectId: previous.payloadObjectId }),
+    ...(typeof snapshot.metadata?.lastUpdatedAt === "number"
+      ? { sourceTimestamp: snapshot.metadata.lastUpdatedAt }
+      : {}),
+    ...(validFileSize(snapshot.metadata?.sourceFileSize)
+      ? { sourceFileSize: snapshot.metadata.sourceFileSize }
+      : {}),
+    ...(validFileTime(snapshot.metadata?.sourceFileCtimeMs)
+      ? { sourceFileCtimeMs: snapshot.metadata.sourceFileCtimeMs }
+      : {}),
+    ...(typeof snapshot.metadata?.bubbleCount === "number"
+      ? { sourceBubbleCount: snapshot.metadata.bubbleCount }
+      : {}),
+    ...(typeof snapshot.metadata?.chatCoreHash === "string"
+      ? { sourceChatCoreHash: snapshot.metadata.chatCoreHash }
+      : {}),
+    ...(typeof snapshot.metadata?.headerFingerprint === "string" &&
+    /^[0-9a-f]{64}$/.test(snapshot.metadata.headerFingerprint)
+      ? { sourceHeaderFingerprint: snapshot.metadata.headerFingerprint }
+      : {}),
+  };
+}
+
+/**
+ * Copy-on-read projection view for bounded targeted scans. The state chat
+ * adapter mutates only the handful of source hints it actually observes; a
+ * full clone here made one queued chat allocate every historical projection.
+ */
+export function projectionOverlayForBoundedScan(
+  projections: Readonly<Record<string, LocalProjection>>,
+): Record<string, LocalProjection> {
+  const overlay = Object.create(null) as Record<string, LocalProjection>;
+  return new Proxy(overlay, {
+    get(target, property, receiver) {
+      if (typeof property !== "string") {
+        return Reflect.get(target, property, receiver) as unknown;
+      }
+      if (Object.hasOwn(target, property)) {
+        return target[property];
+      }
+      const source = projections[property];
+      if (source === undefined) {
+        return undefined;
+      }
+      const learned = { ...source };
+      target[property] = learned;
+      return learned;
+    },
+    has(target, property) {
+      return (
+        Reflect.has(target, property) ||
+        (typeof property === "string" && projections[property] !== undefined)
+      );
+    },
+    // Deliberately expose only touched entries. Targeted scans use exact ID
+    // lookup and must not turn Object.keys/values into an O(total state) copy.
+    ownKeys: (target) => Reflect.ownKeys(target),
+    getOwnPropertyDescriptor(target, property) {
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+  });
+}
+
 function rememberSnapshotSource(
   projection: LocalProjection,
   snapshot: ResourceSnapshot,
-): void {
+): boolean {
+  let changed = false;
   const capturedTimestamp = snapshot.metadata?.lastUpdatedAt;
   if (
     typeof capturedTimestamp === "number" &&
     Number.isFinite(capturedTimestamp)
   ) {
-    projection.sourceTimestamp = capturedTimestamp;
-  } else if (projection.kind === "chat" && capturedTimestamp === null) {
+    if (projection.sourceTimestamp !== capturedTimestamp) {
+      projection.sourceTimestamp = capturedTimestamp;
+      changed = true;
+    }
+  } else if (
+    projection.kind === "chat" &&
+    capturedTimestamp === null &&
+    projection.sourceTimestamp !== undefined
+  ) {
     delete projection.sourceTimestamp;
+    changed = true;
   }
   const capturedBubbleCount = snapshot.metadata?.bubbleCount;
+  const capturedFileSize = snapshot.metadata?.sourceFileSize;
+  const capturedFileCtimeMs = snapshot.metadata?.sourceFileCtimeMs;
+  if (validFileSize(capturedFileSize) && validFileTime(capturedFileCtimeMs)) {
+    if (projection.sourceFileSize !== capturedFileSize) {
+      projection.sourceFileSize = capturedFileSize;
+      changed = true;
+    }
+    if (projection.sourceFileCtimeMs !== capturedFileCtimeMs) {
+      projection.sourceFileCtimeMs = capturedFileCtimeMs;
+      changed = true;
+    }
+  }
   if (
     projection.kind === "chat" &&
     typeof capturedBubbleCount === "number" &&
     Number.isSafeInteger(capturedBubbleCount) &&
     capturedBubbleCount >= 0
   ) {
-    projection.sourceBubbleCount = capturedBubbleCount;
+    if (projection.sourceBubbleCount !== capturedBubbleCount) {
+      projection.sourceBubbleCount = capturedBubbleCount;
+      changed = true;
+    }
   }
+  const capturedCoreHash = snapshot.metadata?.chatCoreHash;
+  if (
+    projection.kind === "chat" &&
+    typeof capturedCoreHash === "string" &&
+    /^[0-9a-f]{64}$/.test(capturedCoreHash)
+  ) {
+    if (projection.sourceChatCoreHash !== capturedCoreHash) {
+      projection.sourceChatCoreHash = capturedCoreHash;
+      changed = true;
+    }
+  }
+  const capturedHeaderFingerprint = snapshot.metadata?.headerFingerprint;
+  if (
+    projection.kind === "chat" &&
+    typeof capturedHeaderFingerprint === "string" &&
+    /^[0-9a-f]{64}$/.test(capturedHeaderFingerprint)
+  ) {
+    if (projection.sourceHeaderFingerprint !== capturedHeaderFingerprint) {
+      projection.sourceHeaderFingerprint = capturedHeaderFingerprint;
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function markProjection(
@@ -6716,6 +8659,22 @@ function markProjection(
     ...(typeof tip.metadata?.lastUpdatedAt === "number"
       ? { sourceTimestamp: tip.metadata.lastUpdatedAt }
       : {}),
+    ...(retainedLocal !== undefined &&
+    validFileSize(retainedLocal.metadata?.sourceFileSize)
+      ? { sourceFileSize: retainedLocal.metadata.sourceFileSize }
+      : {}),
+    ...(retainedLocal !== undefined &&
+    validFileTime(retainedLocal.metadata?.sourceFileCtimeMs)
+      ? { sourceFileCtimeMs: retainedLocal.metadata.sourceFileCtimeMs }
+      : {}),
+    ...(typeof tip.metadata?.chatCoreHash === "string" &&
+    /^[0-9a-f]{64}$/.test(tip.metadata.chatCoreHash)
+      ? { sourceChatCoreHash: tip.metadata.chatCoreHash }
+      : {}),
+    ...(typeof tip.metadata?.headerFingerprint === "string" &&
+    /^[0-9a-f]{64}$/.test(tip.metadata.headerFingerprint)
+      ? { sourceHeaderFingerprint: tip.metadata.headerFingerprint }
+      : {}),
   };
   repository.state.pendingDatabaseChanges =
     repository.state.pendingDatabaseChanges.filter(
@@ -6723,6 +8682,15 @@ function markProjection(
         pending.eventHash !== tip.eventHash ||
         pending.changeIndex !== tip.changeIndex,
     );
+  projection.changed = false;
+}
+
+function validFileSize(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function validFileTime(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
 /**
@@ -6855,6 +8823,7 @@ function isWorkspaceMappingBlockReason(reason: string | undefined): boolean {
   return (
     reason.startsWith(WORKSPACE_MAPPING_BLOCK_PREFIX) ||
     reason.startsWith(APPLY_FAILURE_BLOCK_PREFIX) ||
+    reason.startsWith(LIVE_APPLY_PAYLOAD_BLOCK_PREFIX) ||
     reason === FOLDERLESS_WORKSPACE_BLOCK_REASON
   );
 }
@@ -6863,7 +8832,7 @@ export function queuePending(
   repository: SyncRepository,
   projection: ResourceProjection,
   blockedReason?: string,
-): void {
+): boolean {
   const tip = projection.tip;
   if (
     isPolicyExcludedUiStateResource(projection.resourceId, tip.kind) ||
@@ -6872,13 +8841,14 @@ export function queuePending(
     // Never hand the helper a change it is only going to skip. Any entry an
     // earlier run of this build already queued is dropped here too, so an
     // existing repository stops asking for a restart that would do nothing.
+    const before = repository.state.pendingDatabaseChanges.length;
     repository.state.pendingDatabaseChanges =
       repository.state.pendingDatabaseChanges.filter(
         (pending) =>
           pending.eventHash !== tip.eventHash ||
           pending.changeIndex !== tip.changeIndex,
       );
-    return;
+    return repository.state.pendingDatabaseChanges.length !== before;
   }
   const existing = repository.state.pendingDatabaseChanges.find(
     (pending) =>
@@ -6891,12 +8861,20 @@ export function queuePending(
       // clears it, and it does so the moment the workspace resolves. See
       // isWorkspaceMappingBlockReason for what deleting it here used to cost.
       if (!isWorkspaceMappingBlockReason(existing.blockedReason)) {
+        if (existing.blockedReason === undefined) {
+          return false;
+        }
         delete existing.blockedReason;
+        return true;
       }
     } else {
+      if (existing.blockedReason === blockedReason) {
+        return false;
+      }
       existing.blockedReason = blockedReason;
+      return true;
     }
-    return;
+    return false;
   }
   repository.state.pendingDatabaseChanges.push({
     eventHash: tip.eventHash,
@@ -6905,21 +8883,27 @@ export function queuePending(
     kind: tip.kind,
     ...(blockedReason === undefined ? {} : { blockedReason }),
   });
+  return true;
 }
 
 function prunePending(
   repository: SyncRepository,
   projections: ResourceProjection[],
-): void {
+): boolean {
   const active = new Set(
     projections.map(
       (projection) => `${projection.tip.eventHash}#${projection.tip.changeIndex}`,
     ),
   );
-  repository.state.pendingDatabaseChanges =
-    repository.state.pendingDatabaseChanges.filter((pending) =>
+  const previous = repository.state.pendingDatabaseChanges;
+  const retained = previous.filter((pending) =>
       active.has(`${pending.eventHash}#${pending.changeIndex}`),
     );
+  if (retained.length === previous.length) {
+    return false;
+  }
+  repository.state.pendingDatabaseChanges = retained;
+  return true;
 }
 
 /**
@@ -6938,7 +8922,7 @@ interface PendingHelperBatch {
   deferredForBatchLimit: number;
 }
 
-function pendingHelperBatch(repository: SyncRepository): PendingHelperBatch {
+export function pendingHelperBatch(repository: SyncRepository): PendingHelperBatch {
   const changes: HelperChange[] = [];
   let totalBytes = 0;
   let deferredForBatchLimit = 0;
@@ -6953,7 +8937,12 @@ function pendingHelperBatch(repository: SyncRepository): PendingHelperBatch {
       if (isPolicyExcludedUiStateResource(pending.resourceId, pending.kind)) {
         continue;
       }
-      const tip = findTip(repository, pending.eventHash, pending.changeIndex);
+      const tip = findTip(
+        repository,
+        pending.resourceId,
+        pending.eventHash,
+        pending.changeIndex,
+      );
       if (tip === undefined) {
         continue;
       }
@@ -6963,7 +8952,11 @@ function pendingHelperBatch(repository: SyncRepository): PendingHelperBatch {
         continue;
       }
       const payloadBytes = tip.payload?.plainBytes ?? 0;
-      if (totalBytes + payloadBytes > MAX_APPLY_BATCH_BYTES) {
+      if (
+        changes.length >= 256 ||
+        (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES &&
+          totalBytes + payloadBytes > MAX_HELPER_APPLY_WORK_BYTES)
+      ) {
         // Counted rather than silently skipped: the caller says so, and the
         // entry stays queued for the next pass.
         deferredForBatchLimit += 1;
@@ -6985,7 +8978,12 @@ function pendingHelperBatch(repository: SyncRepository): PendingHelperBatch {
         change.metadata = tip.metadata;
       }
       changes.push(change);
-      totalBytes += payloadBytes;
+      // A single authenticated oversized object is deliberately included so
+      // the helper can turn it into a visible per-resource blocked failure
+      // without reading the payload. Aggregate overflow alone is deferred.
+      if (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES) {
+        totalBytes += payloadBytes;
+      }
   }
   return { changes, deferredForBatchLimit };
 }
@@ -6996,6 +8994,7 @@ function pendingLastUpdatedAt(
 ): number {
   const lastUpdatedAt = findTip(
     repository,
+    pending.resourceId,
     pending.eventHash,
     pending.changeIndex,
   )?.metadata?.lastUpdatedAt;
@@ -7004,19 +9003,13 @@ function pendingLastUpdatedAt(
 
 function findTip(
   repository: SyncRepository,
+  resourceId: string,
   eventHash: string,
   changeIndex: number,
 ): ResourceTip | undefined {
-  for (const tips of Object.values(repository.state.tips)) {
-    const match = tips.find(
-      (tip) =>
-        tip.eventHash === eventHash && tip.changeIndex === changeIndex,
-    );
-    if (match !== undefined) {
-      return match;
-    }
-  }
-  return undefined;
+  return repository.state.tips[resourceId]?.find(
+    (tip) => tip.eventHash === eventHash && tip.changeIndex === changeIndex,
+  );
 }
 
 /**
@@ -7097,41 +9090,114 @@ export async function autoMergeConflicts(
         }
         continue;
       }
-      // A base folded away by a checkpoint reads as null; the conflict then
-      // degrades to manual resolution instead of throwing mid-sync.
-      const base = await repository.tryReadVersion(conflict.baseVersionId);
-      if (base === null) {
-        continue;
-      }
-      // A tip that merely re-asserts the base (e.g. a checkpoint marker
-      // concurrent with an unpublished edit) carries no change of its own, so
-      // the other tip wins for every kind before kind-specific merge policy.
-      if (
-        await resolveTrivialConflict(
-          repository,
-          conflict,
-          tips,
-          base.change,
-          onWarning,
-        )
-      ) {
-        mergedAny = true;
-        continue;
-      }
+      const autoMergeWorkBudget = Math.min(
+        repository.maxPayloadBytes,
+        CHAT_AUTO_MERGE_MAX_WORK_BYTES,
+      );
       const workspaceDatabase =
         conflict.kind === "workspace-storage" &&
         isWorkspaceDatabaseTipMetadata(tips[0]?.metadata);
       const notepads =
         conflict.kind === "workspace-storage" &&
         isNotepadsTipMetadata(tips[0]?.metadata);
-      if (
-        tips.some((tip) => tip.operation !== "put") ||
-        !(
-          workspaceDatabase ||
+      const allTipsArePuts = tips.every((tip) => tip.operation === "put");
+      const structuralThreeWay =
+        allTipsArePuts &&
+        (workspaceDatabase ||
           notepads ||
-          isAutoMergeKind(conflict.kind, tips[0]?.metadata)
+          isAutoMergeKind(conflict.kind, tips[0]?.metadata));
+      // Every based conflict is classified from the authenticated manifest
+      // record first. Unsupported authored kinds used to decrypt a potentially
+      // 512 MiB base on every cycle only to discover below that they had no
+      // automatic merge policy at all.
+      const baseMetadata = await repository.tryReadVersionMetadata(
+        conflict.baseVersionId,
+      );
+      if (
+        baseMetadata === null ||
+        baseMetadata.change.resourceId !== conflict.resourceId ||
+        baseMetadata.change.kind !== conflict.kind
+      ) {
+        if (structuralThreeWay) {
+          warnAutoMergeWorkDeferred(
+            conflict.resourceId,
+            autoMergeWorkBudget,
+            onWarning,
+          );
+        }
+        continue;
+      }
+      const trivialSurvivor = findTrivialConflictSurvivor(
+        tips,
+        baseMetadata.change,
+      );
+      if (
+        trivialSurvivor !== undefined &&
+        isProtectedTrivialConflictSurvivor(trivialSurvivor)
+      ) {
+        continue;
+      }
+      if (
+        trivialSurvivor?.operation === "put" &&
+        !declaredAutoMergeWorkFits(
+          [trivialSurvivor],
+          0,
+          autoMergeWorkBudget,
         )
       ) {
+        // Trivial means no structural parse is necessary, but the survivor is
+        // still materialized and republished. Apply the same authenticated
+        // fixed bound before that read; otherwise a base reassertion beside a
+        // 512 MiB ordinary survivor bypasses the interactive merge budget.
+        warnAutoMergeWorkDeferred(
+          conflict.resourceId,
+          autoMergeWorkBudget,
+          onWarning,
+        );
+        continue;
+      }
+      if (
+        await resolveTrivialConflict(
+          repository,
+          conflict,
+          tips,
+          baseMetadata.change,
+          onWarning,
+        )
+      ) {
+        mergedAny = true;
+        continue;
+      }
+      if (!structuralThreeWay) {
+        continue;
+      }
+      const basePlainBytes = baseMetadata.change.payload?.plainBytes;
+      if (
+        baseMetadata.change.operation !== "put" ||
+        basePlainBytes === undefined ||
+        !declaredAutoMergeWorkFits(
+          tips,
+          basePlainBytes,
+          autoMergeWorkBudget,
+        )
+      ) {
+        warnAutoMergeWorkDeferred(
+          conflict.resourceId,
+          autoMergeWorkBudget,
+          onWarning,
+        );
+        continue;
+      }
+      // Only supported, aggregate-bounded structural merges reach payload
+      // materialization. Reads stay sequential and the three retained buffers
+      // together are bounded by the authenticated plaintext sum above.
+      const base = await repository.tryReadVersion(conflict.baseVersionId);
+      if (base === null || base.content === null) {
+        warnAutoMergeWorkDeferred(
+          conflict.resourceId,
+          autoMergeWorkBudget,
+          onWarning,
+        );
         continue;
       }
       const localTip =
@@ -7141,10 +9207,11 @@ export async function autoMergeConflicts(
       if (localTip === undefined || remoteTip === undefined) {
         continue;
       }
-      const [local, remote] = await Promise.all([
-        repository.readVersion(localTip.versionId),
-        repository.readVersion(remoteTip.versionId),
-      ]);
+      // Keep only the first materialized tip beside the base while the second
+      // is decrypted. Chat's declared aggregate was bounded above; other kinds
+      // also avoid a needless simultaneous decompression burst.
+      const local = await repository.readVersion(localTip.versionId);
+      const remote = await repository.readVersion(remoteTip.versionId);
       if (
         base.content === null ||
         local.content === null ||
@@ -7161,15 +9228,65 @@ export async function autoMergeConflicts(
           ? (local.content as Buffer)
           : (remote.content as Buffer);
       const olderTip = orderedTips[1];
+      const jsoncMerge = isJsonMergeKind(
+        conflict.kind,
+        localTip.metadata,
+      );
+      const textMerge =
+        conflict.kind !== "chat" &&
+        conflict.kind !== "remote-targets" &&
+        !workspaceDatabase &&
+        !notepads &&
+        conflict.kind !== "ui-state" &&
+        !jsoncMerge;
+      if (
+        textMerge &&
+        !buffersFitAutoMergeLineBudget([
+          base.content,
+          local.content,
+          remote.content,
+        ])
+      ) {
+        warnAutoMergeWorkDeferred(
+          conflict.resourceId,
+          autoMergeWorkBudget,
+          onWarning,
+        );
+        continue;
+      }
+      const structuralJsonBuffers =
+        conflict.kind === "remote-targets"
+          ? [local.content, remote.content]
+          : notepads || conflict.kind === "ui-state" || jsoncMerge
+            ? [base.content, local.content, remote.content]
+            : undefined;
+      if (
+        structuralJsonBuffers !== undefined &&
+        !buffersFitAutoMergeJsonStructureBudget(structuralJsonBuffers)
+      ) {
+        warnAutoMergeWorkDeferred(
+          conflict.resourceId,
+          autoMergeWorkBudget,
+          onWarning,
+        );
+        continue;
+      }
       const chatOutcome =
         conflict.kind === "chat" &&
         newestTip !== undefined &&
         olderTip !== undefined
-          ? mergeChatSnapshotBuffers(base.content, [
+            ? mergeChatSnapshotBuffers(base.content, [
               contentOf(newestTip),
               contentOf(olderTip),
-            ])
+            ], autoMergeWorkBudget)
           : undefined;
+      if (chatOutcome?.workBudgetExceeded === true) {
+        warnAutoMergeWorkDeferred(
+          conflict.resourceId,
+          autoMergeWorkBudget,
+          onWarning,
+        );
+      }
       // chat is its own branch rather than a `??` in front of the chain, so it
       // can never reach the diff3 fallback: a line-based merge of two chat
       // snapshots can produce syntactically valid JSON that describes a
@@ -7206,15 +9323,30 @@ export async function autoMergeConflicts(
             : notepads
             ? notepadOutcome ?? { status: "conflict" }
             : workspaceDatabase
-              ? mergeWorkspaceDatabaseBuffers(base.content, local.content, remote.content)
+              ? mergeWorkspaceDatabaseBuffers(
+                  base.content,
+                  local.content,
+                  remote.content,
+                  autoMergeWorkBudget,
+                )
               : conflict.kind === "ui-state"
                 ? mergeUiStateBuffers(base.content, local.content, remote.content)
-                : isJsonMergeKind(conflict.kind, localTip.metadata)
+                : jsoncMerge
                   ? mergeJsoncBuffers(base.content, local.content, remote.content)
                   : validatedTextMergeOutcome(
                       conflict.kind,
                       mergeTextBuffers(base.content, local.content, remote.content),
                     );
+      if (
+        "workBudgetExceeded" in outcome &&
+        outcome.workBudgetExceeded === true
+      ) {
+        warnAutoMergeWorkDeferred(
+          conflict.resourceId,
+          autoMergeWorkBudget,
+          onWarning,
+        );
+      }
       // A ui-state value with no structural merge still resolves without asking:
       // both devices sort the same two tips with the same replicated comparator,
       // so both republish the same side's bytes and the reconciler collapses the
@@ -7243,6 +9375,14 @@ export async function autoMergeConflicts(
       ) {
         continue;
       }
+      if (resolved.content.byteLength > autoMergeWorkBudget) {
+        warnAutoMergeWorkDeferred(
+          conflict.resourceId,
+          autoMergeWorkBudget,
+          onWarning,
+        );
+        continue;
+      }
       // The merged content is a deterministic function of the tips, and the
       // metadata has to be one too. `localTip` is whichever tip this device
       // happens to own, so using it made two devices attach DIFFERENT metadata to
@@ -7256,13 +9396,20 @@ export async function autoMergeConflicts(
         chatOutcome?.winner === undefined
           ? lastWriter ?? newestTip ?? localTip
           : orderedTips[chatOutcome.winner] ?? newestTip ?? localTip;
+      const mergedMetadata =
+        conflict.kind === "chat"
+          ? chatMetadataForExactPayload(
+              metadataTip.metadata,
+              resolved.content,
+            )
+          : { ...(metadataTip.metadata ?? {}) };
       const snapshot: ResourceSnapshot = {
         resourceId: conflict.resourceId,
         kind: conflict.kind,
         content: resolved.content,
         semanticHash: resolved.semanticHash ?? sha256(resolved.content),
         metadata: {
-          ...(metadataTip.metadata ?? {}),
+          ...mergedMetadata,
           // The union of both sides' bubbles is what was published, so the count
           // that travels with it has to describe the union, not the winner.
           ...(chatOutcome?.bubbleCount === undefined
@@ -7347,10 +9494,19 @@ async function resolveBaseFreeChatConflict(
   if (first === undefined || second === undefined) {
     return false;
   }
-  const [firstData, secondData] = await Promise.all([
-    repository.tryReadVersion(first.versionId),
-    repository.tryReadVersion(second.versionId),
-  ]);
+  const workBudget = Math.min(
+    repository.maxPayloadBytes,
+    CHAT_AUTO_MERGE_MAX_WORK_BYTES,
+  );
+  // ResourceTip carries the authenticated plaintext length. Reject the pair
+  // before decrypting either object: two individually publishable near-limit
+  // tips must not become a 256 MiB interactive extension-host spike.
+  if (!declaredAutoMergeWorkFits([first, second], 0, workBudget)) {
+    warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
+    return false;
+  }
+  const firstData = await repository.tryReadVersion(first.versionId);
+  const secondData = await repository.tryReadVersion(second.versionId);
   if (
     firstData === null ||
     secondData === null ||
@@ -7362,7 +9518,10 @@ async function resolveBaseFreeChatConflict(
   const outcome = mergeChatSnapshotBuffers(null, [
     firstData.content,
     secondData.content,
-  ]);
+  ], workBudget);
+  if (outcome.workBudgetExceeded === true) {
+    warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
+  }
   if (outcome.content === undefined || outcome.winner === undefined) {
     return false;
   }
@@ -7377,7 +9536,10 @@ async function resolveBaseFreeChatConflict(
         content: outcome.content,
         semanticHash: outcome.semanticHash ?? sha256(outcome.content),
         metadata: {
-          ...(winnerTip.metadata ?? {}),
+          ...chatMetadataForExactPayload(
+            winnerTip.metadata,
+            outcome.content,
+          ),
           ...(outcome.bubbleCount === undefined
             ? {}
             : { bubbleCount: outcome.bubbleCount }),
@@ -7388,6 +9550,55 @@ async function resolveBaseFreeChatConflict(
     [],
     onWarning,
   );
+}
+
+/**
+ * Rebuilds every chat-format metadata field from the exact bytes being
+ * published by an automatic merge.
+ *
+ * A v2 merge can upgrade a v1 winner, materialize one side's missing blob, or
+ * add a reference carried only by the other side. Inheriting the winner's
+ * schema/count/core fields therefore describes a payload that was never
+ * published; most importantly, a stale missing count of zero suppresses the
+ * bounded enrichment pass forever. Non-format metadata such as workspaceUri
+ * is retained from the deterministic winner.
+ */
+function chatMetadataForExactPayload(
+  inherited: Record<string, JsonValue> | undefined,
+  content: Buffer,
+): Record<string, JsonValue> {
+  const snapshot = parsePortableChatSnapshot(content);
+  const metadata: Record<string, JsonValue> = { ...(inherited ?? {}) };
+  for (const key of [
+    "composerId",
+    "workspaceId",
+    "lastUpdatedAt",
+    "bubbleCount",
+    "title",
+    "chatCoreHash",
+    "chatSnapshotSchemaVersion",
+    "agentKvBlobCount",
+    "agentKvReferencedCount",
+    "agentKvMissingCount",
+  ]) {
+    delete metadata[key];
+  }
+  metadata.composerId = snapshot.composerId;
+  metadata.workspaceId = snapshot.header.workspaceId;
+  metadata.lastUpdatedAt = snapshot.header.lastUpdatedAt;
+  metadata.bubbleCount = snapshot.bubbles.length;
+  metadata.chatCoreHash = portableChatCoreHash(snapshot);
+  metadata.chatSnapshotSchemaVersion = snapshot.schemaVersion;
+  if (isPortableChatSnapshotV2(snapshot)) {
+    metadata.agentKvBlobCount = snapshot.agentKv.blobs.length;
+    metadata.agentKvReferencedCount = snapshot.agentKv.referencedIds.length;
+    metadata.agentKvMissingCount = snapshot.agentKv.missingIds.length;
+  }
+  const title = chatHeaderTitle(snapshot.header.value);
+  if (title !== null) {
+    metadata.title = title;
+  }
+  return metadata;
 }
 
 /**
@@ -7409,10 +9620,16 @@ async function resolveBaseFreeWorkspaceDatabaseConflict(
   if (newest === undefined || older === undefined) {
     return false;
   }
-  const [newestData, olderData] = await Promise.all([
-    repository.tryReadVersion(newest.versionId),
-    repository.tryReadVersion(older.versionId),
-  ]);
+  const workBudget = Math.min(
+    repository.maxPayloadBytes,
+    CHAT_AUTO_MERGE_MAX_WORK_BYTES,
+  );
+  if (!declaredAutoMergeWorkFits([newest, older], 0, workBudget)) {
+    warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
+    return false;
+  }
+  const newestData = await repository.tryReadVersion(newest.versionId);
+  const olderData = await repository.tryReadVersion(older.versionId);
   if (
     newestData === null ||
     olderData === null ||
@@ -7423,15 +9640,28 @@ async function resolveBaseFreeWorkspaceDatabaseConflict(
   }
   let content: Buffer;
   try {
+    const limits = {
+      maxPlainBytes: workBudget,
+      maxRows: AUTO_MERGE_MAX_STRUCTURAL_ROWS,
+    };
     content = serializeWorkspaceDatabaseSnapshot(
       unionWorkspaceDatabaseSnapshots(
-        parseWorkspaceDatabaseSnapshot(newestData.content),
-        parseWorkspaceDatabaseSnapshot(olderData.content),
+        parseWorkspaceDatabaseSnapshot(newestData.content, limits),
+        parseWorkspaceDatabaseSnapshot(olderData.content, limits),
+        limits,
       ),
+      limits,
     );
-  } catch {
+  } catch (error) {
     // A payload this build cannot read - a future schema, a snapshot for a
     // different workspace - stays a conflict instead of losing a side.
+    if (isWorkspaceDatabaseMergeBudgetError(error)) {
+      warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
+    }
+    return false;
+  }
+  if (content.byteLength > workBudget) {
+    warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
     return false;
   }
   return publishAutoMerge(
@@ -7469,16 +9699,31 @@ async function resolveBaseFreeRemoteTargetsConflict(
   if (newest === undefined || older === undefined) {
     return false;
   }
-  const [newestData, olderData] = await Promise.all([
-    repository.tryReadVersion(newest.versionId),
-    repository.tryReadVersion(older.versionId),
-  ]);
+  const workBudget = Math.min(
+    repository.maxPayloadBytes,
+    CHAT_AUTO_MERGE_MAX_WORK_BYTES,
+  );
+  if (!declaredAutoMergeWorkFits([newest, older], 0, workBudget)) {
+    warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
+    return false;
+  }
+  const newestData = await repository.tryReadVersion(newest.versionId);
+  const olderData = await repository.tryReadVersion(older.versionId);
   if (
     newestData === null ||
     olderData === null ||
     newestData.content === null ||
     olderData.content === null
   ) {
+    return false;
+  }
+  if (
+    !buffersFitAutoMergeJsonStructureBudget([
+      newestData.content,
+      olderData.content,
+    ])
+  ) {
+    warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
     return false;
   }
   const outcome = mergeRemoteTargetsBuffers(
@@ -7489,6 +9734,10 @@ async function resolveBaseFreeRemoteTargetsConflict(
     return false;
   }
   const content = outcome.content;
+  if (content.byteLength > workBudget) {
+    warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
+    return false;
+  }
   return publishAutoMerge(
     repository,
     conflict,
@@ -7524,10 +9773,16 @@ async function resolveBaseFreeNotepadsConflict(
   if (newest === undefined || older === undefined) {
     return false;
   }
-  const [newestData, olderData] = await Promise.all([
-    repository.tryReadVersion(newest.versionId),
-    repository.tryReadVersion(older.versionId),
-  ]);
+  const workBudget = Math.min(
+    repository.maxPayloadBytes,
+    CHAT_AUTO_MERGE_MAX_WORK_BYTES,
+  );
+  if (!declaredAutoMergeWorkFits([newest, older], 0, workBudget)) {
+    warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
+    return false;
+  }
+  const newestData = await repository.tryReadVersion(newest.versionId);
+  const olderData = await repository.tryReadVersion(older.versionId);
   if (
     newestData === null ||
     olderData === null ||
@@ -7536,11 +9791,24 @@ async function resolveBaseFreeNotepadsConflict(
   ) {
     return false;
   }
+  if (
+    !buffersFitAutoMergeJsonStructureBudget([
+      newestData.content,
+      olderData.content,
+    ])
+  ) {
+    warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
+    return false;
+  }
   const outcome = unionNotepadBuffers(newestData.content, olderData.content);
   if (outcome.status !== "merged" || outcome.content === undefined) {
     return false;
   }
   const content = outcome.content;
+  if (content.byteLength > workBudget) {
+    warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
+    return false;
+  }
   return publishAutoMerge(
     repository,
     conflict,
@@ -7687,6 +9955,17 @@ async function resolveBaseFreeConflict(
       onWarning,
     );
   }
+  const workBudget = Math.min(
+    repository.maxPayloadBytes,
+    CHAT_AUTO_MERGE_MAX_WORK_BYTES,
+  );
+  if (!declaredAutoMergeWorkFits([winner], 0, workBudget)) {
+    // This path also handles ui-state conflicts with three or more tips. Only
+    // the elected winner is materialized, but without a per-winner gate one
+    // ordinary 512 MiB PUT still blocks the shared extension host.
+    warnAutoMergeWorkDeferred(conflict.resourceId, workBudget, onWarning);
+    return false;
+  }
   // A payload compacted out from under the winner degrades to manual
   // resolution rather than resolving to the loser, which would not be the
   // same answer on a device that can still read it.
@@ -7757,16 +10036,15 @@ async function resolveTrivialConflict(
   base: ResourceChange,
   onWarning: (warning: string) => void,
 ): Promise<boolean> {
-  const matching = tips.filter(
-    (tip) =>
-      tip.operation === base.operation &&
-      tip.semanticHash === base.semanticHash,
-  );
-  if (matching.length !== 1) {
+  const survivor = findTrivialConflictSurvivor(tips, base);
+  if (survivor === undefined) {
     return false;
   }
-  const survivor = tips.find((tip) => tip !== matching[0]);
-  if (survivor === undefined) {
+  if (isProtectedTrivialConflictSurvivor(survivor)) {
+    // Republishing a helper recipe as an ordinary auto-merge launders away
+    // the source/provenance fields that make additive repair, blob-only
+    // enrichment and version restore safe. Leave the authenticated survivor
+    // available to the manual resolver instead.
     return false;
   }
   if (survivor.operation === "put") {
@@ -7821,6 +10099,114 @@ async function resolveTrivialConflict(
   return true;
 }
 
+function findTrivialConflictSurvivor(
+  tips: readonly ResourceTip[],
+  base: ResourceChange,
+): ResourceTip | undefined {
+  const matching = tips.filter(
+    (tip) =>
+      tip.operation === base.operation &&
+      tip.semanticHash === base.semanticHash,
+  );
+  return matching.length === 1
+    ? tips.find((tip) => tip !== matching[0])
+    : undefined;
+}
+
+function isProtectedTrivialConflictSurvivor(survivor: ResourceTip): boolean {
+  const survivorOrigin = effectiveSyncOrigin(survivor.metadata);
+  return (
+    survivor.metadata?.syncOrigin === "checkpoint-marker" ||
+    survivorOrigin === "automatic-chat-repair" ||
+    survivorOrigin === "agent-kv-enrichment" ||
+    survivorOrigin === "version-restore"
+  );
+}
+
+function declaredAutoMergeWorkFits(
+  tips: readonly ResourceTip[],
+  alreadyMaterializedBytes: number,
+  workBudget: number,
+): boolean {
+  if (
+    !Number.isSafeInteger(alreadyMaterializedBytes) ||
+    alreadyMaterializedBytes < 0 ||
+    alreadyMaterializedBytes > workBudget
+  ) {
+    return false;
+  }
+  let remaining = workBudget - alreadyMaterializedBytes;
+  for (const tip of tips) {
+    const plainBytes = tip.payload?.plainBytes;
+    if (
+      tip.operation !== "put" ||
+      plainBytes === undefined ||
+      !Number.isSafeInteger(plainBytes) ||
+      plainBytes < 0 ||
+      plainBytes > remaining
+    ) {
+      return false;
+    }
+    remaining -= plainBytes;
+  }
+  return true;
+}
+
+/** Map/Set/sort object work can amplify tiny structural rows far beyond JSON bytes. */
+const AUTO_MERGE_MAX_STRUCTURAL_ROWS = 16_384;
+const AUTO_MERGE_MAX_LINE_OCCURRENCES = 65_536;
+
+/** Counts line-split work without allocating strings or an array of lines. */
+function buffersFitAutoMergeLineBudget(buffers: readonly Buffer[]): boolean {
+  let remaining = AUTO_MERGE_MAX_LINE_OCCURRENCES;
+  for (const buffer of buffers) {
+    // `split("\n")` creates one element even when no newline is present.
+    if (remaining <= 0) {
+      return false;
+    }
+    remaining -= 1;
+    for (const byte of buffer) {
+      if (byte !== 0x0a) {
+        continue;
+      }
+      if (remaining <= 0) {
+        return false;
+      }
+      remaining -= 1;
+    }
+  }
+  return true;
+}
+
+/**
+ * Bounds JSON/JSONC object work before `toString`, parse, recursive merge and
+ * Map/Set/sort allocation. Counting punctuation outside strings and comments
+ * also counts every item in a minified array through its commas, so a small
+ * byte payload cannot turn into millions of JS nodes. The scan is allocation-
+ * free and shared across every input retained by one interactive merge.
+ */
+function buffersFitAutoMergeJsonStructureBudget(
+  buffers: readonly Buffer[],
+): boolean {
+  return buffersFitJsonStructureBudget(buffers, { allowComments: true });
+}
+
+function warnAutoMergeWorkDeferred(
+  resourceId: string,
+  workBudget: number,
+  onWarning: (warning: string) => void,
+): void {
+  onWarning(
+    `The automatic merge of ${resourceId} exceeded the bounded ${formatBytes(
+      workBudget,
+    )} interactive merge budget (or lacked a trustworthy declared payload size), so no over-budget result was published.${
+      workBudget < CHAT_AUTO_MERGE_MAX_WORK_BYTES
+        ? " Increase cursorSettingSync.maxPayloadMiB only if you intend to allow larger per-resource work; the fixed interactive cap still applies."
+        : ""
+    } The conflict is waiting for "Cursor Setting Sync: Resolve Conflicts".`,
+  );
+}
+
 function isWorkspaceDatabaseTipMetadata(
   metadata: ResourceTip["metadata"],
 ): boolean {
@@ -7842,28 +10228,51 @@ function mergeWorkspaceDatabaseBuffers(
   base: Buffer,
   local: Buffer,
   remote: Buffer,
-): MergeOutcome {
+  workBudget: number,
+): MergeOutcome & { workBudgetExceeded?: true } {
   try {
+    const limits = {
+      maxPlainBytes: workBudget,
+      maxRows: AUTO_MERGE_MAX_STRUCTURAL_ROWS,
+    };
     // All three sides drop non-portable rows before the walk. A base or tip an
     // older build published still carries machine chrome, and against a
     // filtered tip every such row would read as a deletion - one side changing
     // it becomes a concurrent-delete conflict this merge exists to avoid.
     const merged = mergeWorkspaceDatabaseSnapshots(
-      filterPortableWorkspaceRows(parseWorkspaceDatabaseSnapshot(base)),
-      filterPortableWorkspaceRows(parseWorkspaceDatabaseSnapshot(local)),
-      filterPortableWorkspaceRows(parseWorkspaceDatabaseSnapshot(remote)),
+      filterPortableWorkspaceRows(
+        parseWorkspaceDatabaseSnapshot(base, limits),
+      ),
+      filterPortableWorkspaceRows(
+        parseWorkspaceDatabaseSnapshot(local, limits),
+      ),
+      filterPortableWorkspaceRows(
+        parseWorkspaceDatabaseSnapshot(remote, limits),
+      ),
+      limits,
     );
     if (merged.status !== "merged" || merged.snapshot === undefined) {
       return { status: "conflict" };
     }
     return {
       status: "merged",
-      content: serializeWorkspaceDatabaseSnapshot(merged.snapshot),
+      content: serializeWorkspaceDatabaseSnapshot(merged.snapshot, limits),
     };
-  } catch {
+  } catch (error) {
     // Unparseable or mismatched snapshots fall back to manual resolution.
-    return { status: "conflict" };
+    return isWorkspaceDatabaseMergeBudgetError(error)
+      ? { status: "conflict", workBudgetExceeded: true }
+      : { status: "conflict" };
   }
+}
+
+function isWorkspaceDatabaseMergeBudgetError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.message.includes("exceeds the row limit") ||
+      error.message.includes("exceeds the payload limit") ||
+      error.message.includes("exceeds configured limits"))
+  );
 }
 
 function isAutoMergeKind(
