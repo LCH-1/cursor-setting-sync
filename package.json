@@ -2,7 +2,7 @@
   "name": "cursor-setting-sync",
   "displayName": "Cursor Setting Sync",
   "description": "Securely synchronize Cursor settings, workspace state, profiles, extensions, user files, and chat data across devices.",
-  "version": "0.0.65",
+  "version": "0.0.66",
   "publisher": "lch",
   "icon": "icon.png",
   "license": "MIT",
@@ -50,6 +50,8 @@
     "onCommand:cursorSync.restoreVersion",
     "onCommand:cursorSync.repairUnavailableChats",
     "onCommand:cursorSync.continueUnavailableChatSafely",
+    "onCommand:cursorSync.preserveAllUnavailableChatsSafely",
+    "onCommand:cursorSync.openRecoveredChatSafely",
     "onCommand:cursorSync.checkpointRepository",
     "onCommand:cursorSync.disconnect"
   ],
@@ -102,6 +104,14 @@
       {
         "command": "cursorSync.continueUnavailableChatSafely",
         "title": "Cursor Setting Sync: Continue Unavailable Chat Safely"
+      },
+      {
+        "command": "cursorSync.preserveAllUnavailableChatsSafely",
+        "title": "Cursor Setting Sync: Preserve All Recoverable Chats Safely"
+      },
+      {
+        "command": "cursorSync.openRecoveredChatSafely",
+        "title": "Cursor Setting Sync: Open Recovered Chat Safely"
       },
       {
         "command": "cursorSync.checkpointRepository",

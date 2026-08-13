@@ -7,6 +7,8 @@ import {
   auditChatContinuationRoots,
   auditChatReferences,
   buildChatRepairSnapshot,
+  composerCursorFromStorageClass,
+  composerCursorStorageClass,
   inspectBrokenChatContinuationsInDatabase,
   inspectBrokenChatsInDatabase,
 } from "../src/chat/repair";
@@ -1119,6 +1121,531 @@ describe("Cursor chat reference audit", () => {
       .join("\n");
     expect(plan).toContain("composerHeaders_1 (composerId=?)");
     expect(plan).not.toContain("TEMP B-TREE");
+    database.close();
+  });
+
+  it("pages definite continuation damage by stable composer key without skips or duplicates", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-chat-agentkv-pages-"));
+    roots.push(root);
+    const database = new DatabaseSync(join(root, "paged-roots.vscdb"));
+    createSchema(database);
+    const composerIds = Array.from(
+      { length: 5 },
+      (_, index) => `${index + 1}0000000-0000-4000-8000-000000000000`,
+    );
+    for (let index = 0; index < composerIds.length; index += 1) {
+      const composerId = composerIds[index]!;
+      const missingIds = Array.from({ length: index + 1 }, (_, ordinal) =>
+        sha256(Buffer.from(`missing-page-${index}-${ordinal}`, "utf8")),
+      );
+      insertChatWithConversationState(
+        database,
+        composerId,
+        `Damaged ${index}`,
+        serializedConversationState(missingIds),
+        // Deliberately oppose key order. Paged scans must not use recency.
+        composerIds.length - index,
+      );
+    }
+
+    const legacy = await inspectBrokenChatContinuationsInDatabase(database);
+    expect(legacy.broken).toHaveLength(5);
+    expect(legacy).not.toHaveProperty("resumeAfter");
+    expect(legacy).not.toHaveProperty("scannedThrough");
+    expect(legacy).not.toHaveProperty("complete");
+
+    const collected: string[] = [];
+    const pageSizes: number[] = [];
+    let after: { composerId: string } | undefined;
+    let previousCursor: string | undefined;
+    for (let pageNumber = 0; pageNumber < 4; pageNumber += 1) {
+      const page = await inspectBrokenChatContinuationsInDatabase(database, {
+        ...(after === undefined ? {} : { after }),
+        pageAtRetentionLimit: true,
+        limits: { maxRetainedChats: 2 },
+      });
+      expect(page.broken.length).toBeLessThanOrEqual(2);
+      expect(page.limitReached).toBe(false);
+      collected.push(...page.broken.map((item) => item.composerId));
+      pageSizes.push(page.broken.length);
+      if (page.complete === true) {
+        expect(page.resumeAfter).toBeNull();
+        break;
+      }
+      expect(page.complete).toBe(false);
+      expect(page.resumeAfter).not.toBeNull();
+      expect(typeof page.resumeAfter?.composerId).toBe("string");
+      const cursor = page.resumeAfter?.composerId as string;
+      expect(cursor).not.toBe(previousCursor);
+      previousCursor = cursor;
+      after = { composerId: cursor };
+
+      // Recency can change between transactions without moving the keyset.
+      database
+        .prepare("UPDATE composerHeaders SET lastUpdatedAt = lastUpdatedAt + 100")
+        .run();
+    }
+
+    expect(pageSizes).toEqual([2, 2, 1]);
+    expect(collected).toEqual(composerIds);
+    expect(new Set(collected).size).toBe(composerIds.length);
+    database.close();
+  });
+
+  it("stops a graph walk cooperatively before another root probe", async () => {
+    const rootIds = generatedGraphLeaves("cancelled-walk", 8).map(
+      (leaf) => leaf.id,
+    );
+    const snapshot = chat([], [], {
+      conversationState: serializedConversationState(rootIds),
+    });
+    let cancelled = false;
+    let probes = 0;
+
+    const audit = await auditChatContinuationRoots(
+      snapshot,
+      () => {
+        probes += 1;
+        if (probes === 3) {
+          cancelled = true;
+        }
+        return { status: "missing" };
+      },
+      { isCancelled: () => cancelled },
+    );
+
+    expect(audit).toEqual({
+      status: "unknown",
+      conversationStateCount: 1,
+      referencedRootCount: 8,
+      probedRootCount: 3,
+      reason: "cancelled",
+    });
+    expect(probes).toBe(3);
+  });
+
+  it("returns an exact cursor on cancellation and resumes without skips or duplicates", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-chat-agentkv-cancel-"));
+    roots.push(root);
+    const database = new DatabaseSync(join(root, "cancelled-page.vscdb"));
+    createSchema(database);
+    const composerIds = Array.from(
+      { length: 3 },
+      (_, index) => `8${index}000000-0000-4000-8000-000000000000`,
+    );
+    for (const composerId of composerIds) {
+      insertChatWithConversationState(
+        database,
+        composerId,
+        `Cancelled page ${composerId}`,
+        serializedConversationState([
+          sha256(Buffer.from(`missing-cancelled-page-${composerId}`, "utf8")),
+        ]),
+      );
+    }
+
+    // One single-root conversation reaches eight cooperative boundaries. The
+    // ninth check is the next composer boundary, after the first row is fully
+    // classified and therefore safe to checkpoint.
+    let cancellationChecks = 0;
+    const cancelledPage =
+      await inspectBrokenChatContinuationsInDatabase(database, {
+        isCancelled: () => {
+          cancellationChecks += 1;
+          return cancellationChecks >= 9;
+        },
+      });
+
+    expect(cancelledPage).toMatchObject({
+      examinedChats: 1,
+      auditedChats: 1,
+      unknownChats: 0,
+      probedRootCount: 1,
+      limitReached: false,
+      complete: false,
+      resumeAfter: { composerId: composerIds[0] },
+      scannedThrough: { composerId: composerIds[0] },
+    });
+    expect(cancelledPage.broken.map((item) => item.composerId)).toEqual([
+      composerIds[0],
+    ]);
+
+    const resumedPage = await inspectBrokenChatContinuationsInDatabase(
+      database,
+      {
+        after: cancelledPage.resumeAfter!,
+        pageAtRetentionLimit: true,
+      },
+    );
+    const collected = [
+      ...cancelledPage.broken,
+      ...resumedPage.broken,
+    ].map((item) => item.composerId);
+    expect(resumedPage.complete).toBe(true);
+    expect(resumedPage.resumeAfter).toBeNull();
+    expect(collected).toEqual(composerIds);
+    expect(new Set(collected)).toHaveLength(composerIds.length);
+    database.close();
+  });
+
+  it("resumes aggregate chat and root-probe page bounds without classifying the boundary row", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-chat-agentkv-work-pages-"));
+    roots.push(root);
+    const database = new DatabaseSync(join(root, "paged-work-roots.vscdb"));
+    createSchema(database);
+    const composerIds = [
+      "70000000-0000-4000-8000-000000000001",
+      "70000000-0000-4000-8000-000000000002",
+      "70000000-0000-4000-8000-000000000003",
+    ];
+    const leaves = composerIds.map((_, index) =>
+      generatedGraphLeaves(`work-page-${index}`, 3),
+    );
+    for (let index = 0; index < composerIds.length; index += 1) {
+      insertChatWithConversationState(
+        database,
+        composerIds[index]!,
+        `Work page ${index}`,
+        serializedConversationState(leaves[index]!.map((leaf) => leaf.id)),
+      );
+    }
+    const insert = database.prepare(
+      "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)",
+    );
+    for (const leaf of leaves[0]!) {
+      insert.run(`agentKv:blob:${leaf.id}`, leaf.bytes);
+    }
+
+    const rootBudgetPage = await inspectBrokenChatContinuationsInDatabase(
+      database,
+      {
+        pageAtRetentionLimit: true,
+        limits: { maxRootProbes: 4, maxRetainedChats: 4 },
+      },
+    );
+    expect(rootBudgetPage).toMatchObject({
+      examinedChats: 1,
+      auditedChats: 1,
+      unknownChats: 0,
+      probedRootCount: 3,
+      limitReached: false,
+      broken: [],
+      complete: false,
+      resumeAfter: { composerId: composerIds[0] },
+    });
+
+    const chatBudgetPage = await inspectBrokenChatContinuationsInDatabase(
+      database,
+      {
+        after: rootBudgetPage.resumeAfter!,
+        pageAtRetentionLimit: true,
+        limits: {
+          maxChats: 1,
+          maxRootProbes: 4,
+          maxRetainedChats: 4,
+        },
+      },
+    );
+    expect(chatBudgetPage).toMatchObject({
+      examinedChats: 1,
+      auditedChats: 1,
+      unknownChats: 0,
+      probedRootCount: 3,
+      limitReached: false,
+      complete: false,
+      resumeAfter: { composerId: composerIds[1] },
+    });
+    expect(chatBudgetPage.broken.map((item) => item.composerId)).toEqual([
+      composerIds[1],
+    ]);
+
+    const finalPage = await inspectBrokenChatContinuationsInDatabase(database, {
+      after: chatBudgetPage.resumeAfter!,
+      pageAtRetentionLimit: true,
+      limits: { maxChats: 1, maxRootProbes: 4, maxRetainedChats: 4 },
+    });
+    expect(finalPage).toMatchObject({
+      examinedChats: 1,
+      auditedChats: 1,
+      unknownChats: 0,
+      probedRootCount: 3,
+      limitReached: false,
+      complete: true,
+      resumeAfter: null,
+    });
+    expect(finalPage.broken.map((item) => item.composerId)).toEqual([
+      composerIds[2],
+    ]);
+    database.close();
+  });
+
+  it("keeps an exact BLOB composer cursor while paging continuation damage", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-chat-agentkv-blob-page-"));
+    roots.push(root);
+    const database = new DatabaseSync(join(root, "paged-blob-roots.vscdb"));
+    createSchema(database);
+    const textComposer = "60000000-0000-4000-8000-000000000001";
+    const blobComposer = "60000000-0000-4000-8000-000000000002";
+    insertChatWithConversationState(
+      database,
+      textComposer,
+      "Text composer",
+      serializedConversationState([
+        sha256(Buffer.from("missing-text-continuation", "utf8")),
+      ]),
+    );
+    database
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'workspace', 1, 2, 0, 0, 0, NULL, ?)`,
+      )
+      .run(Buffer.from(blobComposer), JSON.stringify({ name: "Blob composer" }));
+    database
+      .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+      .run(
+        `composerData:${blobComposer}`,
+        JSON.stringify({
+          fullConversationHeadersOnly: [],
+          conversationState: serializedConversationState([
+            sha256(Buffer.from("missing-blob-continuation", "utf8")),
+          ]),
+        }),
+      );
+
+    const first = await inspectBrokenChatContinuationsInDatabase(database, {
+      pageAtRetentionLimit: true,
+      limits: { maxRetainedChats: 1 },
+    });
+    expect(first.broken.map((item) => item.composerId)).toEqual([textComposer]);
+    expect(first.resumeAfter).toEqual({ composerId: textComposer });
+    if (first.resumeAfter === null || first.resumeAfter === undefined) {
+      throw new Error("Expected a cursor before the BLOB composer.");
+    }
+
+    const second = await inspectBrokenChatContinuationsInDatabase(database, {
+      after: first.resumeAfter,
+      pageAtRetentionLimit: true,
+      limits: { maxRetainedChats: 1 },
+    });
+    expect(second.broken.map((item) => item.composerId)).toEqual([blobComposer]);
+    expect(second.broken[0]?.composerCursor.composerId).toBeInstanceOf(
+      Uint8Array,
+    );
+    expect(second.complete).toBe(true);
+    expect(second.resumeAfter).toBeNull();
+    const blobCursor = second.scannedThrough?.composerId;
+    expect(blobCursor).toBeInstanceOf(Uint8Array);
+    if (!(blobCursor instanceof Uint8Array)) {
+      throw new Error("Expected the exact BLOB primary-key cursor.");
+    }
+    expect(Buffer.from(blobCursor).toString("utf8")).toBe(blobComposer);
+
+    const terminal = await inspectBrokenChatContinuationsInDatabase(database, {
+      after: { composerId: blobCursor },
+      pageAtRetentionLimit: true,
+      limits: { maxRetainedChats: 1 },
+    });
+    expect(terminal.broken).toEqual([]);
+    expect(terminal.complete).toBe(true);
+    expect(terminal.resumeAfter).toBeNull();
+
+    const blobTarget = await inspectBrokenChatContinuationsInDatabase(database, {
+      composerCursor: second.broken[0]!.composerCursor,
+    });
+    expect(blobTarget.examinedChats).toBe(1);
+    expect(blobTarget.broken).toHaveLength(1);
+    expect(blobTarget.broken[0]).toMatchObject({
+      composerId: blobComposer,
+      title: "Blob composer",
+    });
+    expect(blobTarget.broken[0]?.composerCursor.composerId).toBeInstanceOf(
+      Uint8Array,
+    );
+    database.close();
+  });
+
+  it("keeps TEXT and BLOB rows with the same decoded UUID unambiguous", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-chat-agentkv-identity-"));
+    roots.push(root);
+    const database = new DatabaseSync(join(root, "duplicate-identity.vscdb"));
+    createSchema(database);
+    const duplicateComposer = "6a000000-0000-4000-8000-000000000001";
+    const missingRoot = sha256(Buffer.from("duplicate-identity-root", "utf8"));
+    insertChatWithConversationState(
+      database,
+      duplicateComposer,
+      "Text identity",
+      serializedConversationState([missingRoot]),
+    );
+    database
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'workspace', 1, 3, 0, 0, 0, NULL, ?)`,
+      )
+      .run(
+        Buffer.from(duplicateComposer, "utf8"),
+        JSON.stringify({ name: "Blob identity" }),
+      );
+
+    const page = await inspectBrokenChatContinuationsInDatabase(database, {
+      pageAtRetentionLimit: true,
+      limits: { maxRetainedChats: 2 },
+    });
+    expect(page.broken).toHaveLength(2);
+    const textObservation = page.broken.find(
+      (item) => typeof item.composerCursor.composerId === "string",
+    );
+    const blobObservation = page.broken.find(
+      (item) => item.composerCursor.composerId instanceof Uint8Array,
+    );
+    expect(textObservation).toMatchObject({
+      composerId: duplicateComposer,
+      title: "Text identity",
+    });
+    expect(blobObservation).toMatchObject({
+      composerId: duplicateComposer,
+      title: "Blob identity",
+    });
+    expect(composerCursorStorageClass(textObservation!.composerCursor)).toBe(
+      "text",
+    );
+    expect(composerCursorStorageClass(blobObservation!.composerCursor)).toBe(
+      "blob",
+    );
+    expect(
+      composerCursorFromStorageClass(duplicateComposer, "text"),
+    ).toEqual(textObservation!.composerCursor);
+    expect(
+      composerCursorFromStorageClass(duplicateComposer, "blob")?.composerId,
+    ).toEqual(blobObservation!.composerCursor.composerId);
+
+    const legacyStringScope =
+      await inspectBrokenChatContinuationsInDatabase(database, {
+        composerIds: new Set([duplicateComposer]),
+      });
+    expect(legacyStringScope.examinedChats).toBe(0);
+    expect(legacyStringScope.broken).toEqual([]);
+
+    const exactTextScope = await inspectBrokenChatContinuationsInDatabase(
+      database,
+      { composerCursor: textObservation!.composerCursor },
+    );
+    expect(exactTextScope.broken).toHaveLength(1);
+    expect(exactTextScope.broken[0]).toMatchObject({ title: "Text identity" });
+    expect(typeof exactTextScope.broken[0]?.composerCursor.composerId).toBe(
+      "string",
+    );
+
+    const exactBlobScope = await inspectBrokenChatContinuationsInDatabase(
+      database,
+      { composerCursor: blobObservation!.composerCursor },
+    );
+    expect(exactBlobScope.broken).toHaveLength(1);
+    expect(exactBlobScope.broken[0]).toMatchObject({ title: "Blob identity" });
+    expect(exactBlobScope.broken[0]?.composerCursor.composerId).toBeInstanceOf(
+      Uint8Array,
+    );
+    database.close();
+  });
+
+  it("matches exact TEXT composer identities case-sensitively", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-chat-agentkv-case-"));
+    roots.push(root);
+    const database = new DatabaseSync(join(root, "case-identity.vscdb"));
+    createSchema(database);
+    const lowerComposer = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+    const upperComposer = lowerComposer.toUpperCase();
+    insertChatWithConversationState(
+      database,
+      lowerComposer,
+      "Lowercase identity",
+      serializedConversationState([
+        sha256(Buffer.from("lowercase-identity-root", "utf8")),
+      ]),
+    );
+    insertChatWithConversationState(
+      database,
+      upperComposer,
+      "Uppercase identity",
+      serializedConversationState([
+        sha256(Buffer.from("uppercase-identity-root", "utf8")),
+      ]),
+    );
+
+    const lowerTarget = await inspectBrokenChatContinuationsInDatabase(
+      database,
+      { composerCursor: { composerId: lowerComposer } },
+    );
+    expect(lowerTarget.broken).toHaveLength(1);
+    expect(lowerTarget.broken[0]).toMatchObject({
+      composerId: lowerComposer,
+      title: "Lowercase identity",
+    });
+
+    const upperTarget = await inspectBrokenChatContinuationsInDatabase(
+      database,
+      { composerCursor: { composerId: upperComposer } },
+    );
+    expect(upperTarget.broken).toHaveLength(1);
+    expect(upperTarget.broken[0]).toMatchObject({
+      composerId: upperComposer,
+      title: "Uppercase identity",
+    });
+    database.close();
+  });
+
+  it("keeps unknown continuation counters local to each recovery page", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-chat-agentkv-page-unknown-"));
+    roots.push(root);
+    const database = new DatabaseSync(join(root, "paged-unknown.vscdb"));
+    createSchema(database);
+    const composerIds = Array.from(
+      { length: 5 },
+      (_, index) => `${index + 1}1111111-1111-4111-8111-111111111111`,
+    );
+    for (let index = 0; index < composerIds.length; index += 1) {
+      insertChatWithConversationState(
+        database,
+        composerIds[index]!,
+        `Page ${index}`,
+        index === 1 || index === 3
+          ? "~not canonical base64"
+          : serializedConversationState([
+              sha256(Buffer.from(`missing-unknown-page-${index}`, "utf8")),
+            ]),
+      );
+    }
+
+    const pages = [];
+    let after: { composerId: string } | undefined;
+    for (;;) {
+      const page = await inspectBrokenChatContinuationsInDatabase(database, {
+        ...(after === undefined ? {} : { after }),
+        pageAtRetentionLimit: true,
+        limits: { maxRetainedChats: 1 },
+      });
+      pages.push(page);
+      if (page.complete === true) {
+        break;
+      }
+      if (page.resumeAfter === null || page.resumeAfter === undefined) {
+        throw new Error("Expected an advancing continuation page cursor.");
+      }
+      after = { composerId: page.resumeAfter.composerId as string };
+    }
+
+    expect(pages.map((page) => page.broken.length)).toEqual([1, 1, 1]);
+    expect(pages.map((page) => page.unknownChats)).toEqual([1, 1, 0]);
+    expect(
+      pages.map((page) => page.unknownReasonCounts.unreadable),
+    ).toEqual([1, 1, 0]);
+    expect(
+      pages.flatMap((page) => page.broken.map((item) => item.composerId)),
+    ).toEqual([composerIds[0], composerIds[2], composerIds[4]]);
     database.close();
   });
 

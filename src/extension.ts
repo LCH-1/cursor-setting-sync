@@ -75,6 +75,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerCommand("cursorSync.continueUnavailableChatSafely", () =>
       manager?.continueUnavailableChatSafely(),
     ),
+    registerCommand("cursorSync.preserveAllUnavailableChatsSafely", () =>
+      manager?.preserveAllUnavailableChatsSafely(),
+    ),
+    registerCommand("cursorSync.openRecoveredChatSafely", () =>
+      manager?.openRecoveredChatSafely(),
+    ),
     registerCommand(
       "cursorSync.showDiagnostics",
       repositoryCommand((activeManager) => activeManager.showDiagnostics()),
@@ -191,6 +197,8 @@ function registerUnsupportedPlatformCommands(
     "cursorSync.restoreVersion",
     "cursorSync.repairUnavailableChats",
     "cursorSync.continueUnavailableChatSafely",
+    "cursorSync.preserveAllUnavailableChatsSafely",
+    "cursorSync.openRecoveredChatSafely",
     "cursorSync.showDiagnostics",
     "cursorSync.restoreBackup",
     "cursorSync.forgetDevice",

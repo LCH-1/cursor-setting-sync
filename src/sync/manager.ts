@@ -1,6 +1,14 @@
 import { basename, isAbsolute, join, relative } from "node:path";
 import type { Dirent } from "node:fs";
-import { readFile, readdir, rename, rm, stat } from "node:fs/promises";
+import {
+  open as openFile,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  type FileHandle,
+} from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import {
@@ -45,6 +53,10 @@ import type {
   SyncConflict,
 } from "../types";
 import type { CursorPaths } from "../platform/paths";
+import {
+  openDatabase,
+  type DatabaseSync,
+} from "../platform/sqlite";
 import {
   copyFileAtomic,
   directorySize,
@@ -167,6 +179,9 @@ import {
 import {
   DEFAULT_BROKEN_CHAT_INSPECTION_LIMITS,
   buildChatRepairSnapshot,
+  composerCursorFromStorageClass,
+  composerCursorStorageClass,
+  inspectBrokenChatContinuationsInDatabase,
   inspectBrokenCursorChatContinuations,
   inspectBrokenCursorChats,
   isAutomaticChatRepairMetadata,
@@ -175,12 +190,29 @@ import {
   type BrokenChatInspectionCursor,
   type ChatContinuationUnknownReasonCounts,
   type ChatRepairCandidate,
+  type ComposerIdStorageClass,
 } from "../chat/repair";
 import {
   extractVisibleChatRecoveryTranscript,
   prepareVisibleRecoveryAgent,
   writeVisibleChatRecoveryArtifact,
+  type VisibleChatRecoveryTranscript,
 } from "../chat/visibleRecovery";
+import {
+  RECOVERY_CATALOG_LIMITS,
+  RecoveryCatalogInventoryCancelledError,
+  RecoveryCatalogLimitError,
+  acquireRecoveryCatalogBuildSession,
+  readRecoveryCatalog,
+  recoveryCatalogEntryArtifactPaths,
+  upsertRecoveryCatalogEntries,
+  type RecoveryCatalogReadyEntry,
+  type RecoveryCatalogBuildSession,
+  type RecoveryCatalogLimitReason,
+  type RecoveryCatalogResult,
+  type RecoveryCatalogStatus,
+  type RecoveryCatalogUpsertInput,
+} from "../chat/recoveryCatalog";
 import {
   discoverWorkspaces,
   resolveTargetWorkspace,
@@ -1892,7 +1924,10 @@ export class SyncManager implements vscode.Disposable {
         return extractVisibleChatRecoveryTranscript(
           this.paths.globalDatabase,
           inspectedSelection.composerId,
-          { chatCoreHash: inspectedSelection.chatCoreHash },
+          {
+            chatCoreHash: inspectedSelection.chatCoreHash,
+            composerCursor: inspectedSelection.composerCursor,
+          },
         );
       },
     );
@@ -1901,14 +1936,12 @@ export class SyncManager implements vscode.Disposable {
       async (report) => {
         report("Rechecking the selected continuation immediately before recovery...");
         return inspectBrokenCursorChatContinuations(this.paths, {
-          composerIds: new Set([inspectedSelection.composerId]),
+          composerCursor: inspectedSelection.composerCursor,
           limits: { maxSnapshotBytesPerChat: 32 * 1024 * 1024 },
         });
       },
     );
-    const freshDamage = freshness.broken.find(
-      (observation) => observation.composerId === inspectedSelection.composerId,
-    );
+    const freshDamage = freshness.broken[0];
     if (freshDamage === undefined) {
       if (
         freshness.auditedChats === 1 &&
@@ -1954,23 +1987,613 @@ export class SyncManager implements vscode.Disposable {
     const summary = `${transcript.userRecordCount} user message(s), ${transcript.assistantTextRecordCount} assistant text message(s), ${transcript.toolCallCount} inert tool-call summary record(s), and ${artifact.imageAttachments.length} verified selected image(s)`;
     if (mode === "glass") {
       void vscode.window.showInformationMessage(
-        `Cursor opened a new Agent and was asked to attach the verified Markdown recovery context and selected images (${summary}). Verify that its .md and image attachment chips are visible. The suggested continuation instruction is embedded near the top of the transcript; nothing was sent, and the original conversation was not changed. The plaintext recovery files remain in local extension storage until you delete them.`,
+        `Cursor opened a new Agent and was asked to attach the verified Markdown recovery context and selected images (${summary}). Verify that its .md and image attachment chips are visible. The suggested continuation instruction is embedded near the top of the transcript; nothing was sent, and the original conversation was not changed. The plaintext files remain in the local recovery-transcripts folder until you explicitly delete those recovery files.`,
       );
       return;
     }
     if (mode === "classic") {
       void vscode.window.showInformationMessage(
-        `Cursor opened a new Agent and was asked to attach the verified Markdown recovery context and selected images (${summary}). Verify that its .md and image attachment chips are visible. The suggested continuation instruction is embedded near the top of the transcript; nothing was sent, and the original conversation was not changed. The plaintext recovery files remain in local extension storage until you delete them.`,
+        `Cursor opened a new Agent and was asked to attach the verified Markdown recovery context and selected images (${summary}). Verify that its .md and image attachment chips are visible. The suggested continuation instruction is embedded near the top of the transcript; nothing was sent, and the original conversation was not changed. The plaintext files remain in the local recovery-transcripts folder until you explicitly delete those recovery files.`,
       );
       return;
     }
     const open = "Open Recovery Transcript";
     const choice = await vscode.window.showWarningMessage(
-      `Cursor's supported new-Agent context command was unavailable or rejected on this build. The verified Markdown recovery context and selected images were saved locally (${summary}); open the Markdown file and attach it plus every image listed in its verified attachment manifest to a new Agent. Its suggested continuation instruction is embedded near the top. Nothing was sent, the original conversation was not changed, and the plaintext files remain in local extension storage until you delete them.`,
+      `Cursor's supported new-Agent context command was unavailable or rejected on this build. The verified Markdown recovery context and selected images were saved locally (${summary}); open the Markdown file and attach it plus every image listed in its verified attachment manifest to a new Agent. Its suggested continuation instruction is embedded near the top. Nothing was sent, the original conversation was not changed, and the plaintext files remain in the local recovery-transcripts folder until you explicitly delete those recovery files.`,
       open,
     );
     if (choice === open) {
       await vscode.commands.executeCommand("vscode.open", resource);
+    }
+  }
+
+  /**
+   * Builds a resumable local catalog for every continuation-damaged chat that
+   * can be preserved without changing Cursor's databases. Work is checkpointed
+   * after each small audit page, and cancellation is observed only between
+   * items so an artifact/catalog pair is never intentionally left half-made.
+   */
+  async preserveAllUnavailableChatsSafely(): Promise<void> {
+    const preserve = "Preserve All Safely";
+    const confirmation = await vscode.window.showWarningMessage(
+      "Preserve all recoverable continuation-damaged chats as plaintext in a local recovery catalog? This includes message text, tool inputs/results/status, source selections and URIs, todos/new-file/work state, and selected images, which may contain source code or secrets.",
+      {
+        modal: true,
+        detail:
+          "The recovered data is stored as plaintext in this extension's local recovery-transcripts folder until you explicitly delete those recovery files. This handles only definite continuation damage whose visible message bodies can still be verified; missing message-body chats reported separately by Repair Unavailable Chats still require a source PC or backup. This does not repair or change the original chats, create Agents, attach files to Agents, or send prompts.",
+      },
+      preserve,
+    );
+    if (confirmation !== preserve) {
+      return;
+    }
+
+    const result = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "Cursor Setting Sync: Preserve All Recoverable Chats Safely",
+        cancellable: true,
+      },
+      async (progress, cancellationToken) =>
+        this.buildUnavailableChatRecoveryCatalog(
+          progress,
+          cancellationToken,
+        ),
+    );
+    if (result === null) {
+      void vscode.window.showInformationMessage(
+        "Another Cursor window is already building the recovery catalog. Let that command finish, then run Preserve All Recoverable Chats Safely again.",
+      );
+      return;
+    }
+    const summary = recoveryCatalogCompletionSummary(result);
+    if (result.indexPath === null) {
+      if (
+        result.cancelled ||
+        result.incomplete ||
+        result.auditUnknownChats > 0
+      ) {
+        void vscode.window.showWarningMessage(summary);
+      } else {
+        void vscode.window.showInformationMessage(summary);
+      }
+      return;
+    }
+    const openCatalog = "Open Recovery Catalog";
+    const choice =
+      result.cancelled ||
+      result.incomplete ||
+      result.counts["skipped-limit"] > 0 ||
+      result.counts["skipped-body"] > 0 ||
+      result.counts.changed > 0 ||
+      result.counts.unknown > 0 ||
+      result.auditUnknownChats > 0
+        ? await vscode.window.showWarningMessage(summary, openCatalog)
+        : await vscode.window.showInformationMessage(summary, openCatalog);
+    if (choice === openCatalog) {
+      await vscode.commands.executeCommand(
+        "vscode.open",
+        vscode.Uri.file(result.indexPath),
+      );
+    }
+  }
+
+  /** Opens one verified catalog artifact in a new, empty Agent without send. */
+  async openRecoveredChatSafely(): Promise<void> {
+    const catalog = await readRecoveryCatalog(this.paths.extensionStorage);
+    const ready = catalog.manifest.entries.filter(
+      (entry): entry is RecoveryCatalogReadyEntry =>
+        entry.status === "ready",
+    );
+    if (ready.length === 0) {
+      void vscode.window.showInformationMessage(
+        "The local recovery catalog has no verified chat artifact ready to open. Run Preserve All Recoverable Chats Safely first.",
+      );
+      return;
+    }
+    const items: Array<vscode.QuickPickItem & {
+      entry: RecoveryCatalogReadyEntry;
+    }> = ready.map((entry) => ({
+        label: entry.title ?? "Untitled conversation",
+        description: `${entry.composerId} (${entry.composerStorageClass})`,
+        ...(
+          entry.lastUpdatedAt === null || entry.lastUpdatedAt === undefined
+            ? {}
+            : { detail: new Date(entry.lastUpdatedAt).toLocaleString() }
+        ),
+        entry,
+      }));
+    const choice = await vscode.window.showQuickPick(items,
+      {
+        title: "Open Recovered Chat Safely",
+        placeHolder:
+          "Choose one verified recovery artifact to attach to a new Agent",
+      },
+    );
+    if (choice === undefined) {
+      return;
+    }
+    const composerCursor = composerCursorFromStorageClass(
+      choice.entry.composerId,
+      choice.entry.composerStorageClass,
+    );
+    if (composerCursor === null) {
+      throw new Error(
+        "The recovery catalog contains an invalid exact conversation identity.",
+      );
+    }
+    const paths = await recoveryCatalogEntryArtifactPaths(
+      this.paths.extensionStorage,
+      choice.entry,
+    );
+    const transcript = extractVisibleChatRecoveryTranscript(
+      this.paths.globalDatabase,
+      choice.entry.composerId,
+      {
+        chatCoreHash: choice.entry.chatCoreHash,
+        composerCursor,
+      },
+    );
+    if (!workspaceUriIsOpen(transcript.workspaceUri)) {
+      void vscode.window.showWarningMessage(
+        "Open the recovered conversation's original workspace in this Cursor window, then run Open Recovered Chat Safely again. No Agent was created and nothing was attached or sent.",
+      );
+      return;
+    }
+    // This is deliberately the final awaited preflight. Artifact reads and
+    // transcript extraction may take time; a Cursor write during either must
+    // be observed before any new Agent is prepared.
+    const freshness = await inspectBrokenCursorChatContinuations(this.paths, {
+      composerCursor,
+      limits: { maxSnapshotBytesPerChat: 32 * 1024 * 1024 },
+    });
+    const freshDamage = freshness.broken[0];
+    if (
+      freshDamage === undefined ||
+      freshDamage.chatCoreHash !== choice.entry.chatCoreHash ||
+      freshDamage.fingerprint !== choice.entry.damageFingerprint
+    ) {
+      const detail =
+        freshDamage === undefined &&
+        (freshness.unknownChats > 0 || freshness.limitReached)
+          ? "The selected conversation could not be safely re-audited."
+          : "The selected conversation is now complete or changed since this catalog entry was created.";
+      void vscode.window.showWarningMessage(
+        `${detail} This preserved entry remains in the catalog, but it cannot be opened automatically. No Agent was created and nothing was attached or sent.`,
+      );
+      return;
+    }
+    if (!workspaceUriIsOpen(transcript.workspaceUri)) {
+      void vscode.window.showWarningMessage(
+        "The recovered conversation's original workspace changed or closed during verification. Open it in this Cursor window, then run Open Recovered Chat Safely again. No Agent was created and nothing was attached or sent.",
+      );
+      return;
+    }
+    const resources = paths.map((path) => vscode.Uri.file(path));
+    const mode = await prepareVisibleRecoveryAgent(vscode.commands, resources);
+    if (mode !== "manual") {
+      void vscode.window.showInformationMessage(
+        "Cursor opened a new Agent and was asked to attach the verified recovery transcript and images. Verify the attachment chips before continuing. Nothing was sent, and the original chat was not changed.",
+      );
+      return;
+    }
+    const openTranscript = "Open Recovery Transcript";
+    const manualChoice = await vscode.window.showWarningMessage(
+      "Cursor's supported new-Agent context command was unavailable or rejected on this build. It may have partially opened an empty Agent or attached only some files before rejecting. The catalog artifact was reverified and nothing was sent; inspect the current Agent before opening the transcript, then attach the transcript plus every listed image exactly once.",
+      openTranscript,
+    );
+    if (manualChoice === openTranscript) {
+      await vscode.commands.executeCommand("vscode.open", resources[0]);
+    }
+  }
+
+  private async buildUnavailableChatRecoveryCatalog(
+    progress: vscode.Progress<{ message?: string; increment?: number }>,
+    cancellationToken: vscode.CancellationToken | undefined,
+  ): Promise<RecoveryCatalogBuildResult | null> {
+    let buildSession: RecoveryCatalogBuildSession | null;
+    try {
+      buildSession = await acquireRecoveryCatalogBuildSession(
+        this.paths.extensionStorage,
+        () => recoveryCatalogCancellationRequested(cancellationToken),
+      );
+    } catch (error) {
+      if (!(error instanceof RecoveryCatalogInventoryCancelledError)) {
+        throw error;
+      }
+      const catalog = await readRecoveryCatalog(this.paths.extensionStorage);
+      return {
+        counts: emptyRecoveryCatalogCounts(),
+        examinedChats: 0,
+        auditUnknownChats: 0,
+        cancelled: true,
+        incomplete: false,
+        databaseChanged: false,
+        retiredEntries: 0,
+        ...recoveryCatalogState(catalog),
+        quotaReached: null,
+        indexPath: catalog.indexPath,
+      };
+    }
+    if (buildSession === null) {
+      return null;
+    }
+    let generationMonitor: CursorDatabaseGenerationMonitor | undefined;
+    try {
+      generationMonitor = await openCursorDatabaseGenerationMonitor(
+        this.paths.globalDatabase,
+      );
+      return await this.buildUnavailableChatRecoveryCatalogPages(
+        progress,
+        cancellationToken,
+        generationMonitor,
+        buildSession,
+      );
+    } finally {
+      try {
+        generationMonitor?.database.close();
+      } finally {
+        try {
+          await generationMonitor?.file.close();
+        } finally {
+          await buildSession.release();
+        }
+      }
+    }
+  }
+
+  private async buildUnavailableChatRecoveryCatalogPages(
+    progress: vscode.Progress<{ message?: string; increment?: number }>,
+    cancellationToken: vscode.CancellationToken | undefined,
+    generationMonitor: CursorDatabaseGenerationMonitor,
+    buildSession: RecoveryCatalogBuildSession,
+  ): Promise<RecoveryCatalogBuildResult> {
+    const counts = emptyRecoveryCatalogCounts();
+    let after: BrokenChatInspectionCursor | undefined;
+    let examinedChats = 0;
+    let auditUnknownChats = 0;
+    let catalog = await readRecoveryCatalog(this.paths.extensionStorage);
+    let indexPath: string | null = catalog.indexPath;
+    const incomplete = false;
+    const observedBrokenIdentities = new Set<string>();
+    const pageSize = 4;
+    for (;;) {
+      if (recoveryCatalogCancellationRequested(cancellationToken)) {
+        return {
+          counts,
+          examinedChats,
+          auditUnknownChats,
+          cancelled: true,
+          incomplete,
+          databaseChanged: false,
+          retiredEntries: 0,
+          ...recoveryCatalogState(catalog),
+          quotaReached: null,
+          indexPath,
+        };
+      }
+      progress.report({
+        message: `Auditing chats (${recoveryCatalogProcessedCount(counts)} catalogued)...`,
+      });
+      const inspection = await inspectBrokenChatContinuationsInDatabase(
+        generationMonitor.database,
+        {
+          ...(after === undefined ? {} : { after }),
+          pageAtRetentionLimit: true,
+          isCancelled: () =>
+            recoveryCatalogCancellationRequested(cancellationToken),
+          limits: {
+            maxRetainedChats: pageSize,
+            maxChats: 64,
+            maxSnapshotBytesPerChat: 32 * 1024 * 1024,
+            maxRootProbes: 4_096,
+          },
+        },
+      );
+      examinedChats += inspection.examinedChats;
+      auditUnknownChats += inspection.unknownChats;
+      let quotaReached: RecoveryCatalogLimitReason | null = null;
+      for (const observation of inspection.broken) {
+        if (recoveryCatalogCancellationRequested(cancellationToken)) {
+          break;
+        }
+        const composerStorageClass = composerCursorStorageClass(
+          observation.composerCursor,
+        );
+        if (composerStorageClass === null) {
+          auditUnknownChats += 1;
+          this.status.log(
+            `Recovery catalog skipped ${observation.composerId}: its exact SQLite identity was not safely persistable.`,
+          );
+          continue;
+        }
+        const exactIdentity = `${composerStorageClass}\0${observation.composerId}`;
+        const existing = catalog.manifest.entries.find(
+          (entry) =>
+            entry.composerId === observation.composerId &&
+            entry.composerStorageClass === composerStorageClass,
+        );
+        let existingReadyVerified = false;
+        let existingReadyCorrupt = false;
+        if (
+          !observedBrokenIdentities.has(exactIdentity) &&
+          observedBrokenIdentities.size >= RECOVERY_CATALOG_LIMITS.maxEntries
+        ) {
+          quotaReached = "entries";
+          break;
+        }
+        observedBrokenIdentities.add(exactIdentity);
+        if (existing?.status === "ready") {
+          try {
+            await recoveryCatalogEntryArtifactPaths(
+              this.paths.extensionStorage,
+              existing,
+            );
+            existingReadyVerified = true;
+            if (
+              existing.chatCoreHash === observation.chatCoreHash &&
+              existing.damageFingerprint === observation.fingerprint
+            ) {
+              counts.ready += 1;
+              continue;
+            }
+          } catch (error) {
+            existingReadyCorrupt = true;
+            this.status.log(
+              `Recovery catalog will rebuild ${observation.composerId} because its current ready artifact failed verification: ${recoveryCatalogErrorMessage(error)}`,
+            );
+          }
+        }
+        if (
+          existing === undefined && catalog.capacity.remainingEntries === 0
+        ) {
+          quotaReached = "entries";
+          break;
+        }
+        if (
+          catalog.capacity.remainingReadyArtifactBytes === 0 &&
+          existing?.status !== "ready"
+        ) {
+          quotaReached = "artifact-bytes";
+          break;
+        }
+        progress.report({
+          message: `Preserving ${recoveryCatalogProcessedCount(counts) + 1}: ${observation.title ?? "Untitled conversation"}`,
+        });
+        let entry: RecoveryCatalogUpsertInput;
+        try {
+          entry = await this.preserveRecoveryCatalogObservation(
+            observation,
+            composerStorageClass,
+            buildSession,
+          );
+        } catch (error) {
+          if (error instanceof RecoveryCatalogLimitError) {
+            if (existingReadyCorrupt) {
+              catalog = await upsertRecoveryCatalogEntries(
+                this.paths.extensionStorage,
+                [
+                  {
+                    composerId: observation.composerId,
+                    composerStorageClass,
+                    chatCoreHash: observation.chatCoreHash,
+                    damageFingerprint: observation.fingerprint,
+                    title: observation.title,
+                    lastUpdatedAt: recoveryCatalogLastUpdatedAt(
+                      observation.lastUpdatedAt,
+                    ),
+                    status: "skipped-limit",
+                  },
+                ],
+              );
+              indexPath = catalog.indexPath;
+              counts["skipped-limit"] += 1;
+            }
+            quotaReached = error.reason;
+            break;
+          }
+          throw error;
+        }
+        if (existingReadyVerified && entry.status !== "ready") {
+          counts[entry.status] += 1;
+          this.status.log(
+            `Recovery catalog retained the prior verified artifact for ${observation.composerId}; the current recheck returned ${entry.status}.`,
+          );
+          continue;
+        }
+        try {
+          catalog = await upsertRecoveryCatalogEntries(
+            this.paths.extensionStorage,
+            [entry],
+          );
+          indexPath = catalog.indexPath;
+          counts[entry.status] += 1;
+        } catch (error) {
+          if (error instanceof RecoveryCatalogLimitError) {
+            if (existingReadyCorrupt) {
+              catalog = await upsertRecoveryCatalogEntries(
+                this.paths.extensionStorage,
+                [
+                  {
+                    composerId: observation.composerId,
+                    composerStorageClass,
+                    chatCoreHash: observation.chatCoreHash,
+                    damageFingerprint: observation.fingerprint,
+                    title: observation.title,
+                    lastUpdatedAt: recoveryCatalogLastUpdatedAt(
+                      observation.lastUpdatedAt,
+                    ),
+                    status: "skipped-limit",
+                  },
+                ],
+              );
+              indexPath = catalog.indexPath;
+              counts["skipped-limit"] += 1;
+            }
+            quotaReached = error.reason;
+            break;
+          }
+          throw error;
+        }
+      }
+      if (quotaReached !== null) {
+        return {
+          counts,
+          examinedChats,
+          auditUnknownChats,
+          cancelled: false,
+          incomplete: true,
+          databaseChanged: false,
+          retiredEntries: 0,
+          ...recoveryCatalogState(catalog),
+          quotaReached,
+          indexPath,
+        };
+      }
+      if (recoveryCatalogCancellationRequested(cancellationToken)) {
+        return {
+          counts,
+          examinedChats,
+          auditUnknownChats,
+          cancelled: true,
+          incomplete,
+          databaseChanged: false,
+          retiredEntries: 0,
+          ...recoveryCatalogState(catalog),
+          quotaReached: null,
+          indexPath,
+        };
+      }
+      if (inspection.complete === true) {
+        let databaseChanged = true;
+        try {
+          databaseChanged =
+            await cursorDatabaseGenerationMonitorChanged(generationMonitor);
+        } catch (error) {
+          this.status.log(
+            `Recovery catalog could not verify that Cursor's database stayed unchanged: ${recoveryCatalogErrorMessage(error)}`,
+          );
+        }
+        return {
+          counts,
+          examinedChats,
+          auditUnknownChats,
+          cancelled: false,
+          incomplete: incomplete || databaseChanged,
+          databaseChanged,
+          retiredEntries: 0,
+          ...recoveryCatalogState(catalog),
+          quotaReached: null,
+          indexPath,
+        };
+      }
+      const next = inspection.resumeAfter;
+      if (
+        next === undefined ||
+        next === null ||
+        sameBrokenChatInspectionCursor(after, next)
+      ) {
+        throw new Error(
+          "The bounded continuation audit did not provide a safe advancing cursor. Existing recovery catalog checkpoints were kept.",
+        );
+      }
+      after = next;
+    }
+  }
+
+  private async preserveRecoveryCatalogObservation(
+    observation: BrokenChatContinuationObservation,
+    composerStorageClass: ComposerIdStorageClass,
+    buildSession: RecoveryCatalogBuildSession,
+  ): Promise<RecoveryCatalogUpsertInput> {
+    const base = {
+      composerId: observation.composerId,
+      composerStorageClass,
+      chatCoreHash: observation.chatCoreHash,
+      damageFingerprint: observation.fingerprint,
+      title: observation.title,
+      lastUpdatedAt: recoveryCatalogLastUpdatedAt(observation.lastUpdatedAt),
+    };
+    let transcript: VisibleChatRecoveryTranscript;
+    try {
+      transcript = extractVisibleChatRecoveryTranscript(
+        this.paths.globalDatabase,
+        observation.composerId,
+        {
+          chatCoreHash: observation.chatCoreHash,
+          composerCursor: observation.composerCursor,
+        },
+      );
+    } catch (error) {
+      const status = recoveryCatalogExtractionFailureStatus(error);
+      this.status.log(
+        `Recovery catalog skipped ${observation.composerId} (${status}): ${recoveryCatalogErrorMessage(error)}`,
+      );
+      return { ...base, status };
+    }
+
+    let freshInspection: {
+      damage: BrokenChatContinuationObservation | undefined;
+      auditedChats: number;
+      unknownChats: number;
+      limitReached: boolean;
+    };
+    try {
+      const freshness = await inspectBrokenCursorChatContinuations(this.paths, {
+        composerCursor: observation.composerCursor,
+        limits: { maxSnapshotBytesPerChat: 32 * 1024 * 1024 },
+      });
+      freshInspection = {
+        damage: freshness.broken[0],
+        auditedChats: freshness.auditedChats,
+        unknownChats: freshness.unknownChats,
+        limitReached: freshness.limitReached,
+      };
+    } catch (error) {
+      this.status.log(
+        `Recovery catalog could not recheck ${observation.composerId} (unknown): ${recoveryCatalogErrorMessage(error)}`,
+      );
+      return { ...base, status: "unknown" };
+    }
+    if (freshInspection.damage === undefined) {
+      const status: RecoveryCatalogStatus =
+        freshInspection.auditedChats === 1 &&
+        freshInspection.unknownChats === 0 &&
+        !freshInspection.limitReached
+          ? "changed"
+          : freshInspection.limitReached
+            ? "skipped-limit"
+            : "unknown";
+      return { ...base, status };
+    }
+    if (
+      freshInspection.damage.chatCoreHash !== observation.chatCoreHash ||
+      freshInspection.damage.fingerprint !== observation.fingerprint
+    ) {
+      return { ...base, status: "changed" };
+    }
+    try {
+      const artifact = await writeVisibleChatRecoveryArtifact(
+        this.paths.extensionStorage,
+        this.paths.workspaceStorageRoot,
+        transcript,
+        {
+          namespace: "catalog",
+          composerStorageClass,
+          beforeCatalogWrite: (totalBytes, fileCount) =>
+            buildSession.reserveArtifact(totalBytes, fileCount),
+        },
+      );
+      return { ...base, status: "ready", artifact };
+    } catch (error) {
+      if (error instanceof RecoveryCatalogLimitError) {
+        throw error;
+      }
+      const status = recoveryCatalogArtifactFailureStatus(error);
+      this.status.log(
+        `Recovery catalog could not materialize ${observation.composerId} (${status}): ${recoveryCatalogErrorMessage(error)}`,
+      );
+      return { ...base, status };
     }
   }
 
@@ -2262,10 +2885,11 @@ export class SyncManager implements vscode.Disposable {
           lackingSourceCount === 1 ? "" : "s"
         } ${lackingSourceCount === 1 ? "does" : "do"} not have a complete synchronized v2 copy queued here: this PC and the synchronized legacy history lack the continuation blobs needed to resume ${
           lackingSourceCount === 1 ? "it" : "them"
-        }. Nothing was changed.${oversizedSourceDetail} Update Cursor Setting Sync and run Sync Now on a PC where the affected chat still continues; then run Sync Now on this PC and choose Restart to Apply.${
+        }. Nothing was changed.${oversizedSourceDetail} Update Cursor Setting Sync and run Sync Now on a PC where the affected chat still continues; then run Sync Now on this PC and choose Restart to Apply. Preserve All Safely catalogs only definite continuation-damaged chats whose visible message bodies can still be verified; separately reported missing message-body chats still require a source PC or database backup.${
           incompleteDetail.length === 0 ? "" : ` ${incompleteDetail}`
         }`;
       const continueSafely = "Continue Safely in New Agent";
+      const preserveAllSafely = "Preserve All Safely";
       const lackingSourceDamage = continuationDamage.filter(
         (observation) =>
           !completePendingResourceIds.has(observation.resourceId),
@@ -2273,9 +2897,12 @@ export class SyncManager implements vscode.Disposable {
       if (completePendingResourceIds.size === 0) {
         const choice = await vscode.window.showWarningMessage(
           incompleteSourceWarning,
+          preserveAllSafely,
           continueSafely,
         );
-        if (choice === continueSafely) {
+        if (choice === preserveAllSafely) {
+          await this.preserveAllUnavailableChatsSafely();
+        } else if (choice === continueSafely) {
           await this.continueUnavailableChatSafely(lackingSourceDamage);
         }
         return;
@@ -2286,10 +2913,13 @@ export class SyncManager implements vscode.Disposable {
           completePendingResourceIds.size === 1 ? " already has" : "s already have"
         } a verified complete v2 copy queued and can be applied now.`,
         restart,
+        preserveAllSafely,
         continueSafely,
       );
       if (choice === restart) {
         await this.restartToApply();
+      } else if (choice === preserveAllSafely) {
+        await this.preserveAllUnavailableChatsSafely();
       } else if (choice === continueSafely) {
         await this.continueUnavailableChatSafely(lackingSourceDamage);
       }
@@ -7949,6 +8579,280 @@ function sameBrokenChatInspectionCursor(
     return Buffer.from(leftId).equals(Buffer.from(rightId));
   }
   return leftId === rightId;
+}
+
+type RecoveryCatalogCounts = Record<RecoveryCatalogStatus, number>;
+
+interface RecoveryCatalogBuildResult {
+  counts: RecoveryCatalogCounts;
+  examinedChats: number;
+  auditUnknownChats: number;
+  cancelled: boolean;
+  incomplete: boolean;
+  databaseChanged: boolean;
+  retiredEntries: number;
+  catalogEntryCount: number;
+  catalogReadyEntries: number;
+  catalogReadyArtifactBytes: number;
+  quotaReached: RecoveryCatalogLimitReason | null;
+  indexPath: string | null;
+}
+
+function recoveryCatalogState(catalog: RecoveryCatalogResult): {
+  catalogEntryCount: number;
+  catalogReadyEntries: number;
+  catalogReadyArtifactBytes: number;
+} {
+  return {
+    catalogEntryCount: catalog.capacity.entryCount,
+    catalogReadyEntries: catalog.manifest.entries.filter(
+      (entry) => entry.status === "ready",
+    ).length,
+    catalogReadyArtifactBytes: catalog.capacity.readyArtifactBytes,
+  };
+}
+
+function emptyRecoveryCatalogCounts(): RecoveryCatalogCounts {
+  return {
+    ready: 0,
+    "skipped-limit": 0,
+    "skipped-body": 0,
+    changed: 0,
+    unknown: 0,
+  };
+}
+
+function recoveryCatalogProcessedCount(
+  counts: RecoveryCatalogCounts,
+): number {
+  return (
+    counts.ready +
+    counts["skipped-limit"] +
+    counts["skipped-body"] +
+    counts.changed +
+    counts.unknown
+  );
+}
+
+function recoveryCatalogCompletionSummary(
+  result: RecoveryCatalogBuildResult,
+): string {
+  const processed = recoveryCatalogProcessedCount(result.counts);
+  const prefix = result.cancelled
+    ? `Cancelled at an item boundary after cataloguing ${processed} conversation${processed === 1 ? "" : "s"}. Completed catalog checkpoints were kept.`
+    : result.quotaReached !== null
+      ? `Stopped cleanly at the bounded recovery catalog ${recoveryCatalogQuotaLabel(result.quotaReached)} quota after cataloguing ${processed} conversation${processed === 1 ? "" : "s"}. Completed catalog checkpoints were kept.${recoveryCatalogQuotaDetail(result.quotaReached)}`
+      : result.databaseChanged
+        ? `Cursor's live chat database changed during the multi-page audit. ${processed} verified catalog checkpoint${processed === 1 ? " was" : "s were"} kept, but the result is intentionally incomplete; run Preserve All Recoverable Chats Safely again for a stable full pass.`
+      : result.incomplete
+      ? `Stopped at the bounded bulk command limit after cataloguing ${processed} conversation${processed === 1 ? "" : "s"}. Completed catalog checkpoints were kept.`
+      : `Finished the bounded audit of ${result.examinedChats} continuation record${result.examinedChats === 1 ? "" : "s"} and catalogued ${processed} definite continuation-damaged conversation${processed === 1 ? "" : "s"}.`;
+  const details = [
+    `${result.counts.ready} ready`,
+    `${result.counts["skipped-limit"]} skipped by a recovery safety limit`,
+    `${result.counts["skipped-body"]} skipped because visible message bodies were not safely recoverable`,
+    `${result.counts.changed} changed during verification`,
+    `${result.counts.unknown} failed closed for another reason`,
+  ];
+  const auditUnknown =
+    result.auditUnknownChats === 0
+      ? ""
+      : ` The continuation audit could not safely classify ${result.auditUnknownChats} additional record${result.auditUnknownChats === 1 ? "" : "s"}; they were not treated as healthy or catalogued.`;
+  const retired =
+    result.retiredEntries === 0
+      ? ""
+      : ` ${result.retiredEntries} previously cataloged entr${result.retiredEntries === 1 ? "y was" : "ies were"} retired because a stable full pass no longer found definite continuation damage.`;
+  const storage =
+    result.catalogReadyEntries === 0
+      ? ` The local catalog currently has ${result.catalogEntryCount} entr${result.catalogEntryCount === 1 ? "y" : "ies"} and no ready plaintext artifact.`
+      : ` The local catalog currently has ${result.catalogReadyEntries} ready plaintext artifact${result.catalogReadyEntries === 1 ? "" : "s"} (${formatBytes(result.catalogReadyArtifactBytes)} currently referenced) across ${result.catalogEntryCount} entr${result.catalogEntryCount === 1 ? "y" : "ies"}. Catalog artifacts and any obsolete content-addressed derivatives remain in the local recovery-transcripts folder until you explicitly delete those recovery files. The original chats were not changed and no Agent or prompt was created.`;
+  return `${prefix} ${details.join(", ")}.${auditUnknown}${retired}${storage}`;
+}
+
+function recoveryCatalogQuotaDetail(
+  reason: RecoveryCatalogLimitReason,
+): string {
+  switch (reason) {
+    case "artifact-bytes":
+      return " This quota counts files referenced by the current ready catalog; obsolete or rejected content-addressed derivatives may remain in the local recovery-transcripts folder until you explicitly delete those recovery files.";
+    case "physical-artifact-bytes":
+    case "physical-artifact-files":
+    case "physical-inventory":
+      return " This physical quota counts all final, obsolete/rejected, and recognized atomic-partial files in the isolated catalog artifact tree.";
+    case "metadata-partial-bytes":
+    case "metadata-partial-files":
+      return " This separate quota bounds retained manifest/index atomic-write partials; remove those recovery-transcripts files explicitly if you no longer need them.";
+    case "entries":
+    case "manifest-bytes":
+    case "manifest-structure":
+      return "";
+  }
+}
+
+function recoveryCatalogQuotaLabel(
+  reason: RecoveryCatalogLimitReason,
+): string {
+  switch (reason) {
+    case "entries":
+      return `${RECOVERY_CATALOG_LIMITS.maxEntries}-entry`;
+    case "artifact-bytes":
+      return formatBytes(RECOVERY_CATALOG_LIMITS.maxReadyArtifactBytes);
+    case "manifest-bytes":
+      return formatBytes(RECOVERY_CATALOG_LIMITS.maxManifestBytes);
+    case "manifest-structure":
+      return "manifest-structure";
+    case "physical-artifact-bytes":
+      return `${formatBytes(RECOVERY_CATALOG_LIMITS.maxPhysicalArtifactBytes)} physical-artifact`;
+    case "physical-artifact-files":
+      return `${RECOVERY_CATALOG_LIMITS.maxPhysicalArtifactFiles}-physical-file`;
+    case "physical-inventory":
+      return "physical-inventory safety";
+    case "metadata-partial-bytes":
+      return `${formatBytes(RECOVERY_CATALOG_LIMITS.maxMetadataPartialBytes)} metadata-partial`;
+    case "metadata-partial-files":
+      return `${RECOVERY_CATALOG_LIMITS.maxMetadataPartialFiles}-metadata-partial-file`;
+  }
+}
+
+function recoveryCatalogExtractionFailureStatus(
+  error: unknown,
+): RecoveryCatalogStatus {
+  const message = recoveryCatalogErrorMessage(error).toLowerCase();
+  if (message.includes("changed")) {
+    return "changed";
+  }
+  if (
+    message.includes("limit") ||
+    message.includes("exceed") ||
+    message.includes("oversized")
+  ) {
+    return "skipped-limit";
+  }
+  if (
+    message.includes("visible") ||
+    message.includes("referenced") ||
+    message.includes("message") ||
+    message.includes("recoverable user")
+  ) {
+    return "skipped-body";
+  }
+  return "unknown";
+}
+
+function recoveryCatalogArtifactFailureStatus(
+  error: unknown,
+): RecoveryCatalogStatus {
+  const message = recoveryCatalogErrorMessage(error).toLowerCase();
+  if (message.includes("changed") || message.includes("disappeared")) {
+    return "changed";
+  }
+  if (
+    message.includes("limit") ||
+    message.includes("exceed") ||
+    message.includes("oversized")
+  ) {
+    return "skipped-limit";
+  }
+  return "unknown";
+}
+
+function recoveryCatalogErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function recoveryCatalogCancellationRequested(
+  token: vscode.CancellationToken | undefined,
+): boolean {
+  return token?.isCancellationRequested === true;
+}
+
+function recoveryCatalogLastUpdatedAt(value: unknown): number | null {
+  return typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0 &&
+    value <= 8_640_000_000_000_000
+    ? value
+    : null;
+}
+
+interface CursorDatabaseGenerationMonitor {
+  database: DatabaseSync;
+  databasePath: string;
+  file: FileHandle;
+  device: bigint;
+  inode: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+  initialDataVersion: number;
+}
+
+async function openCursorDatabaseGenerationMonitor(
+  databasePath: string,
+): Promise<CursorDatabaseGenerationMonitor> {
+  const file = await openFile(databasePath, "r");
+  let database: DatabaseSync | undefined;
+  try {
+    const identity = await file.stat({ bigint: true });
+    database = openDatabase(databasePath, { readOnly: true });
+    database.exec("PRAGMA busy_timeout=2000");
+    database.exec("PRAGMA query_only=ON");
+    return {
+      database,
+      databasePath,
+      file,
+      device: identity.dev,
+      inode: identity.ino,
+      size: identity.size,
+      mtimeNs: identity.mtimeNs,
+      ctimeNs: identity.ctimeNs,
+      initialDataVersion: readCursorDatabaseDataVersion(database),
+    };
+  } catch (error) {
+    database?.close();
+    await file.close();
+    throw error;
+  }
+}
+
+async function cursorDatabaseGenerationMonitorChanged(
+  monitor: CursorDatabaseGenerationMonitor,
+): Promise<boolean> {
+  const [held, current] = await Promise.all([
+    monitor.file.stat({ bigint: true }),
+    stat(monitor.databasePath, { bigint: true }),
+  ]);
+  return (
+    readCursorDatabaseDataVersion(monitor.database) !==
+      monitor.initialDataVersion ||
+    held.dev !== monitor.device ||
+    held.ino !== monitor.inode ||
+    held.size !== monitor.size ||
+    held.mtimeNs !== monitor.mtimeNs ||
+    held.ctimeNs !== monitor.ctimeNs ||
+    current.dev !== monitor.device ||
+    current.ino !== monitor.inode ||
+    current.size !== monitor.size ||
+    current.mtimeNs !== monitor.mtimeNs ||
+    current.ctimeNs !== monitor.ctimeNs
+  );
+}
+
+function readCursorDatabaseDataVersion(database: DatabaseSync): number {
+  const row = database.prepare("PRAGMA data_version").get() as
+    | Record<string, unknown>
+    | undefined;
+  const raw = row?.data_version;
+  const value =
+    typeof raw === "bigint" &&
+    raw <= BigInt(Number.MAX_SAFE_INTEGER) &&
+    raw >= BigInt(Number.MIN_SAFE_INTEGER)
+      ? Number(raw)
+      : raw;
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new Error("Cursor's chat database generation could not be read safely.");
+  }
+  return value;
 }
 
 function chatRepairAuditProgressDetail(

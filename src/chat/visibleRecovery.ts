@@ -15,6 +15,8 @@ import {
 import {
   auditChatReferences,
   readPortableChatSnapshotBounded,
+  type BrokenChatInspectionCursor,
+  type ComposerIdStorageClass,
 } from "./repair";
 import {
   isSyncableComposerId,
@@ -49,6 +51,8 @@ export interface VisibleChatRecoveryExpectation {
   chatCoreHash?: string;
   /** Exact referenced-row state observed by a prior visible-row audit. */
   referenceFingerprint?: string;
+  /** Exact SQLite storage identity observed by the continuation audit. */
+  composerCursor?: BrokenChatInspectionCursor;
 }
 
 export interface VisibleChatRecoveryTranscript {
@@ -88,6 +92,28 @@ export interface VisibleChatRecoveryImageArtifact {
   mimeType: "image/png";
   byteLength: number;
 }
+
+interface VisibleChatRecoveryCatalogReservation {
+  /**
+   * Catalog build-session reservation invoked exactly once after every source
+   * byte is verified, but before the first artifact file is written.
+   */
+  beforeCatalogWrite: (
+    totalBytes: number,
+    fileCount: number,
+  ) => void | Promise<void>;
+}
+
+export type VisibleChatRecoveryArtifactOptions =
+  | {
+      namespace?: "standalone";
+      beforeCatalogWrite?: never;
+      composerStorageClass?: never;
+    }
+  | ({
+      namespace: "catalog";
+      composerStorageClass: ComposerIdStorageClass;
+    } & VisibleChatRecoveryCatalogReservation);
 
 export interface CursorCommandBridge {
   getCommands(filterInternal?: boolean): Thenable<string[]>;
@@ -170,6 +196,7 @@ export function extractVisibleChatRecoveryTranscript(
         database,
         composerId,
         normalizedLimits.maxSnapshotBytes,
+        expectation.composerCursor,
       );
       if (bounded.status !== "known") {
         throw new Error(
@@ -388,6 +415,7 @@ export async function writeVisibleChatRecoveryArtifact(
   extensionStorage: string,
   workspaceStorageRoot: string,
   transcript: VisibleChatRecoveryTranscript,
+  options: VisibleChatRecoveryArtifactOptions = {},
 ): Promise<VisibleChatRecoveryArtifact> {
   const verifiedImages = await verifySelectedImages(
     workspaceStorageRoot,
@@ -395,7 +423,35 @@ export async function writeVisibleChatRecoveryArtifact(
   );
   const finalBytes = appendVerifiedImageManifest(transcript, verifiedImages);
   const finalHash = sha256(finalBytes);
-  const recoveryDirectory = `recovery-transcripts/recovered-${transcript.composerId}`;
+  const recoveryRoot =
+    options.namespace === "catalog"
+      ? "recovery-transcripts/catalog-v1-artifacts"
+      : "recovery-transcripts";
+  const recoveryDirectory =
+    options.namespace === "catalog"
+      ? `${recoveryRoot}/recovered-${visibleRecoveryCatalogComposerKey(transcript.composerId, options.composerStorageClass)}`
+      : `${recoveryRoot}/recovered-${transcript.composerId}`;
+  const repairExisting = options.namespace === "catalog";
+  if (options.namespace === "catalog" && options.beforeCatalogWrite === undefined) {
+    throw new Error(
+      "A recovery catalog write requires a physical-quota reservation.",
+    );
+  }
+  if (options.namespace !== "catalog" && "beforeCatalogWrite" in options) {
+    throw new Error(
+      "A recovery catalog write reservation requires the catalog namespace.",
+    );
+  }
+  if (options.namespace === "catalog") {
+    await options.beforeCatalogWrite(
+      finalBytes.byteLength +
+        verifiedImages.reduce(
+          (total, image) => total + image.bytes.byteLength,
+          0,
+        ),
+      verifiedImages.length + 1,
+    );
+  }
   const imageAttachments: VisibleChatRecoveryImageArtifact[] = [];
   for (const image of verifiedImages) {
     const imageRelativePath = `${recoveryDirectory}/image-${image.hash}${image.suffix}`;
@@ -405,6 +461,7 @@ export async function writeVisibleChatRecoveryArtifact(
       imageRelativePath,
       image.bytes,
       image.hash,
+      repairExisting,
     );
     imageAttachments.push({
       path: imagePath,
@@ -420,8 +477,17 @@ export async function writeVisibleChatRecoveryArtifact(
     relativePath,
     finalBytes,
     finalHash,
+    repairExisting,
   );
   return { path, transcriptHash: finalHash, imageAttachments };
+}
+
+/** Case-sensitive composer identity encoded into a case-insensitive-safe path. */
+export function visibleRecoveryCatalogComposerKey(
+  composerId: string,
+  storageClass: ComposerIdStorageClass,
+): string {
+  return sha256(Buffer.from(`${storageClass}\0${composerId}`, "utf8"));
 }
 
 async function writeAndVerifyContentAddressedFile(
@@ -429,7 +495,9 @@ async function writeAndVerifyContentAddressedFile(
   relativePath: string,
   bytes: Buffer,
   expectedHash: string,
+  repairExisting: boolean,
 ): Promise<void> {
+  let existed = false;
   try {
     await writeFileAtomicWithinRoot(
       extensionStorage,
@@ -441,6 +509,18 @@ async function writeAndVerifyContentAddressedFile(
     if (!isAlreadyExistsError(error)) {
       throw error;
     }
+    existed = true;
+  }
+  if (existed && repairExisting) {
+    // Refresh the exact catalog-owned derivative before it is exposed to a
+    // later manifest update. The fresh timestamp is also an in-flight marker
+    // for another window's grace-bounded orphan cleanup.
+    await writeFileAtomicWithinRoot(
+      extensionStorage,
+      relativePath,
+      bytes,
+      true,
+    );
   }
   let readBack: Buffer;
   try {
@@ -450,13 +530,44 @@ async function writeAndVerifyContentAddressedFile(
       bytes.byteLength,
     );
   } catch (error) {
-    if (isMissingPathError(error)) {
-      throw new Error(
-        "The recovered transcript disappeared before verification.",
-        { cause: error },
-      );
+    if (!repairExisting) {
+      if (isMissingPathError(error)) {
+        throw new Error(
+          "The recovered transcript disappeared before verification.",
+          { cause: error },
+        );
+      }
+      throw error;
     }
-    throw error;
+    await writeFileAtomicWithinRoot(
+      extensionStorage,
+      relativePath,
+      bytes,
+      true,
+    );
+    readBack = await readFileWithinRoot(
+      extensionStorage,
+      relativePath,
+      bytes.byteLength,
+    );
+  }
+  if (
+    repairExisting &&
+    (readBack.byteLength !== bytes.byteLength ||
+      sha256(readBack) !== expectedHash ||
+      !readBack.equals(bytes))
+  ) {
+    await writeFileAtomicWithinRoot(
+      extensionStorage,
+      relativePath,
+      bytes,
+      true,
+    );
+    readBack = await readFileWithinRoot(
+      extensionStorage,
+      relativePath,
+      bytes.byteLength,
+    );
   }
   if (
     readBack.byteLength !== bytes.byteLength ||

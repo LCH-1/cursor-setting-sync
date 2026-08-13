@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -8,8 +8,10 @@ const ui = vi.hoisted(() => ({
   answers: [] as Array<((labels: string[]) => number | undefined) | undefined>,
   offered: [] as Array<{ title: string; labels: string[] }>,
   confirmations: [] as string[],
+  warningOffers: [] as string[][],
   information: [] as string[],
   progressReports: [] as string[],
+  workspaceUris: [] as string[],
   warningChoice: undefined as string | undefined,
   informationChoice: undefined as string | undefined,
 }));
@@ -18,12 +20,20 @@ vi.mock("vscode", () => ({
   ProgressLocation: { Notification: 15 },
   extensions: { all: [] },
   workspace: {
+    get workspaceFolders() {
+      return ui.workspaceUris.map((value) => ({
+        uri: { toString: () => value },
+      }));
+    },
     registerTextDocumentContentProvider: () => ({ dispose: () => undefined }),
   },
   window: {
     withProgress: async (
       _options: unknown,
-      task: (progress: { report: (value: unknown) => void }) => Promise<unknown>,
+      task: (
+        progress: { report: (value: unknown) => void },
+        token: { isCancellationRequested: boolean },
+      ) => Promise<unknown>,
     ) =>
       task({
         report: (value: unknown) => {
@@ -35,7 +45,7 @@ vi.mock("vscode", () => ({
             ui.progressReports.push((value as { message: string }).message);
           }
         },
-      }),
+      }, { isCancellationRequested: false }),
     showQuickPick: async (
       items: Array<{ label: string }>,
       options: { title?: string },
@@ -48,6 +58,9 @@ vi.mock("vscode", () => ({
     },
     showWarningMessage: async (message: string, ...args: unknown[]) => {
       ui.confirmations.push(message);
+      ui.warningOffers.push(
+        args.filter((argument): argument is string => typeof argument === "string"),
+      );
       if (
         ui.warningChoice !== undefined &&
         args.includes(ui.warningChoice)
@@ -68,7 +81,10 @@ vi.mock("vscode", () => ({
     },
   },
   commands: { executeCommand: async () => undefined },
-  Uri: { parse: (value: string) => ({ toString: () => value }) },
+  Uri: {
+    parse: (value: string) => ({ toString: () => value }),
+    file: (value: string) => ({ fsPath: value, toString: () => `file://${value}` }),
+  },
 }));
 
 import { SyncManager } from "../src/sync/manager";
@@ -102,8 +118,10 @@ beforeEach(() => {
   ui.answers.length = 0;
   ui.offered.length = 0;
   ui.confirmations.length = 0;
+  ui.warningOffers.length = 0;
   ui.information.length = 0;
   ui.progressReports.length = 0;
+  ui.workspaceUris.length = 0;
   ui.warningChoice = undefined;
   ui.informationChoice = undefined;
 });
@@ -843,6 +861,110 @@ describe("Repair Unavailable Chats command", () => {
         "then run Sync Now on this PC and choose Restart to Apply",
       );
       expect(warning).not.toContain(fixture.rootId);
+      expect(ui.warningOffers[0]).toEqual([
+        "Preserve All Safely",
+        "Continue Safely in New Agent",
+      ]);
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
+
+  it("routes the primary missing-source action to bounded bulk preservation", async () => {
+    const fixture = await createContinuationRepairFixture("missing");
+    try {
+      const preserve = vi
+        .spyOn(fixture.manager, "preserveAllUnavailableChatsSafely")
+        .mockResolvedValue();
+      ui.warningChoice = "Preserve All Safely";
+
+      await fixture.manager.repairUnavailableChats();
+
+      expect(preserve).toHaveBeenCalledOnce();
+      expect(ui.warningOffers[0]?.[0]).toBe("Preserve All Safely");
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
+
+  it("preserves every definite continuation-damaged chat without creating an Agent", async () => {
+    const fixture = await createContinuationRepairFixture("missing");
+    try {
+      ui.warningChoice = "Preserve All Safely";
+
+      await fixture.manager.preserveAllUnavailableChatsSafely();
+
+      expect(ui.confirmations[0]).toContain("plaintext");
+      const manifestPath = join(
+        fixture.extensionStorage,
+        "recovery-transcripts",
+        "catalog-v1.json",
+      );
+      const firstManifestText = await readFile(manifestPath, "utf8");
+      const manifest = JSON.parse(firstManifestText) as {
+        entries: Array<{
+          artifact?: unknown;
+          chatCoreHash: string;
+          composerId: string;
+          damageFingerprint: string;
+          lastUpdatedAt: number | null;
+          status: string;
+          title: string | null;
+        }>;
+      };
+      expect(manifest.entries).toHaveLength(1);
+      const entry = manifest.entries[0];
+      expect(entry?.composerId).toBe(
+        "66666666-6666-4666-8666-666666666666",
+      );
+      expect(entry?.status).toBe("ready");
+      expect(entry?.chatCoreHash).toMatch(/^[0-9a-f]{64}$/u);
+      expect(entry?.damageFingerprint).toMatch(/^[0-9a-f]{64}$/u);
+      expect(entry?.lastUpdatedAt).toBe(20);
+      expect(entry?.title).toBe("Continuation chat");
+      expect(entry?.artifact).toBeDefined();
+      expect(ui.information.at(-1)).toContain("1 ready");
+
+      await fixture.manager.preserveAllUnavailableChatsSafely();
+      expect(await readFile(manifestPath, "utf8")).toBe(firstManifestText);
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
+
+  it("refuses a stale catalog entry before creating or attaching to an Agent", async () => {
+    const fixture = await createContinuationRepairFixture("missing");
+    try {
+      ui.warningChoice = "Preserve All Safely";
+      await fixture.manager.preserveAllUnavailableChatsSafely();
+      const database = new DatabaseSync(fixture.globalDatabase);
+      database
+        .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+        .run(`agentKv:blob:${fixture.rootId}`, Buffer.from("portable continuation root"));
+      database.close();
+      await fixture.manager.preserveAllUnavailableChatsSafely();
+      const staleManifest = JSON.parse(
+        await readFile(
+          join(
+            fixture.extensionStorage,
+            "recovery-transcripts",
+            "catalog-v1.json",
+          ),
+          "utf8",
+        ),
+      ) as { entries: Array<{ status: string }> };
+      expect(staleManifest.entries[0]?.status).toBe("ready");
+      ui.warningChoice = undefined;
+      ui.answers.push(() => 0);
+      ui.workspaceUris.push("file:///C:/work/project-a");
+
+      await fixture.manager.openRecoveredChatSafely();
+
+      expect(ui.offered.at(-1)?.title).toBe("Open Recovered Chat Safely");
+      expect(ui.confirmations.at(-1)).toContain(
+        "now complete or changed",
+      );
+      expect(ui.confirmations.at(-1)).toContain("No Agent was created");
     } finally {
       fixture.manager.dispose();
     }
@@ -1187,6 +1309,7 @@ async function createContinuationRepairFixture(
   repository: SyncRepository;
   rootId: string;
   globalDatabase: string;
+  extensionStorage: string;
 }> {
   const root = await mkdtemp(join(tmpdir(), "cursor-continuation-command-"));
   temporaryRoots.push(root);
@@ -1271,7 +1394,15 @@ async function createContinuationRepairFixture(
         isSubagent, recency, checkpointAt, value
       ) VALUES (?, 'project-a', 1, 20, 0, 0, 0, NULL, ?)`,
     )
-    .run(composerId, JSON.stringify({ name: "Continuation chat" }));
+    .run(
+      composerId,
+      JSON.stringify({
+        name: "Continuation chat",
+        workspaceIdentifier: {
+          uri: { external: "file:///C:/work/project-a" },
+        },
+      }),
+    );
   database
     .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
     .run(
@@ -1284,7 +1415,10 @@ async function createContinuationRepairFixture(
     );
   database
     .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
-    .run(`bubbleId:${composerId}:a`, JSON.stringify({ text: "renderable" }));
+    .run(
+      `bubbleId:${composerId}:a`,
+      JSON.stringify({ type: 1, text: "renderable" }),
+    );
   if (mode === "healthy") {
     database
       .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
@@ -1292,9 +1426,10 @@ async function createContinuationRepairFixture(
   }
   database.close();
 
+  const extensionStorage = join(root, "extension-storage");
   const paths = {
     globalDatabase,
-    extensionStorage: join(root, "extension-storage"),
+    extensionStorage,
     helperScript: join(root, "helper.js"),
   } as unknown as CursorPaths;
   const compatibility = {
@@ -1338,7 +1473,7 @@ async function createContinuationRepairFixture(
   internals.openGitWindow = vi.fn(async () => false);
   internals.commitGitWindow = vi.fn(async () => undefined);
   internals.syncNow = vi.fn(async () => undefined);
-  return { manager, repository, rootId, globalDatabase };
+  return { manager, repository, rootId, globalDatabase, extensionStorage };
 }
 
 function continuationChatSnapshot(
@@ -1361,7 +1496,12 @@ function continuationChatSnapshot(
       isSubagent: 0,
       recency: 0,
       checkpointAt: null,
-      value: JSON.stringify({ name: title }),
+      value: JSON.stringify({
+        name: title,
+        workspaceIdentifier: {
+          uri: { external: "file:///C:/work/project-a" },
+        },
+      }),
     },
     composerData: {
       key: `composerData:${composerId}`,
@@ -1378,7 +1518,7 @@ function continuationChatSnapshot(
       {
         key: `bubbleId:${composerId}:a`,
         valueBase64: Buffer.from(
-          JSON.stringify({ text: "renderable" }),
+          JSON.stringify({ type: 1, text: "renderable" }),
           "utf8",
         ).toString("base64"),
         valueType: "text" as const,

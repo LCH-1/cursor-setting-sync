@@ -2,11 +2,21 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.66] - 2026-08-13
+
+### Added
+
+- **Hundreds of continuation-damaged chats can now be preserved in one bounded, cancellable pass.** When no exact synchronized source or backup can repair the original chat in place, **Preserve All Recoverable Chats Safely** creates a checkpointed fallback catalog without opening hundreds of Agents, rewriting original conversation rows, writing Cursor's database, or sending prompts. Its plaintext can include message text, thinking/error state, inert tool inputs/results/status, source selections and URIs, todos and new/original-file work state, and selected PNGs. The manifest is capped at 2,000 current entries and 512 MiB of currently referenced ready files; final, obsolete/rejected, and recognized atomic-partial artifact-tree files separately share a hard 512 MiB/130,000-entry cap, while retained manifest/index partials have a 32 MiB/16-entry cap. **Open Recovered Chat Safely** revalidates the original workspace, selected live conversation, and every stored file immediately before preparing one empty Agent. Recovery files remain until the user explicitly removes the local `recovery-transcripts` folder or its files.
+
+### Fixed
+
+- **Unavailable-chat repair now reports bounded audit reasons precisely and cannot strand later damage behind an earlier batch.** Exact, warning-free compatible stored sources still take the automatic in-place repair path. Chats without that source stay unchanged and can be preserved only through the explicit local-catalog fallback; unreadable, structural-limit, cancellation, database-race, corrupt-artifact, and storage-quota cases all fail closed without being mislabeled as healthy or ready.
+
 ## [0.0.65] - 2026-08-13
 
 ### Added
 
-- **An unavailable conversation whose continuation blobs no longer exist can now continue safely in a new Agent without rewriting the damaged chat.** **Continue Unavailable Chat Safely** verifies every visible row in a read-only transaction, rechecks the continuation damage immediately before export, and creates a bounded plaintext Markdown context containing the recoverable user and assistant text, thinking and error state, inert tool inputs/results/status, deduplicated source selections, and allowlisted composer work state. A surviving selected PNG is validated byte-for-byte, copied content-addressed, and attached beside the Markdown file. Nothing is submitted automatically, and the original composer and Cursor database remain unchanged. The local plaintext recovery artifacts remain in extension storage until the user deletes them.
+- **An unavailable conversation whose continuation blobs no longer exist can now continue safely in a new Agent without rewriting the damaged chat.** **Continue Unavailable Chat Safely** verifies every visible row in a read-only transaction, rechecks the continuation damage immediately before export, and creates a bounded plaintext Markdown context containing the recoverable user and assistant text, thinking and error state, inert tool inputs/results/status, deduplicated source selections, and allowlisted composer work state. A surviving selected PNG is validated byte-for-byte, copied content-addressed, and attached beside the Markdown file. Nothing is submitted automatically, and the extension does not rewrite the original conversation rows. Cursor may persist the newly opened empty Agent itself. The local plaintext recovery artifacts remain in extension storage until the user deletes them.
 
 ### Fixed
 

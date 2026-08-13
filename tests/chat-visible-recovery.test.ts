@@ -17,6 +17,9 @@ import {
   writeVisibleChatRecoveryArtifact,
   type CursorCommandBridge,
 } from "../src/chat/visibleRecovery";
+import {
+  upsertRecoveryCatalogEntry,
+} from "../src/chat/recoveryCatalog";
 
 const COMPOSER_ID = "ffc51e9b-99b9-45b5-a20c-202d36102fe0";
 const REMOTE_URI =
@@ -452,6 +455,149 @@ describe("visible-row continuation recovery", () => {
       ),
     ).rejects.toThrow(/size limit/i);
     expect(await readdir(boundedStorage)).toEqual([]);
+  });
+
+  it("heals corrupt catalog-owned content-addressed files without touching standalone files", async () => {
+    const fixture = await createCalendarFixture();
+    const recovery = extractVisibleChatRecoveryTranscript(
+      fixture.databasePath,
+      COMPOSER_ID,
+    );
+    const storage = join(fixture.root, "extension-storage");
+    await mkdir(storage);
+    const standalone = await writeVisibleChatRecoveryArtifact(
+      storage,
+      fixture.workspaceStorageRoot,
+      recovery,
+    );
+    const catalog = await writeVisibleChatRecoveryArtifact(
+      storage,
+      fixture.workspaceStorageRoot,
+      recovery,
+      {
+        namespace: "catalog",
+        composerStorageClass: "text",
+        beforeCatalogWrite: () => {},
+      },
+    );
+    await writeFile(catalog.path, "corrupt transcript", "utf8");
+    await writeFile(catalog.imageAttachments[0]!.path, "corrupt image", "utf8");
+
+    const healed = await writeVisibleChatRecoveryArtifact(
+      storage,
+      fixture.workspaceStorageRoot,
+      recovery,
+      {
+        namespace: "catalog",
+        composerStorageClass: "text",
+        beforeCatalogWrite: () => {},
+      },
+    );
+
+    expect(healed).toEqual(catalog);
+    expect(await readFile(healed.path, "utf8")).toContain(
+      "Verified selected image attachments",
+    );
+    expect(await readFile(healed.imageAttachments[0]!.path)).toEqual(
+      ONE_PIXEL_PNG,
+    );
+    expect(await readFile(standalone.path, "utf8")).toContain(
+      "Verified selected image attachments",
+    );
+    expect(await readFile(standalone.imageAttachments[0]!.path)).toEqual(
+      ONE_PIXEL_PNG,
+    );
+  });
+
+  it("isolates standalone artifacts from catalog validation and cleanup", async () => {
+    const fixture = await createCalendarFixture();
+    const recovery = extractVisibleChatRecoveryTranscript(
+      fixture.databasePath,
+      COMPOSER_ID,
+    );
+    const storage = join(fixture.root, "extension-storage");
+    await mkdir(storage);
+    const standalone = await writeVisibleChatRecoveryArtifact(
+      storage,
+      fixture.workspaceStorageRoot,
+      recovery,
+    );
+    const catalog = await writeVisibleChatRecoveryArtifact(
+      storage,
+      fixture.workspaceStorageRoot,
+      recovery,
+      {
+        namespace: "catalog",
+        composerStorageClass: "text",
+        beforeCatalogWrite: () => {},
+      },
+    );
+    const standaloneTranscript = await readFile(standalone.path);
+    const standaloneImage = await readFile(standalone.imageAttachments[0]!.path);
+    const input = {
+      composerId: COMPOSER_ID,
+      composerStorageClass: "text" as const,
+      chatCoreHash: "a".repeat(64),
+      damageFingerprint: "b".repeat(64),
+      title: "isolated",
+      status: "ready" as const,
+    };
+    await expect(
+      upsertRecoveryCatalogEntry(storage, {
+        ...input,
+        artifact: standalone,
+      }),
+    ).rejects.toThrow(/path is not content-addressed/iu);
+    await upsertRecoveryCatalogEntry(storage, { ...input, artifact: catalog });
+    await upsertRecoveryCatalogEntry(storage, {
+      ...input,
+      status: "changed",
+    });
+    // Catalog replacement changes only the manifest. Its content-addressed
+    // derivatives are retained for a later explicit/maintenance policy, and
+    // the standalone namespace is never a cleanup target.
+    expect(await readFile(catalog.path, "utf8")).toContain(
+      "Verified selected image attachments",
+    );
+    expect(await readFile(catalog.imageAttachments[0]!.path)).toEqual(
+      ONE_PIXEL_PNG,
+    );
+    expect(await readFile(standalone.path)).toEqual(standaloneTranscript);
+    expect(await readFile(standalone.imageAttachments[0]!.path)).toEqual(
+      standaloneImage,
+    );
+  });
+
+  it("rejects a catalog reservation before writing its first artifact", async () => {
+    const fixture = await createCalendarFixture();
+    const recovery = extractVisibleChatRecoveryTranscript(
+      fixture.databasePath,
+      COMPOSER_ID,
+    );
+    const storage = join(fixture.root, "extension-storage");
+    await mkdir(storage);
+    const reserve = vi.fn(() => {
+      throw new Error("catalog capacity exhausted");
+    });
+
+    await expect(
+      writeVisibleChatRecoveryArtifact(
+        storage,
+        fixture.workspaceStorageRoot,
+        recovery,
+        {
+          namespace: "catalog",
+          composerStorageClass: "text",
+          beforeCatalogWrite: reserve,
+        },
+      ),
+    ).rejects.toThrow(/capacity exhausted/i);
+    expect(reserve).toHaveBeenCalledOnce();
+    expect(reserve).toHaveBeenCalledWith(
+      expect.any(Number),
+      recovery.selectedImages.length + 1,
+    );
+    expect(await readdir(storage)).toEqual([]);
   });
 
   it("validates selected PNG structure, dimensions, count, and aggregate bounds", async () => {

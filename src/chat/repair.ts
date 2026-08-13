@@ -145,6 +145,9 @@ export interface BrokenChatInspectionCursor {
   composerId: Exclude<SqliteStorageValue, null>;
 }
 
+/** Persistable storage-class half of an exact syncable composer identity. */
+export type ComposerIdStorageClass = "text" | "blob";
+
 export interface BrokenChatInspectionLimits {
   /** Maximum full damaged-chat snapshots retained by one command run. */
   maxRetainedChats: number;
@@ -176,6 +179,8 @@ export interface BrokenChatInspectionOptions {
 export interface ChatContinuationAuditLimits {
   /** Maximum syncable composer bodies materialized by one command run. */
   maxChats: number;
+  /** Maximum definite damaged-chat observations retained by one page. */
+  maxRetainedChats: number;
   /** Maximum canonical portable chat bytes materialized for one conversation. */
   maxSnapshotBytesPerChat: number;
   /** Maximum exact agentKv key lookups across the complete command run. */
@@ -194,6 +199,7 @@ export const DEFAULT_CHAT_CONTINUATION_AUDIT_LIMITS: Readonly<
   ChatContinuationAuditLimits
 > = Object.freeze({
   maxChats: 10_000,
+  maxRetainedChats: 10_000,
   maxSnapshotBytesPerChat:
     DEFAULT_BROKEN_CHAT_INSPECTION_LIMITS.maxRetainedBytes,
   maxRootProbes: 100_000,
@@ -205,8 +211,26 @@ export const DEFAULT_CHAT_CONTINUATION_AUDIT_LIMITS: Readonly<
 
 export interface ChatContinuationAuditOptions {
   limits?: Partial<ChatContinuationAuditLimits>;
-  /** Optional exact composer scope for a post-selection freshness recheck. */
+  /**
+   * Cooperative cancellation checked between composer rows and graph-node
+   * probes. Unscoped audits automatically use keyset order so a cancelled
+   * result can be resumed without skipping or duplicating a conversation.
+   */
+  isCancelled?: () => boolean;
+  /**
+   * Legacy decoded-text scope. A requested ID is skipped when more than one
+   * TEXT/BLOB header row decodes to it, so callers never select ambiguously.
+   */
   composerIds?: ReadonlySet<string>;
+  /** Exact SQLite header-row identity for a post-selection freshness recheck. */
+  composerCursor?: BrokenChatInspectionCursor;
+  /** Continue the deterministic composerId-primary-key-indexed walk. */
+  after?: BrokenChatInspectionCursor;
+  /**
+   * Stop before retaining the first damaged observation beyond the page cap.
+   * The returned cursor resumes at that exact row without a skip or duplicate.
+   */
+  pageAtRetentionLimit?: boolean;
 }
 
 export type ChatContinuationRootProbeResult = AgentKvBlobLookupResult;
@@ -236,7 +260,8 @@ export type ChatContinuationRootAudit =
         | "roots-per-chat-limit"
         | "root-probe-budget"
         | "graph-limit"
-        | "root-probe-failed";
+        | "root-probe-failed"
+        | "cancelled";
     };
 
 export interface ChatContinuationUnknownReasonCounts {
@@ -253,6 +278,8 @@ export interface ChatContinuationUnknownReasonCounts {
 export interface BrokenChatContinuationObservation {
   resourceId: string;
   composerId: string;
+  /** Exact SQLite storage-class identity of the audited composer header row. */
+  composerCursor: BrokenChatInspectionCursor;
   title: string | null;
   workspaceId: string | null;
   lastUpdatedAt: number | null;
@@ -279,6 +306,15 @@ export interface BrokenChatContinuationInspection {
   /** True when a configured command bound prevented a complete inspection. */
   limitReached: boolean;
   broken: BrokenChatContinuationObservation[];
+  /**
+   * Present for a keyset-paged call. Null means the ordered database walk
+   * completed; otherwise pass this exact cursor as the next call's `after`.
+   */
+  resumeAfter?: BrokenChatInspectionCursor | null;
+  /** Last ordered composer row fully consumed by a keyset-paged call. */
+  scannedThrough?: BrokenChatInspectionCursor | null;
+  /** True only when a keyset-paged call reached the end of its ordered walk. */
+  complete?: boolean;
 }
 
 export type ChatReferenceAudit =
@@ -360,6 +396,26 @@ export async function inspectBrokenChatContinuationsInDatabase(
   options?: ChatContinuationAuditOptions,
 ): Promise<BrokenChatContinuationInspection> {
   const limits = normalizeChatContinuationAuditLimits(options);
+  const after = options?.after;
+  const hasDecodedScope = options?.composerIds !== undefined;
+  const hasExactScope = options?.composerCursor !== undefined;
+  const cancellationAwareUnscopedWalk =
+    options?.isCancelled !== undefined && !hasDecodedScope && !hasExactScope;
+  const keysetWalk =
+    options?.pageAtRetentionLimit === true ||
+    after !== undefined ||
+    cancellationAwareUnscopedWalk;
+  const reportsProgress = keysetWalk || options?.isCancelled !== undefined;
+  if (hasDecodedScope && hasExactScope) {
+    throw new Error(
+      "A continuation audit cannot combine decoded and exact composer scopes.",
+    );
+  }
+  if (keysetWalk && (hasDecodedScope || hasExactScope)) {
+    throw new Error(
+      "A scoped continuation audit cannot be combined with keyset paging.",
+    );
+  }
   database.exec("BEGIN");
   try {
     let examinedChats = 0;
@@ -374,27 +430,52 @@ export async function inspectBrokenChatContinuationsInDatabase(
     let probedRootCount = 0;
     let limitReached = false;
     const broken: BrokenChatContinuationObservation[] = [];
-    const composers =
-      options?.composerIds === undefined
+    let resumeAfter: BrokenChatInspectionCursor | null = null;
+    let lastCompletedCursor = after ?? null;
+    let walkComplete = !cancellationRequested(options?.isCancelled);
+    const afterPredicate = after === undefined ? "" : " AND h.composerId > ?";
+    const composerOrder = keysetWalk
+      ? "h.composerId"
+      : `CASE
+           WHEN typeof(h.lastUpdatedAt) IN ('integer', 'real')
+             THEN h.lastUpdatedAt
+           ELSE NULL
+         END DESC,
+         CAST(h.composerId AS TEXT)`;
+    const composers = hasExactScope
+      ? database.prepare(
+          `SELECT h.composerId AS composerId,
+                  h.composerId AS sortComposerId
+             FROM composerHeaders h
+             JOIN cursorDiskKV d
+               ON d.key = 'composerData:' || CAST(h.composerId AS TEXT)
+            WHERE typeof(h.composerId) = ?
+              AND h.composerId = ? COLLATE BINARY
+              AND COALESCE(h.isSubagent, 0) = 0`,
+        )
+      : !hasDecodedScope
         ? database.prepare(
-            `SELECT h.composerId AS composerId
+            `SELECT h.composerId AS composerId,
+                    h.composerId AS sortComposerId
                FROM composerHeaders h
                JOIN cursorDiskKV d
                  ON d.key = 'composerData:' || CAST(h.composerId AS TEXT)
-              WHERE COALESCE(h.isSubagent, 0) = 0
-              ORDER BY CASE
-                         WHEN typeof(h.lastUpdatedAt) IN ('integer', 'real')
-                           THEN h.lastUpdatedAt
-                         ELSE NULL
-                       END DESC,
-                       CAST(h.composerId AS TEXT)`,
+               WHERE COALESCE(h.isSubagent, 0) = 0
+                     ${afterPredicate}
+               ORDER BY ${composerOrder}`,
           )
         : database.prepare(
-            `SELECT h.composerId AS composerId
+            `SELECT h.composerId AS composerId,
+                    h.composerId AS sortComposerId
                FROM composerHeaders h
                JOIN cursorDiskKV d
                  ON d.key = 'composerData:' || CAST(h.composerId AS TEXT)
-              WHERE h.composerId = ? AND COALESCE(h.isSubagent, 0) = 0`,
+              WHERE ((typeof(h.composerId) = 'text'
+                       AND h.composerId = ?1 COLLATE BINARY)
+                     OR (typeof(h.composerId) = 'blob'
+                         AND h.composerId = CAST(?1 AS BLOB)))
+                AND COALESCE(h.isSubagent, 0) = 0
+              LIMIT 2`,
           );
     const rootProbe = database.prepare(
       "SELECT key, " +
@@ -403,117 +484,223 @@ export async function inspectBrokenChatContinuationsInDatabase(
         "FROM cursorDiskKV WHERE key = ?",
     );
 
-    const composerRows =
-      options?.composerIds === undefined
-        ? composers.iterate()
-        : scopedComposerRows(composers, options.composerIds);
+    const composerRows = !walkComplete
+      ? []
+      : hasExactScope
+        ? exactScopedComposerRows(composers, options.composerCursor!)
+        : !hasDecodedScope
+          ? after === undefined
+            ? composers.iterate()
+            : composers.iterate(after.composerId)
+          : scopedComposerRows(composers, options.composerIds!);
     for (const row of composerRows as Iterable<{
       composerId: SqliteStorageValue;
+      sortComposerId: SqliteStorageValue;
     }>) {
-      const composerId = sqliteText(row.composerId);
-      if (composerId === null || !isSyncableComposerId(composerId)) {
-        continue;
-      }
-      if (examinedChats >= limits.maxChats) {
-        limitReached = true;
-        break;
-      }
-      examinedChats += 1;
-
-      let boundedSnapshot: BoundedPortableChatReadResult;
+      const sortComposerId = sqliteKeysetCursorValue(row.sortComposerId);
+      const rowCursor =
+        sortComposerId === null
+          ? null
+          : {
+              composerId: sortComposerId,
+            } satisfies BrokenChatInspectionCursor;
+      let rowCompleted = true;
       try {
-        boundedSnapshot = readPortableChatSnapshotBounded(
-          database,
-          composerId,
-          limits.maxSnapshotBytesPerChat,
-        );
-      } catch {
-        boundedSnapshot = { status: "unknown", limitReached: false };
-      }
-      if (boundedSnapshot.status === "unknown") {
-        unknownChats += 1;
-        if (boundedSnapshot.limitReached) {
-          unknownReasonCounts.snapshotSizeLimit += 1;
-        } else {
-          unknownReasonCounts.unreadable += 1;
-        }
-        limitReached ||= boundedSnapshot.limitReached;
-        continue;
-      }
-      const snapshot = boundedSnapshot.snapshot;
-
-      const remainingRootProbes = limits.maxRootProbes - probedRootCount;
-      const audit = await auditChatContinuationRootsWithLimits(
-        snapshot,
-        (key, remainingBytes) =>
-          probeAgentKvRootStorage(rootProbe, key, remainingBytes),
-        limits,
-        remainingRootProbes,
-      );
-      probedRootCount += audit.probedRootCount;
-      if (audit.status === "unknown") {
-        unknownChats += 1;
-        switch (audit.reason) {
-          case "conversation-state-json-structure-limit":
-            unknownReasonCounts.structuralWorkLimit += 1;
-            break;
-          case "conversation-state-limit":
-          case "roots-per-chat-limit":
-          case "root-probe-budget":
-          case "graph-limit":
-            unknownReasonCounts.otherSafetyLimit += 1;
-            break;
-          case "conversation-state-unreadable":
-          case "root-probe-failed":
-            unknownReasonCounts.unreadable += 1;
-            break;
-        }
-        if (
-          audit.reason === "conversation-state-limit" ||
-          audit.reason === "roots-per-chat-limit" ||
-          audit.reason === "root-probe-budget" ||
-          audit.reason === "graph-limit"
-        ) {
-          limitReached = true;
-        }
-        if (audit.reason === "root-probe-budget") {
+        if (cancellationRequested(options?.isCancelled)) {
+          walkComplete = false;
+          resumeAfter = lastCompletedCursor;
+          rowCompleted = false;
           break;
         }
-        continue;
+        const composerId = sqliteText(row.composerId);
+        if (
+          composerId === null ||
+          !isSyncableComposerId(composerId) ||
+          rowCursor === null
+        ) {
+          continue;
+        }
+        if (examinedChats >= limits.maxChats) {
+          // In a keyset page this aggregate work bound is resumable and is
+          // represented by complete=false plus an advancing cursor. It is not
+          // a hard per-chat safety failure.
+          limitReached ||= !keysetWalk;
+          walkComplete = false;
+          resumeAfter = lastCompletedCursor;
+          rowCompleted = false;
+          break;
+        }
+
+        let boundedSnapshot: BoundedPortableChatReadResult;
+        try {
+          boundedSnapshot = readPortableChatSnapshotBounded(
+            database,
+            composerId,
+            limits.maxSnapshotBytesPerChat,
+            rowCursor,
+          );
+        } catch {
+          boundedSnapshot = { status: "unknown", limitReached: false };
+        }
+        if (cancellationRequested(options?.isCancelled)) {
+          walkComplete = false;
+          resumeAfter = lastCompletedCursor;
+          rowCompleted = false;
+          break;
+        }
+        if (boundedSnapshot.status === "unknown") {
+          examinedChats += 1;
+          unknownChats += 1;
+          if (boundedSnapshot.limitReached) {
+            unknownReasonCounts.snapshotSizeLimit += 1;
+          } else {
+            unknownReasonCounts.unreadable += 1;
+          }
+          limitReached ||= boundedSnapshot.limitReached;
+          continue;
+        }
+        const snapshot = boundedSnapshot.snapshot;
+
+        const remainingRootProbes = limits.maxRootProbes - probedRootCount;
+        const audit = await auditChatContinuationRootsWithLimits(
+          snapshot,
+          (key, remainingBytes) =>
+            probeAgentKvRootStorage(rootProbe, key, remainingBytes),
+          limits,
+          remainingRootProbes,
+          options?.isCancelled,
+        );
+        if (audit.status === "unknown") {
+          if (audit.reason === "cancelled") {
+            probedRootCount += audit.probedRootCount;
+            walkComplete = false;
+            resumeAfter = lastCompletedCursor;
+            rowCompleted = false;
+            break;
+          }
+          if (
+            audit.reason === "root-probe-budget" &&
+            options?.pageAtRetentionLimit === true &&
+            probedRootCount > 0
+          ) {
+            // The chat fits the configured per-page probe budget in principle,
+            // but not what remains after earlier chats. Leave it unconsumed so
+            // the next page can classify it with a fresh aggregate budget.
+            probedRootCount += audit.probedRootCount;
+            walkComplete = false;
+            resumeAfter = lastCompletedCursor;
+            rowCompleted = false;
+            break;
+          }
+          examinedChats += 1;
+          probedRootCount += audit.probedRootCount;
+          unknownChats += 1;
+          switch (audit.reason) {
+            case "conversation-state-json-structure-limit":
+              unknownReasonCounts.structuralWorkLimit += 1;
+              break;
+            case "conversation-state-limit":
+            case "roots-per-chat-limit":
+            case "root-probe-budget":
+            case "graph-limit":
+              unknownReasonCounts.otherSafetyLimit += 1;
+              break;
+            case "conversation-state-unreadable":
+            case "root-probe-failed":
+              unknownReasonCounts.unreadable += 1;
+              break;
+          }
+          if (
+            audit.reason === "conversation-state-limit" ||
+            audit.reason === "roots-per-chat-limit" ||
+            audit.reason === "root-probe-budget" ||
+            audit.reason === "graph-limit"
+          ) {
+            limitReached = true;
+          }
+          if (audit.reason === "root-probe-budget") {
+            walkComplete = false;
+            // A chat that exceeds even a fresh page is a true bounded unknown;
+            // advance past it so callers cannot loop on the same input.
+            if (rowCursor !== null) {
+              lastCompletedCursor = rowCursor;
+            }
+            resumeAfter = lastCompletedCursor;
+            break;
+          }
+          continue;
+        }
+        if (
+          audit.unavailableRootIds.length > 0 &&
+          broken.length >= limits.maxRetainedChats
+        ) {
+          if (options?.pageAtRetentionLimit === true) {
+            // These lookups physically occurred even though the observation is
+            // deliberately left for the next page, so report their exact work.
+            probedRootCount += audit.probedRootCount;
+            walkComplete = false;
+            resumeAfter = lastCompletedCursor;
+            rowCompleted = false;
+            break;
+          }
+          limitReached = true;
+          examinedChats += 1;
+          auditedChats += 1;
+          probedRootCount += audit.probedRootCount;
+          continue;
+        }
+        examinedChats += 1;
+        auditedChats += 1;
+        probedRootCount += audit.probedRootCount;
+        if (audit.unavailableRootIds.length === 0) {
+          continue;
+        }
+        broken.push({
+          resourceId: `chat/${composerId}`,
+          composerId,
+          composerCursor: rowCursor,
+          title: chatHeaderTitle(snapshot.header.value),
+          workspaceId: snapshot.header.workspaceId,
+          lastUpdatedAt: snapshot.header.lastUpdatedAt,
+          conversationStateCount: audit.conversationStateCount,
+          referencedRootCount: audit.referencedRootIds.length,
+          unavailableRootCount: audit.unavailableRootIds.length,
+          unavailableRootIds: audit.unavailableRootIds,
+          chatCoreHash: portableChatCoreHash(snapshot),
+          fingerprint: audit.fingerprint,
+        });
+      } finally {
+        if (rowCompleted && rowCursor !== null) {
+          lastCompletedCursor = rowCursor;
+        }
       }
-      auditedChats += 1;
-      if (audit.unavailableRootIds.length === 0) {
-        continue;
-      }
-      broken.push({
-        resourceId: `chat/${composerId}`,
-        composerId,
-        title: chatHeaderTitle(snapshot.header.value),
-        workspaceId: snapshot.header.workspaceId,
-        lastUpdatedAt: snapshot.header.lastUpdatedAt,
-        conversationStateCount: audit.conversationStateCount,
-        referencedRootCount: audit.referencedRootIds.length,
-        unavailableRootCount: audit.unavailableRootIds.length,
-        unavailableRootIds: audit.unavailableRootIds,
-        chatCoreHash: portableChatCoreHash(snapshot),
-        fingerprint: audit.fingerprint,
-      });
     }
 
     database.exec("COMMIT");
-    return {
+    const result: BrokenChatContinuationInspection = {
       examinedChats,
       auditedChats,
       unknownChats,
       unknownReasonCounts,
       probedRootCount,
       limitReached,
-      broken: broken.sort(
-        (left, right) =>
-          right.unavailableRootCount - left.unavailableRootCount ||
-          compareText(left.resourceId, right.resourceId),
-      ),
+      // Preserve keyset order in pages so consumers can checkpoint and write
+      // results deterministically. Legacy full calls keep severity-first UI
+      // presentation exactly as before.
+      broken: keysetWalk
+        ? broken
+        : broken.sort(
+            (left, right) =>
+              right.unavailableRootCount - left.unavailableRootCount ||
+              compareText(left.resourceId, right.resourceId),
+          ),
     };
+    if (reportsProgress) {
+      result.resumeAfter = resumeAfter;
+      result.scannedThrough = lastCompletedCursor;
+      result.complete = walkComplete;
+    }
+    return result;
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
@@ -523,15 +710,45 @@ export async function inspectBrokenChatContinuationsInDatabase(
 function* scopedComposerRows(
   statement: ReturnType<DatabaseSync["prepare"]>,
   composerIds: ReadonlySet<string>,
-): Iterable<{ composerId: SqliteStorageValue }> {
+): Iterable<{
+  composerId: SqliteStorageValue;
+  sortComposerId: SqliteStorageValue;
+}> {
   for (const composerId of composerIds) {
     if (!isSyncableComposerId(composerId)) {
       continue;
     }
-    yield* statement.iterate(composerId) as Iterable<{
+    const rows = statement.all(composerId) as Array<{
       composerId: SqliteStorageValue;
+      sortComposerId: SqliteStorageValue;
     }>;
+    // SQLite permits a TEXT UUID and a byte-identical BLOB UUID to coexist
+    // even under a TEXT PRIMARY KEY. A legacy string scope cannot say which
+    // row its caller observed, so it must refuse both rather than guess.
+    if (rows.length === 1) {
+      yield rows[0]!;
+    }
   }
+}
+
+function* exactScopedComposerRows(
+  statement: ReturnType<DatabaseSync["prepare"]>,
+  cursor: BrokenChatInspectionCursor,
+): Iterable<{
+  composerId: SqliteStorageValue;
+  sortComposerId: SqliteStorageValue;
+}> {
+  const identity = exactComposerIdentity(cursor);
+  if (identity === null) {
+    return;
+  }
+  yield* statement.iterate(
+    identity.storageClass,
+    identity.value,
+  ) as Iterable<{
+    composerId: SqliteStorageValue;
+    sortComposerId: SqliteStorageValue;
+  }>;
 }
 
 /**
@@ -550,6 +767,7 @@ export async function auditChatContinuationRoots(
     probe,
     limits,
     limits.maxRootProbes,
+    options?.isCancelled,
   );
 }
 
@@ -558,8 +776,15 @@ async function auditChatContinuationRootsWithLimits(
   probe: ChatContinuationRootProbe,
   limits: Readonly<ChatContinuationAuditLimits>,
   remainingRootProbes: number,
+  isCancelled?: () => boolean,
 ): Promise<ChatContinuationRootAudit> {
+  if (cancellationRequested(isCancelled)) {
+    return cancelledContinuationRootAudit(0, 0, 0);
+  }
   const stateScan = scanPortableChatConversationStates(snapshot);
+  if (cancellationRequested(isCancelled)) {
+    return cancelledContinuationRootAudit(0, 0, 0);
+  }
   if (stateScan.status === "structure-limit") {
     return {
       status: "unknown",
@@ -594,6 +819,13 @@ async function auditChatContinuationRootsWithLimits(
       maxProtobufDepth: limits.maxProtobufDepth,
     },
   });
+  if (cancellationRequested(isCancelled)) {
+    return cancelledContinuationRootAudit(
+      states.length,
+      extracted.roots.length,
+      0,
+    );
+  }
   if (extracted.unreadable.length > 0) {
     return {
       status: "unknown",
@@ -655,15 +887,30 @@ async function auditChatContinuationRootsWithLimits(
   }
 
   let walked: Awaited<ReturnType<typeof walkAgentKvReachability>>;
+  let cancellationObserved = false;
+  let performedProbeCount = 0;
   try {
-    walked = await walkAgentKvReachability(states, probe, {
+    walked = await walkAgentKvReachability(
+      states,
+      async (key, remainingBytes) => {
+        if (cancellationRequested(isCancelled)) {
+          cancellationObserved = true;
+          // Stop the graph walker at this node without performing another DB
+          // lookup. Cancellation supersedes the synthetic byte-limit result.
+          return { status: "over-budget" };
+        }
+        performedProbeCount += 1;
+        return await probe(key, remainingBytes);
+      },
+      {
       limits: {
         maxNodes: Math.min(limits.maxRootsPerChat, remainingRootProbes),
         maxBytes: limits.maxSeedBytesPerChat,
         maxDepth: limits.maxGraphDepth,
         maxProtobufDepth: limits.maxProtobufDepth,
       },
-    });
+      },
+    );
   } catch {
     return {
       status: "unknown",
@@ -672,6 +919,13 @@ async function auditChatContinuationRootsWithLimits(
       probedRootCount: 0,
       reason: "root-probe-failed",
     };
+  }
+  if (cancellationObserved || cancellationRequested(isCancelled)) {
+    return cancelledContinuationRootAudit(
+      states.length,
+      extracted.roots.length,
+      performedProbeCount,
+    );
   }
   if (walked.limitReasons.length > 0) {
     const nodeLimitedByGlobalBudget =
@@ -737,6 +991,35 @@ async function auditChatContinuationRootsWithLimits(
           })),
       }),
     ),
+  };
+}
+
+function cancellationRequested(
+  isCancelled: (() => boolean) | undefined,
+): boolean {
+  if (isCancelled === undefined) {
+    return false;
+  }
+  try {
+    return isCancelled() === true;
+  } catch {
+    // A broken cancellation source must fail closed instead of allowing an
+    // expensive audit to continue without its caller's control signal.
+    return true;
+  }
+}
+
+function cancelledContinuationRootAudit(
+  conversationStateCount: number,
+  referencedRootCount: number,
+  probedRootCount: number,
+): ChatContinuationRootAudit {
+  return {
+    status: "unknown",
+    conversationStateCount,
+    referencedRootCount,
+    probedRootCount,
+    reason: "cancelled",
   };
 }
 
@@ -1619,8 +1902,13 @@ export function readPortableChatSnapshotBounded(
   database: DatabaseSync,
   composerId: string,
   snapshotByteLimit: number,
+  composerCursor?: BrokenChatInspectionCursor,
 ): BoundedPortableChatReadResult {
   if (!isSyncableComposerId(composerId)) {
+    return { status: "unknown", limitReached: false };
+  }
+  const identity = resolveComposerIdentity(database, composerId, composerCursor);
+  if (identity === null) {
     return { status: "unknown", limitReached: false };
   }
   const rawValueLimit = portableRawValueLimit(snapshotByteLimit);
@@ -1631,9 +1919,11 @@ export function readPortableChatSnapshotBounded(
               typeof(value) AS headerValueType,
               length(CAST(value AS BLOB)) AS headerValueBytes
          FROM composerHeaders
-        WHERE CAST(composerId AS TEXT) = ? AND COALESCE(isSubagent, 0) = 0`,
+        WHERE typeof(composerId) = ?
+          AND composerId = ? COLLATE BINARY
+          AND COALESCE(isSubagent, 0) = 0`,
     )
-    .get(composerId) as
+    .get(identity.storageClass, identity.value) as
     | Pick<
         RawComposerHeaderGuarded,
         | "workspaceIdType"
@@ -1791,9 +2081,16 @@ export function readPortableChatSnapshotBounded(
               typeof(value) AS headerValueType,
               length(CAST(value AS BLOB)) AS headerValueBytes
          FROM composerHeaders
-        WHERE CAST(composerId AS TEXT) = ? AND COALESCE(isSubagent, 0) = 0`,
+        WHERE typeof(composerId) = ?
+          AND composerId = ? COLLATE BINARY
+          AND COALESCE(isSubagent, 0) = 0`,
     )
-    .get(snapshotByteLimit, snapshotByteLimit, composerId) as
+    .get(
+      snapshotByteLimit,
+      snapshotByteLimit,
+      identity.storageClass,
+      identity.value,
+    ) as
     | RawComposerHeaderGuarded
     | undefined;
   if (rawHeader === undefined) {
@@ -1878,8 +2175,13 @@ export function readPortableChatSnapshotBounded(
 export function readPortableChatSnapshot(
   database: DatabaseSync,
   composerId: string,
+  composerCursor?: BrokenChatInspectionCursor,
 ): PortableChatSnapshot | null {
   if (!isSyncableComposerId(composerId)) {
+    return null;
+  }
+  const identity = resolveComposerIdentity(database, composerId, composerCursor);
+  if (identity === null) {
     return null;
   }
   const rawHeader = database
@@ -1887,9 +2189,11 @@ export function readPortableChatSnapshot(
       `SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
               isSubagent, recency, checkpointAt, value
          FROM composerHeaders
-        WHERE CAST(composerId AS TEXT) = ? AND COALESCE(isSubagent, 0) = 0`,
+        WHERE typeof(composerId) = ?
+          AND composerId = ? COLLATE BINARY
+          AND COALESCE(isSubagent, 0) = 0`,
     )
-    .get(composerId) as RawComposerHeader | undefined;
+    .get(identity.storageClass, identity.value) as RawComposerHeader | undefined;
   if (rawHeader === undefined) {
     return null;
   }
@@ -2300,6 +2604,101 @@ function sqliteText(value: SqliteStorageValue): string | null {
   return null;
 }
 
+interface ExactComposerIdentity {
+  storageClass: ComposerIdStorageClass;
+  value: string | Uint8Array;
+  composerId: string;
+}
+
+/** Returns the persistable class only for an exact, syncable row cursor. */
+export function composerCursorStorageClass(
+  cursor: BrokenChatInspectionCursor,
+): ComposerIdStorageClass | null {
+  return exactComposerIdentity(cursor)?.storageClass ?? null;
+}
+
+/**
+ * Reconstructs an exact row cursor from catalog-safe UUID text plus its SQLite
+ * storage class. Syncable UUIDs are ASCII, so the BLOB form round-trips to the
+ * exact bytes that passed the audit's lossless UTF-8 gate.
+ */
+export function composerCursorFromStorageClass(
+  composerId: string,
+  storageClass: ComposerIdStorageClass,
+): BrokenChatInspectionCursor | null {
+  if (
+    !isSyncableComposerId(composerId) ||
+    (storageClass !== "text" && storageClass !== "blob")
+  ) {
+    return null;
+  }
+  const cursor: BrokenChatInspectionCursor = {
+    composerId:
+      storageClass === "text"
+        ? composerId
+        : Uint8Array.from(Buffer.from(composerId, "utf8")),
+  };
+  return exactComposerIdentity(cursor, composerId) === null ? null : cursor;
+}
+
+function exactComposerIdentity(
+  cursor: BrokenChatInspectionCursor,
+  expectedComposerId?: string,
+): ExactComposerIdentity | null {
+  const value = cursor.composerId;
+  if (typeof value !== "string" && !(value instanceof Uint8Array)) {
+    return null;
+  }
+  const composerId = sqliteText(value);
+  if (
+    composerId === null ||
+    !isSyncableComposerId(composerId) ||
+    (expectedComposerId !== undefined && composerId !== expectedComposerId)
+  ) {
+    return null;
+  }
+  return {
+    storageClass: typeof value === "string" ? "text" : "blob",
+    value: typeof value === "string" ? value : Uint8Array.from(value),
+    composerId,
+  };
+}
+
+/**
+ * Resolves a decoded UUID to exactly one physical header row. The optional
+ * cursor is already an exact SQLite identity from an audit observation. A
+ * legacy string-only caller is accepted only when TEXT and BLOB lookup
+ * together produce exactly one row.
+ */
+function resolveComposerIdentity(
+  database: DatabaseSync,
+  composerId: string,
+  cursor?: BrokenChatInspectionCursor,
+): ExactComposerIdentity | null {
+  if (cursor !== undefined) {
+    return exactComposerIdentity(cursor, composerId);
+  }
+  const rows = database
+    .prepare(
+      `SELECT composerId
+         FROM composerHeaders
+        WHERE ((typeof(composerId) = 'text'
+                 AND composerId = ?1 COLLATE BINARY)
+               OR (typeof(composerId) = 'blob'
+                   AND composerId = CAST(?1 AS BLOB)))
+          AND COALESCE(isSubagent, 0) = 0
+        LIMIT 2`,
+    )
+    .all(composerId) as Array<{ composerId: SqliteStorageValue }>;
+  if (rows.length !== 1) {
+    return null;
+  }
+  const value = sqliteKeysetCursorValue(rows[0]!.composerId);
+  return value === null
+    ? null
+    : exactComposerIdentity({ composerId: value }, composerId);
+}
+
 function nullableText(value: SqliteStorageValue, column: string): string | null {
   if (value === null) {
     return null;
@@ -2375,6 +2774,12 @@ function normalizeChatContinuationAuditLimits(
     maxChats: auditLimit(
       "maxChats",
       configured?.maxChats ?? DEFAULT_CHAT_CONTINUATION_AUDIT_LIMITS.maxChats,
+      1,
+    ),
+    maxRetainedChats: auditLimit(
+      "maxRetainedChats",
+      configured?.maxRetainedChats ??
+        DEFAULT_CHAT_CONTINUATION_AUDIT_LIMITS.maxRetainedChats,
       1,
     ),
     maxSnapshotBytesPerChat: auditLimit(
