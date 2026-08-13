@@ -9,6 +9,7 @@ const ui = vi.hoisted(() => ({
   offered: [] as Array<{ title: string; labels: string[] }>,
   confirmations: [] as string[],
   information: [] as string[],
+  progressReports: [] as string[],
   warningChoice: undefined as string | undefined,
   informationChoice: undefined as string | undefined,
 }));
@@ -23,7 +24,18 @@ vi.mock("vscode", () => ({
     withProgress: async (
       _options: unknown,
       task: (progress: { report: (value: unknown) => void }) => Promise<unknown>,
-    ) => task({ report: () => undefined }),
+    ) =>
+      task({
+        report: (value: unknown) => {
+          if (
+            value !== null &&
+            typeof value === "object" &&
+            typeof (value as { message?: unknown }).message === "string"
+          ) {
+            ui.progressReports.push((value as { message: string }).message);
+          }
+        },
+      }),
     showQuickPick: async (
       items: Array<{ label: string }>,
       options: { title?: string },
@@ -91,6 +103,7 @@ beforeEach(() => {
   ui.offered.length = 0;
   ui.confirmations.length = 0;
   ui.information.length = 0;
+  ui.progressReports.length = 0;
   ui.warningChoice = undefined;
   ui.informationChoice = undefined;
 });
@@ -450,7 +463,7 @@ describe("Repair Unavailable Chats command", () => {
       expect(ui.confirmations.at(-1)).toContain(
         "Rerunning alone cannot make it fit",
       );
-      expect(ui.confirmations.at(-1)).toContain("Restore Version History");
+      expect(ui.confirmations.at(-1)).not.toContain("Restore Version History");
       expect(ui.confirmations.at(-1)).toContain("not an all-clear result");
       expect(ui.confirmations.at(-1)).not.toContain(
         "run Repair Unavailable Chats again",
@@ -830,6 +843,90 @@ describe("Repair Unavailable Chats command", () => {
         "then run Sync Now on this PC and choose Restart to Apply",
       );
       expect(warning).not.toContain(fixture.rootId);
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
+
+  it("audits continuation data after advancing beyond three no-source message-body pages", async () => {
+    const fixture = await createContinuationRepairFixture("missing");
+    try {
+      const database = new DatabaseSync(fixture.globalDatabase);
+      for (let index = 0; index < 17; index += 1) {
+        const composerId = `70000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
+        database
+          .prepare(
+            `INSERT INTO composerHeaders(
+              composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+              isSubagent, recency, checkpointAt, value
+            ) VALUES (?, 'project-a', 1, ?, 0, 0, 0, NULL, ?)`,
+          )
+          .run(
+            composerId,
+            100 + index,
+            JSON.stringify({ name: `No source ${index}` }),
+          );
+        database
+          .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+          .run(
+            `composerData:${composerId}`,
+            JSON.stringify({
+              fullConversationHeadersOnly: [{ bubbleId: `missing-${index}` }],
+            }),
+          );
+      }
+      const structurallyBoundedComposer =
+        "70000000-0000-4000-8000-999999999999";
+      database
+        .prepare(
+          `INSERT INTO composerHeaders(
+            composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+            isSubagent, recency, checkpointAt, value
+          ) VALUES (?, 'project-a', 1, 200, 0, 0, 0, NULL, ?)`,
+        )
+        .run(
+          structurallyBoundedComposer,
+          JSON.stringify({ name: "Bounded healthy chat" }),
+        );
+      database
+        .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+        .run(
+          `composerData:${structurallyBoundedComposer}`,
+          JSON.stringify({
+            fullConversationHeadersOnly: [],
+            boundedNoise: Array.from({ length: 270_000 }, () => null),
+          }),
+        );
+      database.close();
+      const before = (await fixture.repository.listEvents()).length;
+
+      await fixture.manager.repairUnavailableChats();
+
+      expect(await fixture.repository.listEvents()).toHaveLength(before);
+      expect(
+        ui.progressReports.filter(
+          (message) =>
+            message === "Checking which chat messages are unavailable...",
+        ),
+      ).toHaveLength(4);
+      expect(ui.information).toEqual([]);
+      expect(ui.confirmations).toHaveLength(1);
+      const warning = ui.confirmations[0] ?? "";
+      expect(warning).toContain(
+        "17 unavailable message-body conversations have no warning-free compatible synchronized source",
+      );
+      expect(warning).toContain(
+        "1 Cursor conversation has 1 unavailable continuation blob",
+      );
+      expect(warning).toContain(
+        "run Sync Now on a PC where the affected chat still continues",
+      );
+      expect(warning).not.toContain("Restore Version History");
+      expect(warning).not.toContain("inspect the next batch");
+      expect(warning).not.toContain("memory safety limit");
+      expect(warning).toContain(
+        "per-conversation JSON or metadata safety bound",
+      );
     } finally {
       fixture.manager.dispose();
     }

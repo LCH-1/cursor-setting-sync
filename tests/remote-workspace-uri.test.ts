@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   normalizeWorkspaceUri,
   resolveTargetWorkspace,
+  workspaceUriMatchesAny,
 } from "../src/chat/workspace";
 
 // {"hostName":"geekdive_local2"} — the exact descriptor observed in a real
@@ -20,6 +21,15 @@ describe("the two spellings of one SSH host", () => {
     expect(normalizeWorkspaceUri(DESCRIPTOR_URI, "linux")).toBe(
       "vscode-remote://ssh-remote+geekdive_local2/home/ubuntu/servers/linchpinedu/backend",
     );
+  });
+
+  it("accepts an open alias-form workspace for a stored descriptor URI", () => {
+    expect(workspaceUriMatchesAny(DESCRIPTOR_URI, [ALIAS_URI], "win32")).toBe(
+      true,
+    );
+    expect(
+      workspaceUriMatchesAny(DESCRIPTOR_URI, ["file:///C:/other"], "win32"),
+    ).toBe(false);
   });
 
   it("maps an incoming remote workspace onto the local one on the same server", () => {

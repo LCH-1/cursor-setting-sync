@@ -171,11 +171,19 @@ import {
   inspectBrokenCursorChats,
   isAutomaticChatRepairMetadata,
   type BrokenChatObservation,
+  type BrokenChatContinuationObservation,
+  type BrokenChatInspectionCursor,
   type ChatRepairCandidate,
 } from "../chat/repair";
 import {
+  extractVisibleChatRecoveryTranscript,
+  prepareVisibleRecoveryAgent,
+  writeVisibleChatRecoveryArtifact,
+} from "../chat/visibleRecovery";
+import {
   discoverWorkspaces,
   resolveTargetWorkspace,
+  workspaceUriMatchesAny,
 } from "../chat/workspace";
 import { HelperLauncher } from "../helper/launcher";
 import type {
@@ -291,6 +299,14 @@ interface PlannedChatRepair {
   candidateVersions: Array<{ versionId: string; plainBytes: number }>;
   sourceVersionId: string;
   repairedBubbleCount: number;
+}
+
+interface ChatRepairAuditProgress {
+  examinedChats: number;
+  unavailableWithoutSource: number;
+  oversizedChats: number;
+  historyBudgetDeferred: number;
+  unresolvedLimitReached: boolean;
 }
 
 /**
@@ -1787,6 +1803,180 @@ export class SyncManager implements vscode.Disposable {
    * already-queued complete v2 tip or left untouched with recovery guidance.
    */
   async repairUnavailableChats(): Promise<void> {
+    const auditProgress: ChatRepairAuditProgress = {
+      examinedChats: 0,
+      unavailableWithoutSource: 0,
+      oversizedChats: 0,
+      historyBudgetDeferred: 0,
+      unresolvedLimitReached: false,
+    };
+    let after: BrokenChatInspectionCursor | undefined;
+    for (;;) {
+      const next = await this.repairUnavailableChatsPage(after, auditProgress);
+      if (next === undefined) {
+        return;
+      }
+      after = next;
+    }
+  }
+
+  /**
+   * Preserves a continuation-damaged chat as read-only Markdown context and
+   * opens a new, empty Agent. The original composer and live DB are never
+   * written.
+   */
+  async continueUnavailableChatSafely(
+    knownDamage?: readonly BrokenChatContinuationObservation[],
+  ): Promise<void> {
+    let inspectionUnknownChats = 0;
+    let inspectionLimitReached = false;
+    let damage: readonly BrokenChatContinuationObservation[];
+    if (knownDamage !== undefined) {
+      damage = knownDamage;
+    } else {
+      const inspection = await this.withProgress(
+        "Cursor Setting Sync",
+        async (report) => {
+          report("Checking unavailable chat continuation data...");
+          return inspectBrokenCursorChatContinuations(this.paths, {
+            limits: { maxSnapshotBytesPerChat: 32 * 1024 * 1024 },
+          });
+        },
+      );
+      damage = inspection.broken;
+      inspectionUnknownChats = inspection.unknownChats;
+      inspectionLimitReached = inspection.limitReached;
+    }
+    if (damage.length === 0) {
+      if (inspectionUnknownChats > 0 || inspectionLimitReached) {
+        void vscode.window.showWarningMessage(
+          `The continuation audit was inconclusive: ${inspectionUnknownChats} conversation(s) could not be verified${
+            inspectionLimitReached ? ", and a bounded safety limit was reached" : ""
+          }. No recovery file or new Agent was created; this is not an all-clear result.`,
+        );
+      } else {
+        void vscode.window.showInformationMessage(
+          "No continuation-damaged conversation with complete visible messages was found.",
+        );
+      }
+      return;
+    }
+    let selected = damage[0];
+    if (damage.length > 1) {
+      const choice = await vscode.window.showQuickPick(
+        damage.map((observation) => ({
+          label: observation.title ?? "Untitled conversation",
+          description: observation.composerId,
+          observation,
+        })),
+        {
+          title: "Continue Unavailable Chat Safely",
+          placeHolder:
+            "Choose a conversation to preserve as context in a new Agent",
+        },
+      );
+      if (choice === undefined) {
+        return;
+      }
+      selected = choice.observation;
+    }
+    if (selected === undefined) {
+      return;
+    }
+    const inspectedSelection = selected;
+    const transcript = await this.withProgress(
+      "Cursor Setting Sync",
+      async (report) => {
+        report("Verifying visible messages in one read-only transaction...");
+        return extractVisibleChatRecoveryTranscript(
+          this.paths.globalDatabase,
+          inspectedSelection.composerId,
+          { chatCoreHash: inspectedSelection.chatCoreHash },
+        );
+      },
+    );
+    const freshness = await this.withProgress(
+      "Cursor Setting Sync",
+      async (report) => {
+        report("Rechecking the selected continuation immediately before recovery...");
+        return inspectBrokenCursorChatContinuations(this.paths, {
+          composerIds: new Set([inspectedSelection.composerId]),
+          limits: { maxSnapshotBytesPerChat: 32 * 1024 * 1024 },
+        });
+      },
+    );
+    const freshDamage = freshness.broken.find(
+      (observation) => observation.composerId === inspectedSelection.composerId,
+    );
+    if (freshDamage === undefined) {
+      if (
+        freshness.auditedChats === 1 &&
+        freshness.unknownChats === 0 &&
+        !freshness.limitReached
+      ) {
+        void vscode.window.showInformationMessage(
+          "The selected conversation's continuation data is now complete. No recovery file or new Agent was created.",
+        );
+        return;
+      }
+      throw new Error(
+        "The selected conversation could not be safely rechecked; no recovery file or new Agent was created.",
+      );
+    }
+    if (
+      freshDamage.chatCoreHash !== inspectedSelection.chatCoreHash ||
+      freshDamage.fingerprint !== inspectedSelection.fingerprint
+    ) {
+      throw new Error(
+        "The selected conversation changed after inspection; run Continue Unavailable Chat Safely again.",
+      );
+    }
+    if (!workspaceUriIsOpen(transcript.workspaceUri)) {
+      throw new Error(
+        "Open the conversation's original workspace in this Cursor window, then run Continue Unavailable Chat Safely again.",
+      );
+    }
+    const artifact = await writeVisibleChatRecoveryArtifact(
+      this.paths.extensionStorage,
+      this.paths.workspaceStorageRoot,
+      transcript,
+    );
+    const resource = vscode.Uri.file(artifact.path);
+    const resources = [
+      resource,
+      ...artifact.imageAttachments.map((image) => vscode.Uri.file(image.path)),
+    ];
+    const mode = await prepareVisibleRecoveryAgent(
+      vscode.commands,
+      resources,
+    );
+    const summary = `${transcript.userRecordCount} user message(s), ${transcript.assistantTextRecordCount} assistant text message(s), ${transcript.toolCallCount} inert tool-call summary record(s), and ${artifact.imageAttachments.length} verified selected image(s)`;
+    if (mode === "glass") {
+      void vscode.window.showInformationMessage(
+        `Cursor opened a new Agent and was asked to attach the verified Markdown recovery context and selected images (${summary}). Verify that its .md and image attachment chips are visible. The suggested continuation instruction is embedded near the top of the transcript; nothing was sent, and the original conversation was not changed. The plaintext recovery files remain in local extension storage until you delete them.`,
+      );
+      return;
+    }
+    if (mode === "classic") {
+      void vscode.window.showInformationMessage(
+        `Cursor opened a new Agent and was asked to attach the verified Markdown recovery context and selected images (${summary}). Verify that its .md and image attachment chips are visible. The suggested continuation instruction is embedded near the top of the transcript; nothing was sent, and the original conversation was not changed. The plaintext recovery files remain in local extension storage until you delete them.`,
+      );
+      return;
+    }
+    const open = "Open Recovery Transcript";
+    const choice = await vscode.window.showWarningMessage(
+      `Cursor's supported new-Agent context command was unavailable or rejected on this build. The verified Markdown recovery context and selected images were saved locally (${summary}); open the Markdown file and attach it plus every image listed in its verified attachment manifest to a new Agent. Its suggested continuation instruction is embedded near the top. Nothing was sent, the original conversation was not changed, and the plaintext files remain in local extension storage until you delete them.`,
+      open,
+    );
+    if (choice === open) {
+      await vscode.commands.executeCommand("vscode.open", resource);
+    }
+  }
+
+  private async repairUnavailableChatsPage(
+    after: BrokenChatInspectionCursor | undefined,
+    auditProgress: ChatRepairAuditProgress,
+  ): Promise<BrokenChatInspectionCursor | undefined> {
     const repository = this.requireRepository();
     const configuredBlock = resourceConfigurationBlockReason("chat", {
       syncChat: this.configuration.syncChat,
@@ -1829,15 +2019,21 @@ export class SyncManager implements vscode.Disposable {
         report("Checking which chat messages are unavailable...");
         return inspectBrokenCursorChats(this.paths, {
           limits: chatRepairInspectionLimits,
+          ...(after === undefined ? {} : { after }),
+          pageAtRetentionLimit: true,
         });
       },
     );
+    auditProgress.examinedChats += inspection.examinedChats;
+    auditProgress.oversizedChats += inspection.oversizedChats;
+    auditProgress.unresolvedLimitReached ||=
+      inspection.unresolvedLimitReached;
     const observations = inspection.broken;
     const bubbleIncompleteDetail = chatRepairDeferredInspectionDetail(
       inspection.deferredBrokenChats,
-      inspection.oversizedChats,
+      0,
       inspection.snapshotByteLimit,
-      inspection.limitReached,
+      inspection.resumeAfter !== null,
     );
     if (observations.length === 0) {
       // A chat can render every legacy bubble and still be impossible to
@@ -1858,7 +2054,10 @@ export class SyncManager implements vscode.Disposable {
       );
       const continuationDamage = continuationInspection.broken;
       const incompleteDetail = [
-        bubbleIncompleteDetail,
+        chatRepairAuditProgressDetail(
+          auditProgress,
+          inspection.snapshotByteLimit,
+        ),
         continuationAuditIncompleteDetail(
           continuationInspection.unknownChats,
           continuationInspection.limitReached,
@@ -1868,17 +2067,29 @@ export class SyncManager implements vscode.Disposable {
         .join(" ");
       if (continuationDamage.length === 0) {
         if (
-          bubbleIncompleteDetail.length > 0 ||
+          auditProgress.unavailableWithoutSource > 0 ||
+          auditProgress.oversizedChats > 0 ||
+          auditProgress.historyBudgetDeferred > 0 ||
+          auditProgress.unresolvedLimitReached ||
           continuationInspection.unknownChats > 0 ||
           continuationInspection.limitReached
         ) {
+          const hadMessageBodyFinding =
+            auditProgress.unavailableWithoutSource > 0 ||
+            auditProgress.oversizedChats > 0 ||
+            auditProgress.historyBudgetDeferred > 0 ||
+            auditProgress.unresolvedLimitReached;
           void vscode.window.showWarningMessage(
-            `No definite unavailable chat data was found after checking ${inspection.examinedChats} message bodies and ${continuationInspection.examinedChats} continuation records. ${incompleteDetail} Nothing was changed, and this is not an all-clear result.`,
+            `${
+              hadMessageBodyFinding
+                ? "The bounded audit found no chat repair it can safely apply"
+                : "No definite unavailable chat data was found"
+            } after checking ${auditProgress.examinedChats} message bodies and ${continuationInspection.examinedChats} continuation records. ${incompleteDetail} Nothing was changed, and this is not an all-clear result.`,
           );
           return;
         }
         void vscode.window.showInformationMessage(
-          `Checked ${inspection.examinedChats} Cursor conversation message bodies and ${continuationInspection.auditedChats} continuation records. No referenced chat message rows or reachable continuation blobs are unavailable.`,
+          `Checked ${auditProgress.examinedChats} Cursor conversation message bodies and ${continuationInspection.auditedChats} continuation records. No referenced chat message rows or reachable continuation blobs are unavailable.`,
         );
         return;
       }
@@ -2052,8 +2263,19 @@ export class SyncManager implements vscode.Disposable {
         }. Nothing was changed.${oversizedSourceDetail} Update Cursor Setting Sync and run Sync Now on a PC where the affected chat still continues; then run Sync Now on this PC and choose Restart to Apply.${
           incompleteDetail.length === 0 ? "" : ` ${incompleteDetail}`
         }`;
+      const continueSafely = "Continue Safely in New Agent";
+      const lackingSourceDamage = continuationDamage.filter(
+        (observation) =>
+          !completePendingResourceIds.has(observation.resourceId),
+      );
       if (completePendingResourceIds.size === 0) {
-        void vscode.window.showWarningMessage(incompleteSourceWarning);
+        const choice = await vscode.window.showWarningMessage(
+          incompleteSourceWarning,
+          continueSafely,
+        );
+        if (choice === continueSafely) {
+          await this.continueUnavailableChatSafely(lackingSourceDamage);
+        }
         return;
       }
       const restart = "Restart to Apply";
@@ -2062,9 +2284,12 @@ export class SyncManager implements vscode.Disposable {
           completePendingResourceIds.size === 1 ? " already has" : "s already have"
         } a verified complete v2 copy queued and can be applied now.`,
         restart,
+        continueSafely,
       );
       if (choice === restart) {
         await this.restartToApply();
+      } else if (choice === continueSafely) {
+        await this.continueUnavailableChatSafely(lackingSourceDamage);
       }
       return;
     }
@@ -2320,6 +2545,14 @@ export class SyncManager implements vscode.Disposable {
           )} retained-candidate memory limit. A source known from authenticated metadata to be oversized was not read; over-budget retained candidates were discarded. Nothing was changed for those conversations, and this is not an all-clear result.`;
 
     if (plans.length === 0) {
+      auditProgress.historyBudgetDeferred +=
+        historyBudgetDeferredResourceIds.size;
+      auditProgress.unavailableWithoutSource += Math.max(
+        0,
+        observations.length -
+          alreadyQueued -
+          historyBudgetDeferredResourceIds.size,
+      );
       if (alreadyQueued > 0) {
         const restart = "Restart to Apply";
         const choice = await vscode.window.showInformationMessage(
@@ -2339,21 +2572,33 @@ export class SyncManager implements vscode.Disposable {
         }
         return;
       }
+      const next = inspection.resumeAfter ?? inspection.scannedThrough;
+      if (next !== null && !sameBrokenChatInspectionCursor(after, next)) {
+        if (inspection.resumeAfter !== null) {
+          // The retention-boundary chat was reference-audited on this page but
+          // deliberately not retained. The next page starts with that same
+          // chat, so count it there instead of reporting a duplicate audit.
+          auditProgress.examinedChats = Math.max(
+            0,
+            auditProgress.examinedChats - 1,
+          );
+        }
+        return next;
+      }
       void vscode.window.showWarningMessage(
-        `Found ${observations.length} unavailable Cursor conversation${observations.length === 1 ? "" : "s"}, but no warning-free compatible stored version contains every missing message. Nothing was changed; Restore Version History remains available for manual recovery.${
-          deferredInspectionDetail.length === 0
-            ? ""
-            : ` ${deferredInspectionDetail}`
-        }${
-          historyBudgetDeferredDetail.length === 0
-            ? ""
-            : ` ${historyBudgetDeferredDetail}`
-        }`,
+        `${chatRepairAuditProgressDetail(
+          auditProgress,
+          inspection.snapshotByteLimit,
+        )} Nothing was changed.`,
       );
       return;
     }
 
-    const skipped = observations.length - plans.length - alreadyQueued;
+    const skipped =
+      auditProgress.unavailableWithoutSource +
+      observations.length -
+      plans.length -
+      alreadyQueued;
     const detailLines = plans.slice(0, 8).map(
       (plan) =>
         `• ${plan.label}: ${plan.repairedBubbleCount} unavailable message${
@@ -2411,7 +2656,7 @@ export class SyncManager implements vscode.Disposable {
       freshInspection.deferredBrokenChats,
       freshInspection.oversizedChats,
       freshInspection.snapshotByteLimit,
-      freshInspection.limitReached,
+      freshInspection.unresolvedLimitReached,
     );
     const freshByResource = new Map(
       freshInspection.broken.map((observation) => [
@@ -2702,6 +2947,10 @@ export class SyncManager implements vscode.Disposable {
           deferredInspectionDetail,
           freshInspectionDetail,
           historyBudgetDeferredDetail,
+          chatRepairAuditProgressDetail(
+            auditProgress,
+            inspection.snapshotByteLimit,
+          ),
         ]
           .filter((detail) => detail.length > 0)
           .map((detail) => ` ${detail}`)
@@ -7685,29 +7934,88 @@ function chatRepairDeferredInspectionDetail(
   return detail.join(" ");
 }
 
+function sameBrokenChatInspectionCursor(
+  left: BrokenChatInspectionCursor | undefined,
+  right: BrokenChatInspectionCursor,
+): boolean {
+  if (left === undefined) {
+    return false;
+  }
+  const leftId = left.composerId;
+  const rightId = right.composerId;
+  if (leftId instanceof Uint8Array && rightId instanceof Uint8Array) {
+    return Buffer.from(leftId).equals(Buffer.from(rightId));
+  }
+  return leftId === rightId;
+}
+
+function chatRepairAuditProgressDetail(
+  progress: ChatRepairAuditProgress,
+  snapshotByteLimit: number,
+): string {
+  const detail: string[] = [];
+  if (progress.unavailableWithoutSource > 0) {
+    detail.push(
+      `${progress.unavailableWithoutSource} unavailable message-body conversation${
+        progress.unavailableWithoutSource === 1 ? " has" : "s have"
+      } no warning-free compatible synchronized source and ${
+        progress.unavailableWithoutSource === 1 ? "was" : "were"
+      } left unchanged. Recovery requires a known-good source PC or database backup.`,
+    );
+  }
+  if (progress.historyBudgetDeferred > 0) {
+    detail.push(
+      `${progress.historyBudgetDeferred} conversation${
+        progress.historyBudgetDeferred === 1 ? " was" : "s were"
+      } deferred because synchronized repair history exceeded the bounded repair memory limit. A source known from authenticated metadata to be oversized was not read; it was left unchanged.`,
+    );
+  }
+  if (progress.oversizedChats > 0) {
+    detail.push(
+      `${progress.oversizedChats} conversation${
+        progress.oversizedChats === 1 ? " exceeded" : "s exceeded"
+      } the hard ${formatBytes(snapshotByteLimit)} repair snapshot limit. Rerunning alone cannot make ${
+        progress.oversizedChats === 1 ? "it" : "them"
+      } fit.`,
+    );
+  }
+  if (progress.unresolvedLimitReached) {
+    detail.push(
+      "At least one conversation could not be classified within a per-conversation JSON or metadata safety bound; rerunning alone does not advance past that condition.",
+    );
+  }
+  return detail.join(" ");
+}
+
 function chatRepairFreshInspectionDetail(
   deferredBrokenChats: number,
   oversizedChats: number,
   snapshotByteLimit: number,
-  limitReached: boolean,
+  unresolvedLimitReached: boolean,
 ): string {
-  if (deferredBrokenChats === 0 && oversizedChats === 0 && !limitReached) {
+  if (
+    deferredBrokenChats === 0 &&
+    oversizedChats === 0 &&
+    !unresolvedLimitReached
+  ) {
     return "";
   }
   const detail: string[] = [];
-  if (deferredBrokenChats > 0 || (limitReached && oversizedChats === 0)) {
-    const deferred =
-      deferredBrokenChats === 0
-        ? "one or more planned damaged conversations"
-        : `${deferredBrokenChats} planned damaged conversation${
-            deferredBrokenChats === 1 ? "" : "s"
-          }`;
+  if (deferredBrokenChats > 0) {
+    const deferred = `${deferredBrokenChats} planned damaged conversation${
+      deferredBrokenChats === 1 ? "" : "s"
+    }`;
     detail.push(
       `The final memory-bounded recheck deferred ${deferred}; ${
         deferredBrokenChats === 1 ? "it was" : "they were"
       } left unchanged. Run Repair Unavailable Chats again to re-evaluate ${
         deferredBrokenChats === 1 ? "it" : "them"
       }.`,
+    );
+  }
+  if (unresolvedLimitReached) {
+    detail.push(
+      "The final recheck could not safely classify one or more planned conversations within a per-conversation JSON or metadata safety bound; they were left unchanged. Rerunning alone does not advance past that condition.",
     );
   }
   if (oversizedChats > 0) {
@@ -10221,6 +10529,24 @@ function isNotepadsTipMetadata(metadata: ResourceTip["metadata"]): boolean {
   const relativePath = metadata?.relativePath;
   return (
     typeof relativePath === "string" && isWorkspaceNotepadsPath(relativePath)
+  );
+}
+
+function workspaceUriIsOpen(expected: string | null): boolean {
+  if (expected === null) {
+    return false;
+  }
+  let expectedUri: vscode.Uri;
+  try {
+    expectedUri = vscode.Uri.parse(expected, true);
+  } catch {
+    return false;
+  }
+  return workspaceUriMatchesAny(
+    expectedUri.toString(),
+    (vscode.workspace.workspaceFolders ?? []).map((folder) =>
+      folder.uri.toString(),
+    ),
   );
 }
 

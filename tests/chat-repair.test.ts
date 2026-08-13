@@ -514,7 +514,7 @@ describe("Cursor chat reference audit", () => {
       insertHeader(
         database,
         composerId,
-        JSON.stringify({ name: `Damaged ${index}` }),
+        JSON.stringify(index === 5 ? {} : { name: `Damaged ${index}` }),
         100 + index,
       );
       database
@@ -522,6 +522,7 @@ describe("Cursor chat reference audit", () => {
         .run(
           `composerData:${composerId}`,
           JSON.stringify({
+            ...(index === 5 ? { name: "Composer data fallback" } : {}),
             fullConversationHeadersOnly: [
               { bubbleId: `present-${index}` },
               { bubbleId: `missing-${index}` },
@@ -598,6 +599,146 @@ describe("Cursor chat reference audit", () => {
     expect(targeted.broken.map((item) => item.composerId)).toEqual([
       composerIds[2],
     ]);
+
+    const preparedSql: string[] = [];
+    const originalPrepare = database.prepare.bind(database);
+    const prepareSpy = vi.spyOn(database, "prepare").mockImplementation((sql) => {
+      preparedSql.push(sql);
+      return originalPrepare(sql);
+    });
+    const firstPage = inspectBrokenChatsInDatabase(database, {
+      pageAtRetentionLimit: true,
+      limits: { maxRetainedChats: 2, maxRetainedBytes: 8 * 1024 * 1024 },
+    });
+    const firstPageSql = preparedSql.find((sql) =>
+      sql.includes("FROM composerHeaders h"),
+    );
+    if (firstPageSql === undefined) {
+      throw new Error("Expected the paged composer inspection query.");
+    }
+    const firstPlan = database
+      .prepare(`EXPLAIN QUERY PLAN ${firstPageSql}`)
+      .all()
+      .map((row) => String(row.detail))
+      .join("\n");
+    expect(firstPlan).toContain("composerHeaders_1");
+    expect(firstPlan).not.toContain("TEMP B-TREE");
+    expect(firstPage.broken.map((item) => item.composerId)).toEqual([
+      composerIds[0],
+      composerIds[1],
+    ]);
+    expect(firstPage.deferredBrokenChats).toBe(1);
+    expect(firstPage.resumeAfter).toEqual({
+      composerId: composerIds[1],
+    });
+
+    preparedSql.length = 0;
+    const secondPage = inspectBrokenChatsInDatabase(database, {
+      ...(firstPage.resumeAfter === null
+        ? {}
+        : { after: firstPage.resumeAfter }),
+      pageAtRetentionLimit: true,
+      limits: { maxRetainedChats: 2, maxRetainedBytes: 8 * 1024 * 1024 },
+    });
+    const secondPageSql = preparedSql.find((sql) =>
+      sql.includes("FROM composerHeaders h"),
+    );
+    if (secondPageSql === undefined || firstPage.resumeAfter === null) {
+      throw new Error("Expected the resumed composer inspection query.");
+    }
+    const secondPlan = database
+      .prepare(`EXPLAIN QUERY PLAN ${secondPageSql}`)
+      .all(firstPage.resumeAfter.composerId)
+      .map((row) => String(row.detail))
+      .join("\n");
+    expect(secondPlan).toContain("composerHeaders_1 (composerId>?)");
+    expect(secondPlan).not.toContain("TEMP B-TREE");
+    expect(secondPage.broken.map((item) => item.composerId)).toEqual([
+      composerIds[2],
+      composerIds[3],
+    ]);
+    expect(secondPage.resumeAfter).toEqual({
+      composerId: composerIds[3],
+    });
+
+    prepareSpy.mockRestore();
+    const finalPage = inspectBrokenChatsInDatabase(database, {
+      ...(secondPage.resumeAfter === null
+        ? {}
+        : { after: secondPage.resumeAfter }),
+      pageAtRetentionLimit: true,
+      limits: { maxRetainedChats: 2, maxRetainedBytes: 8 * 1024 * 1024 },
+    });
+    expect(finalPage.broken.map((item) => item.composerId)).toEqual([
+      composerIds[4],
+      composerIds[5],
+    ]);
+    expect(finalPage.broken[1]?.title).toBe("Composer data fallback");
+    expect(finalPage.resumeAfter).toBeNull();
+    expect(finalPage.scannedThrough).toEqual({
+      composerId: composerIds[5],
+    });
+    database.close();
+  });
+
+  it("keeps an exact BLOB composer primary key while paging", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-chat-repair-blob-page-"));
+    roots.push(root);
+    const database = new DatabaseSync(join(root, "blob-page.vscdb"));
+    createSchema(database);
+    const textComposer = "20000000-0000-4000-8000-000000000001";
+    const blobComposer = "20000000-0000-4000-8000-000000000002";
+    insertHeader(database, textComposer, JSON.stringify({ name: "Text" }));
+    database
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'workspace', 1, 2, 0, 0, 0, NULL, ?)`,
+      )
+      .run(Buffer.from(blobComposer), JSON.stringify({ name: "Blob" }));
+    for (const composerId of [textComposer, blobComposer]) {
+      database
+        .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+        .run(
+          `composerData:${composerId}`,
+          JSON.stringify({
+            fullConversationHeadersOnly: [{ bubbleId: "missing" }],
+          }),
+        );
+    }
+
+    const first = inspectBrokenChatsInDatabase(database, {
+      pageAtRetentionLimit: true,
+      limits: { maxRetainedChats: 1, maxRetainedBytes: 1024 * 1024 },
+    });
+    expect(first.broken.map((item) => item.composerId)).toEqual([textComposer]);
+    expect(first.resumeAfter).toEqual({ composerId: textComposer });
+    if (first.resumeAfter === null) {
+      throw new Error("Expected a keyset cursor before the BLOB composer.");
+    }
+
+    const second = inspectBrokenChatsInDatabase(database, {
+      after: first.resumeAfter,
+      pageAtRetentionLimit: true,
+      limits: { maxRetainedChats: 1, maxRetainedBytes: 1024 * 1024 },
+    });
+    expect(second.broken.map((item) => item.composerId)).toEqual([blobComposer]);
+    expect(second.resumeAfter).toBeNull();
+    const blobCursor = second.scannedThrough?.composerId;
+    expect(blobCursor).toBeInstanceOf(Uint8Array);
+    if (!(blobCursor instanceof Uint8Array)) {
+      throw new Error("Expected the exact BLOB primary-key cursor.");
+    }
+    expect(Buffer.from(blobCursor).toString("utf8")).toBe(blobComposer);
+
+    const terminal = inspectBrokenChatsInDatabase(database, {
+      after: { composerId: blobCursor },
+      pageAtRetentionLimit: true,
+      limits: { maxRetainedChats: 1, maxRetainedBytes: 1024 * 1024 },
+    });
+    expect(terminal.broken).toEqual([]);
+    expect(terminal.resumeAfter).toBeNull();
     database.close();
   });
 
@@ -943,6 +1084,41 @@ describe("Cursor chat reference audit", () => {
       (await inspectBrokenChatContinuationsInDatabase(database)).broken[0]
         ?.fingerprint,
     ).toBe(observation?.fingerprint);
+
+    const otherComposer = "22222222-2222-4222-8222-222222222222";
+    insertChatWithConversationState(
+      database,
+      otherComposer,
+      "Other damaged continuation",
+      serializedConversationState(["f".repeat(64)]),
+    );
+    const preparedSql: string[] = [];
+    const originalPrepare = database.prepare.bind(database);
+    const prepareSpy = vi.spyOn(database, "prepare").mockImplementation((sql) => {
+      preparedSql.push(sql);
+      return originalPrepare(sql);
+    });
+    const scoped = await inspectBrokenChatContinuationsInDatabase(database, {
+      composerIds: new Set([COMPOSER]),
+    });
+    prepareSpy.mockRestore();
+    expect(scoped.examinedChats).toBe(1);
+    expect(scoped.broken.map((item) => item.composerId)).toEqual([COMPOSER]);
+    const scopedSql = preparedSql.find((sql) =>
+      sql.includes("FROM composerHeaders h"),
+    );
+    expect(scopedSql).toContain("h.composerId = ?");
+    expect(scopedSql).not.toContain("ORDER BY");
+    if (scopedSql === undefined) {
+      throw new Error("Expected the scoped continuation query.");
+    }
+    const plan = database
+      .prepare(`EXPLAIN QUERY PLAN ${scopedSql}`)
+      .all(COMPOSER)
+      .map((row) => String(row.detail))
+      .join("\n");
+    expect(plan).toContain("composerHeaders_1 (composerId=?)");
+    expect(plan).not.toContain("TEMP B-TREE");
     database.close();
   });
 

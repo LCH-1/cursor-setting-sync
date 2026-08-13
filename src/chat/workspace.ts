@@ -495,6 +495,18 @@ export function normalizeWorkspaceUri(
     : trimmed;
 }
 
+/** Exact normalized membership check used before opening recovery context. */
+export function workspaceUriMatchesAny(
+  expected: string,
+  candidates: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const normalizedExpected = normalizeWorkspaceUri(expected, platform);
+  return candidates.some(
+    (candidate) => normalizeWorkspaceUri(candidate, platform) === normalizedExpected,
+  );
+}
+
 /**
  * Collapses the two spellings Cursor uses for one SSH host.
  *

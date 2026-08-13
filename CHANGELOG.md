@@ -2,6 +2,17 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.65] - 2026-08-13
+
+### Added
+
+- **An unavailable conversation whose continuation blobs no longer exist can now continue safely in a new Agent without rewriting the damaged chat.** **Continue Unavailable Chat Safely** verifies every visible row in a read-only transaction, rechecks the continuation damage immediately before export, and creates a bounded plaintext Markdown context containing the recoverable user and assistant text, thinking and error state, inert tool inputs/results/status, deduplicated source selections, and allowlisted composer work state. A surviving selected PNG is validated byte-for-byte, copied content-addressed, and attached beside the Markdown file. Nothing is submitted automatically, and the original composer and Cursor database remain unchanged. The local plaintext recovery artifacts remain in extension storage until the user deletes them.
+
+### Fixed
+
+- **Unrecoverable legacy chats no longer prevent `Repair Unavailable Chats` from reaching a later continuation-damaged conversation.** The command advances through indexed, bounded `composerId` keyset pages, releases each no-source batch, and proceeds to the independent continuation audit in the same invocation. It no longer repeats the same first batch, misreports an aggregate safety limit as a request to apply that batch, or suggests Restore Version History when no earlier stored version exists.
+- **Safe continuation now handles the real Remote SSH and attachment edge cases.** Hex-descriptor and alias spellings of the same SSH workspace compare as one identity, the selected chat is re-audited after UI selection, image paths are rebound only to the matching local workspace-storage image directory, and PNG structure, CRCs, dimensions, decoded work, size, and hash are checked before an Agent can be opened. Internal Cursor command rejection falls back to a verified manual artifact instead of sending or stacking another action.
+
 ## [0.0.64] - 2026-08-13
 
 ### Fixed

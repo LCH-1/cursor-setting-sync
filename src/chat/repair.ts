@@ -61,6 +61,7 @@ interface RawComposerHeaderGuarded extends RawComposerHeader {
 
 interface RawBrokenComposerMetadata extends RawKvMetadataRow {
   composerId: SqliteStorageValue;
+  sortComposerId: SqliteStorageValue;
   headerValueType: SqliteStorageValue;
   headerValueBytes: SqliteStorageValue;
   workspaceIdType: SqliteStorageValue;
@@ -127,7 +128,21 @@ export interface BrokenChatInspection {
   snapshotByteLimit: number;
   /** True when a fixed byte, count, or JSON-structure bound made work unknown. */
   limitReached: boolean;
+  /** True only for a non-resumable per-chat/structure bound, not page fullness. */
+  unresolvedLimitReached: boolean;
+  /**
+   * Keyset cursor immediately before the first damaged conversation omitted
+   * from a paged result. Null means the ordered database walk completed.
+   */
+  resumeAfter: BrokenChatInspectionCursor | null;
+  /** Last ordered composer row fully inspected by this page. */
+  scannedThrough: BrokenChatInspectionCursor | null;
   broken: BrokenChatObservation[];
+}
+
+export interface BrokenChatInspectionCursor {
+  /** Exact SQLite primary-key value used by the indexed command-only DB walk. */
+  composerId: Exclude<SqliteStorageValue, null>;
 }
 
 export interface BrokenChatInspectionLimits {
@@ -148,6 +163,14 @@ export interface BrokenChatInspectionOptions {
   limits?: Partial<BrokenChatInspectionLimits>;
   /** Optional exact resource scope, used by the post-confirmation recheck. */
   resourceIds?: ReadonlySet<string>;
+  /** Continue the deterministic composerId-primary-key-indexed walk. */
+  after?: BrokenChatInspectionCursor;
+  /**
+   * Stop at the first aggregate-retention deferral and return a keyset cursor.
+   * Callers can then discard an unrecoverable bounded batch and inspect the
+   * next one without retaining an ever-growing exclusion set.
+   */
+  pageAtRetentionLimit?: boolean;
 }
 
 export interface ChatContinuationAuditLimits {
@@ -182,6 +205,8 @@ export const DEFAULT_CHAT_CONTINUATION_AUDIT_LIMITS: Readonly<
 
 export interface ChatContinuationAuditOptions {
   limits?: Partial<ChatContinuationAuditLimits>;
+  /** Optional exact composer scope for a post-selection freshness recheck. */
+  composerIds?: ReadonlySet<string>;
 }
 
 export type ChatContinuationRootProbeResult = AgentKvBlobLookupResult;
@@ -330,19 +355,28 @@ export async function inspectBrokenChatContinuationsInDatabase(
     let probedRootCount = 0;
     let limitReached = false;
     const broken: BrokenChatContinuationObservation[] = [];
-    const composers = database.prepare(
-      `SELECT h.composerId AS composerId
-         FROM composerHeaders h
-         JOIN cursorDiskKV d
-           ON d.key = 'composerData:' || CAST(h.composerId AS TEXT)
-        WHERE COALESCE(h.isSubagent, 0) = 0
-        ORDER BY CASE
-                   WHEN typeof(h.lastUpdatedAt) IN ('integer', 'real')
-                     THEN h.lastUpdatedAt
-                   ELSE NULL
-                 END DESC,
-                 CAST(h.composerId AS TEXT)`,
-    );
+    const composers =
+      options?.composerIds === undefined
+        ? database.prepare(
+            `SELECT h.composerId AS composerId
+               FROM composerHeaders h
+               JOIN cursorDiskKV d
+                 ON d.key = 'composerData:' || CAST(h.composerId AS TEXT)
+              WHERE COALESCE(h.isSubagent, 0) = 0
+              ORDER BY CASE
+                         WHEN typeof(h.lastUpdatedAt) IN ('integer', 'real')
+                           THEN h.lastUpdatedAt
+                         ELSE NULL
+                       END DESC,
+                       CAST(h.composerId AS TEXT)`,
+          )
+        : database.prepare(
+            `SELECT h.composerId AS composerId
+               FROM composerHeaders h
+               JOIN cursorDiskKV d
+                 ON d.key = 'composerData:' || CAST(h.composerId AS TEXT)
+              WHERE h.composerId = ? AND COALESCE(h.isSubagent, 0) = 0`,
+          );
     const rootProbe = database.prepare(
       "SELECT key, " +
         "CASE WHEN length(CAST(value AS BLOB)) <= ? THEN value ELSE NULL END AS value, " +
@@ -350,7 +384,11 @@ export async function inspectBrokenChatContinuationsInDatabase(
         "FROM cursorDiskKV WHERE key = ?",
     );
 
-    for (const row of composers.iterate() as Iterable<{
+    const composerRows =
+      options?.composerIds === undefined
+        ? composers.iterate()
+        : scopedComposerRows(composers, options.composerIds);
+    for (const row of composerRows as Iterable<{
       composerId: SqliteStorageValue;
     }>) {
       const composerId = sqliteText(row.composerId);
@@ -439,6 +477,20 @@ export async function inspectBrokenChatContinuationsInDatabase(
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
+  }
+}
+
+function* scopedComposerRows(
+  statement: ReturnType<DatabaseSync["prepare"]>,
+  composerIds: ReadonlySet<string>,
+): Iterable<{ composerId: SqliteStorageValue }> {
+  for (const composerId of composerIds) {
+    if (!isSyncableComposerId(composerId)) {
+      continue;
+    }
+    yield* statement.iterate(composerId) as Iterable<{
+      composerId: SqliteStorageValue;
+    }>;
   }
 }
 
@@ -708,9 +760,25 @@ export function inspectBrokenChatsInDatabase(
     let deferredBrokenChats = 0;
     let oversizedChats = 0;
     let limitReached = false;
+    let unresolvedLimitReached = false;
+    let resumeAfter: BrokenChatInspectionCursor | null = null;
+    let lastCompletedCursor = options?.after ?? null;
     const rawValueLimit = portableRawValueLimit(limits.maxRetainedBytes);
+    const after = options?.after;
+    const keysetWalk =
+      options?.pageAtRetentionLimit === true || after !== undefined;
+    const afterPredicate = after === undefined ? "" : " AND h.composerId > ?";
+    const composerOrder = keysetWalk
+      ? "h.composerId"
+      : `CASE
+           WHEN typeof(h.lastUpdatedAt) IN ('integer', 'real')
+             THEN h.lastUpdatedAt
+           ELSE NULL
+         END DESC,
+         CAST(h.composerId AS TEXT)`;
     const composerStatement = database.prepare(
       `SELECT h.composerId AS composerId,
+              h.composerId AS sortComposerId,
               typeof(h.value) AS headerValueType,
               length(CAST(h.value AS BLOB)) AS headerValueBytes,
               typeof(h.workspaceId) AS workspaceIdType,
@@ -721,12 +789,8 @@ export function inspectBrokenChatsInDatabase(
          JOIN cursorDiskKV d
            ON d.key = 'composerData:' || CAST(h.composerId AS TEXT)
         WHERE COALESCE(h.isSubagent, 0) = 0
-        ORDER BY CASE
-                   WHEN typeof(h.lastUpdatedAt) IN ('integer', 'real')
-                     THEN h.lastUpdatedAt
-                   ELSE NULL
-                 END DESC,
-                 CAST(h.composerId AS TEXT)`,
+              ${afterPredicate}
+        ORDER BY ${composerOrder}`,
     );
     const headerStatement = database.prepare(
       `SELECT composerId,
@@ -781,7 +845,19 @@ export function inspectBrokenChatsInDatabase(
          FROM cursorDiskKV
         WHERE key = ?`,
     );
-    for (const row of composerStatement.iterate() as Iterable<RawBrokenComposerMetadata>) {
+    const composerRows =
+      after === undefined
+        ? composerStatement.iterate()
+        : composerStatement.iterate(after.composerId);
+    for (const row of composerRows as Iterable<RawBrokenComposerMetadata>) {
+      const sortComposerId = sqliteKeysetCursorValue(row.sortComposerId);
+      const rowCursor =
+        sortComposerId === null
+          ? null
+          : {
+              composerId: sortComposerId,
+            } satisfies BrokenChatInspectionCursor;
+      let rowCompleted = true;
       // One malformed composer must not hide every repairable conversation.
       // This command exists for a damaged database, so per-chat isolation is a
       // correctness property rather than merely defensive logging.
@@ -822,6 +898,7 @@ export function inspectBrokenChatsInDatabase(
         if (referenceKeys.status === "unknown") {
           if (referenceKeys.reason === REPAIR_ROW_JSON_STRUCTURE_LIMIT_REASON) {
             limitReached = true;
+            unresolvedLimitReached = true;
           }
           continue;
         }
@@ -836,6 +913,7 @@ export function inspectBrokenChatsInDatabase(
         if (!referenceAudit.damaged) {
           if (referenceAudit.unknown) {
             limitReached = true;
+            unresolvedLimitReached = true;
           }
           // Orphan rows are not part of Cursor's conversation. In particular,
           // a huge inert orphan must not turn a healthy chat into a damaged
@@ -908,6 +986,11 @@ export function inspectBrokenChatsInDatabase(
         ) {
           deferredBrokenChats += 1;
           limitReached = true;
+          if (options?.pageAtRetentionLimit === true) {
+            resumeAfter = lastCompletedCursor;
+            rowCompleted = false;
+            break;
+          }
           continue;
         }
         const snapshot = readPortableChatSnapshot(database, composerId);
@@ -924,6 +1007,7 @@ export function inspectBrokenChatsInDatabase(
           audit.reason === REPAIR_ROW_JSON_STRUCTURE_LIMIT_REASON
         ) {
           limitReached = true;
+          unresolvedLimitReached = true;
         }
         if (
           audit.status !== "known" ||
@@ -947,12 +1031,19 @@ export function inspectBrokenChatsInDatabase(
         ) {
           deferredBrokenChats += 1;
           limitReached = true;
+          if (options?.pageAtRetentionLimit === true) {
+            resumeAfter = lastCompletedCursor;
+            rowCompleted = false;
+            break;
+          }
           continue;
         }
         broken.push({
           resourceId,
           composerId,
-          title: chatHeaderTitle(snapshot.header.value),
+          title:
+            chatHeaderTitle(snapshot.header.value) ??
+            chatComposerDataTitle(snapshot.composerData),
           workspaceId: snapshot.header.workspaceId,
           lastUpdatedAt: snapshot.header.lastUpdatedAt,
           referencedBubbleCount: audit.referencedBubbleKeys.length,
@@ -965,6 +1056,10 @@ export function inspectBrokenChatsInDatabase(
         // The other composer rows remain independently auditable. Unsupported
         // storage classes cannot be represented in a portable repair payload,
         // so guessing a replacement here would be less safe than skipping it.
+      } finally {
+        if (rowCompleted && rowCursor !== null) {
+          lastCompletedCursor = rowCursor;
+        }
       }
     }
     database.exec("COMMIT");
@@ -975,13 +1070,39 @@ export function inspectBrokenChatsInDatabase(
       oversizedChats,
       snapshotByteLimit: limits.maxRetainedBytes,
       limitReached,
-      // The SQL order is deliberate: partial command batches repair the most
-      // recently active damaged conversations before older ones.
+      unresolvedLimitReached,
+      resumeAfter,
+      scannedThrough: lastCompletedCursor,
+      // Paged callers deliberately use the composerId primary-key index so
+      // every next batch advances without repeatedly sorting the entire DB.
+      // Non-paged callers retain the historical newest-first presentation.
       broken,
     };
   } catch (error) {
     database.exec("ROLLBACK");
     throw error;
+  }
+}
+
+function chatComposerDataTitle(row: PortableKvRow): string | null {
+  if (row.valueType !== "text") {
+    return null;
+  }
+  const bytes = Buffer.from(row.valueBase64, "base64");
+  if (bytes.byteLength > 64 * 1024 || !losslessUtf8(bytes)) {
+    return null;
+  }
+  try {
+    const value = JSON.parse(bytes.toString("utf8")) as unknown;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return null;
+    }
+    const name = (value as Record<string, unknown>).name;
+    return typeof name === "string"
+      ? chatHeaderTitle(JSON.stringify({ name }))
+      : null;
+  } catch {
+    return null;
   }
 }
 
@@ -2158,6 +2279,18 @@ function nullableNumber(value: SqliteStorageValue, column: string): number | nul
     throw new Error(`composerHeaders.${column} is not numeric.`);
   }
   return number;
+}
+
+function sqliteKeysetCursorValue(
+  value: SqliteStorageValue,
+): Exclude<SqliteStorageValue, null> | null {
+  if (typeof value === "bigint" || typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : null;
+  }
+  return value instanceof Uint8Array ? Uint8Array.from(value) : null;
 }
 
 function losslessUtf8(bytes: Buffer): boolean {
