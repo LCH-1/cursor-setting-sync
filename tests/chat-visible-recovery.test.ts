@@ -455,7 +455,7 @@ describe("visible-row continuation recovery", () => {
   });
 
   it("validates selected PNG structure, dimensions, count, and aggregate bounds", async () => {
-    const missing = await createCalendarFixture();
+    const missing = await createCalendarFixture({ imageOnly: true });
     await rm(missing.imagePath);
     const missingRecovery = extractVisibleChatRecoveryTranscript(
       missing.databasePath,
@@ -470,7 +470,7 @@ describe("visible-row continuation recovery", () => {
       ),
     ).rejects.toThrow(/does not exist/i);
 
-    const mismatch = await createCalendarFixture();
+    const mismatch = await createCalendarFixture({ imageOnly: true });
     updateBubble(
       mismatch.databasePath,
       "bubble-111",
@@ -489,7 +489,7 @@ describe("visible-row continuation recovery", () => {
       ),
     ).rejects.toThrow(/dimensions do not match/i);
 
-    const truncated = await createCalendarFixture();
+    const truncated = await createCalendarFixture({ imageOnly: true });
     await writeFile(truncated.imagePath, ONE_PIXEL_PNG.subarray(0, 16));
     const truncatedRecovery = extractVisibleChatRecoveryTranscript(
       truncated.databasePath,
@@ -504,7 +504,7 @@ describe("visible-row continuation recovery", () => {
       ),
     ).rejects.toThrow(/invalid chunk structure|truncated chunk/i);
 
-    const corrupt = await createCalendarFixture();
+    const corrupt = await createCalendarFixture({ imageOnly: true });
     const corruptPng = Buffer.from(ONE_PIXEL_PNG);
     corruptPng[corruptPng.length - 1] = (corruptPng.at(-1) ?? 0) ^ 0xff;
     await writeFile(corrupt.imagePath, corruptPng);
@@ -521,7 +521,7 @@ describe("visible-row continuation recovery", () => {
       ),
     ).rejects.toThrow(/CRC verification/i);
 
-    const count = await createCalendarFixture();
+    const count = await createCalendarFixture({ imageOnly: true });
     const twoImages = userBubbleWithImage(count.imagePath);
     const context = twoImages.context as { selectedImages: unknown[] };
     context.selectedImages.push(structuredClone(context.selectedImages[0]));
@@ -535,7 +535,7 @@ describe("visible-row continuation recovery", () => {
       ),
     ).toThrow(/selected-image count limit/i);
 
-    const aggregate = await createCalendarFixture();
+    const aggregate = await createCalendarFixture({ imageOnly: true });
     const aggregateRecovery = extractVisibleChatRecoveryTranscript(
       aggregate.databasePath,
       COMPOSER_ID,
@@ -742,7 +742,9 @@ describe("visible-row continuation recovery", () => {
   });
 });
 
-async function createCalendarFixture(): Promise<{
+async function createCalendarFixture(
+  options: { imageOnly?: boolean } = {},
+): Promise<{
   root: string;
   databasePath: string;
   workspaceStorageRoot: string;
@@ -784,7 +786,10 @@ async function createCalendarFixture(): Promise<{
       ) VALUES (?, ?, 1, 119, 0, 0, 119, NULL, ?)`,
     )
     .run(COMPOSER_ID, WORKSPACE_ID, JSON.stringify(header));
-  const ids = Array.from({ length: 119 }, (_, index) => `bubble-${index}`);
+  const bubbleIndexes = options.imageOnly
+    ? [111]
+    : Array.from({ length: 119 }, (_, index) => index);
+  const ids = bubbleIndexes.map((index) => `bubble-${index}`);
   const insert = database.prepare(
     "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)",
   );
@@ -834,7 +839,7 @@ async function createCalendarFixture(): Promise<{
     [117, "ㅎㅇ"],
   ]);
   let assistantIndex = 0;
-  for (let index = 0; index < ids.length; index += 1) {
+  for (const index of bubbleIndexes) {
     const userText = users.get(index);
     let value: unknown;
     if (userText !== undefined) {
@@ -887,7 +892,7 @@ async function createCalendarFixture(): Promise<{
       };
       assistantIndex += 1;
     }
-    insert.run(`bubbleId:${COMPOSER_ID}:${ids[index]}`, JSON.stringify(value));
+    insert.run(`bubbleId:${COMPOSER_ID}:bubble-${index}`, JSON.stringify(value));
   }
   database.close();
   return { root, databasePath, workspaceStorageRoot, imagePath };
