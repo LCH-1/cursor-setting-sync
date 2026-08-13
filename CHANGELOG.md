@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.64] - 2026-08-13
+
+### Fixed
+
+- **A transient cloud-provider metadata update no longer aborts synchronization while `repo.json` is being read.** The opened-handle identity and size checks remain fail-closed, but a safe read discarded because OneDrive, Dropbox, Syncthing, or another provider replaced or restamped the manifest is now retried through the same bounded transient-I/O policy as other shared-folder reads. Structural path and symbolic-link validation failures are still reported immediately and are never retried.
+
 ## [0.0.63] - 2026-08-11
 
 ### Added

@@ -59,6 +59,7 @@ import {
   readFileBounded,
   readFileWithinRoot,
   readJsonFileBounded,
+  retryTransientRead,
   statResilient,
   writeFileAtomic,
   writeJsonAtomic,
@@ -106,7 +107,9 @@ export async function readRepositoryManifest(
 ): Promise<RepositoryFile> {
   return JSON.parse(
     (
-      await readFileWithinRoot(root, REPOSITORY_FILE, MAX_REPOSITORY_FILE_BYTES)
+      await retryTransientRead(() =>
+        readFileWithinRoot(root, REPOSITORY_FILE, MAX_REPOSITORY_FILE_BYTES),
+      )
     ).toString("utf8"),
   ) as RepositoryFile;
 }

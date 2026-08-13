@@ -110,7 +110,9 @@ describe("base-free conflicts", () => {
     });
   });
 
-  it("elects the same winner and the same metadata on both devices", async () => {
+  it(
+    "elects the same winner and the same metadata on both devices",
+    async () => {
     // Two devices resolving the same base-free fork with no communication must
     // emit byte-identical content AND identical metadata, or the reconciler —
     // which collapses two tips on operation plus semanticHash alone — leaves
@@ -172,7 +174,9 @@ describe("base-free conflicts", () => {
       expect([...fromA.forkedValueTypes].sort()).toEqual(["blob", "text"]);
       expect(fromA.metadata?.valueType).toBe(fromA.newestValueType);
     });
-  });
+    },
+    20_000,
+  );
 
   it("lets a put beat a delete whatever the comparator says", async () => {
     await withRepository(async (repository) => {

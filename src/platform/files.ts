@@ -71,6 +71,20 @@ const TRANSIENT_IO_CODES = new Set([
   "ETIMEDOUT",
 ]);
 
+/**
+ * A synchronized file was replaced or modified during one safe read attempt.
+ * The attempt has already been discarded, so callers may safely retry the
+ * complete path validation and opened-handle read.
+ */
+export class SynchronizedFileChangedError extends Error {
+  readonly code = "EAGAIN";
+
+  constructor(candidate: string, phase: "opened" | "read") {
+    super(`Synchronized file changed while being ${phase}: ${candidate}`);
+    this.name = "SynchronizedFileChangedError";
+  }
+}
+
 export function isTransientIoError(error: unknown): boolean {
   return (
     error instanceof Error &&
@@ -360,7 +374,7 @@ export async function readFileWithinRoot(
   try {
     const opened = await handle.stat();
     if (!opened.isFile() || !sameFileIdentity(before, opened)) {
-      throw new Error(`Synchronized file changed while being opened: ${candidate}`);
+      throw new SynchronizedFileChangedError(candidate, "opened");
     }
     if (maxBytes !== undefined && opened.size > maxBytes) {
       throw new Error(`Synchronized file exceeds its size limit: ${candidate}`);
@@ -383,7 +397,7 @@ export async function readFileWithinRoot(
       !sameFileIdentity(before, after) ||
       !sameFileVersion(before, after)
     ) {
-      throw new Error(`Synchronized file changed while being read: ${candidate}`);
+      throw new SynchronizedFileChangedError(candidate, "read");
     }
     return content;
   } finally {
@@ -414,7 +428,7 @@ async function readOpenedFileBounded(
       offset,
     );
     if (bytesRead === 0) {
-      throw new Error(`Synchronized file changed while being read: ${candidate}`);
+      throw new SynchronizedFileChangedError(candidate, "read");
     }
     offset += bytesRead;
   }
@@ -423,7 +437,7 @@ async function readOpenedFileBounded(
   // prove the observed bound no longer describes the file.
   const probe = Buffer.allocUnsafe(1);
   if ((await handle.read(probe, 0, 1, openedSize)).bytesRead !== 0) {
-    throw new Error(`Synchronized file changed while being read: ${candidate}`);
+    throw new SynchronizedFileChangedError(candidate, "read");
   }
   return content;
 }
