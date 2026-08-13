@@ -927,6 +927,12 @@ describe("Repair Unavailable Chats command", () => {
       expect(warning).toContain(
         "per-conversation JSON or metadata safety bound",
       );
+      expect(warning).toContain(
+        "1 continuation record exceeded the conversation-state JSON structural-work limit",
+      );
+      expect(warning).not.toContain(
+        "1 continuation record was not safely readable",
+      );
     } finally {
       fixture.manager.dispose();
     }
@@ -1025,7 +1031,9 @@ describe("Repair Unavailable Chats command", () => {
       expect(ui.information[0]).toContain(
         "complete synchronized v2 copy queued on this PC",
       );
-      expect(ui.information[0]).toContain("1 continuation record");
+      expect(ui.information[0]).toContain(
+        "1 continuation record exceeded the bounded snapshot-size limit",
+      );
     } finally {
       fixture.manager.dispose();
     }

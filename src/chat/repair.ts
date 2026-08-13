@@ -239,6 +239,17 @@ export type ChatContinuationRootAudit =
         | "root-probe-failed";
     };
 
+export interface ChatContinuationUnknownReasonCounts {
+  /** Decoded conversation-state JSON exceeded the structural parser work limit. */
+  structuralWorkLimit: number;
+  /** The portable chat snapshot exceeded its exact materialization byte limit. */
+  snapshotSizeLimit: number;
+  /** Another bounded continuation walk/probe limit prevented classification. */
+  otherSafetyLimit: number;
+  /** Snapshot, conversation-state, or root data could not be read safely. */
+  unreadable: number;
+}
+
 export interface BrokenChatContinuationObservation {
   resourceId: string;
   composerId: string;
@@ -262,6 +273,8 @@ export interface BrokenChatContinuationInspection {
   examinedChats: number;
   auditedChats: number;
   unknownChats: number;
+  /** Exhaustive category counts for every chat included in `unknownChats`. */
+  unknownReasonCounts: ChatContinuationUnknownReasonCounts;
   probedRootCount: number;
   /** True when a configured command bound prevented a complete inspection. */
   limitReached: boolean;
@@ -352,6 +365,12 @@ export async function inspectBrokenChatContinuationsInDatabase(
     let examinedChats = 0;
     let auditedChats = 0;
     let unknownChats = 0;
+    const unknownReasonCounts: ChatContinuationUnknownReasonCounts = {
+      structuralWorkLimit: 0,
+      snapshotSizeLimit: 0,
+      otherSafetyLimit: 0,
+      unreadable: 0,
+    };
     let probedRootCount = 0;
     let limitReached = false;
     const broken: BrokenChatContinuationObservation[] = [];
@@ -413,6 +432,11 @@ export async function inspectBrokenChatContinuationsInDatabase(
       }
       if (boundedSnapshot.status === "unknown") {
         unknownChats += 1;
+        if (boundedSnapshot.limitReached) {
+          unknownReasonCounts.snapshotSizeLimit += 1;
+        } else {
+          unknownReasonCounts.unreadable += 1;
+        }
         limitReached ||= boundedSnapshot.limitReached;
         continue;
       }
@@ -429,6 +453,21 @@ export async function inspectBrokenChatContinuationsInDatabase(
       probedRootCount += audit.probedRootCount;
       if (audit.status === "unknown") {
         unknownChats += 1;
+        switch (audit.reason) {
+          case "conversation-state-json-structure-limit":
+            unknownReasonCounts.structuralWorkLimit += 1;
+            break;
+          case "conversation-state-limit":
+          case "roots-per-chat-limit":
+          case "root-probe-budget":
+          case "graph-limit":
+            unknownReasonCounts.otherSafetyLimit += 1;
+            break;
+          case "conversation-state-unreadable":
+          case "root-probe-failed":
+            unknownReasonCounts.unreadable += 1;
+            break;
+        }
         if (
           audit.reason === "conversation-state-limit" ||
           audit.reason === "roots-per-chat-limit" ||
@@ -466,6 +505,7 @@ export async function inspectBrokenChatContinuationsInDatabase(
       examinedChats,
       auditedChats,
       unknownChats,
+      unknownReasonCounts,
       probedRootCount,
       limitReached,
       broken: broken.sort(

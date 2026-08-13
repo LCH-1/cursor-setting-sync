@@ -173,6 +173,7 @@ import {
   type BrokenChatObservation,
   type BrokenChatContinuationObservation,
   type BrokenChatInspectionCursor,
+  type ChatContinuationUnknownReasonCounts,
   type ChatRepairCandidate,
 } from "../chat/repair";
 import {
@@ -2060,6 +2061,7 @@ export class SyncManager implements vscode.Disposable {
         ),
         continuationAuditIncompleteDetail(
           continuationInspection.unknownChats,
+          continuationInspection.unknownReasonCounts,
           continuationInspection.limitReached,
         ),
       ]
@@ -8028,21 +8030,49 @@ function chatRepairFreshInspectionDetail(
 
 function continuationAuditIncompleteDetail(
   unknownChats: number,
+  unknownReasonCounts: ChatContinuationUnknownReasonCounts,
   limitReached: boolean,
 ): string {
   if (unknownChats === 0 && !limitReached) {
     return "";
   }
-  const unknown =
-    unknownChats === 0
-      ? ""
-      : `${unknownChats} continuation record${
-          unknownChats === 1 ? " was" : "s were"
-        } not safely readable`;
+  const details: string[] = [];
+  const addReason = (
+    count: number,
+    singular: string,
+    plural: string,
+  ): void => {
+    if (count > 0) {
+      details.push(`${count} ${count === 1 ? singular : plural}`);
+    }
+  };
+  addReason(
+    unknownReasonCounts.structuralWorkLimit,
+    "continuation record exceeded the conversation-state JSON structural-work limit",
+    "continuation records exceeded the conversation-state JSON structural-work limit",
+  );
+  addReason(
+    unknownReasonCounts.snapshotSizeLimit,
+    "continuation record exceeded the bounded snapshot-size limit",
+    "continuation records exceeded the bounded snapshot-size limit",
+  );
+  addReason(
+    unknownReasonCounts.otherSafetyLimit,
+    "continuation record exceeded another continuation safety limit",
+    "continuation records exceeded other continuation safety limits",
+  );
+  addReason(
+    unknownReasonCounts.unreadable,
+    "continuation record was not safely readable",
+    "continuation records were not safely readable",
+  );
   const bounded = limitReached
     ? "the continuation audit also reached a safety bound before every conversation could be verified"
     : "";
-  return `${[unknown, bounded].filter((detail) => detail.length > 0).join("; ")}.`;
+  if (bounded.length > 0) {
+    details.push(bounded);
+  }
+  return `${details.join("; ")}.`;
 }
 
 /** "3m 12s", or "7s" under a minute. */
