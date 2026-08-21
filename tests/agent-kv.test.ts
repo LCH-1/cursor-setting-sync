@@ -12,9 +12,11 @@ describe("agentKv conversation graph", () => {
   it("walks nested protobuf references and retains opaque leaves", async () => {
     const leaf = Buffer.from("opaque JSON or text leaf", "utf8");
     const leafId = sha256(leaf);
-    const child = bytesField(2, Buffer.from(leafId, "hex"));
+    const child = shellTurn({ commandId: leafId });
     const childId = sha256(child);
-    const serializedState = state(bytesField(9, bytesField(4, Buffer.from(childId, "hex"))));
+    const serializedState = state(
+      bytesField(8, Buffer.from(childId, "hex")),
+    );
     const rows = new Map<string, AgentKvBlobLookupResult>([
       [
         key(childId),
@@ -47,25 +49,26 @@ describe("agentKv conversation graph", () => {
     // A true hash-valid cycle would require a SHA-256 fixed point/collision.
     // Repeated roots and diamond fan-in exercise the same visited-set guard.
     const shared = Buffer.from([0xff]);
-    const sharedId = sha256(shared);
-    const first = Buffer.concat([
-      bytesField(1, Buffer.from(sharedId, "hex")),
-      bytesField(2, Buffer.from(sharedId, "hex")),
-    ]);
-    const second = bytesField(3, Buffer.from(sharedId, "hex"));
+    const sharedStep = assistantStep(shared);
+    const sharedId = sha256(sharedStep);
+    const first = agentTurn([sharedId], "first");
+    const second = agentTurn([sharedId], "second");
     const firstId = sha256(first);
     const secondId = sha256(second);
-    const firstState = state(bytesField(1, Buffer.from(firstId, "hex")));
+    const firstState = state(bytesField(8, Buffer.from(firstId, "hex")));
     const combinedState = state(
       Buffer.concat([
-        bytesField(2, Buffer.from(secondId, "hex")),
-        bytesField(3, Buffer.from(firstId, "hex")),
+        bytesField(8, Buffer.from(secondId, "hex")),
+        bytesField(8, Buffer.from(firstId, "hex")),
       ]),
     );
     const rows = new Map<string, AgentKvBlobLookupResult>([
       [key(firstId), { status: "found", key: key(firstId), bytes: first }],
       [key(secondId), { status: "found", key: key(secondId), bytes: second }],
-      [key(sharedId), { status: "found", key: key(sharedId), bytes: shared }],
+      [
+        key(sharedId),
+        { status: "found", key: key(sharedId), bytes: sharedStep },
+      ],
     ]);
     const lookup = vi.fn(lookupFrom(rows));
 
@@ -89,7 +92,7 @@ describe("agentKv conversation graph", () => {
     const serializedState = state(
       Buffer.concat([
         bytesField(1, Buffer.from(missingId, "hex")),
-        bytesField(2, Buffer.from(tamperedId, "hex")),
+        bytesField(3, Buffer.from(tamperedId, "hex")),
       ]),
     );
 
@@ -125,7 +128,7 @@ describe("agentKv conversation graph", () => {
     const serializedState = state(
       Buffer.concat([
         bytesField(1, Buffer.from(firstId, "hex")),
-        bytesField(2, Buffer.from(secondId, "hex")),
+        bytesField(3, Buffer.from(secondId, "hex")),
       ]),
     );
     const seedBytes = Buffer.from(serializedState.slice(1), "base64").byteLength;
@@ -159,7 +162,7 @@ describe("agentKv conversation graph", () => {
     const serializedState = state(
       Buffer.concat([
         bytesField(1, Buffer.from(unreadableId, "hex")),
-        bytesField(2, Buffer.from(throwingId, "hex")),
+        bytesField(3, Buffer.from(throwingId, "hex")),
       ]),
     );
 
@@ -209,8 +212,7 @@ describe("agentKv conversation graph", () => {
     const secondId = "bb".repeat(32);
     const valid = state(
       Buffer.concat([
-        bytesField(2, Buffer.from(secondId, "hex")),
-        bytesField(1, Buffer.from(firstId, "hex")),
+        bytesField(1, Buffer.from(secondId, "hex")),
         bytesField(3, Buffer.from(firstId, "hex")),
       ]),
     );
@@ -252,12 +254,283 @@ describe("agentKv conversation graph", () => {
     );
   });
 
+  it("does not turn Calendar's 32-byte Grep, Shell, or token payloads into blob edges", async () => {
+    const embeddedMatch32 = bytesField(2, Buffer.alloc(30, 0x61));
+    expect(embeddedMatch32).toHaveLength(32);
+    const content32 = Buffer.alloc(32, 0x62);
+    const grepFileMatch = Buffer.concat([
+      bytesField(2, embeddedMatch32),
+      bytesField(2, bytesField(2, content32)),
+    ]);
+    const grepStep = toolStep(
+      5,
+      bytesField(
+        2,
+        bytesField(
+          1,
+          bytesField(
+            4,
+            mapEntry(
+              "workspace",
+              bytesField(3, bytesField(1, grepFileMatch)),
+            ),
+          ),
+        ),
+      ),
+    );
+    const shellScalar32 = Buffer.alloc(32, 0x63);
+    const shellStep = toolStep(
+      1,
+      bytesField(1, bytesField(8, bytesField(2, bytesField(2, shellScalar32)))),
+    );
+    const opaqueAssistantStep = assistantStep(Buffer.alloc(32, 0x64));
+    const steps = [grepStep, shellStep, opaqueAssistantStep].map((bytes) => ({
+      bytes,
+      id: sha256(bytes),
+    }));
+    const turn = agentTurn(steps.map(({ id }) => id));
+    const turnId = sha256(turn);
+
+    const tokenCategory32 = bytesField(1, Buffer.alloc(30, 0x65));
+    expect(tokenCategory32).toHaveLength(32);
+    const serializedState = state(
+      Buffer.concat([
+        bytesField(8, Buffer.from(turnId, "hex")),
+        bytesField(5, bytesField(3, bytesField(3, tokenCategory32))),
+      ]),
+    );
+    const rows = new Map<string, AgentKvBlobLookupResult>([
+      [key(turnId), { status: "found", key: key(turnId), bytes: turn }],
+      ...steps.map(
+        ({ id, bytes }) =>
+          [key(id), { status: "found", key: key(id), bytes }] as const,
+      ),
+    ]);
+    const lookup = vi.fn(lookupFrom(rows));
+
+    const result = await walkAgentKvReachability(serializedState, lookup);
+
+    expect(result.roots).toEqual([turnId]);
+    expect(result.blobs.map(({ id }) => id).sort()).toEqual(
+      [turnId, ...steps.map(({ id }) => id)].sort(),
+    );
+    expect(result.missing).toEqual([]);
+    expect(result.limitReasons).toEqual([]);
+    expect(result.complete).toBe(true);
+    expect(lookup).toHaveBeenCalledTimes(4);
+    for (const falseId of [
+      embeddedMatch32.toString("hex"),
+      content32.toString("hex"),
+      shellScalar32.toString("hex"),
+      tokenCategory32.toString("hex"),
+    ]) {
+      expect(lookup).not.toHaveBeenCalledWith(key(falseId), expect.anything());
+    }
+  });
+
+  it("walks typed read, truncated, and nested task references and keeps true missing IDs", async () => {
+    const readMissingId = "71".repeat(32);
+    const truncatedMissingId = "72".repeat(32);
+    const taskMissingId = "73".repeat(32);
+    const readStep = readBlobStep(readMissingId);
+    const truncatedStep = toolStep(
+      34,
+      bytesField(1, Buffer.from(truncatedMissingId, "hex")),
+    );
+    const taskStep = toolStep(
+      19,
+      bytesField(
+        2,
+        bytesField(1, bytesField(1, readBlobStep(taskMissingId))),
+      ),
+    );
+    const steps = [readStep, truncatedStep, taskStep].map((bytes) => ({
+      bytes,
+      id: sha256(bytes),
+    }));
+    const turn = agentTurn(steps.map(({ id }) => id));
+    const turnId = sha256(turn);
+    const rows = new Map<string, AgentKvBlobLookupResult>([
+      [key(turnId), { status: "found", key: key(turnId), bytes: turn }],
+      ...steps.map(
+        ({ id, bytes }) =>
+          [key(id), { status: "found", key: key(id), bytes }] as const,
+      ),
+    ]);
+
+    const result = await walkAgentKvReachability(
+      state(bytesField(8, Buffer.from(turnId, "hex"))),
+      lookupFrom(rows),
+    );
+
+    expect(result.missing).toEqual(
+      [readMissingId, taskMissingId, truncatedMissingId]
+        .sort()
+        .map((id) => ({ id, key: key(id), depth: 2 })),
+    );
+    expect(result.unavailableIds).toEqual(
+      [readMissingId, taskMissingId, truncatedMissingId].sort(),
+    );
+    expect(result.limitReasons).toEqual([]);
+    expect(result.complete).toBe(false);
+  });
+
+  it("preserves selected-context, subagent, map, and oneof reference semantics", async () => {
+    const overwrittenImage = opaqueFixture("overwritten image");
+    const selectedImage = opaqueFixture("selected image");
+    const inlineImage = opaqueFixture("inline image fallback");
+    const invocation = opaqueFixture("invocation");
+    const extra = opaqueFixture("extra context");
+    const pullRequest = opaqueFixture("pull request");
+    const gitDiff = opaqueFixture("git diff");
+    const snapshot = { bytes: Buffer.alloc(0), id: sha256(Buffer.alloc(0)) };
+    const selectedContext = Buffer.concat([
+      bytesField(
+        1,
+        Buffer.concat([
+          bytesField(1, Buffer.from(overwrittenImage.id, "hex")),
+          bytesField(8, Buffer.from("inline", "utf8")),
+        ]),
+      ),
+      bytesField(
+        1,
+        bytesField(9, bytesField(1, Buffer.from(selectedImage.id, "hex"))),
+      ),
+      bytesField(
+        1,
+        bytesField(
+          9,
+          Buffer.concat([
+            bytesField(1, Buffer.from(inlineImage.id, "hex")),
+            bytesField(2, Buffer.from("present", "utf8")),
+          ]),
+        ),
+      ),
+      bytesField(2, bytesField(10, Buffer.from(invocation.id, "hex"))),
+      bytesField(16, bytesField(2, Buffer.from(extra.id, "hex"))),
+      bytesField(20, bytesField(6, Buffer.from(gitDiff.id, "hex"))),
+      bytesField(21, bytesField(7, Buffer.from(pullRequest.id, "hex"))),
+    ]);
+    const user = Buffer.concat([
+      bytesField(3, selectedContext),
+      bytesField(10, Buffer.from(snapshot.id, "hex")),
+    ]);
+    const userId = sha256(user);
+    const turn = bytesField(
+      1,
+      bytesField(1, Buffer.from(userId, "hex")),
+    );
+    const turnId = sha256(turn);
+
+    const overwrittenMap = opaqueFixture("overwritten map value");
+    const retainedMap = opaqueFixture("retained map value");
+    const fileContent = opaqueFixture("file content");
+    const initialContent = opaqueFixture("initial content");
+    const embeddedSubagent = opaqueFixture("embedded subagent state value");
+    const referencedSubagent = opaqueFixture("referenced subagent state value");
+    const subagentState = bytesField(
+      1,
+      bytesField(3, Buffer.from(referencedSubagent.id, "hex")),
+    );
+    const subagentStateId = sha256(subagentState);
+    const serializedState = state(
+      Buffer.concat([
+        bytesField(8, Buffer.from(turnId, "hex")),
+        bytesField(
+          12,
+          mapEntry("same.ts", Buffer.from(overwrittenMap.id, "hex")),
+        ),
+        bytesField(
+          12,
+          mapEntry("same.ts", Buffer.from(retainedMap.id, "hex")),
+        ),
+        bytesField(
+          15,
+          mapEntry(
+            "file.ts",
+            Buffer.concat([
+              bytesField(1, Buffer.from(fileContent.id, "hex")),
+              bytesField(2, Buffer.from(initialContent.id, "hex")),
+            ]),
+          ),
+        ),
+        bytesField(
+          16,
+          mapEntry(
+            "inline-subagent",
+            bytesField(
+              1,
+              bytesField(1, Buffer.from(embeddedSubagent.id, "hex")),
+            ),
+          ),
+        ),
+        bytesField(
+          31,
+          mapEntry("subagent-ref", Buffer.from(subagentStateId, "hex")),
+        ),
+      ]),
+    );
+    const materialized = [
+      { id: turnId, bytes: turn },
+      { id: userId, bytes: user },
+      snapshot,
+      selectedImage,
+      invocation,
+      extra,
+      gitDiff,
+      pullRequest,
+      retainedMap,
+      fileContent,
+      initialContent,
+      embeddedSubagent,
+      { id: subagentStateId, bytes: subagentState },
+      referencedSubagent,
+    ];
+    const rows = new Map<string, AgentKvBlobLookupResult>(
+      materialized.map(({ id, bytes }) => [
+        key(id),
+        { status: "found", key: key(id), bytes },
+      ]),
+    );
+    const lookup = vi.fn(lookupFrom(rows));
+
+    const result = await walkAgentKvReachability(serializedState, lookup);
+
+    expect(result.roots).toEqual(
+      [
+        turnId,
+        retainedMap.id,
+        fileContent.id,
+        initialContent.id,
+        embeddedSubagent.id,
+        subagentStateId,
+      ].sort(),
+    );
+    expect(result.blobs.map(({ id }) => id).sort()).toEqual(
+      materialized.map(({ id }) => id).sort(),
+    );
+    expect(result.complete).toBe(true);
+    for (const ignored of [overwrittenImage, inlineImage, overwrittenMap]) {
+      expect(lookup).not.toHaveBeenCalledWith(key(ignored.id), expect.anything());
+    }
+  });
+
+  it("fails closed on an unknown conversation schema field without fabricating an ID", () => {
+    const arbitrary32 = Buffer.alloc(32, 0x7a);
+
+    const result = extractAgentKvRootIds(state(bytesField(99, arbitrary32)));
+
+    expect(result.roots).toEqual([]);
+    expect(result.limitReasons).toEqual(["schema"]);
+    expect(result.complete).toBe(false);
+  });
+
   it("reports node, byte, graph-depth, and protobuf-depth bounds", async () => {
     const leaf = Buffer.from([0xff]);
     const leafId = sha256(leaf);
-    const root = bytesField(1, Buffer.from(leafId, "hex"));
+    const root = shellTurn({ commandId: leafId });
     const rootId = sha256(root);
-    const serializedState = state(bytesField(1, Buffer.from(rootId, "hex")));
+    const serializedState = state(bytesField(8, Buffer.from(rootId, "hex")));
     const rows = new Map<string, AgentKvBlobLookupResult>([
       [key(rootId), { status: "found", key: key(rootId), bytes: root }],
       [key(leafId), { status: "found", key: key(leafId), bytes: leaf }],
@@ -275,7 +548,7 @@ describe("agentKv conversation graph", () => {
     const twoRoots = state(
       Buffer.concat([
         bytesField(1, Buffer.from(rootId, "hex")),
-        bytesField(2, Buffer.from(leafId, "hex")),
+        bytesField(3, Buffer.from(leafId, "hex")),
       ]),
     );
     const nodeLimited = await walkAgentKvReachability(
@@ -313,7 +586,10 @@ describe("agentKv conversation graph", () => {
     expect(preflightLimited.unavailableIds).toEqual([]);
 
     const nestedSeed = state(
-      bytesField(1, bytesField(2, Buffer.from(rootId, "hex"))),
+      bytesField(
+        15,
+        mapEntry("src/depth.ts", bytesField(1, Buffer.from(rootId, "hex"))),
+      ),
     );
     const protobufLimited = extractAgentKvRootIds(nestedSeed, {
       limits: { maxProtobufDepth: 0 },
@@ -351,9 +627,7 @@ describe("agentKv conversation graph", () => {
     const childIds = Array.from({ length: 4_096 }, (_, index) =>
       distinctId(index + 10_000),
     );
-    const root = Buffer.concat(
-      childIds.map((id) => bytesField(1, Buffer.from(id, "hex"))),
-    );
+    const root = agentTurn(childIds);
     const rootId = sha256(root);
     const lookup = vi.fn<AgentKvBlobLookup>((requested) =>
       requested === key(rootId)
@@ -362,7 +636,7 @@ describe("agentKv conversation graph", () => {
     );
 
     const result = await walkAgentKvReachability(
-      state(bytesField(1, Buffer.from(rootId, "hex"))),
+      state(bytesField(8, Buffer.from(rootId, "hex"))),
       lookup,
       { limits: { maxNodes: 4 } },
     );
@@ -433,6 +707,58 @@ function key(id: string): string {
 
 function state(bytes: Uint8Array): string {
   return `~${Buffer.from(bytes).toString("base64")}`;
+}
+
+function agentTurn(stepIds: readonly string[], requestId?: string): Buffer {
+  const fields = stepIds.map((id) => bytesField(2, Buffer.from(id, "hex")));
+  if (requestId !== undefined) {
+    fields.push(bytesField(3, Buffer.from(requestId, "utf8")));
+  }
+  return bytesField(1, Buffer.concat(fields));
+}
+
+function shellTurn(options: {
+  commandId?: string;
+  outputId?: string;
+}): Buffer {
+  const fields: Buffer[] = [];
+  if (options.commandId !== undefined) {
+    fields.push(bytesField(1, Buffer.from(options.commandId, "hex")));
+  }
+  if (options.outputId !== undefined) {
+    fields.push(bytesField(2, Buffer.from(options.outputId, "hex")));
+  }
+  return bytesField(2, Buffer.concat(fields));
+}
+
+function assistantStep(text: Uint8Array): Buffer {
+  return bytesField(1, bytesField(1, text));
+}
+
+function toolStep(toolFieldNumber: number, toolCall: Uint8Array): Buffer {
+  return bytesField(2, bytesField(toolFieldNumber, toolCall));
+}
+
+function readBlobStep(id: string): Buffer {
+  return toolStep(
+    8,
+    bytesField(
+      2,
+      bytesField(1, bytesField(10, Buffer.from(id, "hex"))),
+    ),
+  );
+}
+
+function opaqueFixture(label: string): { bytes: Buffer; id: string } {
+  const bytes = Buffer.from(label, "utf8");
+  return { bytes, id: sha256(bytes) };
+}
+
+function mapEntry(keyText: string, value: Uint8Array): Buffer {
+  return Buffer.concat([
+    bytesField(1, Buffer.from(keyText, "utf8")),
+    bytesField(2, value),
+  ]);
 }
 
 function bytesField(fieldNumber: number, payload: Uint8Array): Buffer {

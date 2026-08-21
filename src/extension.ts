@@ -5,6 +5,7 @@ import { inspectCompatibility } from "./platform/compatibility";
 import { SyncManager } from "./sync/manager";
 import { StatusController } from "./ui/status";
 import { ConflictController } from "./ui/conflicts";
+import { MANAGE_COMMAND, MANAGE_TITLE } from "./constants";
 
 let manager: SyncManager | null = null;
 
@@ -13,6 +14,88 @@ const SUPPORTED_PLATFORMS: ReadonlySet<NodeJS.Platform> = new Set([
   "darwin",
   "linux",
 ]);
+
+type ManagementAction =
+  | "diagnostics"
+  | "sync"
+  | "apply"
+  | "conflicts"
+  | "repair-chats"
+  | "open-recovered"
+  | "restore-version"
+  | "restore-backup"
+  | "archive"
+  | "forget-device"
+  | "setup"
+  | "disconnect";
+
+interface ManagementItem extends vscode.QuickPickItem {
+  action: ManagementAction;
+}
+
+const MANAGEMENT_ITEMS: readonly ManagementItem[] = [
+  {
+    label: "$(pulse) Show Diagnostics",
+    description: "status, warnings, pending work, repository usage",
+    action: "diagnostics",
+  },
+  {
+    label: "$(sync) Sync Now",
+    description: "normally automatic; force one bounded cycle now",
+    action: "sync",
+  },
+  {
+    label: "$(debug-restart) Apply Queued Changes",
+    description:
+      "quit Cursor, apply offline, then relaunch; normally automatic on shutdown",
+    action: "apply",
+  },
+  {
+    label: "$(diff) Resolve Conflicts",
+    description: "choose between changes that cannot be merged safely",
+    action: "conflicts",
+  },
+  {
+    label: "$(wrench) Repair Unavailable Chats",
+    description: "audit and safely repair or preserve damaged conversations",
+    action: "repair-chats",
+  },
+  {
+    label: "$(comment-discussion) Open Recovered Chat",
+    description: "open one previously preserved recovery transcript",
+    action: "open-recovered",
+  },
+  {
+    label: "$(history) Restore Version History",
+    description: "publish an earlier synchronized resource version",
+    action: "restore-version",
+  },
+  {
+    label: "$(database) Restore Database Backup",
+    description: "restore a pre-apply SQLite backup while Cursor is closed",
+    action: "restore-backup",
+  },
+  {
+    label: "$(archive) Archive Repository",
+    description: "copy the complete encrypted repository to a safe location",
+    action: "archive",
+  },
+  {
+    label: "$(device-desktop) Forget Device",
+    description: "retire or restore a device stream",
+    action: "forget-device",
+  },
+  {
+    label: "$(settings-gear) Setup or Reconfigure",
+    description: "connect this PC to a sync repository",
+    action: "setup",
+  },
+  {
+    label: "$(debug-disconnect) Disconnect This PC",
+    description: "clear only this PC's repository configuration and key",
+    action: "disconnect",
+  },
+];
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   if (!SUPPORTED_PLATFORMS.has(process.platform)) {
@@ -35,83 +118,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     status,
     conflicts,
   );
-  const repositoryCommand =
-    (run: (activeManager: SyncManager) => Promise<void>) => async () => {
-      const activeManager = manager;
-      if (activeManager === null) {
-        return;
-      }
-      await activeManager.prepareForRepositoryCommand();
-      await run(activeManager);
-    };
-
   context.subscriptions.push(
     status,
     conflicts,
     manager,
-    registerCommand("cursorSync.setup", () => manager?.setup()),
-    registerCommand(
-      "cursorSync.syncNow",
-      repositoryCommand((activeManager) => activeManager.syncNowCommand()),
-    ),
-    registerCommand(
-      "cursorSync.restartToApply",
-      repositoryCommand((activeManager) => activeManager.restartToApply()),
-    ),
-    registerCommand(
-      "cursorSync.resolveConflicts",
-      repositoryCommand((activeManager) => activeManager.resolveConflicts()),
-    ),
-    registerCommand(
-      "cursorSync.restoreVersion",
-      repositoryCommand((activeManager) => activeManager.restoreVersion()),
-    ),
-    registerCommand(
-      "cursorSync.repairUnavailableChats",
-      repositoryCommand((activeManager) =>
-        activeManager.repairUnavailableChats(),
-      ),
-    ),
-    registerCommand("cursorSync.continueUnavailableChatSafely", () =>
-      manager?.continueUnavailableChatSafely(),
-    ),
-    registerCommand("cursorSync.preserveAllUnavailableChatsSafely", () =>
-      manager?.preserveAllUnavailableChatsSafely(),
-    ),
-    registerCommand("cursorSync.openRecoveredChatSafely", () =>
-      manager?.openRecoveredChatSafely(),
-    ),
-    registerCommand(
-      "cursorSync.showDiagnostics",
-      repositoryCommand((activeManager) => activeManager.showDiagnostics()),
-    ),
-    registerCommand(
-      "cursorSync.restoreBackup",
-      repositoryCommand((activeManager) => activeManager.restoreBackup()),
-    ),
-    registerCommand(
-      "cursorSync.forgetDevice",
-      repositoryCommand((activeManager) => activeManager.forgetDevice()),
-    ),
-    registerCommand(
-      "cursorSync.repositoryUsage",
-      repositoryCommand((activeManager) => activeManager.showRepositoryUsage()),
-    ),
-    registerCommand(
-      "cursorSync.compactRepository",
-      repositoryCommand((activeManager) => activeManager.compactRepository()),
-    ),
-    registerCommand(
-      "cursorSync.checkpointRepository",
-      repositoryCommand((activeManager) =>
-        activeManager.checkpointRepository(),
-      ),
-    ),
-    registerCommand(
-      "cursorSync.archiveRepository",
-      repositoryCommand((activeManager) => activeManager.archiveRepository()),
-    ),
-    registerCommand("cursorSync.disconnect", () => manager?.disconnect()),
+    registerCommand(MANAGE_COMMAND, async (requestedAction) => {
+      const activeManager = manager;
+      if (activeManager === null) {
+        return;
+      }
+      const action = isManagementAction(requestedAction)
+        ? requestedAction
+        : (
+            await vscode.window.showQuickPick(MANAGEMENT_ITEMS, {
+              title: MANAGE_TITLE,
+              placeHolder:
+                "Synchronization, live file apply, shutdown database apply, and repository maintenance are automatic.",
+              matchOnDescription: true,
+            })
+          )?.action;
+      if (action !== undefined) {
+        await runManagementAction(activeManager, action);
+      }
+    }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (
         event.affectsConfiguration("cursorSettingSync") ||
@@ -169,7 +198,7 @@ function announceReducedCapability(
     .showWarningMessage(`${headline} ${problems[0] ?? ""}`.trim(), action)
     .then((choice) => {
       if (choice === action) {
-        void vscode.commands.executeCommand("cursorSync.showDiagnostics");
+        void vscode.commands.executeCommand(MANAGE_COMMAND, "diagnostics");
       }
     }, () => {
       status.log("Unable to show the compatibility notification.");
@@ -189,31 +218,11 @@ function registerUnsupportedPlatformCommands(
   // the supported platform set. Registering the contributed commands as clear
   // no-ops avoids an opaque activation failure elsewhere.
   const message = "Cursor Setting Sync supports Windows, macOS and Linux.";
-  for (const command of [
-    "cursorSync.setup",
-    "cursorSync.syncNow",
-    "cursorSync.restartToApply",
-    "cursorSync.resolveConflicts",
-    "cursorSync.restoreVersion",
-    "cursorSync.repairUnavailableChats",
-    "cursorSync.continueUnavailableChatSafely",
-    "cursorSync.preserveAllUnavailableChatsSafely",
-    "cursorSync.openRecoveredChatSafely",
-    "cursorSync.showDiagnostics",
-    "cursorSync.restoreBackup",
-    "cursorSync.forgetDevice",
-    "cursorSync.repositoryUsage",
-    "cursorSync.compactRepository",
-    "cursorSync.checkpointRepository",
-    "cursorSync.archiveRepository",
-    "cursorSync.disconnect",
-  ]) {
-    context.subscriptions.push(
-      vscode.commands.registerCommand(command, () => {
-        void vscode.window.showInformationMessage(message);
-      }),
-    );
-  }
+  context.subscriptions.push(
+    vscode.commands.registerCommand(MANAGE_COMMAND, () => {
+      void vscode.window.showInformationMessage(message);
+    }),
+  );
   context.subscriptions.push(
     vscode.window.setStatusBarMessage("Cursor Setting Sync: unsupported platform"),
   );
@@ -221,15 +230,67 @@ function registerUnsupportedPlatformCommands(
 
 function registerCommand(
   command: string,
-  callback: () => Promise<void> | undefined,
+  callback: (...args: unknown[]) => Promise<void> | undefined,
 ): vscode.Disposable {
-  return vscode.commands.registerCommand(command, async () => {
+  return vscode.commands.registerCommand(command, async (...args: unknown[]) => {
     try {
-      await callback();
+      await callback(...args);
     } catch (error) {
       void vscode.window.showErrorMessage(
         `Cursor Setting Sync: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   });
+}
+
+function isManagementAction(value: unknown): value is ManagementAction {
+  return MANAGEMENT_ITEMS.some((item) => item.action === value);
+}
+
+async function runManagementAction(
+  activeManager: SyncManager,
+  action: ManagementAction,
+): Promise<void> {
+  if (action === "setup") {
+    await activeManager.setup();
+    return;
+  }
+  if (action === "disconnect") {
+    await activeManager.disconnect();
+    return;
+  }
+  if (action === "open-recovered") {
+    await activeManager.openRecoveredChatSafely();
+    return;
+  }
+  await activeManager.prepareForRepositoryCommand();
+  switch (action) {
+    case "diagnostics":
+      await activeManager.showDiagnostics();
+      return;
+    case "sync":
+      await activeManager.syncNowCommand();
+      return;
+    case "apply":
+      await activeManager.restartToApply();
+      return;
+    case "conflicts":
+      await activeManager.resolveConflicts();
+      return;
+    case "repair-chats":
+      await activeManager.repairUnavailableChats();
+      return;
+    case "restore-version":
+      await activeManager.restoreVersion();
+      return;
+    case "restore-backup":
+      await activeManager.restoreBackup();
+      return;
+    case "archive":
+      await activeManager.archiveRepository();
+      return;
+    case "forget-device":
+      await activeManager.forgetDevice();
+      return;
+  }
 }

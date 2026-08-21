@@ -1,0 +1,66 @@
+name: Publish Extension
+
+on:
+  release:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish-open-vsx:
+    name: Publish to Open VSX (Cursor)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run verify
+
+      - name: Verify tag equals package.json version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          PKG_VER="$(node -p "require('./package.json').version")"
+          [[ "$TAG" == "v$PKG_VER" ]] || { echo "Tag $TAG != package.json $PKG_VER"; exit 1; }
+
+      - name: Publish to Open VSX
+        uses: HaaLeo/publish-vscode-extension@v2
+        with:
+          pat: ${{ secrets.OPEN_VSX_TOKEN }}
+          preRelease: ${{ github.event.release.prerelease || false }}
+          skipDuplicate: true
+
+  publish-vscode-marketplace:
+    name: Publish to VS Code Marketplace
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run verify
+
+      - name: Verify tag equals package.json version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          PKG_VER="$(node -p "require('./package.json').version")"
+          [[ "$TAG" == "v$PKG_VER" ]] || { echo "Tag $TAG != package.json $PKG_VER"; exit 1; }
+
+      - name: Publish to Visual Studio Marketplace
+        uses: HaaLeo/publish-vscode-extension@v2
+        with:
+          pat: ${{ secrets.VS_MARKETPLACE_TOKEN }}
+          registryUrl: https://marketplace.visualstudio.com
+          skipDuplicate: true

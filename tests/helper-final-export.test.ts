@@ -17,14 +17,25 @@ vi.mock("vscode", () => ({
   extensions: { all: [] },
 }));
 
-import { parsePortableChatSnapshot } from "../src/chat/stateVscdb";
-import { __testing as helperMainTesting } from "../src/helper/main";
+import {
+  MAX_CHAT_HEADER_METADATA_ROWS_PER_PAGE,
+  MAX_CHAT_OVERSIZED_SETTLEMENTS,
+  parsePortableChatSnapshot,
+  portableChatCoreHash,
+} from "../src/chat/stateVscdb";
+import {
+  __testing as helperMainTesting,
+  prepareChanges,
+} from "../src/helper/main";
 import type { HelperChange, HelperRequest } from "../src/helper/types";
 import type { CursorPaths } from "../src/platform/paths";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import { EventReconciler } from "../src/protocol/reconciler";
 import { SyncRepository } from "../src/protocol/repository";
-import type { PortableChatSnapshot } from "../src/chat/stateVscdb";
+import type {
+  PortableChatSnapshot,
+  PortableChatSnapshotV2,
+} from "../src/chat/stateVscdb";
 import type { PortableStoreSnapshot } from "../src/chat/storeDb";
 
 const PASSPHRASE = "a sufficiently long final export passphrase";
@@ -732,6 +743,257 @@ describe("the helper's bounded final chat export", () => {
     );
   }, 120_000);
 
+  it("drains more than 32 header pages while keeping an incomplete queued chat blocked", async () => {
+    const fixture = await createFixture();
+    const fillerCount = MAX_CHAT_HEADER_METADATA_ROWS_PER_PAGE * 32 + 1;
+    const insert = fixture.database.prepare(
+      `INSERT INTO composerHeaders(
+        composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+        isSubagent, recency, checkpointAt, value
+      ) VALUES (?, NULL, 1, ?, 0, 1, 0, NULL, '{}')`,
+    );
+    fixture.database.exec("BEGIN");
+    try {
+      for (let index = 0; index < fillerCount; index += 1) {
+        insert.run(composerId(100_000 + index), 100_000 - index);
+      }
+      fixture.database.exec("COMMIT");
+    } catch (error) {
+      fixture.database.exec("ROLLBACK");
+      throw error;
+    }
+    fixture.database.close();
+
+    const complete = portableChatV2(
+      composerId(900_001),
+      "complete remote",
+      2,
+      "complete",
+    );
+    const missingId = "d".repeat(64);
+    const incomplete = portableChatV2(
+      composerId(900_002),
+      "incomplete remote",
+      2,
+      "incomplete",
+      [missingId],
+    );
+    const publish = await fixture.repository.publish(
+      [complete, incomplete].map((snapshot) => {
+        const content = canonicalBytes(snapshot);
+        return {
+          resourceId: `chat/${snapshot.composerId}`,
+          kind: "chat" as const,
+          content,
+          semanticHash: sha256(content),
+          metadata: {
+            composerId: snapshot.composerId,
+            workspaceId: null,
+            lastUpdatedAt: snapshot.header.lastUpdatedAt,
+            bubbleCount: snapshot.bubbles.length,
+            chatSnapshotSchemaVersion: 2,
+            agentKvBlobCount: snapshot.agentKv.blobs.length,
+            agentKvReferencedCount: snapshot.agentKv.referencedIds.length,
+            agentKvMissingCount: snapshot.agentKv.missingIds.length,
+            chatCoreHash: portableChatCoreHash(snapshot),
+          },
+        };
+      }),
+      [],
+    );
+    const reconciler = new EventReconciler();
+    const before = reconciler.reconcile(
+      await fixture.repository.listEvents(),
+      fixture.repository.state,
+      null,
+    );
+    const completeResourceId = `chat/${complete.composerId}`;
+    const incompleteResourceId = `chat/${incomplete.composerId}`;
+    const completeProjection = before.projections.find(
+      (candidate) => candidate.resourceId === completeResourceId,
+    );
+    const incompleteProjection = before.projections.find(
+      (candidate) => candidate.resourceId === incompleteResourceId,
+    );
+    if (completeProjection === undefined || incompleteProjection === undefined) {
+      throw new Error("Expected both queued chat projections.");
+    }
+    expect(completeProjection.tip.eventHash).toBe(publish.eventHash);
+    expect(incompleteProjection.tip.eventHash).toBe(publish.eventHash);
+    fixture.repository.state.pendingDatabaseChanges = [
+      completeProjection,
+      incompleteProjection,
+    ].map((projection) => ({
+      eventHash: projection.tip.eventHash,
+      changeIndex: projection.tip.changeIndex,
+      resourceId: projection.resourceId,
+      kind: "chat" as const,
+    }));
+    await fixture.repository.saveState();
+
+    const outcome = await helperMainTesting.exportFinalChanges(
+      fixture.request,
+      fixture.repository,
+    );
+
+    expect(outcome.incompleteKinds).not.toContain("chat");
+    expect(
+      outcome.warnings.some((warning) =>
+        warning.includes("final state-vscdb-chat export remained incomplete"),
+      ),
+    ).toBe(false);
+    expect(outcome.verifiedApplyVersionIds).toContain(
+      completeProjection.tip.versionId,
+    );
+    const after = reconciler.reconcile(
+      await fixture.repository.listEvents(),
+      fixture.repository.state,
+      null,
+    );
+    const eligible = helperMainTesting.shutdownApplyBatch(
+      fixture.repository,
+      after.projections,
+    );
+    expect(eligible.map((change) => change.resourceId)).toEqual([
+      completeResourceId,
+    ]);
+    const preparation = await prepareChanges(fixture.repository, eligible);
+    expect(preparation.prepared.map((item) => item.change.resourceId)).toEqual([
+      completeResourceId,
+    ]);
+    expect(preparation.skipped).toEqual([]);
+    expect(
+      fixture.repository.state.pendingDatabaseChanges.some(
+        (pending) => pending.resourceId === incompleteResourceId,
+      ),
+    ).toBe(true);
+  }, 120_000);
+
+  it("keeps a present malformed forced target blocked and exits after 32 stagnant passes", async () => {
+    const fixture = await createFixture();
+    const id = composerId(925_000);
+    const resourceId = `chat/${id}`;
+    fixture.database
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, NULL, 1, 1, 0, 'malformed', 0, NULL, '{}')`,
+      )
+      .run(id);
+    fixture.database.close();
+
+    const remote = portableChatV2(id, "remote target", 2, "remote");
+    const content = canonicalBytes(remote);
+    await fixture.repository.publish(
+      [
+        {
+          resourceId,
+          kind: "chat",
+          content,
+          semanticHash: sha256(content),
+          metadata: {
+            composerId: id,
+            workspaceId: null,
+            lastUpdatedAt: remote.header.lastUpdatedAt,
+            bubbleCount: remote.bubbles.length,
+            chatSnapshotSchemaVersion: 2,
+            agentKvBlobCount: remote.agentKv.blobs.length,
+            agentKvReferencedCount: remote.agentKv.referencedIds.length,
+            agentKvMissingCount: remote.agentKv.missingIds.length,
+            chatCoreHash: portableChatCoreHash(remote),
+          },
+        },
+      ],
+      [],
+    );
+    const reconciler = new EventReconciler();
+    const before = reconciler.reconcile(
+      await fixture.repository.listEvents(),
+      fixture.repository.state,
+      null,
+    );
+    const projection = before.projections.find(
+      (candidate) => candidate.resourceId === resourceId,
+    );
+    if (projection === undefined) {
+      throw new Error("Expected the queued malformed-target projection.");
+    }
+    fixture.repository.state.pendingDatabaseChanges = [
+      {
+        eventHash: projection.tip.eventHash,
+        changeIndex: projection.tip.changeIndex,
+        resourceId,
+        kind: "chat",
+      },
+    ];
+    await fixture.repository.saveState();
+    const heartbeat = vi.fn();
+
+    const outcome = await helperMainTesting.exportFinalChanges(
+      fixture.request,
+      fixture.repository,
+      heartbeat,
+    );
+
+    expect(outcome.incompleteKinds).toContain("chat");
+    expect(outcome.protectedLocalResourceIds).toContain(resourceId);
+    expect(
+      outcome.warnings.some(
+        (warning) =>
+          warning.includes("final state-vscdb-chat export remained incomplete") &&
+          warning.includes("32 consecutive no-progress passes"),
+      ),
+    ).toBe(true);
+    expect(heartbeat.mock.calls.length).toBeGreaterThanOrEqual(32);
+    expect(heartbeat.mock.calls.length).toBeLessThan(40);
+    expect(
+      fixture.repository.state.pendingDatabaseChanges.some(
+        (pending) => pending.resourceId === resourceId,
+      ),
+    ).toBe(true);
+  }, 30_000);
+
+  it("fails closed after 32 stagnant passes for a permanent oversized overflow", async () => {
+    const fixture = await createFixture();
+    fixture.request.syncOptions.maxPayloadBytes = 1024;
+    const insert = fixture.database.prepare(
+      `INSERT INTO composerHeaders(
+        composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+        isSubagent, recency, checkpointAt, value
+      ) VALUES (?, NULL, 1, ?, 0, 0, 0, NULL,
+        replace(hex(zeroblob(2048)), '00', 'h'))`,
+    );
+    fixture.database.exec("BEGIN");
+    try {
+      for (let index = 0; index <= MAX_CHAT_OVERSIZED_SETTLEMENTS; index += 1) {
+        insert.run(composerId(950_000 + index), 950_000 - index);
+      }
+      fixture.database.exec("COMMIT");
+    } catch (error) {
+      fixture.database.exec("ROLLBACK");
+      throw error;
+    }
+    fixture.database.close();
+    const heartbeat = vi.fn();
+
+    const outcome = await helperMainTesting.exportFinalChanges(
+      fixture.request,
+      fixture.repository,
+      heartbeat,
+    );
+
+    expect(outcome.incompleteKinds).toContain("chat");
+    expect(
+      outcome.warnings.some(
+        (warning) =>
+          warning.includes("final state-vscdb-chat export remained incomplete") &&
+          warning.includes("32 consecutive no-progress passes"),
+      ),
+    ).toBe(true);
+    expect(heartbeat.mock.calls.length).toBeLessThan(100);
+  }, 30_000);
+
   it("drains bounded transcript pages and releases each page before continuing", async () => {
     const fixture = await createFixture();
     fixture.database.close();
@@ -948,6 +1210,33 @@ function portableChat(
         valueType: "text",
       },
     ],
+  };
+}
+
+function portableChatV2(
+  composerId: string,
+  title: string,
+  lastUpdatedAt: number,
+  text: string,
+  missingIds: string[] = [],
+): PortableChatSnapshotV2 {
+  const base = portableChat(
+    composerId,
+    title,
+    lastUpdatedAt,
+    text,
+  );
+  return {
+    schemaVersion: 2,
+    composerId: base.composerId,
+    header: base.header,
+    composerData: base.composerData,
+    bubbles: base.bubbles,
+    agentKv: {
+      blobs: [],
+      referencedIds: [...missingIds],
+      missingIds: [...missingIds],
+    },
   };
 }
 

@@ -168,7 +168,7 @@ export async function cloneRepository(
     throw new GitError(
       "command",
       `Files appeared in the clone target while cloning (${afterClone[0] ?? ""}). ` +
-        "If this folder synchronizes from another computer, wait for that synchronization to finish and run Setup again - it will join the repository that arrived. " +
+        'If this folder synchronizes from another computer, wait for that synchronization to finish, then open "Cursor Setting Sync: Manage" and choose "Setup or Reconfigure" again - it will join the repository that arrived. ' +
         "Only empty the folder if you are certain the files are not another computer's sync data.",
     );
   }
@@ -204,7 +204,7 @@ export async function cloneRepository(
       "command",
       `The clone finished but its files could not be moved into place (${
         error instanceof Error ? error.message : String(error)
-      }). Close programs that may hold the folder open and run Setup again.`,
+      }). Close programs that may hold the folder open, then open "Cursor Setting Sync: Manage" and choose "Setup or Reconfigure" again.`,
     );
   }
   // Staging is empty and the clone has fully materialized; a locked leftover

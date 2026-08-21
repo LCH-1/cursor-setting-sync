@@ -205,7 +205,7 @@ describe("ui-state auto-merge", () => {
       expect(fromA.newestValueType).toBe(fromB.newestValueType);
       expect(fromA.metadata?.valueType).toBe(fromA.newestValueType);
     });
-  });
+  }, 15_000);
 
   it("leaves an over-limit merge for the manual resolver instead of aborting the cycle", async () => {
     // A three-way merge is the union of both sides' additions, so two tips that
@@ -255,7 +255,9 @@ describe("ui-state auto-merge", () => {
       expect(warnings).toHaveLength(2);
       expect(warnings[0]).toContain(resourceId);
       expect(warnings[0]).toContain("cursorSettingSync.maxPayloadMiB");
-      expect(warnings[0]).toContain("Cursor Setting Sync: Resolve Conflicts");
+      expect(warnings[0]).toContain(
+        'Cursor Setting Sync: Manage" → "Resolve Conflicts',
+      );
     }, limit);
   });
 

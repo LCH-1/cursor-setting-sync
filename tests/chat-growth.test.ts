@@ -116,9 +116,9 @@ describe("a conversation that grows after its header stops changing", () => {
 
   it("captures only the transitive agentKv graph reachable from conversationState", async () => {
     const { paths, database } = await createGlobalDatabase();
-    const leaf = Buffer.from("opaque text leaf", "utf8");
+    const leaf = conversationStepBytes("opaque text leaf");
     const leafId = sha256(leaf);
-    const root = bytesField(2, Buffer.from(leafId, "hex"));
+    const root = conversationTurnBytes([leafId]);
     const rootId = sha256(root);
     const unreachable = Buffer.from("unrelated global blob", "utf8");
     const unreachableId = sha256(unreachable);
@@ -127,7 +127,7 @@ describe("a conversation that grows after its header stops changing", () => {
       database,
       `composerData:${COMPOSER}`,
       JSON.stringify({
-        conversationState: state(bytesField(1, Buffer.from(rootId, "hex"))),
+        conversationState: state(bytesField(8, Buffer.from(rootId, "hex"))),
       }),
     );
     insertKv(database, `bubbleId:${COMPOSER}:b0`, "{}");
@@ -292,8 +292,8 @@ describe("a conversation that grows after its header stops changing", () => {
       JSON.stringify({
         conversationState: state(
           Buffer.concat([
-            bytesField(1, Buffer.from(missingId, "hex")),
-            bytesField(2, Buffer.from(tamperedId, "hex")),
+            bytesField(8, Buffer.from(missingId, "hex")),
+            bytesField(8, Buffer.from(tamperedId, "hex")),
           ]),
         ),
       }),
@@ -1326,6 +1326,160 @@ describe("a conversation that grows after its header stops changing", () => {
     expect(opens).not.toHaveBeenCalled();
   }, 30_000);
 
+  it("reports forward progress while a stable header sweep exceeds 32 pages", async () => {
+    const { paths, database } = await createGlobalDatabase();
+    const chatCount = MAX_CHAT_HEADER_METADATA_ROWS_PER_PAGE * 32 + 1;
+    const insert = database.prepare(
+      `INSERT INTO composerHeaders(
+        composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+        isSubagent, recency, checkpointAt, value
+      ) VALUES (?, 'workspace-a', 1, ?, 0, 1, 0, 0, '{}')`,
+    );
+    database.exec("BEGIN");
+    try {
+      for (let index = 0; index < chatCount; index += 1) {
+        insert.run(composerIdFor(index + 0x40_000), FROZEN_TIMESTAMP - index);
+      }
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+    database.close();
+
+    const adapter = new StateVscdbChatAdapter(paths, {
+      periodicDeepVerification: false,
+      maxProgressDatabaseGenerationRestarts: 1,
+    });
+    let previousToken = adapter.scanStatus().progressToken ?? -1;
+    let scans = 0;
+    for (; scans < 40; scans += 1) {
+      const result = await adapter.scan({});
+      expect(result.snapshots).toEqual([]);
+      expect(result.deletions).toEqual([]);
+      const status = adapter.scanStatus();
+      const token = status.progressToken ?? -1;
+      expect(token).toBeGreaterThan(previousToken);
+      previousToken = token;
+      if (status.complete) {
+        scans += 1;
+        break;
+      }
+    }
+
+    expect(scans).toBeGreaterThan(32);
+    expect(adapter.scanStatus()).toMatchObject({
+      complete: true,
+      deferredResourceIds: [],
+    });
+  }, 30_000);
+
+  it("restarts one progress epoch after a database mutation mid-sweep", async () => {
+    const { paths, database } = await createGlobalDatabase();
+    const chatCount = MAX_CHAT_HEADER_METADATA_ROWS_PER_PAGE * 2 + 1;
+    const insert = database.prepare(
+      `INSERT INTO composerHeaders(
+        composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+        isSubagent, recency, checkpointAt, value
+      ) VALUES (?, 'workspace-a', 1, ?, 0, 1, 0, 0, '{}')`,
+    );
+    for (let index = 0; index < chatCount; index += 1) {
+      insert.run(composerIdFor(index + 0x48_000), FROZEN_TIMESTAMP - index);
+    }
+    database.close();
+
+    const adapter = new StateVscdbChatAdapter(paths, {
+      periodicDeepVerification: false,
+      maxProgressDatabaseGenerationRestarts: 1,
+    });
+    await adapter.scan({});
+    let previousToken = adapter.scanStatus().progressToken ?? -1;
+    expect(adapter.scanStatus().complete).toBe(false);
+
+    // Change the durable generation after the first keyset page. The mixed
+    // pass must finish, then restart once from row zero to obtain one complete
+    // stable observation of the new generation.
+    const writer = new DatabaseSync(paths.globalDatabase);
+    writer
+      .prepare("UPDATE composerHeaders SET lastUpdatedAt = ? WHERE composerId = ?")
+      .run(FROZEN_TIMESTAMP + 1, composerIdFor(0x48_000));
+    writer.close();
+
+    let scansAfterMutation = 0;
+    for (; scansAfterMutation < 8; scansAfterMutation += 1) {
+      const result = await adapter.scan({});
+      expect(result.snapshots).toEqual([]);
+      expect(result.deletions).toEqual([]);
+      const token = adapter.scanStatus().progressToken ?? -1;
+      expect(token).toBeGreaterThan(previousToken);
+      previousToken = token;
+      if (adapter.scanStatus().complete) {
+        scansAfterMutation += 1;
+        break;
+      }
+    }
+
+    expect(scansAfterMutation).toBe(5);
+    expect(adapter.scanStatus()).toMatchObject({
+      complete: true,
+      deferredResourceIds: [],
+    });
+  }, 30_000);
+
+  it("freezes progress after one database restart despite appended rowids", async () => {
+    const { paths, database } = await createGlobalDatabase();
+    const forcedId = composerIdFor(0x4f_000);
+    const forcedResourceId = `chat/${forcedId}`;
+    database
+      .prepare(
+        `INSERT INTO composerHeaders(
+          composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+          isSubagent, recency, checkpointAt, value
+        ) VALUES (?, 'workspace-a', 1, 1, 0, 'malformed', 0, 0, '{}')`,
+      )
+      .run(forcedId);
+    database.close();
+
+    const adapter = new StateVscdbChatAdapter(paths, {
+      periodicDeepVerification: false,
+      maxProgressDatabaseGenerationRestarts: 1,
+      forceCoreVerificationResourceIds: [forcedResourceId],
+    });
+    await adapter.scan({});
+    const initialToken = adapter.scanStatus().progressToken ?? -1;
+    expect(adapter.scanStatus().deferredResourceIds).toContain(forcedResourceId);
+
+    const appendSubagent = (index: number): void => {
+      const writer = new DatabaseSync(paths.globalDatabase);
+      writer
+        .prepare(
+          `INSERT INTO composerHeaders(
+            composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+            isSubagent, recency, checkpointAt, value
+          ) VALUES (?, 'workspace-a', 1, ?, 0, 1, 0, 0, '{}')`,
+        )
+        .run(composerIdFor(0x50_000 + index), index + 2);
+      writer.close();
+    };
+
+    appendSubagent(0);
+    await adapter.scan({});
+    expect(adapter.scanStatus().progressToken).toBeGreaterThan(initialToken);
+
+    appendSubagent(1);
+    await adapter.scan({});
+    const frozenToken = adapter.scanStatus().progressToken;
+    for (let pass = 0; pass < 33; pass += 1) {
+      appendSubagent(pass + 2);
+      await adapter.scan({});
+      expect(adapter.scanStatus().progressToken).toBe(frozenToken);
+      expect(adapter.scanStatus().complete).toBe(false);
+      expect(adapter.scanStatus().deferredResourceIds).toContain(
+        forcedResourceId,
+      );
+    }
+  }, 30_000);
+
   it("bounds many large changed snapshots per scan and publishes them round-robin", async () => {
     const { paths, database } = await createGlobalDatabase();
     const known: Record<string, LocalProjection> = {};
@@ -1482,10 +1636,11 @@ describe("a conversation that grows after its header stops changing", () => {
     expect(result.snapshots).toEqual([]);
     expect(capturedResourceIds.sort()).toEqual([...resourceIds].sort());
     expect(adapter.oversizedSnapshotSettlements(limit)).toHaveLength(2);
-    expect(adapter.scanStatus()).toEqual({
+    expect(adapter.scanStatus()).toMatchObject({
       complete: true,
       deferredResourceIds: [],
     });
+    expect(typeof adapter.scanStatus().progressToken).toBe("number");
 
     capturedResourceIds.length = 0;
     opens.mockClear();
@@ -1544,10 +1699,11 @@ describe("a conversation that grows after its header stops changing", () => {
         .oversizedSnapshotSettlements(limit)
         .every((settlement) => settlement.byteLength > limit),
     ).toBe(true);
-    expect(adapter.scanStatus()).toEqual({
+    expect(adapter.scanStatus()).toMatchObject({
       complete: true,
       deferredResourceIds: [],
     });
+    expect(typeof adapter.scanStatus().progressToken).toBe("number");
 
     opens.mockClear();
     expect((await adapter.scan(known)).snapshots).toEqual([]);
@@ -1622,11 +1778,15 @@ describe("a conversation that grows after its header stops changing", () => {
     expect(overflow?.warning).toContain(`At least ${chatCount}`);
     expect(overflow?.warning).toContain("remains incomplete");
     expect(adapter.scanStatus().complete).toBe(false);
+    const stalledProgressToken = adapter.scanStatus().progressToken;
     opens.mockClear();
-    expect(await adapter.scan(known)).toMatchObject({
-      snapshots: [],
-      deletions: [],
-    });
+    for (let pass = 0; pass < 33; pass += 1) {
+      expect(await adapter.scan(known)).toMatchObject({
+        snapshots: [],
+        deletions: [],
+      });
+      expect(adapter.scanStatus().progressToken).toBe(stalledProgressToken);
+    }
     expect(opens).not.toHaveBeenCalled();
     expect(adapter.scanStatus().complete).toBe(false);
 
@@ -1994,10 +2154,11 @@ describe("a conversation that grows after its header stops changing", () => {
       }
     }
 
-    expect(adapter.scanStatus()).toEqual({
+    expect(adapter.scanStatus()).toMatchObject({
       complete: true,
       deferredResourceIds: [],
     });
+    expect(typeof adapter.scanStatus().progressToken).toBe("number");
     expect([...new Set(materialized)].sort()).toEqual([...resourceIds].sort());
     expect(materialized).toHaveLength(resourceIds.length);
     opens.mockClear();
@@ -2107,10 +2268,11 @@ describe("a conversation that grows after its header stops changing", () => {
     expect(settlements[0]?.warning).toContain(
       "fixed 32 MiB live chat-capture safety budget",
     );
-    expect(adapter.scanStatus()).toEqual({
+    expect(adapter.scanStatus()).toMatchObject({
       complete: true,
       deferredResourceIds: [],
     });
+    expect(typeof adapter.scanStatus().progressToken).toBe("number");
     countProbes.mockClear();
     insertKv(database, "unrelated:wal-generation", "changed");
     expect((await adapter.scan({})).snapshots).toEqual([]);
@@ -2621,6 +2783,19 @@ function bytesField(fieldNumber: number, payload: Uint8Array): Buffer {
     varint(BigInt(payload.byteLength)),
     Buffer.from(payload),
   ]);
+}
+
+function conversationTurnBytes(stepIds: readonly string[]): Buffer {
+  return bytesField(
+    1,
+    Buffer.concat(
+      stepIds.map((id) => bytesField(2, Buffer.from(id, "hex"))),
+    ),
+  );
+}
+
+function conversationStepBytes(text: string): Buffer {
+  return bytesField(1, bytesField(1, Buffer.from(text, "utf8")));
 }
 
 function varint(input: bigint): Buffer {

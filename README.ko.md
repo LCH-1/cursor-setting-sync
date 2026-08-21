@@ -42,17 +42,17 @@ Cursor 내장 런타임이 필요한 SQLite 기능을 제공하지 않을 때도
 
 ## 설치
 
-Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트에서 `Cursor Setting Sync: Setup`을 실행합니다.
+Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트의 유일한 항목인 `Cursor Setting Sync: Manage`를 실행하고 **Setup or Reconfigure**를 선택합니다.
 
 ## 셋업
 
 ### 공통 (모든 방식 공통)
 
-- 어느 방식이든 `Cursor Setting Sync: Setup`을 실행하는 것으로 시작합니다.
+- 어느 방식이든 `Cursor Setting Sync: Manage` → **Setup or Reconfigure**에서 시작합니다.
 - 패스프레이즈는 선택 사항입니다. 입력한다면 12자 이상이어야 하고 모든 PC에서 동일해야 합니다. 공유 저장소에 저장되지 않으며, 복구할 수 없습니다.
 - 패스프레이즈를 비워 두면 보안 경고가 뜬 뒤 진행됩니다. 이 경우 암호화 키가 저장소 안(데이터 옆)에 놓여, 공유 폴더나 git 원격을 읽을 수 있는 사람은 누구나 복호화할 수 있습니다. 신뢰할 수 있는 로컬 폴더나 완전히 통제되는 비공개 원격에서만 사용하세요.
-- 추가 PC에서는 파일 리소스가 안전할 때 자동으로 적용됩니다. DB·워크스페이스 스토리지 변경이 대기하면 상태바 안내에 따라 `Cursor Setting Sync: Restart to Apply`를 실행합니다.
-- Setup 전에 `Sync Now`(또는 다른 명령)를 실행하면 아무 일도 일어나지 않습니다. 상태바에 `unconfigured`가 표시되고 Setup을 안내하는 메시지가 뜹니다. 저장소가 설정되기 전까지는 아무것도 동기화되지 않습니다.
+- 추가 PC에서는 파일 리소스가 안전할 때 자동으로 적용됩니다. DB·워크스페이스 스토리지 변경은 모든 Cursor 창을 정상 종료하면 종료 헬퍼가 자동 적용합니다. 즉시 적용하려면 **Manage** 안의 **Apply Queued Changes**를 사용합니다.
+- 설정 전에는 상태바를 누르면 **Manage**의 **Setup or Reconfigure**로 바로 연결됩니다. 저장소가 설정되기 전까지는 아무것도 동기화되지 않습니다.
 
 방식별 상세는 아래를 참고하고, 제공자별 주의사항은 [저장소 옵션](#저장소-옵션) 표를 확인하세요.
 
@@ -60,7 +60,7 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 
 **첫 번째 PC**
 
-1. `Cursor Setting Sync: Setup`을 실행합니다.
+1. `Cursor Setting Sync: Manage`를 실행하고 **Setup or Reconfigure**를 선택합니다.
 2. 공유 폴더(또는 로컬 폴더) 안의 빈 폴더를 선택합니다.
 3. **Plain shared folder**를 선택합니다.
 4. 패스프레이즈를 입력합니다(12자 이상, 또는 비워서 생략).
@@ -68,7 +68,7 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 
 **추가 PC**
 
-1. 확장을 설치하고 `Cursor Setting Sync: Setup`을 실행합니다.
+1. 확장을 설치하고 `Cursor Setting Sync: Manage`에서 **Setup or Reconfigure**를 선택합니다.
 2. 같은 공유 폴더(각 PC의 로컬 사본)를 선택합니다.
 3. **Plain shared folder**를 선택하고 같은 패스프레이즈를 입력합니다.
 
@@ -80,63 +80,57 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 
 **첫 번째 PC (새 저장소 생성)**
 
-1. `Cursor Setting Sync: Setup`을 실행합니다.
+1. `Cursor Setting Sync: Manage`를 실행하고 **Setup or Reconfigure**를 선택합니다.
 2. 빈 폴더를 선택합니다(위치는 자유).
 3. **New git repository with remote**를 선택하고 원격 URL을 입력합니다(비워두면 원격 없는 로컬 git 히스토리).
 4. 패스프레이즈를 입력합니다(12자 이상, 또는 비워서 생략). 첫 동기화에서 원격으로 push됩니다.
 
 **추가 PC (기존 저장소 합류)**
 
-1. 확장을 설치하고 `Cursor Setting Sync: Setup`을 실행합니다.
+1. 확장을 설치하고 `Cursor Setting Sync: Manage`에서 **Setup or Reconfigure**를 선택합니다.
 2. 빈 폴더를 선택합니다.
 3. **Clone an existing git repository**를 선택하고 같은 원격 URL을 입력합니다.
 4. 같은 패스프레이즈를 입력합니다.
 
 ## 저장소 옵션
 
-저장소는 암호화된 append-only 파일들이 담긴 폴더입니다. "동기화"의 의미는 그 폴더를 다른 PC로 무엇이 옮겨 주느냐에 따라 달라집니다. `Setup`에서 폴더를 지정하고, 폴더가 이동하는 방식에 맞는 전송을 선택하세요.
+저장소는 암호화된 append-only 파일들이 담긴 폴더입니다. "동기화"의 의미는 그 폴더를 다른 PC로 무엇이 옮겨 주느냐에 따라 달라집니다. **Manage**의 **Setup or Reconfigure**에서 폴더를 지정하고, 폴더가 이동하는 방식에 맞는 전송을 선택하세요.
 
 | 전송 방식 | 설정 방법 | 결과 |
 | --- | --- | --- |
-| **OneDrive / Dropbox / iCloud Drive** | **Plain shared folder**를 선택하고, 제공자가 동기화하는 위치 안의 빈 폴더를 지정하세요. 폴더는 반드시 디스크에 실제로 유지해야 합니다. OneDrive는 폴더 우클릭 → **"항상 이 장치에 유지"**("공간 확보"는 사용 금지, 이것이 "파일 온디맨드" 기능입니다), Dropbox는 "온라인 전용"을 끄고, iCloud Drive는 기본적으로 파일을 로컬에 유지합니다. | 완전한 다중 PC 동기화. 제공자가 폴더를 업로드하고, 각 PC는 같은 동기 폴더의 자기 로컬 사본을 `Setup`에서 가리킵니다. |
+| **OneDrive / Dropbox / iCloud Drive** | **Plain shared folder**를 선택하고, 제공자가 동기화하는 위치 안의 빈 폴더를 지정하세요. 폴더는 반드시 디스크에 실제로 유지해야 합니다. OneDrive는 폴더 우클릭 → **"항상 이 장치에 유지"**("공간 확보"는 사용 금지, 이것이 "파일 온디맨드" 기능입니다), Dropbox는 "온라인 전용"을 끄고, iCloud Drive는 기본적으로 파일을 로컬에 유지합니다. | 완전한 다중 PC 동기화. 제공자가 폴더를 업로드하고, 각 PC는 같은 동기 폴더의 자기 로컬 사본을 **Setup or Reconfigure**에서 가리킵니다. |
 | **Google Drive** | 데스크톱용 Google Drive에서 **"파일 미러링"** 모드(스트리밍 전용 아님)를 쓰고, 폴더를 우클릭해 **"오프라인 액세스 가능"**으로 설정한 다음 **Plain shared folder**를 선택하세요. | 완전한 다중 PC 동기화. 스트리밍 전용 모드에서는 파일이 가상 placeholder라 파일 감시와 읽기가 불안정하므로 파일 미러링 모드가 필수입니다. |
 | **Syncthing / Resilio** | 모든 PC의 공유를 같은 폴더로 맞추고 **Plain shared folder**를 선택하세요. | 클라우드 계정 없이 완전한 다중 PC 동기화. 확장은 `sync-conflict` 사본을 이미 무시합니다. |
-| **로컬 폴더(클라우드·git 없음)** | **Plain shared folder**를 선택하고 아무 로컬 경로나 지정하세요. | 단일 PC 버전 백업. 전체 버전 히스토리, `Restore Version History`, `Restore Backup`이 모두 동작합니다. 폴더를 기기 밖으로 옮기는 주체가 없으므로 다른 PC로 전파되지 않을 뿐입니다. |
+| **로컬 폴더(클라우드·git 없음)** | **Plain shared folder**를 선택하고 아무 로컬 경로나 지정하세요. | 단일 PC 버전 백업. 전체 버전 히스토리, **Restore Version History**, **Restore Database Backup**이 모두 동작합니다. 폴더를 기기 밖으로 옮기는 주체가 없으므로 다른 PC로 전파되지 않을 뿐입니다. |
 | **Git — clone existing** | **Clone an existing git repository**를 선택하고 저장소 URL(GitHub·GitLab·셀프호스팅 원격)을 붙여넣으세요. | 다른 PC들이 이미 push하는 저장소에 합류합니다. 매 주기마다 읽기 전에 pull하고 쓰기 후 commit/push합니다. |
 | **Git — new with remote** | **New git repository with remote**를 선택하고 원격 URL을 붙여넣으세요. | 폴더에 git을 초기화하고 원격을 연결하며, 첫 동기화에서 push합니다. GitHub/GitLab/셀프호스팅으로 여러 PC를 새로 시작할 때 쓰세요. |
 | **Git — local-only** | **New git repository with remote**를 선택하고 URL을 비워 두세요. | 원격 없는 로컬 git 히스토리 — 로컬 폴더와 같지만 git 커밋이 남습니다. 나중에 원격을 추가해 게시할 수 있습니다. |
 
-Git 전송에는 `git` CLI가 `PATH`에 있어야 합니다. 인증은 시스템 git 자격증명을 비대화식(`GIT_TERMINAL_PROMPT=0`)으로 사용하므로, 자격증명 헬퍼나 SSH 키를 미리 설정하세요. 인증 실패 시 경고로 강등되고 폴더는 로컬에서 계속 동작합니다. 원격 변경은 폴링으로 감지됩니다(git 모드는 파일 변경 이벤트를 받지 않음). 암호화 페이로드는 델타 압축이 안 되어 git 저장소는 담긴 데이터만큼 커집니다 — GitHub는 100MB 초과 파일을 거부하고 수 GB 이하 저장소를 선호하므로, `Show Repository Usage`를 확인하고 저장소가 커지면 `Checkpoint & Prune History`로 git 히스토리를 스쿼시하세요.
+Git 전송에는 `git` CLI가 `PATH`에 있어야 합니다. 인증은 시스템 git 자격증명을 비대화식(`GIT_TERMINAL_PROMPT=0`)으로 사용하므로, 자격증명 헬퍼나 SSH 키를 미리 설정하세요. 인증 실패 시 경고로 강등되고 폴더는 로컬에서 계속 동작합니다. 원격 변경은 폴링으로 감지됩니다(git 모드는 파일 변경 이벤트를 받지 않음). 암호화 페이로드는 델타 압축이 안 되어 git 저장소는 담긴 데이터만큼 커집니다. 확장은 git 파일 크기를 자동 검사하며, 이벤트 로그가 500개를 넘으면 동기화와 동일한 전파·안전 조건 아래에서 체크포인트와 프루닝을 주기적으로 시도합니다.
 
-## 명령어
+## 다른 PC에서 같은 원본 채팅 이어가기
 
-**초기 설정 · 일상 동기화**
+PC B에서는 대화가 정상적으로 이어지고 있고, 새 승계 Agent가 아니라 PC A에서 그 원본 대화를 그대로 이어 쓰려면 다음 순서로 진행합니다.
 
-- **Setup** — 최초 설정. 저장소 폴더와 전송 방식(plain / clone / new git)을 고르고 암호화 패스프레이즈를 입력합니다(12자 이상, 모든 PC 동일, 폴더에 저장 안 됨).
-- **Sync Now** — 즉시 한 번 동기화. 평소에는 자동으로 동기화됩니다(30초 폴링 + 파일 감시). 로컬 변경을 발행하고 원격 변경을 받아옵니다.
-- **Restart to Apply** — 대기 중인 DB 변경을 적용합니다. 이 명령이 대기열을 오프라인 헬퍼에 넘기고, Cursor를 종료시키고, 모든 프로세스가 끝나기를 기다린 뒤 행을 쓰고 다시 실행합니다. 사용자가 직접 Cursor를 껐다 켜는 것으로는 **적용되지 않습니다** — 종료 헬퍼는 이 기기의 변경을 내보내기만 하므로 대기열은 그대로 남습니다. 파일은 실행 중에도 적용되지만 `state.vscdb`(채팅, 사용자 규칙, 워크스페이스 DB)는 Cursor 종료 후에만 SQL로 안전하게 씁니다.
+1. 두 PC에 같은 최신 확장 버전을 설치합니다. PC B에서 정상 원본 대화를 연 뒤 자동 동기화와 공유 폴더 업로드 또는 git push가 모두 끝날 때까지 기다립니다. 즉시 한 주기를 강제하려면 **Manage**에서 **Sync Now**를 선택합니다.
+2. PC A에서 자동 저장소 갱신을 기다립니다. DB 변경이 대기하면 모든 Cursor 창을 정상 종료하고 종료 헬퍼가 끝난 뒤 다시 실행합니다. 즉시 적용하려면 **Manage**에서 **Apply Queued Changes**를 선택합니다. Cursor 실행 중에는 채팅 DB 행을 쓰지 않습니다.
+3. 같은 워크스페이스를 다시 열고 원본 대화를 선택합니다. 정확히 같은 `composerId`가 유지되며 새 Agent를 만들지 않습니다.
 
-**충돌 · 복구**
+PC A는 완전한 portable v2 continuation graph에서만 채팅 core를 대기열에 넣어 적용하고, 오프라인 헬퍼가 쓰기 직전에 메타데이터와 reachable closure를 다시 검증합니다. Legacy blob-only 이벤트 자체는 blob만 추가할 수 있고 없는 core를 직접 만들지는 않지만, 그 payload의 closure가 완전하면 현재 확장이 검증된 core-applying child로 다시 발행해 기존 저장소에서도 원본 core를 복구할 수 있게 합니다. 실제로 보존된 orphan blob은 유지하고, 현재 core에서 도달할 수 없으며 원본 PC에도 없다고 확인된 missing 선언만 bounded 단계로 정규화합니다. Cursor가 양쪽 사본에 같은 고정 timestamp를 부여했더라도, 더 긴 완전한 사본이 공통 visible sequence의 확실한 strict extension일 때만 자동으로 선택됩니다. 모호하게 갈라진 fork는 자동 덮어쓰기하지 않고 수동 처리를 위해 남깁니다. 새로 발행되거나 변경된 채팅도 bounded 두 개 작업 묶음에 포함된 경우에만 같은 동기화 주기 안에서 continuation enrichment를 받습니다. 다만 오래된 채팅이 매우 많으면 backlog는 점진적으로 처리되므로 한 주기로 모든 legacy 대화가 준비된다고 보장하지 않습니다. 정상 원본이 남은 PC에서 추가 자동 동기화 주기를 허용한 뒤 다른 PC에 적용하세요.
 
-- **Resolve Conflicts** — 두 PC에서 편집해 자동 병합되지 않은 충돌을 수동으로 해결합니다. 모든 충돌이 한 화면에 이름과 양쪽 값과 함께 나열됩니다 — `Setting: editor.fontSize · This PC: 14 vs Other PC: 16` — 어느 PC가 언제 썼는지도 함께 표시됩니다. *전부 최신 것으로*, *전부 이 PC 것으로*, *전부 상대 PC 것으로* 중 하나로 목록 전체를 한 번에 처리하거나, 개별 항목을 골라 diff를 열고 따로 결정할 수 있습니다. diff는 직접 확인을 요청한 항목에 대해서만 열립니다. 나중으로 미뤄도 잃는 것은 없습니다. 양쪽 버전이 저장소에 그대로 남고, **Restore Version History**로 진 쪽을 되살릴 수 있습니다. UI 상태와 채팅은 여기에 거의 나타나지 않습니다. UI 상태는 아예 동기화되지 않고, 채팅 분기는 양쪽 메시지의 합집합으로 병합되며, 워크스페이스 DB와 `notepads.json`은 행 단위·노트 단위로 합쳐지므로 어느 PC의 노트도 충돌 해결을 위해 버려지지 않습니다. 사용자가 직접 작성했고 합칠 수 없는 리소스(설정, `.cursor` 규칙과 사용자 파일, 확장)와, 같은 노트를 양쪽에서 서로 다르게 고친 경우만 확인을 요청합니다. 충돌이 열려 있는 동안 해당 리소스는 상대 PC가 이쪽 버전을 볼 수 있도록 최대 1시간에 한 번만 다시 게시하며, 충돌을 해결하면 즉시 정상 동기화로 돌아갑니다.
-- **Restore Version History** — 리소스를 과거 버전으로 되돌립니다(git revert와 유사). 먼저 데이터 종류를 고르며, 일반 채팅을 되살릴 때는 **Agent transcripts**가 아니라 **Cursor conversations**를 선택하세요. 채팅이 많으면 워크스페이스/프로젝트로 한 번 더 좁히고, 실제 과거 복원 버전이 있는 항목만 읽기 쉬운 이름·메시지 수·날짜와 함께 표시합니다. diff 미리보기에서 버전을 확인한 뒤 새 버전으로 발행하며, 기존 히스토리는 보존됩니다.
-- **Repair Unavailable Chats** — 보이는 메시지 행 손상뿐 아니라, 복원된 대화는 보이지만 다음 프롬프트가 거절되는 continuation 데이터 누락도 자동으로 찾습니다. 손상된 채팅을 인덱스 기반의 bounded page로 끝까지 진행하므로, 복구본이 없는 오래된 채팅이 뒤쪽 검사를 영구히 막지 않습니다. 필요한 메시지 본문과 continuation blob을 모두 가진 경고 없는 호환 동기화 버전이 하나 있을 때만 자동 원위치 복구를 제안합니다. 현재 제목·헤더·composerData를 보존하며, 정확한 복구본의 DB 쓰기는 Cursor 종료 후 백업과 최종 race 검사를 거쳐 수행합니다. 그런 원본이 없으면 원래 행은 바꾸지 않습니다. 채팅이 정상적으로 이어지는 PC를 업데이트하고 동기화하거나, 정상 DB 백업을 복원하거나, 아래 로컬 카탈로그 대체 경로를 사용하세요.
-- **Continue Unavailable Chat Safely** — 정확한 continuation blob이 어느 동기화 PC나 저장 버전에도 남아 있지 않을 때, 화면에 남은 대화를 읽기 전용 트랜잭션으로 검증하고 bounded Markdown 복구 컨텍스트와 검증된 PNG 첨부를 가진 **새 Agent**를 준비합니다. 보이는 본문, 실행되지 않는 도구 입력·결과·상태, 소스 선택과 URI, todo와 새 파일/원본 파일 작업 상태, 선택 이미지를 과거 맥락으로 보존하며, 누락 blob을 조작해 만들거나 원본 composer를 다시 쓰거나 프롬프트를 자동 전송하지 않습니다. 이는 같은 채팅의 수리가 아니라 안전한 승계입니다. 복구 파일은 이 확장의 로컬 `recovery-transcripts` 폴더에 평문으로 남으며, 사용자가 해당 복구 파일을 명시적으로 삭제할 때까지 보관됩니다.
-- **Preserve All Recoverable Chats Safely** — Cursor 채팅을 원래 자리로 복원하는 기능이 아니라 로컬 카탈로그 대체 경로입니다. 확실한 continuation 손상을 작고 취소 가능한 페이지로 검사하고, 검증된 화면 대화 기록을 모두 체크포인트합니다. 여러 Agent를 만들거나 프롬프트를 보내거나 Cursor DB에 쓰거나 원래 대화 행을 바꾸지 않습니다. 평문 산출물에는 메시지 본문, assistant thinking/error 상태, 실행되지 않는 도구 입력·결과·상태, 소스 선택과 URI, todo, 새 파일/원본 파일 작업 상태, 선택 PNG가 들어갈 수 있으며 소스 코드나 비밀정보가 포함될 수 있습니다. manifest는 현재 항목 2,000개와 현재 참조되는 ready 파일 512 MiB로 제한됩니다. 별도로 격리된 catalog artifact 트리의 최종 파일, 이전/거부된 파생 파일, 인식 가능한 atomic partial 파일 전체에는 512 MiB/130,000-entry 물리 상한이 있고, manifest/index atomic-write 잔여물에는 32 MiB/16-entry 상한이 있습니다. **Open Recovered Chat Safely**는 새 빈 Agent 하나를 준비하기 직전에 저장 파일 hash, 원래 workspace, 현재 손상 fingerprint를 다시 검증합니다. 메시지 본문이 없는 채팅은 여전히 정확한 원본 PC나 DB 백업이 필요합니다. 복구 파일은 로컬 `recovery-transcripts` 폴더 또는 그 안의 선택한 파일만 명시적으로 지우면 되며, 확장 저장소 전체를 삭제할 필요도 권장도 없습니다.
-- **Restore Backup** — DB를 이전 백업 시점으로 복원합니다. 모든 DB 쓰기 전에 SQLite 백업을 뜨며, 그중 하나를 골라 복원합니다. 잘못된 복원을 되돌릴 "pre-restore" 백업도 목록에 표시됩니다.
+## 하나의 관리 명령
 
-**저장소 관리**
+명령 팔레트에는 **Cursor Setting Sync: Manage** 하나만 표시됩니다. 평소에는 명령이 필요 없습니다. 동기화는 폴링과 파일 감시로 자동 실행되고, 안전한 파일 변경은 Cursor 실행 중 적용되며, 대기 중인 DB 변경은 모든 Cursor 창을 정상 종료하면 적용됩니다. 체크포인트·프루닝·orphan 정리도 bounded 안전 조건 뒤에서 자동 실행됩니다.
 
-- **Checkpoint & Prune History** — 현재 상태를 체크포인트로 접고, 모든 PC가 그것을 받은 뒤 접힌 히스토리를 삭제해 저장소가 무한히 커지는 것을 막습니다. git 모드에서는 git 히스토리도 스쿼시합니다. 실행 전 모든 PC를 업데이트하세요 — 이후 구버전은 명확한 에러로 중단됩니다.
-- **Compact Safe Orphans** — 가벼운 청소. 어떤 이벤트도 참조하지 않는 객체 파일과 오래된 임시 파일만 삭제합니다. 이벤트 히스토리는 건드리지 않습니다.
-- **Archive Repository** — 저장소 폴더 전체를 별도 위치에 백업 아카이브로 복사합니다.
-- **Forget Device** — 더 이상 쓰지 않는 기기를 목록에서 제거합니다(로컬 상태만). 오프라인 기기가 프루닝을 막을 때 사용합니다.
-- **Disconnect** — 이 PC에서 동기화를 중단합니다. 저장된 저장소 경로·암호화 키·워크스페이스 매핑을 지우며, 공유 폴더와 히스토리는 그대로 둡니다. 저장소를 바꾸거나, 동기화를 멈추거나, "The configured folder now contains a different repository." 오류에서 벗어날 때 사용합니다.
+**Manage**에는 사람의 선택이 필요한 경우만 한 목록으로 모았습니다.
 
-**진단**
+- **Show Diagnostics**, **Sync Now**, **Apply Queued Changes**: 상태 확인 또는 즉시 재시도용입니다. 뒤의 두 항목은 자동 작업을 앞당기는 수동 가속기입니다.
+- **Resolve Conflicts**: 안전하게 병합할 수 없는 데이터의 어느 쪽을 유지할지 선택합니다.
+- **Repair Unavailable Chats**, **Open Recovered Chat**: bounded 원위치 복구 또는 안전한 transcript 대체 경로입니다. 복구는 누락 continuation 데이터를 만들어내지 않으며 정확한 원본이 없으면 기존 채팅을 바꾸지 않습니다.
+- **Restore Version History**, **Restore Database Backup**: 명시적인 롤백입니다. DB 복원 전에는 되돌릴 수 있는 pre-restore 백업을 만듭니다.
+- **Archive Repository**, **Forget Device**, **Setup or Reconfigure**, **Disconnect This PC**: 드문 관리 작업입니다. Disconnect는 이 PC의 경로·키·매핑만 지우며 공유 저장소는 바꾸지 않습니다.
 
-- **Show Diagnostics** — 현재 동기화 상태, 실제로 적용 중인 설정 값, 기기 전용 제외 목록, 대기 중인 각 변경과 그 이유, 충돌 중인 리소스, 그리고 지속 중인 경고와 경과 시간을 봅니다. 문제가 있어 보이면 여기부터 확인하세요.
-- **Show Repository Usage** — 저장소가 차지하는 용량을 보고합니다. git 모드에서는 100MB GitHub 제한을 초과하는 파일도 경고합니다.
+상태바를 누르면 현재 상황에 맞는 **Manage** 작업으로 바로 연결되므로, 별도 팔레트 명령 없이도 설정·진단·대기열 적용·충돌 해결은 한 번의 클릭으로 열 수 있습니다.
 
 ## 설정 항목
 
@@ -232,11 +226,11 @@ VS Code 자체 Settings Sync가 기기 간에 전파하는 키는 의도적으�
 ## 알려진 제한
 
 - Cursor/GitHub/Microsoft 로그인과 MCP OAuth 인증은 PC마다 별도로 완료해야 합니다.
-- 강제 종료는 마지막 DB·워크스페이스 스토리지 내보내기를 못 끝낼 수 있습니다. 중요한 작업 후에는 `Cursor Setting Sync: Sync Now`를 실행하고 Cursor를 정상 종료하세요.
-- 워크스페이스 스토리지는 모든 Cursor 프로세스 종료 후에만 캡처됩니다. `Cursor Setting Sync: Sync Now`는 Cursor 실행 중에는 그것을 스캔하지 않습니다.
+- 강제 종료는 마지막 DB·워크스페이스 스토리지 내보내기를 못 끝낼 수 있습니다. 필요하면 **Manage**에서 **Sync Now**를 선택한 뒤 Cursor를 정상 종료하세요.
+- 워크스페이스 스토리지는 모든 Cursor 프로세스 종료 후에만 캡처됩니다. **Sync Now** 작업은 Cursor 실행 중에는 그것을 스캔하지 않습니다.
 - 워크스페이스 DB 가져오기는 프로토콜 v1에서 upsert 전용입니다. 대상에만 있는 행은 보존되며, 들어오지 않은 행이 로컬 상태를 삭제하지 않습니다.
 - 에이전트 트랜스크립트만으로는 모든 Cursor 사이드바 항목을 완전히 재현하지 못할 수 있습니다.
-- 확정된 이벤트와 툼스톤은 저장소 프로토콜 v1에서 유지됩니다. `Checkpoint & Prune History`가 그것을 접어서 삭제하며, 이벤트 로그 파일이 500개를 넘으면 폴링이 같은 접기를 자동으로 실행합니다(최대 6시간에 한 번, 수동 실행과 동일한 안전 조건 아래에서).
+- 확정된 이벤트와 툼스톤은 자동 유지보수가 체크포인트로 접어 제거할 때까지 저장소 프로토콜 v1에서 유지됩니다. 이벤트 로그 파일이 500개를 넘으면 실행 중인 extension host는 자동 시도 사이에 최소 6시간을 기다립니다. Cursor를 다시 시작하면 더 일찍 재평가할 수 있지만 전파·age·보류 작업·충돌 안전 조건은 그대로 적용됩니다.
 - 기기 전용 제외 집합은 PC마다 따로 계산됩니다. 확장이 `machine` 범위로 선언한 키는 그 확장이 설치된 PC에서만 제외되므로, 확장 설치 순서에 따라 그런 키가 전파될 수 있습니다. 위의 기본 목록은 모든 PC에 동일하게 적용되며 영향을 받지 않습니다.
 
 기술적 상세는 [usage](docs/usage.md), [protocol](docs/protocol.md), [security](docs/security.md), [compatibility](docs/compatibility.md)를 참고하세요.

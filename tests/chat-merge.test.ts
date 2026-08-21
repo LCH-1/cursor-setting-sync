@@ -11,6 +11,7 @@ vi.mock("vscode", () => ({
 import { EventReconciler, compareTips } from "../src/protocol/reconciler";
 import { autoMergeConflicts } from "../src/sync/manager";
 import { mergeChatSnapshotBuffers } from "../src/chat/chatMerge";
+import { verifyPortableChatContinuationClosure } from "../src/chat/continuationClosure";
 import {
   parsePortableChatSnapshot,
   portableChatCoreHash,
@@ -84,13 +85,15 @@ describe("mergeChatSnapshotBuffers", () => {
   it("produces identical bytes whichever device runs it", () => {
     // Both devices sort the same two tips with the same comparator, so both
     // call this with the same order; the tie-break must not depend on anything
-    // else either. Equal timestamps make the tie-break the only thing deciding.
-    const left = chat({ bubbles: ["b1", "b2"], lastUpdatedAt: 500, title: "L" });
-    const right = chat({ bubbles: ["b2", "b3"], lastUpdatedAt: 500, title: "R" });
+    // else either. The composerData is identical, so only machine-local header
+    // fields differ and replicated tip order is a safe equal-timestamp choice.
+    const left = chat({ bubbles: ["b1", "b2"], lastUpdatedAt: 500, recency: 1 });
+    const right = chat({ bubbles: ["b2", "b3"], lastUpdatedAt: 500, recency: 9 });
 
     const once = mergeChatSnapshotBuffers(null, [left, right]);
     const twice = mergeChatSnapshotBuffers(null, [left, right]);
 
+    expect(once.status).toBe("merged");
     expect(once.content?.equals(twice.content ?? Buffer.alloc(0))).toBe(true);
     expect(once.semanticHash).toBe(twice.semanticHash);
     // Ordering by key, which is what `ORDER BY key` reads back on the next scan.
@@ -100,6 +103,162 @@ describe("mergeChatSnapshotBuffers", () => {
       bubbleKey("b3"),
     ]);
   });
+
+  it("elects the complete strict visible-sequence extension at a frozen timestamp", () => {
+    const stale = visibleChat({
+      visibleBubbles: ["b1"],
+      lastUpdatedAt: 500,
+      title: "stale",
+      conversationState: "stale-state",
+    });
+    const complete = visibleChat({
+      visibleBubbles: ["b1", "b2", "b3"],
+      lastUpdatedAt: 500,
+      title: "complete",
+      conversationState: "complete-state",
+    });
+
+    for (const [ordered, expectedWinner] of [
+      [[stale, complete] as const, 1],
+      [[complete, stale] as const, 0],
+    ] as const) {
+      const outcome = mergeChatSnapshotBuffers(null, ordered);
+
+      expect(outcome.status).toBe("merged");
+      expect(outcome.winner).toBe(expectedWinner);
+      expect(visibleBubbleIds(outcome.content)).toEqual(["b1", "b2", "b3"]);
+      expect(header(outcome.content).value).toBe("complete");
+    }
+  });
+
+  it("elects the only complete composerData change from a readable base", () => {
+    const base = visibleChat({
+      visibleBubbles: ["b1"],
+      lastUpdatedAt: 500,
+      conversationState: "base-state",
+    });
+    const advanced = visibleChat({
+      visibleBubbles: ["b1"],
+      lastUpdatedAt: 500,
+      conversationState: "advanced-state",
+    });
+
+    const outcome = mergeChatSnapshotBuffers(base, [base, advanced]);
+
+    expect(outcome.status).toBe("merged");
+    expect(outcome.winner).toBe(1);
+    expect(composerDataJson(outcome.content)).toMatchObject({
+      conversationState: "advanced-state",
+    });
+
+    const appended = visibleChat({
+      visibleBubbles: ["b1", "b2"],
+      lastUpdatedAt: 500,
+      conversationState: "appended-state",
+    });
+    const appendedOutcome = mergeChatSnapshotBuffers(base, [base, appended]);
+    expect(appendedOutcome.status).toBe("merged");
+    expect(appendedOutcome.winner).toBe(1);
+    expect(visibleBubbleIds(appendedOutcome.content)).toEqual(["b1", "b2"]);
+  });
+
+  it.each([
+    { name: "shrinks", changedVisibleBubbles: ["b1"] },
+    { name: "diverges", changedVisibleBubbles: ["b1", "b3"] },
+  ])(
+    "keeps a one-sided base change manual when its visible sequence $name",
+    ({ changedVisibleBubbles }) => {
+      const base = visibleChat({
+        visibleBubbles: ["b1", "b2"],
+        lastUpdatedAt: 500,
+        conversationState: "base-state",
+      });
+      const changed = visibleChat({
+        visibleBubbles: changedVisibleBubbles,
+        lastUpdatedAt: 500,
+        conversationState: "changed-state",
+      });
+
+      expect(mergeChatSnapshotBuffers(base, [base, changed]).status).toBe(
+        "conflict",
+      );
+    },
+  );
+
+  it.each([
+    {
+      name: "equal visible sequences with different state",
+      left: visibleChat({
+        visibleBubbles: ["b1"],
+        lastUpdatedAt: 500,
+        conversationState: "left-state",
+      }),
+      right: visibleChat({
+        visibleBubbles: ["b1"],
+        lastUpdatedAt: 500,
+        conversationState: "right-state",
+      }),
+    },
+    {
+      name: "divergent visible sequences",
+      left: visibleChat({
+        visibleBubbles: ["b1", "left"],
+        lastUpdatedAt: 500,
+      }),
+      right: visibleChat({
+        visibleBubbles: ["b1", "right"],
+        lastUpdatedAt: 500,
+      }),
+    },
+  ])("keeps $name manual at an equal timestamp", ({ left, right }) => {
+    expect(mergeChatSnapshotBuffers(null, [left, right]).status).toBe(
+      "conflict",
+    );
+  });
+
+  it("keeps malformed or decoded-structure-over-budget equal-timestamp shapes manual", () => {
+    const safe = visibleChat({ visibleBubbles: [], lastUpdatedAt: 500 });
+    const malformed = visibleChat({
+      visibleBubbles: ["b1"],
+      lastUpdatedAt: 500,
+      composerDataText: '{"fullConversationHeadersOnly":[',
+    });
+    const padding = `[${Array.from({ length: 33_000 }, () => "[]").join(",")}]`;
+    const overBudget = visibleChat({
+      visibleBubbles: ["b1"],
+      lastUpdatedAt: 500,
+      composerDataText:
+        `{"fullConversationHeadersOnly":[{"bubbleId":"b1"}],` +
+        `"padding":${padding}}`,
+    });
+
+    expect(mergeChatSnapshotBuffers(null, [safe, malformed]).status).toBe(
+      "conflict",
+    );
+    expect(mergeChatSnapshotBuffers(null, [safe, overBudget]).status).toBe(
+      "conflict",
+    );
+  });
+
+  it.each(["missing", "unusable"] as const)(
+    "does not elect a strict extension whose dominant bubble is %s",
+    (damage) => {
+      const shorter = visibleChat({
+        visibleBubbles: ["b1"],
+        lastUpdatedAt: 500,
+      });
+      const longer = visibleChat({
+        visibleBubbles: ["b1", "b2"],
+        storedBubbles: damage === "missing" ? ["b1"] : ["b1", "b2"],
+        unusableBubbles: damage === "unusable" ? ["b2"] : [],
+        lastUpdatedAt: 500,
+      });
+
+      expect(mergeChatSnapshotBuffers(null, [shorter, longer]).status).toBe(
+        "conflict",
+      );
+    },
+  );
 
   it("hashes exactly what the adapter's next scan will hash", () => {
     // The 0.0.5 JSONC bug in a new place: publishing a hash the next scan does
@@ -281,7 +440,7 @@ describe("mergeChatSnapshotBuffers", () => {
     ).toBe("conflict");
   });
 
-  it("upgrades v1/v2 merges and unions reachable agentKv blobs deterministically", () => {
+  it("unions v2 winner blobs deterministically without upgrading a v1 winner", () => {
     const blobA = Buffer.from("blob-a", "utf8");
     const blobB = Buffer.from("blob-b", "utf8");
     const missingC = "f".repeat(64);
@@ -318,7 +477,7 @@ describe("mergeChatSnapshotBuffers", () => {
     expect(
       parsePortableChatSnapshot(upgraded.content ?? Buffer.alloc(0))
         .schemaVersion,
-    ).toBe(2);
+    ).toBe(1);
 
     const preservedBase = mergeChatSnapshotBuffers(first, [
       chat({ bubbles: ["b1", "new-a"], lastUpdatedAt: 4 }),
@@ -327,27 +486,158 @@ describe("mergeChatSnapshotBuffers", () => {
     const fromBase = parsePortableChatSnapshot(
       preservedBase.content ?? Buffer.alloc(0),
     );
-    expect(fromBase.schemaVersion).toBe(2);
-    expect(
-      fromBase.schemaVersion === 2
-        ? fromBase.agentKv.blobs.map((blob) => blob.key)
-        : [],
-    ).toEqual([`agentKv:blob:${sha256(blobA)}`]);
+    expect(fromBase.schemaVersion).toBe(1);
   });
 
-  it("declines a disjoint agentKv reference union above the merge node cap", () => {
-    // Each side is a valid bounded v2 payload on its own. Only their disjoint
-    // union crosses the conflict merge's tighter interactive-work limit.
-    const firstIds = Array.from({ length: 2_048 }, (_unused, index) =>
-      sha256(`first-disjoint-reference-${index}`),
+  it("keeps a v1 winner eligible for enrichment instead of falsely completing an inherited partial graph", () => {
+    const missingChildId = sha256("omitted inherited child");
+    const inheritedRoot = bytesField(4, Buffer.from(missingChildId, "hex"));
+    const inheritedRootId = sha256(inheritedRoot);
+    const losingV2 = chatV2(
+      {
+        bubbles: ["old"],
+        lastUpdatedAt: 1,
+        conversationState: serializedRootState([inheritedRootId]),
+      },
+      [inheritedRoot],
+      [missingChildId],
+    );
+    const winningV1 = chat({
+      bubbles: ["old", "new"],
+      lastUpdatedAt: 2,
+      conversationState: serializedRootState([inheritedRootId]),
+    });
+
+    const outcome = mergeChatSnapshotBuffers(null, [losingV2, winningV1]);
+    expect(outcome.status).toBe("merged");
+    expect(outcome.winner).toBe(1);
+    // Emitting v2 here with only the inherited root blob would claim missing0
+    // while its embedded child is absent. v1 forces the normal enrichment path
+    // to reconstruct and verify the elected core graph.
+    expect(
+      parsePortableChatSnapshot(outcome.content ?? Buffer.alloc(0))
+        .schemaVersion,
+    ).toBe(1);
+  });
+
+  it("drops a losing core's orphan missing declaration when the frozen-timestamp winner is complete", async () => {
+    const losingBlob = Buffer.from("retained losing-core recovery blob", "utf8");
+    const losingBlobId = sha256(losingBlob);
+    const losingMissingRoot = sha256("unavailable stale-a root");
+    const activeLeaf = conversationStepBytes("active b descendant");
+    const activeLeafId = sha256(activeLeaf);
+    const activeRoot = conversationTurnBytes([activeLeafId]);
+    const activeRootId = sha256(activeRoot);
+
+    const staleA = chatV2FromCore(
+      visibleChat({
+        visibleBubbles: ["b1"],
+        lastUpdatedAt: 500,
+        conversationState: serializedRootState([losingMissingRoot]),
+      }),
+      [losingBlob],
+      [losingMissingRoot],
+    );
+    const completeB = chatV2FromCore(
+      visibleChat({
+        visibleBubbles: ["b1", "b2"],
+        lastUpdatedAt: 500,
+        conversationState: serializedTurnRootState([activeRootId]),
+      }),
+      [activeRoot, activeLeaf],
+    );
+
+    // The readable base proves B is the sole append even though Cursor froze
+    // lastUpdatedAt. A's old missing root is not part of B's elected graph.
+    const outcome = mergeChatSnapshotBuffers(staleA, [staleA, completeB]);
+    expect(outcome.status).toBe("merged");
+    expect(outcome.winner).toBe(1);
+    const merged = parsePortableChatSnapshot(
+      outcome.content ?? Buffer.alloc(0),
+    );
+    expect(merged.schemaVersion).toBe(2);
+    if (merged.schemaVersion !== 2) {
+      throw new Error("expected v2 merge");
+    }
+    expect(merged.agentKv.missingIds).toEqual([]);
+    expect(merged.agentKv.referencedIds).not.toContain(losingMissingRoot);
+    expect(merged.agentKv.blobs.map((blob) => blob.key)).toContain(
+      `agentKv:blob:${losingBlobId}`,
+    );
+    expect(merged.agentKv.referencedIds).toEqual(
+      [losingBlobId, activeRootId, activeLeafId].sort(),
+    );
+    await expect(
+      verifyPortableChatContinuationClosure(merged),
+    ).resolves.toMatchObject({
+      status: "complete",
+      declaredMissingCount: 0,
+      activeReachableCount: 2,
+      activeMaterializedCount: 2,
+    });
+  });
+
+  it("keeps an elected core's unavailable descendant declared and missing", async () => {
+    const missingChildId = sha256("winner-active missing descendant");
+    const activeRoot = conversationTurnBytes([missingChildId]);
+    const activeRootId = sha256(activeRoot);
+    const staleBlob = Buffer.from("retained stale materialized blob", "utf8");
+    const staleBlobId = sha256(staleBlob);
+    const stale = chatV2FromCore(
+      visibleChat({
+        visibleBubbles: ["b1"],
+        lastUpdatedAt: 500,
+      }),
+      [staleBlob],
+    );
+    const incompleteWinner = chatV2FromCore(
+      visibleChat({
+        visibleBubbles: ["b1", "b2"],
+        lastUpdatedAt: 500,
+        conversationState: serializedTurnRootState([activeRootId]),
+      }),
+      [activeRoot],
+      [missingChildId],
+    );
+
+    const outcome = mergeChatSnapshotBuffers(null, [stale, incompleteWinner]);
+    expect(outcome.status).toBe("merged");
+    expect(outcome.winner).toBe(1);
+    const merged = parsePortableChatSnapshot(
+      outcome.content ?? Buffer.alloc(0),
+    );
+    expect(merged.schemaVersion).toBe(2);
+    if (merged.schemaVersion !== 2) {
+      throw new Error("expected v2 merge");
+    }
+    expect(merged.agentKv.referencedIds).toEqual(
+      [staleBlobId, activeRootId, missingChildId].sort(),
+    );
+    expect(merged.agentKv.missingIds).toEqual([missingChildId]);
+    await expect(
+      verifyPortableChatContinuationClosure(merged),
+    ).resolves.toMatchObject({
+      status: "incomplete",
+      reason: "reachable-content-missing",
+      activeReachableCount: 2,
+      activeMaterializedCount: 1,
+      activeUnavailableCount: 1,
+    });
+  });
+
+  it("declines retained blobs plus elected references above the merge node cap", () => {
+    // Each side is a valid bounded v2 payload on its own. Materialized losing
+    // rows are retained, while reference-only declarations come from the
+    // elected side; that meaningful union still crosses the interactive cap.
+    const firstValues = Array.from({ length: 2_048 }, (_unused, index) =>
+      Buffer.from(`first-retained-blob-${index}`, "utf8"),
     );
     const secondIds = Array.from({ length: 2_049 }, (_unused, index) =>
-      sha256(`second-disjoint-reference-${index}`),
+      sha256(`second-elected-reference-${index}`),
     );
     const first = chatV2(
       { bubbles: ["first"], lastUpdatedAt: 1 },
-      [],
-      firstIds,
+      firstValues,
     );
     const second = chatV2(
       { bubbles: ["second"], lastUpdatedAt: 2 },
@@ -383,7 +673,7 @@ describe("mergeChatSnapshotBuffers", () => {
     );
   });
 
-  it("adds a newer v1 core root to the retained older v2 graph", () => {
+  it("keeps a newer v1 core eligible for enrichment and corrects an elected v2 root", () => {
     const olderBlob = Buffer.from("older complete root", "utf8");
     const olderRoot = sha256(olderBlob);
     const newerRoot = sha256("newer core root without a local blob");
@@ -406,17 +696,7 @@ describe("mergeChatSnapshotBuffers", () => {
     const merged = parsePortableChatSnapshot(
       outcome.content ?? Buffer.alloc(0),
     );
-    expect(merged.schemaVersion).toBe(2);
-    if (merged.schemaVersion !== 2) {
-      throw new Error("expected v2 merge");
-    }
-    expect(merged.agentKv.blobs.map((blob) => blob.key)).toEqual([
-      `agentKv:blob:${olderRoot}`,
-    ]);
-    expect(merged.agentKv.referencedIds).toEqual(
-      [newerRoot, olderRoot].sort(),
-    );
-    expect(merged.agentKv.missingIds).toEqual([newerRoot]);
+    expect(merged.schemaVersion).toBe(1);
 
     // Older builds could already have produced two byte-identical v2 tips
     // whose metadata claimed completeness while omitting the core root.
@@ -453,7 +733,9 @@ describe("mergeChatSnapshotBuffers", () => {
         ),
       ),
     ],
-  ])("declines a v2 merge whose winning core roots are %s", (_case, state) => {
+  ])(
+    "keeps an unsafe v1 winner enrichable but declines v2 winner roots that are %s",
+    (_case, state) => {
     const olderBlob = Buffer.from("retained complete root", "utf8");
     const older = chatV2(
       { bubbles: ["old"], lastUpdatedAt: 1 },
@@ -465,9 +747,12 @@ describe("mergeChatSnapshotBuffers", () => {
       conversationState: state,
     });
 
+    const v1Outcome = mergeChatSnapshotBuffers(null, [unsafeWinner, older]);
+    expect(v1Outcome.status).toBe("merged");
     expect(
-      mergeChatSnapshotBuffers(null, [unsafeWinner, older]).status,
-    ).toBe("conflict");
+      parsePortableChatSnapshot(v1Outcome.content ?? Buffer.alloc(0))
+        .schemaVersion,
+    ).toBe(1);
     const unsafeV2 = chatV2(
       {
         bubbles: ["same"],
@@ -479,7 +764,8 @@ describe("mergeChatSnapshotBuffers", () => {
     expect(
       mergeChatSnapshotBuffers(null, [unsafeV2, unsafeV2]).status,
     ).toBe("conflict");
-  });
+    },
+  );
 });
 
 describe("base-free chat conflicts", () => {
@@ -1025,12 +1311,63 @@ function chat(options: {
   return canonicalBytes(snapshot);
 }
 
+function visibleChat(options: {
+  visibleBubbles: readonly string[];
+  lastUpdatedAt: number | null;
+  storedBubbles?: readonly string[];
+  unusableBubbles?: readonly string[];
+  title?: string;
+  conversationState?: string;
+  composerDataText?: string;
+}): Buffer {
+  const storedBubbles = options.storedBubbles ?? options.visibleBubbles;
+  const snapshot = parsePortableChatSnapshot(
+    chat({
+      bubbles: storedBubbles,
+      lastUpdatedAt: options.lastUpdatedAt,
+      ...(options.title === undefined ? {} : { title: options.title }),
+    }),
+  );
+  const unusable = new Set(options.unusableBubbles ?? []);
+  return canonicalBytes({
+    ...snapshot,
+    composerData: row(
+      snapshot.composerData.key,
+      options.composerDataText ??
+        JSON.stringify({
+          fullConversationHeadersOnly: options.visibleBubbles.map(
+            (bubbleId) => ({ bubbleId }),
+          ),
+          ...(options.conversationState === undefined
+            ? {}
+            : { conversationState: options.conversationState }),
+        }),
+    ),
+    bubbles: storedBubbles.map((bubbleId) =>
+      row(
+        bubbleKey(bubbleId),
+        unusable.has(bubbleId)
+          ? "not-json"
+          : JSON.stringify({ text: bubbleId }),
+      ),
+    ),
+  });
+}
+
 function chatV2(
   options: Parameters<typeof chat>[0],
   values: readonly Buffer[],
   missingIds: readonly string[] = [],
 ): Buffer {
-  const core = parsePortableChatSnapshot(chat(options));
+  return chatV2FromCore(chat(options), values, missingIds);
+}
+
+function chatV2FromCore(
+  coreContent: Buffer,
+  values: readonly Buffer[],
+  missingIds: readonly string[] = [],
+): Buffer {
+  const core = parsePortableChatSnapshot(coreContent);
   const blobs = values
     .map((bytes) => ({
       key: `agentKv:blob:${sha256(bytes)}`,
@@ -1070,6 +1407,47 @@ function serializedRootState(rootIds: readonly string[]): string {
   ).toString("base64")}`;
 }
 
+function serializedTurnRootState(rootIds: readonly string[]): string {
+  return `~${Buffer.concat(
+    rootIds.map((rootId) => bytesField(8, Buffer.from(rootId, "hex"))),
+  ).toString("base64")}`;
+}
+
+function bytesField(fieldNumber: number, payload: Uint8Array): Buffer {
+  return Buffer.concat([
+    varint(BigInt(fieldNumber * 8 + 2)),
+    varint(BigInt(payload.byteLength)),
+    Buffer.from(payload),
+  ]);
+}
+
+function conversationTurnBytes(stepIds: readonly string[]): Buffer {
+  return bytesField(
+    1,
+    Buffer.concat(
+      stepIds.map((id) => bytesField(2, Buffer.from(id, "hex"))),
+    ),
+  );
+}
+
+function conversationStepBytes(text: string): Buffer {
+  return bytesField(1, bytesField(1, Buffer.from(text, "utf8")));
+}
+
+function varint(input: bigint): Buffer {
+  let value = input;
+  const bytes: number[] = [];
+  do {
+    let byte = Number(value & 0x7fn);
+    value >>= 7n;
+    if (value !== 0n) {
+      byte |= 0x80;
+    }
+    bytes.push(byte);
+  } while (value !== 0n);
+  return Buffer.from(bytes);
+}
+
 function bubbleKey(id: string): string {
   return `bubbleId:${COMPOSER}:${id}`;
 }
@@ -1098,6 +1476,30 @@ function bubbleValue(content: Buffer | undefined, id: string): string | null {
   return bubble === undefined
     ? null
     : Buffer.from(bubble.valueBase64, "base64").toString("utf8");
+}
+
+function composerDataJson(content: Buffer | undefined): Record<string, unknown> {
+  const snapshot = parsePortableChatSnapshot(content ?? Buffer.alloc(0));
+  return JSON.parse(
+    Buffer.from(snapshot.composerData.valueBase64, "base64").toString("utf8"),
+  ) as Record<string, unknown>;
+}
+
+function visibleBubbleIds(content: Buffer | undefined): string[] {
+  const headers = composerDataJson(content)["fullConversationHeadersOnly"];
+  if (!Array.isArray(headers)) {
+    throw new Error("composerData has no visible conversation header list");
+  }
+  return headers.map((item) => {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("composerData contains an invalid visible header");
+    }
+    const bubbleId = (item as Record<string, unknown>)["bubbleId"];
+    if (typeof bubbleId !== "string") {
+      throw new Error("composerData contains an invalid visible bubble ID");
+    }
+    return bubbleId;
+  });
 }
 
 function header(

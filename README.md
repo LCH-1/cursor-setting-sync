@@ -42,17 +42,17 @@ File-based synchronization remains available when Cursor's embedded runtime does
 
 ## Installation
 
-Install **Cursor Setting Sync** from the Extensions view, then run `Cursor Setting Sync: Setup` from the Command Palette.
+Install **Cursor Setting Sync** from the Extensions view, then run the single Command Palette entry, `Cursor Setting Sync: Manage`, and choose **Setup or Reconfigure**.
 
 ## Setup
 
 ### Common (every transport)
 
-- Every transport starts by running `Cursor Setting Sync: Setup`.
+- Every transport starts from `Cursor Setting Sync: Manage` → **Setup or Reconfigure**.
 - The passphrase is optional. If you set one, it must be at least 12 characters and identical on every PC. It is never stored in the shared repository and cannot be recovered.
 - Leaving the passphrase empty shows a security warning and then proceeds. The encryption key is then stored inside the repository next to the data, so anyone who can read the shared folder or git remote can decrypt everything. Use it only for a trusted local folder or a fully controlled private remote.
-- On additional PCs, file resources apply automatically when safe. When database or workspace-storage changes are pending, follow the status bar and run `Cursor Setting Sync: Restart to Apply`.
-- Running `Sync Now` (or any other command) before `Setup` does nothing: the status bar shows `unconfigured` and a message points you to `Setup`. Nothing is synchronized until a repository is configured.
+- On additional PCs, file resources apply automatically when safe. Database and workspace-storage changes apply through the shutdown helper after all Cursor windows close normally; use **Apply Queued Changes** inside **Manage** only when you want to apply immediately.
+- Before setup, the status bar opens **Manage** directly at **Setup or Reconfigure**. Nothing is synchronized until a repository is configured.
 
 Pick a transport below, and check the [Storage options](#storage-options) table for provider-specific notes.
 
@@ -60,7 +60,7 @@ Pick a transport below, and check the [Storage options](#storage-options) table 
 
 **First PC**
 
-1. Run `Cursor Setting Sync: Setup`.
+1. Run `Cursor Setting Sync: Manage` and choose **Setup or Reconfigure**.
 2. Select an empty folder inside the shared (or local) location.
 3. Choose **Plain shared folder**.
 4. Enter a passphrase (at least 12 characters, or leave it empty to skip it).
@@ -68,7 +68,7 @@ Pick a transport below, and check the [Storage options](#storage-options) table 
 
 **Additional PCs**
 
-1. Install the extension and run `Cursor Setting Sync: Setup`.
+1. Install the extension, run `Cursor Setting Sync: Manage`, and choose **Setup or Reconfigure**.
 2. Select the same shared folder (each PC's own local copy).
 3. Choose **Plain shared folder** and enter the same passphrase.
 
@@ -80,63 +80,57 @@ Pick a transport below, and check the [Storage options](#storage-options) table 
 
 **First PC (create the repository)**
 
-1. Run `Cursor Setting Sync: Setup`.
+1. Run `Cursor Setting Sync: Manage` and choose **Setup or Reconfigure**.
 2. Select an empty folder (any location).
 3. Choose **New git repository with remote** and enter the remote URL (leave it empty for a local-only git history).
 4. Enter a passphrase (at least 12 characters, or leave it empty to skip it). The first sync pushes to the remote.
 
 **Additional PCs (join the repository)**
 
-1. Install the extension and run `Cursor Setting Sync: Setup`.
+1. Install the extension, run `Cursor Setting Sync: Manage`, and choose **Setup or Reconfigure**.
 2. Select an empty folder.
 3. Choose **Clone an existing git repository** and enter the same remote URL.
 4. Enter the same passphrase.
 
 ## Storage options
 
-The repository is a folder of encrypted, append-only files. What "sync" means depends on what carries that folder to your other PCs. Point `Setup` at a folder and pick the transport that matches how the folder travels.
+The repository is a folder of encrypted, append-only files. What "sync" means depends on what carries that folder to your other PCs. From **Manage**, choose **Setup or Reconfigure**, point it at a folder, and pick the transport that matches how the folder travels.
 
 | Transport | How to set it up | What you get |
 | --- | --- | --- |
-| **OneDrive / Dropbox / iCloud Drive** | Choose **Plain shared folder** and select an empty folder inside the provider's synced location. Keep it on disk: OneDrive right-click → **"Always keep on this device"** (not "Free up space"; this is the Files On-Demand feature), Dropbox → turn off "online-only", iCloud Drive keeps files local by default. | Full multi-PC sync. The provider uploads the folder; each PC points `Setup` at its own local copy of the same synced folder. |
+| **OneDrive / Dropbox / iCloud Drive** | Choose **Plain shared folder** and select an empty folder inside the provider's synced location. Keep it on disk: OneDrive right-click → **"Always keep on this device"** (not "Free up space"; this is the Files On-Demand feature), Dropbox → turn off "online-only", iCloud Drive keeps files local by default. | Full multi-PC sync. The provider uploads the folder; each PC points **Setup or Reconfigure** at its own local copy of the same synced folder. |
 | **Google Drive** | In Google Drive for desktop use **"Mirror files"** mode (not stream-only) and right-click the folder → **"Available offline"**, then choose **Plain shared folder**. | Full multi-PC sync. In stream-only mode files are virtual placeholders, so file watching and reads are unreliable — Mirror files mode is required. |
 | **Syncthing / Resilio** | Point every PC's share at the same folder and choose **Plain shared folder**. | Full multi-PC sync with no cloud account. The extension already ignores `sync-conflict` copies. |
-| **Local folder (no cloud, no git)** | Choose **Plain shared folder** and select any local directory. | Single-PC versioned backup: full version history, `Restore Version History`, and `Restore Backup` all work. It just never reaches other PCs, because nothing carries the folder off the machine. |
+| **Local folder (no cloud, no git)** | Choose **Plain shared folder** and select any local directory. | Single-PC versioned backup: full version history, **Restore Version History**, and **Restore Database Backup** all work. It just never reaches other PCs, because nothing carries the folder off the machine. |
 | **Git — clone existing** | Choose **Clone an existing git repository** and paste the repository URL (GitHub, GitLab, or a self-hosted remote). | Joins a repository other PCs already push to. Each cycle pulls before reading and commits/pushes after writing. |
 | **Git — new with remote** | Choose **New git repository with remote** and paste the remote URL. | Initializes git in the folder and connects the remote; the first sync pushes. Use this to start a fleet on GitHub/GitLab/self-hosted. |
 | **Git — local-only** | Choose **New git repository with remote** and leave the URL empty. | A local git history with no remote — like the local-folder case, but with git commits. Add a remote later to publish. |
 
-Git transport requires the `git` CLI on `PATH`. Authentication uses your system git credentials non-interactively (`GIT_TERMINAL_PROMPT=0`), so configure a credential helper or SSH keys first; an auth failure degrades to a warning and the folder still works locally. Remote changes are detected by polling (git mode receives no file-change events). Because encrypted payloads do not delta-compress, a git repository grows roughly with the data it holds — GitHub rejects files over 100 MB and prefers repositories under a few GB, so keep an eye on `Show Repository Usage` and run `Checkpoint & Prune History` to squash git history when it grows.
+Git transport requires the `git` CLI on `PATH`. Authentication uses your system git credentials non-interactively (`GIT_TERMINAL_PROMPT=0`), so configure a credential helper or SSH keys first; an auth failure degrades to a warning and the folder still works locally. Remote changes are detected by polling (git mode receives no file-change events). Because encrypted payloads do not delta-compress, a git repository grows roughly with the data it holds. The extension checks git file sizes automatically and, once the event log passes 500 files, periodically checkpoints and prunes eligible history behind the same propagation and safety gates used by synchronization.
 
-## Commands
+## Continue the same original chat on another PC
 
-**Setup and everyday sync**
+Use this flow when a conversation still continues normally on PC B and you want to continue that exact conversation on PC A, rather than create a successor Agent:
 
-- **Setup** — First-time configuration. Pick the repository folder and transport (plain / clone / new git), then enter the encryption passphrase (12+ characters, the same on every PC, never stored in the folder).
-- **Sync Now** — Run one synchronization immediately. Synchronization is otherwise automatic (30-second polling plus file watching); this publishes local changes and pulls remote ones on demand.
-- **Restart to Apply** — Applies pending database changes. The command hands the queue to the offline helper, quits Cursor, waits for every process to exit, writes the rows, and relaunches. Quitting and reopening Cursor yourself does **not** apply them: the shutdown helper only exports this device's changes, so the queue is still there afterwards. Files apply while Cursor runs, but `state.vscdb` (chat, user rules, workspace databases) is written safely with SQL only after Cursor exits.
+1. Install the same current extension version on both PCs. On PC B, open the working original conversation and wait for the automatic cycle—and the shared-folder provider or git push—to finish. To force a cycle, open **Manage** and choose **Sync Now**.
+2. On PC A, wait for the automatic repository cycle. If a database change is queued, close every Cursor window normally, let the shutdown helper finish, and reopen Cursor. To apply immediately, choose **Apply Queued Changes** inside **Manage**. Chat database rows are never written while Cursor is running.
+3. Reopen the same workspace and select the original conversation. Its exact `composerId` is retained; this flow does not create a new Agent.
 
-**Conflicts and recovery**
+PC A queues and applies a chat core only from a complete portable v2 continuation graph, and the offline helper verifies its metadata and reachable closure again before writing. A legacy blob-only event itself may add blobs but never materializes an absent core; when that legacy payload is closure-complete, the current extension republishes a verified core-applying child so an existing repository can recover the original core. Materialized orphan blobs are retained, while missing declarations that are proven unreachable and absent are normalized in bounded passes. If Cursor gave both copies the same frozen timestamp, the complete longer copy wins automatically only when it is a provable strict extension of the shared visible sequence; an ambiguous fork remains unresolved for manual handling. Newly published or changed chats admitted by the bounded two-chat work batch receive continuation enrichment in the same cycle. A large backlog of older chats is still processed incrementally, so one cycle is not guaranteed to prepare every legacy conversation—allow additional automatic cycles on the PC that still has the working originals before applying them elsewhere.
 
-- **Resolve Conflicts** — Manually resolve edits made on two PCs that could not auto-merge. Every conflict is listed on one screen under its own name with both sides' values beside it — `Setting: editor.fontSize · This PC: 14 vs Other PC: 16` — plus which PC wrote each side and when. One answer can settle the whole list (*keep the newest everywhere*, *keep this PC's everywhere*, *keep the other PC's everywhere*), or you can open a single entry's diff and decide it alone; a diff is only opened for an entry you ask to review. Deferring costs nothing — both versions stay in the repository, and **Restore Version History** can recover a side that lost. UI state, chat, and workspace storage never appear here: UI state does not travel at all, a chat fork is merged into the union of both sides' messages, and workspace databases and `notepads.json` are combined row by row and notepad by notepad, so no computer's notes are dropped to settle a fork. Only resources that carry something you wrote and cannot be combined — settings, `.cursor` rules and user files, extensions — ever ask. While a conflict is open, that resource keeps publishing this PC's version at most once an hour so the other side can still see it; resolving the conflict restores normal syncing immediately.
-- **Restore Version History** — Roll one resource back to an earlier version (like a git revert). Choose the data type first; for a missing normal chat choose **Cursor conversations**, not **Agent transcripts**. Large chat sets are narrowed by workspace/project, and only resources with an earlier restorable version are shown with a readable name, message count, and date. Browse the versions with a diff preview and publish the chosen one as a new version; history is preserved.
-- **Repair Unavailable Chats** — Automatically finds both missing visible message rows and missing continuation data that can make a restored conversation render but reject the next prompt. It walks damaged chats in bounded indexed pages, so an older chat with no recoverable history cannot pin the command ahead of later damage. Automatic in-place repair is offered only when one warning-free compatible synchronized version contains every required missing message body and continuation blob. It preserves the live title/header/composerData and applies the exact repair only after Cursor exits, with a fresh backup and final race check. If no such source exists, the original rows stay unchanged: update and sync a PC where the chat still continues, restore a known-good database backup, or use the local catalog fallback below.
-- **Continue Unavailable Chat Safely** — When the exact continuation blobs no longer exist on any synchronized PC or stored version, verify the still-visible conversation in a read-only transaction and prepare a **new** Agent with a bounded Markdown recovery context and any surviving verified PNG attachment. It preserves useful visible text, inert tool inputs/results/status, source selections and URIs, todos and new/original-file work state, and selected images as historical context; it never fabricates missing blobs, rewrites the original composer, or submits a prompt. This is a safe successor, not an in-place repair. The recovery files are plaintext in this extension's local `recovery-transcripts` folder and remain until you explicitly delete those recovery files.
-- **Preserve All Recoverable Chats Safely** — This is a local-catalog fallback, not native Cursor chat restoration. It audits definite continuation damage in small cancellable pages and checkpoints every safely verified visible transcript without creating Agents, sending prompts, writing Cursor's database, or changing the original conversation rows. Plaintext artifacts can contain message text, assistant thinking/error state, inert tool inputs/results/status, source selections and URIs, todos, new/original-file work state, and selected PNGs—including source code or secrets. The manifest is capped at 2,000 current entries and 512 MiB of currently referenced ready files. Separately, all final, obsolete/rejected, and recognized atomic-partial files inside the isolated catalog artifact tree share a hard 512 MiB/130,000-entry physical cap; retained manifest/index atomic-write debris has its own 32 MiB/16-entry cap. **Open Recovered Chat Safely** revalidates stored file hashes, the original workspace, and the live damage fingerprint immediately before preparing exactly one new empty Agent. Missing message-body chats still require an exact source PC or database backup. Recovery files remain until you explicitly remove the local `recovery-transcripts` folder or selected files within it; deleting the extension's entire storage is neither required nor recommended.
-- **Restore Backup** — Restore a database to an earlier backup snapshot. A SQLite backup is taken before every database write; pick one to restore. A "pre-restore" backup is also listed so a mistaken restore can be undone.
+## One management command
 
-**Repository management**
+The Command Palette exposes exactly one entry: **Cursor Setting Sync: Manage**. Normal operation needs no command: synchronization polls and watches automatically, safe file changes apply while Cursor runs, queued database changes apply after a normal full shutdown, and checkpoint/prune/orphan maintenance runs behind bounded safety gates.
 
-- **Checkpoint & Prune History** — Fold the current state into a checkpoint and, once every PC has received it, delete the folded history to stop the repository from growing forever. In git mode it also squashes git history. Update every PC before running it — older builds fail loudly afterward.
-- **Compact Safe Orphans** — Lightweight cleanup that removes object files no event references and stale temp files. It never touches event history.
-- **Archive Repository** — Copy the entire repository folder to a separate location as a backup archive.
-- **Forget Device** — Remove a device you no longer use from the list (local state only). Use it when an offline device is blocking pruning.
-- **Disconnect** — Stop synchronizing on this PC. Clears the stored repository, its encryption key, and the workspace mappings; the shared folder and its history are left untouched. Use it to switch repositories, to stop syncing, or to recover from "The configured folder now contains a different repository."
+**Manage** opens one action list for the cases that still require a deliberate choice:
 
-**Diagnostics**
+- **Show Diagnostics**, **Sync Now**, and **Apply Queued Changes** for inspection or an immediate retry. The latter two are manual accelerators for automatic work.
+- **Resolve Conflicts** for data that cannot be merged without choosing a side.
+- **Repair Unavailable Chats** and **Open Recovered Chat** for bounded in-place repair or the safe transcript fallback. Repair never fabricates missing continuation data; if no exact source exists it leaves the original unchanged.
+- **Restore Version History** and **Restore Database Backup** for explicit rollback. A pre-restore backup is created so a mistaken database restore can be undone.
+- **Archive Repository**, **Forget Device**, **Setup or Reconfigure**, and **Disconnect This PC** for infrequent administration. Disconnect clears only this PC's path, key, and mappings; it does not alter the shared repository.
 
-- **Show Diagnostics** — View the current sync status, the settings actually in force, the machine-specific exclusions, every pending change with the reason it is waiting, the conflicting resources, and the standing warnings with their age. Start here when something looks wrong.
-- **Show Repository Usage** — Report how much space the repository uses; in git mode it also warns about files over the 100 MB GitHub limit.
+Status-bar clicks route to the relevant action inside **Manage**, so setup, diagnostics, queued apply, and conflict resolution remain one click away without adding separate palette commands.
 
 ## Settings
 
@@ -232,11 +226,11 @@ Shared-folder status only confirms a local file write. Always wait for OneDrive 
 ## Known limitations
 
 - Cursor/GitHub/Microsoft sign-in and MCP OAuth authorization must be completed separately on every PC.
-- A forced shutdown can prevent the final database and workspace-storage export from completing. Run `Cursor Setting Sync: Sync Now`, then close Cursor normally after important work.
-- Workspace storage is captured only after every Cursor process exits; `Cursor Setting Sync: Sync Now` does not scan it while Cursor is running.
+- A forced shutdown can prevent the final database and workspace-storage export from completing. If needed, open **Manage**, choose **Sync Now**, then close Cursor normally after important work.
+- Workspace storage is captured only after every Cursor process exits; the **Sync Now** action does not scan it while Cursor is running.
 - Workspace database imports are upsert-only in protocol v1: target-only rows are preserved, and a missing incoming row never deletes local state.
 - Agent transcripts alone may not fully recreate every Cursor sidebar entry.
-- Finalized events and tombstones are retained by repository protocol v1; `Checkpoint & Prune History` folds and removes them, and once the event log passes 500 files a poll runs the same fold automatically (at most once every six hours, behind the same safety gates).
+- Finalized events and tombstones are retained by repository protocol v1 until automatic maintenance folds and removes them. Once the event log passes 500 files, a running extension host waits at least six hours between automatic attempts; restarting Cursor may re-evaluate sooner, but the propagation, age, pending-work, and conflict safety gates still apply.
 - The machine-specific exclusion set is computed per PC. A key an extension declares as `machine`-scoped is only excluded where that extension is installed, so install order across the fleet can still let such a key travel. The built-in default list above applies everywhere and is not affected.
 
 See [usage](docs/usage.md), [protocol](docs/protocol.md), [security](docs/security.md), and [compatibility](docs/compatibility.md) for technical details.

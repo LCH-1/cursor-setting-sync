@@ -23,6 +23,7 @@ import {
 } from "../src/sync/manager";
 import { filterPortableWorkspaceRows } from "../src/resources/workspaceStatePolicy";
 import { resolveTargetWorkspace, discoverWorkspaces } from "../src/chat/workspace";
+import { portableChatCoreHash } from "../src/chat/stateVscdb";
 import { workspaceStorageResourceId } from "../src/resources/workspaceStorage";
 import {
   captureWorkspaceDatabaseSnapshot,
@@ -137,6 +138,9 @@ describeBuilt("a second computer joining and merging", () => {
     expect(deviceB.state.device.deviceId).not.toBe(deviceA.state.device.deviceId);
 
     const paths = await buildDevicePaths(root);
+    // The helper and the live extension open the repository through the same
+    // extension storage root, including its persisted local projections.
+    paths.extensionStorage = join(root, "storage-b");
     const localWorkspaces = await discoverWorkspaces(paths);
     expect(localWorkspaces.map((workspace) => workspace.id)).toEqual([WORKSPACE_B]);
 
@@ -193,7 +197,14 @@ describeBuilt("a second computer joining and merging", () => {
     ).toBeNull();
 
     // ---- the real helper writes them ----
-    const result = await runHelper(root, repositoryRoot, paths, deviceB, changes);
+    const result = await runHelper(
+      root,
+      repositoryRoot,
+      paths,
+      deviceB,
+      changes,
+      { [WORKSPACE_A]: WORKSPACE_B },
+    );
     expect(result.error).toBeNull();
     expect(result.success).toBe(true);
 
@@ -269,6 +280,13 @@ describeBuilt("a second computer joining and merging", () => {
     await mkdir(join(root, "pc-b"), { recursive: true });
     const pathsA = await buildDevicePaths(join(root, "pc-a"));
     const pathsB = await buildDevicePaths(join(root, "pc-b"));
+    pathsA.extensionStorage = join(root, "storage-a");
+    pathsB.extensionStorage = join(root, "storage-b");
+    writeItemTable(pathsA, [["notepadData", "from-a"]]);
+    writeItemTable(pathsB, [
+      ["notepadData", "shared-note"],
+      ["interactive.sessions", "from-b"],
+    ]);
     const CHAT_X = "11111111-aaaa-4aaa-8aaa-111111111111";
     const CHAT_Y = "22222222-bbbb-4bbb-8bbb-222222222222";
 
@@ -277,34 +295,56 @@ describeBuilt("a second computer joining and merging", () => {
     const base = portableWorkspaceSnapshot(root, "base", [
       ["notepadData", "shared-note"],
     ]);
+    const wsResourceId = workspaceStorageResourceId(
+      `${WORKSPACE_B}/state.vscdb`,
+    );
     const published = await deviceA.publish([base], []);
     const parents = [`${published.eventHash}#0`];
+    const sideA = {
+      ...portableWorkspaceSnapshot(root, "side-a", [
+        ["notepadData", "from-a"],
+      ]),
+      parents,
+    };
     await deviceA.publish(
       [
-        {
-          ...portableWorkspaceSnapshot(root, "side-a", [
-            ["notepadData", "from-a"],
-          ]),
-          parents,
-        },
+        sideA,
         chatSnapshot(CHAT_X, WORKSPACE_B),
       ],
       [],
     );
     await deviceB.refreshState();
+    const sideB = {
+      ...portableWorkspaceSnapshot(root, "side-b", [
+        ["notepadData", "shared-note"],
+        ["interactive.sessions", "from-b"],
+      ]),
+      parents,
+    };
     await deviceB.publish(
       [
-        {
-          ...portableWorkspaceSnapshot(root, "side-b", [
-            ["notepadData", "shared-note"],
-            ["interactive.sessions", "from-b"],
-          ]),
-          parents,
-        },
+        sideB,
         chatSnapshot(CHAT_Y, WORKSPACE_B),
       ],
       [],
     );
+    // The real manager records the last exact local scan separately from the
+    // repository tip. The helper uses this to recognize each side's
+    // pre-merge local form and safely apply the queued synthetic merge.
+    deviceA.state.projections[wsResourceId] = {
+      resourceId: wsResourceId,
+      kind: "workspace-storage",
+      semanticHash: sideA.semanticHash,
+      versionId: null,
+    };
+    deviceB.state.projections[wsResourceId] = {
+      resourceId: wsResourceId,
+      kind: "workspace-storage",
+      semanticHash: sideB.semanticHash,
+      versionId: null,
+    };
+    await deviceA.saveState();
+    await deviceB.saveState();
 
     // The first device to look sees the fork and resolves it; the second sees
     // the published resolution and has nothing left to resolve - the order two
@@ -330,9 +370,6 @@ describeBuilt("a second computer joining and merging", () => {
     expect(resolvedBy).toBeGreaterThanOrEqual(1);
     await deviceA.refreshState();
     await deviceB.refreshState();
-    const wsResourceId = workspaceStorageResourceId(
-      `${WORKSPACE_B}/state.vscdb`,
-    );
     const reconcileFor = async (device: SyncRepository) =>
       new EventReconciler().reconcile(
         await device.listEvents(),
@@ -346,6 +383,15 @@ describeBuilt("a second computer joining and merging", () => {
     expect(tipA).toHaveLength(1);
     // Byte-identical merges collapse to the same version on both devices.
     expect(tipA[0]?.versionId).toBe(tipB[0]?.versionId);
+    expect(tipA[0]?.metadata?.syncOrigin).toBe("auto-merge");
+    expect(deviceA.state.projections[wsResourceId]?.semanticHash).toBe(
+      sideA.semanticHash,
+    );
+    expect(deviceB.state.projections[wsResourceId]?.semanticHash).toBe(
+      sideB.semanticHash,
+    );
+    expect(localWorkspaceHash(pathsA)).toBe(sideA.semanticHash);
+    expect(localWorkspaceHash(pathsB)).toBe(sideB.semanticHash);
 
     // Each side applies the other's chat and the merged workspace through the
     // real helper bundle.
@@ -621,6 +667,7 @@ async function runHelper(
   paths: CursorPaths,
   repository: SyncRepository,
   changes: HelperChange[],
+  workspaceMappings: Record<string, string> = {},
 ): Promise<HelperResult> {
   const requestId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
   const request: HelperRequest = {
@@ -638,7 +685,7 @@ async function runHelper(
     extensionVersion: "0.0.26",
     paths,
     changes,
-    workspaceMappings: {},
+    workspaceMappings,
     syncOptions: {
       ignoredSettings: [],
       ignoredExtensions: [],
@@ -670,6 +717,38 @@ async function runHelper(
   });
   return readJsonFile<HelperResult>(
     join(paths.extensionStorage, `helper-result-${requestId}.json`),
+  );
+}
+
+function writeItemTable(
+  paths: CursorPaths,
+  rows: Array<[string, string]>,
+): void {
+  const database = new DatabaseSync(
+    join(paths.workspaceStorageRoot, WORKSPACE_B, "state.vscdb"),
+  );
+  try {
+    const insert = database.prepare(
+      "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+    );
+    for (const [key, value] of rows) {
+      insert.run(key, value);
+    }
+  } finally {
+    database.close();
+  }
+}
+
+function localWorkspaceHash(paths: CursorPaths): string {
+  return sha256(
+    serializeWorkspaceDatabaseSnapshot(
+      filterPortableWorkspaceRows(
+        captureWorkspaceDatabaseSnapshot(
+          join(paths.workspaceStorageRoot, WORKSPACE_B, "state.vscdb"),
+          { workspaceId: WORKSPACE_B, includeComposerHeaders: true },
+        ).snapshot,
+      ),
+    ),
   );
 }
 
@@ -798,8 +877,8 @@ function portableWorkspaceSnapshot(
 }
 
 function chatSnapshot(composerId: string, workspaceId: string): ResourceSnapshot {
-  const body = canonicalBytes({
-    schemaVersion: 1 as const,
+  const snapshot = {
+    schemaVersion: 2 as const,
     composerId,
     header: {
       composerId,
@@ -818,13 +897,27 @@ function chatSnapshot(composerId: string, workspaceId: string): ResourceSnapshot
       valueType: "text" as const,
     },
     bubbles: [],
-  });
+    agentKv: {
+      blobs: [],
+      referencedIds: [],
+      missingIds: [],
+    },
+  };
+  const body = canonicalBytes(snapshot);
   return {
     resourceId: `chat/${composerId}`,
     kind: "chat",
     content: body,
     semanticHash: sha256(body),
-    metadata: { composerId, workspaceId },
+    metadata: {
+      composerId,
+      workspaceId,
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 0,
+      agentKvReferencedCount: 0,
+      agentKvMissingCount: 0,
+      chatCoreHash: portableChatCoreHash(snapshot),
+    },
   };
 }
 

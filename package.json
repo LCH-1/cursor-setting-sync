@@ -2,7 +2,7 @@
   "name": "cursor-setting-sync",
   "displayName": "Cursor Setting Sync",
   "description": "Securely synchronize Cursor settings, workspace state, profiles, extensions, user files, and chat data across devices.",
-  "version": "0.0.66",
+  "version": "0.0.71",
   "publisher": "lch",
   "icon": "icon.png",
   "license": "MIT",
@@ -37,93 +37,13 @@
   },
   "activationEvents": [
     "onStartupFinished",
-    "onCommand:cursorSync.setup",
-    "onCommand:cursorSync.syncNow",
-    "onCommand:cursorSync.restartToApply",
-    "onCommand:cursorSync.resolveConflicts",
-    "onCommand:cursorSync.showDiagnostics",
-    "onCommand:cursorSync.restoreBackup",
-    "onCommand:cursorSync.forgetDevice",
-    "onCommand:cursorSync.repositoryUsage",
-    "onCommand:cursorSync.compactRepository",
-    "onCommand:cursorSync.archiveRepository",
-    "onCommand:cursorSync.restoreVersion",
-    "onCommand:cursorSync.repairUnavailableChats",
-    "onCommand:cursorSync.continueUnavailableChatSafely",
-    "onCommand:cursorSync.preserveAllUnavailableChatsSafely",
-    "onCommand:cursorSync.openRecoveredChatSafely",
-    "onCommand:cursorSync.checkpointRepository",
-    "onCommand:cursorSync.disconnect"
+    "onCommand:cursorSync.manage"
   ],
   "contributes": {
     "commands": [
       {
-        "command": "cursorSync.setup",
-        "title": "Cursor Setting Sync: Setup"
-      },
-      {
-        "command": "cursorSync.syncNow",
-        "title": "Cursor Setting Sync: Sync Now"
-      },
-      {
-        "command": "cursorSync.restartToApply",
-        "title": "Cursor Setting Sync: Restart to Apply"
-      },
-      {
-        "command": "cursorSync.resolveConflicts",
-        "title": "Cursor Setting Sync: Resolve Conflicts"
-      },
-      {
-        "command": "cursorSync.showDiagnostics",
-        "title": "Cursor Setting Sync: Show Diagnostics"
-      },
-      {
-        "command": "cursorSync.restoreBackup",
-        "title": "Cursor Setting Sync: Restore Backup"
-      },
-      {
-        "command": "cursorSync.forgetDevice",
-        "title": "Cursor Setting Sync: Forget Device"
-      },
-      {
-        "command": "cursorSync.repositoryUsage",
-        "title": "Cursor Setting Sync: Show Repository Usage"
-      },
-      {
-        "command": "cursorSync.compactRepository",
-        "title": "Cursor Setting Sync: Compact Safe Orphans"
-      },
-      {
-        "command": "cursorSync.restoreVersion",
-        "title": "Cursor Setting Sync: Restore Version History"
-      },
-      {
-        "command": "cursorSync.repairUnavailableChats",
-        "title": "Cursor Setting Sync: Repair Unavailable Chats"
-      },
-      {
-        "command": "cursorSync.continueUnavailableChatSafely",
-        "title": "Cursor Setting Sync: Continue Unavailable Chat Safely"
-      },
-      {
-        "command": "cursorSync.preserveAllUnavailableChatsSafely",
-        "title": "Cursor Setting Sync: Preserve All Recoverable Chats Safely"
-      },
-      {
-        "command": "cursorSync.openRecoveredChatSafely",
-        "title": "Cursor Setting Sync: Open Recovered Chat Safely"
-      },
-      {
-        "command": "cursorSync.checkpointRepository",
-        "title": "Cursor Setting Sync: Checkpoint & Prune History"
-      },
-      {
-        "command": "cursorSync.archiveRepository",
-        "title": "Cursor Setting Sync: Archive Repository"
-      },
-      {
-        "command": "cursorSync.disconnect",
-        "title": "Cursor Setting Sync: Disconnect"
+        "command": "cursorSync.manage",
+        "title": "Cursor Setting Sync: Manage"
       }
     ],
     "configuration": {
@@ -166,7 +86,7 @@
         "cursorSettingSync.applyOnShutdown": {
           "type": "boolean",
           "default": true,
-          "description": "Write queued database changes when you close Cursor, instead of asking you to quit it again. Chat, profiles, extensions and workspace storage live in databases Cursor holds open, so they can only be written while it is not running - this uses the shutdown you were already performing. Turn it off to be prompted for an explicit \"Restart to Apply\" instead. Either way, files apply immediately and nothing is written while Cursor is running."
+          "description": "Write queued database changes when you close Cursor, instead of asking you to quit it again. Chat, profiles, extensions and workspace storage live in databases Cursor holds open, so they can only be written while it is not running - this uses the shutdown you were already performing. Turn it off to be prompted for the \"Apply Queued Changes\" action inside Cursor Setting Sync: Manage instead. Either way, files apply immediately and nothing is written while Cursor is running."
         },
         "cursorSettingSync.syncLocalWorkspaces": {
           "type": "boolean",
@@ -244,7 +164,7 @@
     "check": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "verify": "npm run check && npm run lint && npm test && npm run build",
+    "verify": "npm run check && npm run lint && npm run build && npm test",
     "package": "vsce package --out cursor-setting-sync.vsix",
     "publish": "vsce publish",
     "publish:patch": "vsce publish patch",

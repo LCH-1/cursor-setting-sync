@@ -600,6 +600,104 @@ describe("visible-row continuation recovery", () => {
     expect(await readdir(storage)).toEqual([]);
   });
 
+  it("writes identical PNG bytes from distinct source names once while preserving both references", async () => {
+    const fixture = await createCalendarFixture({ imageOnly: true });
+    const duplicateSourcePath = join(
+      fixture.workspaceStorageRoot,
+      WORKSPACE_ID,
+      "images",
+      "same-bytes-different-name.png",
+    );
+    await writeFile(duplicateSourcePath, ONE_PIXEL_PNG);
+    const bubble = userBubbleWithImage(fixture.imagePath);
+    const context = bubble.context as { selectedImages: Array<Record<string, unknown>> };
+    context.selectedImages.push({
+      ...structuredClone(context.selectedImages[0]),
+      path: duplicateSourcePath,
+      uuid: "11111111-1111-4111-8111-111111111111",
+    });
+    updateBubble(fixture.databasePath, "bubble-111", bubble);
+    const sourceBoundRecovery = extractVisibleChatRecoveryTranscript(
+      fixture.databasePath,
+      COMPOSER_ID,
+      {},
+      {
+        maxSelectedImageTotalBytes: ONE_PIXEL_PNG.byteLength * 2 - 1,
+      },
+    );
+    const sourceBoundStorage = join(
+      fixture.root,
+      "source-bound-extension-storage",
+    );
+    await mkdir(sourceBoundStorage);
+    await expect(
+      writeVisibleChatRecoveryArtifact(
+        sourceBoundStorage,
+        fixture.workspaceStorageRoot,
+        sourceBoundRecovery,
+      ),
+    ).rejects.toThrow(/aggregate size limit/iu);
+    expect(await readdir(sourceBoundStorage)).toEqual([]);
+
+    const recovery = extractVisibleChatRecoveryTranscript(
+      fixture.databasePath,
+      COMPOSER_ID,
+    );
+    expect(recovery.selectedImages).toHaveLength(2);
+    const storage = join(fixture.root, "extension-storage");
+    await mkdir(storage);
+    const reserve = vi.fn();
+
+    const artifact = await writeVisibleChatRecoveryArtifact(
+      storage,
+      fixture.workspaceStorageRoot,
+      recovery,
+      {
+        namespace: "catalog",
+        composerStorageClass: "text",
+        beforeCatalogWrite: reserve,
+      },
+    );
+
+    expect(artifact.imageAttachments).toHaveLength(1);
+    expect(reserve).toHaveBeenCalledOnce();
+    expect(reserve).toHaveBeenCalledWith(
+      (await stat(artifact.path)).size + ONE_PIXEL_PNG.byteLength,
+      2,
+    );
+    const markdown = await readFile(artifact.path, "utf8");
+    expect(markdown).toContain(
+      "record 1 selected image 1, record 1 selected image 2",
+    );
+    expect(markdown.match(/^- `image-[0-9a-f]{64}\.png`/gmu)).toHaveLength(1);
+
+    const catalog = await upsertRecoveryCatalogEntry(storage, {
+      composerId: COMPOSER_ID,
+      composerStorageClass: "text",
+      chatCoreHash: recovery.chatCoreHash,
+      damageFingerprint: recovery.referenceFingerprint,
+      title: recovery.title,
+      status: "ready",
+      artifact,
+    });
+    const entry = catalog.manifest.entries[0];
+    expect(entry?.status).toBe("ready");
+    if (entry?.status !== "ready") {
+      throw new Error("Expected a ready catalog entry.");
+    }
+    expect(entry.artifact.images).toHaveLength(1);
+
+    const standalone = await writeVisibleChatRecoveryArtifact(
+      storage,
+      fixture.workspaceStorageRoot,
+      recovery,
+    );
+    expect(standalone.imageAttachments).toHaveLength(1);
+    expect(await readFile(standalone.path, "utf8")).toContain(
+      "record 1 selected image 1, record 1 selected image 2",
+    );
+  });
+
   it("validates selected PNG structure, dimensions, count, and aggregate bounds", async () => {
     const missing = await createCalendarFixture({ imageOnly: true });
     await rm(missing.imagePath);

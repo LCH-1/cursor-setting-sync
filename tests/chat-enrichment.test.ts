@@ -133,6 +133,608 @@ describe("manager repository-tip chat enrichment", () => {
     expect(core(enriched)).toEqual(core(source));
   });
 
+  it("republishes a complete legacy blob-only enrichment as a core-applying child", async () => {
+    const repository = await createRepository();
+    const composerId = composer(60);
+    const root = agentBlob("legacy-complete-core-root");
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 4),
+      schemaVersion: 2,
+      agentKv: payload([root], [], [root.id]),
+    };
+    source.composerData = row(
+      `composerData:${composerId}`,
+      JSON.stringify({ conversationState: serializedRoot(root.id) }),
+    );
+    const oldTip = await publishChat(repository, source, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 1,
+      agentKvReferencedCount: 1,
+      agentKvMissingCount: 0,
+      syncOrigin: "agent-kv-enrichment",
+    });
+    const collectAgentKv = vi.fn(async () => ({
+      agentKv: source.agentKv,
+    }));
+
+    const result = await enrichCurrentChatTips(repository, {
+      cursor: initialCursor(),
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv,
+    });
+
+    expect(result).toMatchObject({ attempted: 1, published: 1, warnings: [] });
+    expect(collectAgentKv).not.toHaveBeenCalled();
+    await reconcile(repository);
+    const tip = onlyTip(repository, `chat/${composerId}`);
+    expect(tip.parents).toEqual([oldTip.versionId]);
+    expect(tip.semanticHash).toBe(oldTip.semanticHash);
+    expect(tip.metadata).toMatchObject({
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 1,
+      agentKvReferencedCount: 1,
+      agentKvMissingCount: 0,
+      syncOrigin: "agent-kv-enrichment",
+      agentKvEnrichmentAppliesCore: true,
+      enrichedFromVersionId: oldTip.versionId,
+      enrichedFromSemanticHash: oldTip.semanticHash,
+    });
+    expect(
+      (await repository.readVersion(tip.versionId)).content,
+    ).toEqual((await repository.readVersion(oldTip.versionId)).content);
+  });
+
+  it("keeps a partial legacy enrichment blob-only until its closure is filled", async () => {
+    const repository = await createRepository();
+    const composerId = composer(61);
+    const root = agentBlob("legacy-partial-core-root");
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 4),
+      schemaVersion: 2,
+      agentKv: payload([], [root.id], [root.id]),
+    };
+    source.composerData = row(
+      `composerData:${composerId}`,
+      JSON.stringify({ conversationState: serializedRoot(root.id) }),
+    );
+    const oldTip = await publishChat(repository, source, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 0,
+      agentKvReferencedCount: 1,
+      agentKvMissingCount: 1,
+      syncOrigin: "agent-kv-enrichment",
+      agentKvEnrichmentAppliesCore: false,
+    });
+
+    const stillPartial = await enrichCurrentChatTips(repository, {
+      cursor: initialCursor(),
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv: async () => ({ agentKv: source.agentKv }),
+    });
+
+    expect(stillPartial).toMatchObject({
+      attempted: 1,
+      published: 0,
+      warnings: [],
+    });
+    expect(onlyTip(repository, `chat/${composerId}`).versionId).toBe(
+      oldTip.versionId,
+    );
+
+    const filled = await enrichCurrentChatTips(repository, {
+      cursor: stillPartial.cursor,
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv: async () => ({
+        agentKv: payload([root], [], [root.id]),
+      }),
+    });
+
+    expect(filled).toMatchObject({ attempted: 1, published: 1, warnings: [] });
+    await reconcile(repository);
+    expect(onlyTip(repository, `chat/${composerId}`).metadata).toMatchObject({
+      agentKvBlobCount: 1,
+      agentKvMissingCount: 0,
+      agentKvEnrichmentAppliesCore: true,
+    });
+  });
+
+  it("does not mark a legacy missing-zero payload whose closure omits a descendant", async () => {
+    const repository = await createRepository();
+    const composerId = composer(64);
+    const child = agentStepBlob("omitted-legacy-child");
+    const parent = agentBlobLinking(child.id);
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 4),
+      schemaVersion: 2,
+      // The aggregate metadata says complete, but the parent reaches a child
+      // that is neither declared nor materialized in this portable payload.
+      agentKv: payload([parent], [], [parent.id]),
+    };
+    source.composerData = row(
+      `composerData:${composerId}`,
+      JSON.stringify({ conversationState: serializedTurnRoot(parent.id) }),
+    );
+    const oldTip = await publishChat(repository, source, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 1,
+      agentKvReferencedCount: 1,
+      agentKvMissingCount: 0,
+      syncOrigin: "agent-kv-enrichment",
+    });
+    const collectAgentKv = vi.fn(async () => ({
+      agentKv: source.agentKv,
+    }));
+
+    const result = await enrichCurrentChatTips(repository, {
+      cursor: initialCursor(),
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv,
+    });
+
+    expect(result).toMatchObject({ attempted: 1, published: 0, warnings: [] });
+    expect(collectAgentKv).toHaveBeenCalledOnce();
+    expect(onlyTip(repository, `chat/${composerId}`).versionId).toBe(
+      oldTip.versionId,
+    );
+  });
+
+  it("canonicalizes an unreachable absent orphan from an auto-merged tip", async () => {
+    const repository = await createRepository();
+    const composerId = composer(66);
+    const active = agentBlob("auto-merge-active-root");
+    const orphan = agentBlob("auto-merge-unreachable-absent-orphan");
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 4),
+      schemaVersion: 2,
+      agentKv: payload(
+        [active],
+        [orphan.id],
+        [active.id, orphan.id],
+      ),
+    };
+    source.composerData = row(
+      `composerData:${composerId}`,
+      JSON.stringify({ conversationState: serializedRoot(active.id) }),
+    );
+    const oldTip = await publishChat(repository, source, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 1,
+      agentKvReferencedCount: 2,
+      agentKvMissingCount: 1,
+      syncOrigin: "auto-merge",
+    });
+    const root = temporaryRoots.at(-1);
+    if (root === undefined) {
+      throw new Error("Missing temporary root");
+    }
+    const databasePath = join(root, "absent-orphan-state.vscdb");
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec(
+        "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)",
+      );
+    } finally {
+      database.close();
+    }
+
+    const result = await enrichCurrentChatTipsFromLiveDatabase(
+      repository,
+      databasePath,
+      {
+        cursor: initialCursor(),
+        maxPayloadBytes: repository.maxPayloadBytes,
+      },
+    );
+
+    expect(result).toMatchObject({ attempted: 1, published: 1, warnings: [] });
+    await reconcile(repository);
+    const tip = onlyTip(repository, `chat/${composerId}`);
+    expect(tip.parents).toEqual([oldTip.versionId]);
+    expect(tip.metadata).toMatchObject({
+      agentKvBlobCount: 1,
+      agentKvReferencedCount: 1,
+      agentKvMissingCount: 0,
+      syncOrigin: "agent-kv-enrichment",
+      agentKvEnrichmentAppliesCore: true,
+    });
+    const normalized = parsePortableChatSnapshot(
+      (await repository.readVersion(tip.versionId)).content ?? Buffer.alloc(0),
+    );
+    expect(isPortableChatSnapshotV2(normalized) && normalized.agentKv).toEqual(
+      payload([active], [], [active.id]),
+    );
+    expect(core(normalized)).toEqual(core(source));
+  });
+
+  it("normalizes legacy Calendar phantom missing IDs after exact absence proof", async () => {
+    const repository = await createRepository();
+    const composerId = composer(73);
+    const embeddedMatch32 = protobufBytesField(2, Buffer.alloc(30, 0x61));
+    const content32 = Buffer.alloc(32, 0x62);
+    expect(embeddedMatch32).toHaveLength(32);
+    const grepFileMatch = Buffer.concat([
+      protobufBytesField(2, embeddedMatch32),
+      protobufBytesField(2, protobufBytesField(2, content32)),
+    ]);
+    const step = agentBlobFromBytes(
+      protobufBytesField(
+        2,
+        protobufBytesField(
+          5,
+          protobufBytesField(
+            2,
+            protobufBytesField(
+              1,
+              protobufBytesField(
+                4,
+                protobufBytesField(
+                  2,
+                  protobufBytesField(
+                    3,
+                    protobufBytesField(1, grepFileMatch),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    const turn = agentBlobLinking(step.id);
+    const phantomIds = [
+      embeddedMatch32.toString("hex"),
+      content32.toString("hex"),
+    ].sort();
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 4),
+      schemaVersion: 2,
+      agentKv: payload(
+        [turn, step],
+        phantomIds,
+        [turn.id, step.id, ...phantomIds],
+      ),
+    };
+    source.composerData = row(
+      `composerData:${composerId}`,
+      JSON.stringify({ conversationState: serializedTurnRoot(turn.id) }),
+    );
+    const oldTip = await publishChat(repository, source, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 2,
+      agentKvReferencedCount: 4,
+      agentKvMissingCount: 2,
+      syncOrigin: "agent-kv-enrichment",
+      agentKvEnrichmentAppliesCore: false,
+    });
+    const root = temporaryRoots.at(-1);
+    if (root === undefined) {
+      throw new Error("Missing temporary root");
+    }
+    const databasePath = join(root, "calendar-phantom-state.vscdb");
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec(
+        "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)",
+      );
+    } finally {
+      database.close();
+    }
+
+    const result = await enrichCurrentChatTipsFromLiveDatabase(
+      repository,
+      databasePath,
+      {
+        cursor: initialCursor(),
+        maxPayloadBytes: repository.maxPayloadBytes,
+      },
+    );
+
+    expect(result).toMatchObject({ attempted: 1, published: 1, warnings: [] });
+    await reconcile(repository);
+    const tip = onlyTip(repository, `chat/${composerId}`);
+    expect(tip.parents).toEqual([oldTip.versionId]);
+    expect(tip.metadata).toMatchObject({
+      agentKvBlobCount: 2,
+      agentKvReferencedCount: 2,
+      agentKvMissingCount: 0,
+      agentKvEnrichmentAppliesCore: true,
+    });
+    const normalized = parsePortableChatSnapshot(
+      (await repository.readVersion(tip.versionId)).content ?? Buffer.alloc(0),
+    );
+    expect(isPortableChatSnapshotV2(normalized) && normalized.agentKv).toEqual(
+      payload([turn, step], [], [turn.id, step.id]),
+    );
+    expect(core(normalized)).toEqual(core(source));
+  });
+
+  it("rejects an injected collector that prunes an orphan without exact absence proof", async () => {
+    const repository = await createRepository();
+    const composerId = composer(72);
+    const active = agentBlob("malicious-prune-active-root");
+    const orphan = agentBlob("malicious-prune-unproven-orphan");
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 3),
+      schemaVersion: 2,
+      agentKv: payload(
+        [active],
+        [orphan.id],
+        [active.id, orphan.id],
+      ),
+    };
+    source.composerData = row(
+      `composerData:${composerId}`,
+      JSON.stringify({ conversationState: serializedRoot(active.id) }),
+    );
+    const oldTip = await publishChat(repository, source, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 1,
+      agentKvReferencedCount: 2,
+      agentKvMissingCount: 1,
+      syncOrigin: "auto-merge",
+    });
+
+    const result = await enrichCurrentChatTips(repository, {
+      cursor: initialCursor(),
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv: async () => ({
+        agentKv: payload([active], [], [active.id]),
+      }),
+    });
+
+    expect(result).toMatchObject({ attempted: 1, published: 0 });
+    expect(result.warnings.join(" ")).toContain(
+      "pruned without exact absence proof",
+    );
+    expect(onlyTip(repository, `chat/${composerId}`).versionId).toBe(
+      oldTip.versionId,
+    );
+  });
+
+  it("corrects then fills an omitted descendant from a missing-zero auto-merge tip", async () => {
+    const repository = await createRepository();
+    const composerId = composer(67);
+    const child = agentStepBlob("auto-merge-omitted-active-child");
+    const parent = agentBlobLinking(child.id);
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 4),
+      schemaVersion: 2,
+      agentKv: payload([parent], [], [parent.id]),
+    };
+    source.composerData = row(
+      `composerData:${composerId}`,
+      JSON.stringify({ conversationState: serializedTurnRoot(parent.id) }),
+    );
+    await publishChat(repository, source, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 1,
+      agentKvReferencedCount: 1,
+      agentKvMissingCount: 0,
+      syncOrigin: "auto-merge",
+    });
+
+    const corrected = await enrichCurrentChatTips(repository, {
+      cursor: initialCursor(),
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv: async () => ({
+        agentKv: payload(
+          [parent],
+          [child.id],
+          [parent.id, child.id],
+        ),
+      }),
+    });
+
+    expect(corrected).toMatchObject({
+      attempted: 1,
+      published: 1,
+      warnings: [],
+    });
+    await reconcile(repository);
+    expect(onlyTip(repository, `chat/${composerId}`).metadata).toMatchObject({
+      agentKvBlobCount: 1,
+      agentKvReferencedCount: 2,
+      agentKvMissingCount: 1,
+      agentKvEnrichmentAppliesCore: false,
+    });
+
+    const filled = await enrichCurrentChatTips(repository, {
+      cursor: corrected.cursor,
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv: async () => ({
+        agentKv: payload(
+          [parent, child],
+          [],
+          [parent.id, child.id],
+        ),
+      }),
+    });
+
+    expect(filled).toMatchObject({ attempted: 1, published: 1, warnings: [] });
+    await reconcile(repository);
+    expect(onlyTip(repository, `chat/${composerId}`).metadata).toMatchObject({
+      agentKvBlobCount: 2,
+      agentKvReferencedCount: 2,
+      agentKvMissingCount: 0,
+      agentKvEnrichmentAppliesCore: true,
+    });
+  });
+
+  it.each([
+    ["version restore", composer(69), { syncOrigin: "version-restore" }],
+    [
+      "conflict resolution",
+      composer(70),
+      { syncOrigin: "conflict-resolution" },
+    ],
+    [
+      "checkpointed version restore",
+      composer(71),
+      {
+        syncOrigin: "checkpoint-marker",
+        checkpointedSyncOrigin: "version-restore",
+      },
+    ],
+  ] as const)(
+    "audits and fills a false-complete %s tip",
+    async (_label, composerId, originMetadata) => {
+      const repository = await createRepository();
+      const child = agentStepBlob(`${_label}-omitted-active-child`);
+      const parent = agentBlobLinking(child.id);
+      const source: PortableChatSnapshotV2 = {
+        ...legacyChat(composerId, 3),
+        schemaVersion: 2,
+        agentKv: payload([parent], [], [parent.id]),
+      };
+      source.composerData = row(
+        `composerData:${composerId}`,
+        JSON.stringify({ conversationState: serializedTurnRoot(parent.id) }),
+      );
+      await publishChat(repository, source, {
+        chatSnapshotSchemaVersion: 2,
+        agentKvBlobCount: 1,
+        agentKvReferencedCount: 1,
+        agentKvMissingCount: 0,
+        ...originMetadata,
+      });
+      const collectAgentKv = vi.fn(async () => ({
+        agentKv: payload(
+          [parent, child],
+          [],
+          [parent.id, child.id],
+        ),
+      }));
+
+      const result = await enrichCurrentChatTips(repository, {
+        cursor: initialCursor(),
+        maxPayloadBytes: repository.maxPayloadBytes,
+        collectAgentKv,
+      });
+
+      expect(result).toMatchObject({
+        attempted: 1,
+        published: 1,
+        warnings: [],
+      });
+      expect(collectAgentKv).toHaveBeenCalledOnce();
+      await reconcile(repository);
+      expect(onlyTip(repository, `chat/${composerId}`).metadata).toMatchObject({
+        syncOrigin: "agent-kv-enrichment",
+        agentKvBlobCount: 2,
+        agentKvReferencedCount: 2,
+        agentKvMissingCount: 0,
+        agentKvEnrichmentAppliesCore: true,
+      });
+    },
+  );
+
+  it("treats an already core-applying enrichment tip as terminal", async () => {
+    const repository = await createRepository();
+    const composerId = composer(62);
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 2),
+      schemaVersion: 2,
+      agentKv: payload([], [], []),
+    };
+    await publishChat(repository, source, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 0,
+      agentKvReferencedCount: 0,
+      agentKvMissingCount: 0,
+      syncOrigin: "agent-kv-enrichment",
+      agentKvEnrichmentAppliesCore: true,
+    });
+    const collectAgentKv = vi.fn(async () => ({
+      agentKv: source.agentKv,
+    }));
+
+    const result = await enrichCurrentChatTips(repository, {
+      cursor: initialCursor(),
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv,
+    });
+
+    expect(result).toMatchObject({ attempted: 0, published: 0, warnings: [] });
+    expect(collectAgentKv).not.toHaveBeenCalled();
+  });
+
+  it("continues filling historical partial tips that were flagged too early", async () => {
+    const repository = await createRepository();
+    const composerId = composer(65);
+    const root = agentBlob("historical-partial-flagged-root");
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 2),
+      schemaVersion: 2,
+      agentKv: payload([], [root.id], [root.id]),
+    };
+    source.composerData = row(
+      `composerData:${composerId}`,
+      JSON.stringify({ conversationState: serializedRoot(root.id) }),
+    );
+    await publishChat(repository, source, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 0,
+      agentKvReferencedCount: 1,
+      agentKvMissingCount: 1,
+      syncOrigin: "agent-kv-enrichment",
+      // Pre-migration producers attached this to partial children too.
+      agentKvEnrichmentAppliesCore: true,
+    });
+
+    const result = await enrichCurrentChatTips(repository, {
+      cursor: initialCursor(),
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv: async () => ({
+        agentKv: payload([root], [], [root.id]),
+      }),
+    });
+
+    expect(result).toMatchObject({ attempted: 1, published: 1, warnings: [] });
+    await reconcile(repository);
+    expect(onlyTip(repository, `chat/${composerId}`).metadata).toMatchObject({
+      agentKvMissingCount: 0,
+      agentKvEnrichmentAppliesCore: true,
+    });
+  });
+
+  it("stays idle after reconciling a legacy core-applying upgrade", async () => {
+    const repository = await createRepository();
+    const composerId = composer(63);
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 2),
+      schemaVersion: 2,
+      agentKv: payload([], [], []),
+    };
+    await publishChat(repository, source, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 0,
+      agentKvReferencedCount: 0,
+      agentKvMissingCount: 0,
+      syncOrigin: "agent-kv-enrichment",
+    });
+    const collectAgentKv = vi.fn(async () => ({
+      agentKv: source.agentKv,
+    }));
+    const read = vi.spyOn(repository, "tryReadVersion");
+
+    const upgraded = await enrichCurrentChatTips(repository, {
+      cursor: initialCursor(),
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv,
+    });
+    expect(upgraded.published).toBe(1);
+    await reconcile(repository);
+    const idle = await enrichCurrentChatTips(repository, {
+      cursor: upgraded.cursor,
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv,
+    });
+
+    expect(idle).toMatchObject({ attempted: 0, published: 0, warnings: [] });
+    expect(collectAgentKv).not.toHaveBeenCalled();
+    expect(read).toHaveBeenCalledOnce();
+  });
+
   it("fills an incomplete v2 tip and publishes only newly materialized blobs", async () => {
     const repository = await createRepository();
     const composerId = composer(2);
@@ -870,6 +1472,57 @@ describe("manager repository-tip chat enrichment", () => {
     expect(valueGet).not.toHaveBeenCalled();
   });
 
+  it("still proves a later orphan absent after the raw materialization budget reaches zero", async () => {
+    const composerId = composer(73);
+    const bytes = Buffer.alloc(3_072, 0x5a);
+    const materializedId = sha256(bytes);
+    const absentId = sha256(Buffer.from("zero-budget-absent-orphan", "utf8"));
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 1),
+      schemaVersion: 2,
+      agentKv: {
+        blobs: [],
+        // Keep the materialized row first to drive remainingRawBytes to zero
+        // before the exact metadata-only absence probe.
+        referencedIds: [materializedId, absentId],
+        missingIds: [materializedId, absentId],
+      },
+    };
+    const materializedKey = `agentKv:blob:${materializedId}`;
+    const absentKey = `agentKv:blob:${absentId}`;
+    const metadataGet = vi.fn((key: unknown) =>
+      key === materializedKey
+        ? { key, valueType: "blob", valueBytes: bytes.byteLength }
+        : undefined,
+    );
+    const valueGet = vi.fn((key: unknown) =>
+      key === materializedKey
+        ? { key, value: bytes, valueType: "blob" }
+        : undefined,
+    );
+
+    const result = await chatEnrichmentTesting.collectLiveAgentKv(
+      fakeAgentKvDatabase(metadataGet, valueGet),
+      source,
+      {
+        sourceContentBytes: 100,
+        // Encoded room 20 KiB => 16 KiB JSON reserve and exactly 3 KiB raw.
+        maxPayloadBytes: 100 + 20 * 1024,
+      },
+    );
+
+    expect(metadataGet).toHaveBeenNthCalledWith(1, materializedKey);
+    expect(metadataGet).toHaveBeenNthCalledWith(2, absentKey);
+    expect(valueGet).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({
+      agentKv: {
+        referencedIds: [materializedId],
+        missingIds: [],
+      },
+      provenAbsentSourceMissingIds: [absentId],
+    });
+  });
+
   it("retries an over-budget live row after the database generation changes", async () => {
     const repository = await createRepository();
     const composerId = composer(45);
@@ -988,6 +1641,108 @@ describe("manager repository-tip chat enrichment", () => {
     } finally {
       yielded.mockRestore();
     }
+  });
+
+  it("prunes proven-absent orphans in bounded passes without starving an unprobed tail blob", async () => {
+    const repository = await createRepository();
+    const composerId = composer(68);
+    const orphans = Array.from({ length: 4_098 }, (_, index) =>
+      agentBlob(`bounded-orphan-${index}`),
+    ).sort((left, right) =>
+      left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
+    );
+    const tailBlob = orphans.at(-1);
+    if (tailBlob === undefined) {
+      throw new Error("Missing tail blob fixture");
+    }
+    const missingIds = orphans.map((blob) => blob.id);
+    const source: PortableChatSnapshotV2 = {
+      ...legacyChat(composerId, 1),
+      schemaVersion: 2,
+      agentKv: {
+        blobs: [],
+        referencedIds: missingIds,
+        missingIds,
+      },
+    };
+    await publishChat(repository, source, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 0,
+      agentKvReferencedCount: missingIds.length,
+      agentKvMissingCount: missingIds.length,
+      syncOrigin: "auto-merge",
+    });
+    const root = temporaryRoots.at(-1);
+    if (root === undefined) {
+      throw new Error("Missing temporary root");
+    }
+    const databasePath = join(root, "bounded-orphan-tail.vscdb");
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec(
+        "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)",
+      );
+      database
+        .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
+        .run(
+          tailBlob.row.key,
+          Buffer.from(tailBlob.row.valueBase64, "base64"),
+        );
+    } finally {
+      database.close();
+    }
+
+    const first = await enrichCurrentChatTipsFromLiveDatabase(
+      repository,
+      databasePath,
+      {
+        cursor: initialCursor(),
+        maxPayloadBytes: repository.maxPayloadBytes,
+      },
+    );
+
+    expect(first).toMatchObject({ attempted: 1, published: 1, warnings: [] });
+    await reconcile(repository);
+    const partialTip = onlyTip(repository, `chat/${composerId}`);
+    expect(partialTip.metadata).toMatchObject({
+      agentKvBlobCount: 0,
+      agentKvReferencedCount: 2,
+      agentKvMissingCount: 2,
+      agentKvEnrichmentAppliesCore: false,
+    });
+    const partial = parsePortableChatSnapshot(
+      (await repository.readVersion(partialTip.versionId)).content ??
+        Buffer.alloc(0),
+    );
+    expect(isPortableChatSnapshotV2(partial) && partial.agentKv.missingIds).toEqual(
+      missingIds.slice(4_096),
+    );
+
+    const second = await enrichCurrentChatTipsFromLiveDatabase(
+      repository,
+      databasePath,
+      {
+        cursor: first.cursor,
+        maxPayloadBytes: repository.maxPayloadBytes,
+      },
+    );
+
+    expect(second).toMatchObject({ attempted: 1, published: 1, warnings: [] });
+    await reconcile(repository);
+    const completeTip = onlyTip(repository, `chat/${composerId}`);
+    expect(completeTip.metadata).toMatchObject({
+      agentKvBlobCount: 1,
+      agentKvReferencedCount: 1,
+      agentKvMissingCount: 0,
+      agentKvEnrichmentAppliesCore: true,
+    });
+    const complete = parsePortableChatSnapshot(
+      (await repository.readVersion(completeTip.versionId)).content ??
+        Buffer.alloc(0),
+    );
+    expect(isPortableChatSnapshotV2(complete) && complete.agentKv).toEqual(
+      payload([tailBlob], [], [tailBlob.id]),
+    );
   });
 
   it("enriches the repository tip even when the live DB has no copy of its core", async () => {
@@ -1169,7 +1924,9 @@ describe("manager repository-tip chat enrichment", () => {
     });
 
     expect(result.published).toBe(0);
-    expect(result.warnings[0]).toContain("dropped a repository agentKv reference");
+    expect(result.warnings[0]).toContain(
+      "pruned without exact absence proof",
+    );
     expect(onlyTip(repository, `chat/${composerId}`).versionId).toBe(
       oldTip.versionId,
     );
@@ -1453,7 +2210,10 @@ function row(key: string, text: string): PortableKvRow {
 }
 
 function agentBlob(text: string): { id: string; row: PortableKvRow } {
-  const bytes = Buffer.from(text, "utf8");
+  return agentBlobFromBytes(Buffer.from(text, "utf8"));
+}
+
+function agentBlobFromBytes(bytes: Buffer): { id: string; row: PortableKvRow } {
   const id = sha256(bytes);
   return {
     id,
@@ -1465,11 +2225,69 @@ function agentBlob(text: string): { id: string; row: PortableKvRow } {
   };
 }
 
+function agentStepBlob(text: string): { id: string; row: PortableKvRow } {
+  const bytes = protobufBytesField(
+    1,
+    protobufBytesField(1, Buffer.from(text, "utf8")),
+  );
+  const id = sha256(bytes);
+  return {
+    id,
+    row: {
+      key: `agentKv:blob:${id}`,
+      valueBase64: bytes.toString("base64"),
+      valueType: "blob",
+    },
+  };
+}
+
+function agentBlobLinking(id: string): { id: string; row: PortableKvRow } {
+  const bytes = protobufBytesField(
+    1,
+    protobufBytesField(2, Buffer.from(id, "hex")),
+  );
+  const blobId = sha256(bytes);
+  return {
+    id: blobId,
+    row: {
+      key: `agentKv:blob:${blobId}`,
+      valueBase64: bytes.toString("base64"),
+      valueType: "blob",
+    },
+  };
+}
+
 function serializedRoot(id: string): string {
-  const hash = Buffer.from(id, "hex");
-  return `~${Buffer.concat([Buffer.from([0x0a, hash.byteLength]), hash]).toString(
-    "base64",
-  )}`;
+  return `~${protobufBytesField(1, Buffer.from(id, "hex")).toString("base64")}`;
+}
+
+function serializedTurnRoot(id: string): string {
+  return `~${protobufBytesField(8, Buffer.from(id, "hex")).toString("base64")}`;
+}
+
+function protobufBytesField(
+  fieldNumber: number,
+  payloadBytes: Uint8Array,
+): Buffer {
+  return Buffer.concat([
+    protobufVarint(BigInt(fieldNumber * 8 + 2)),
+    protobufVarint(BigInt(payloadBytes.byteLength)),
+    Buffer.from(payloadBytes),
+  ]);
+}
+
+function protobufVarint(input: bigint): Buffer {
+  let value = input;
+  const bytes: number[] = [];
+  do {
+    let byte = Number(value & 0x7fn);
+    value >>= 7n;
+    if (value !== 0n) {
+      byte |= 0x80;
+    }
+    bytes.push(byte);
+  } while (value !== 0n);
+  return Buffer.from(bytes);
 }
 
 function payload(

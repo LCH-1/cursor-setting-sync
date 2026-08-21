@@ -189,6 +189,12 @@ interface HeaderMaterializationSweep {
   /** A mutation during the finite pass queues one fresh follow-up pass. */
   needsAnotherPass: boolean;
   databaseFingerprint: string;
+  /**
+   * Forced inbound targets encountered anywhere in this finite generation.
+   * The configured target set is bounded by the helper apply page, so this
+   * remains bounded even when composerHeaders itself is very large.
+   */
+  seenForcedCoreVerificationResourceIds: Set<string>;
 }
 
 interface HeaderMetadataCursor {
@@ -330,6 +336,12 @@ export interface StateVscdbChatAdapterOptions {
    * must not start a full equal-count audit of every historical chat.
    */
   periodicDeepVerification?: boolean;
+  /**
+   * Header-frontier restarts allowed solely because the SQLite fingerprint
+   * changed during a bounded drain. The shutdown helper sets this to one so a
+   * continuously churning external writer cannot keep it alive forever.
+   */
+  maxProgressDatabaseGenerationRestarts?: number;
   /**
    * Exact incoming chat resources that the offline helper may overwrite.
    * They receive one bounded full-core verification even when Cursor kept the
@@ -500,6 +512,29 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
   /** Exact chats still waiting behind one of this adapter's bounded cursors. */
   private deferredResourceIds = new Set<string>();
   /**
+   * Monotonic evidence that a bounded scan made forward progress. The shutdown
+   * helper may need more than its legacy 32 passes for a large chat database;
+   * it keeps draining while this token advances and stops after 32 genuinely
+   * stagnant passes.
+   */
+  private scanProgressRevision = 0;
+  /** Database generation to which the retained header frontier belongs. */
+  private headerProgressDatabaseFingerprint: string | null = null;
+  /** Configured cap restored only by a genuine non-DB work epoch. */
+  private readonly maxHeaderProgressDatabaseGenerationRestarts: number;
+  /** Remaining frontier restarts allowed solely for DB-generation churn. */
+  private remainingHeaderProgressDatabaseGenerationRestarts: number;
+  /** Once churn exhausts its cap, even appended rowids are not progress. */
+  private cursorProgressFrozen = false;
+  /**
+   * Furthest row reached in the current genuine header-work epoch. This is
+   * deliberately retained across a retry sweep over the same stable database:
+   * resetting a cursor after the same permanent failure is not progress.
+   */
+  private headerProgressHighWater: bigint | null = null;
+  /** Furthest row reached by the current finite bubble-count sweep. */
+  private bubbleProgressHighWater: bigint | null = null;
+  /**
    * Bounded per-resource repository identities. This preserves the useful
    * "known changed" signal without rebuilding/sorting every chat projection
    * on every 64-row SQLite page.
@@ -517,6 +552,20 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
     private readonly paths: CursorPaths,
     private readonly options: StateVscdbChatAdapterOptions = {},
   ) {
+    const maxProgressDatabaseGenerationRestarts =
+      options.maxProgressDatabaseGenerationRestarts ?? Number.MAX_SAFE_INTEGER;
+    if (
+      !Number.isSafeInteger(maxProgressDatabaseGenerationRestarts) ||
+      maxProgressDatabaseGenerationRestarts < 0
+    ) {
+      throw new Error(
+        "The chat scan progress database-generation restart limit must be a nonnegative safe integer.",
+      );
+    }
+    this.maxHeaderProgressDatabaseGenerationRestarts =
+      maxProgressDatabaseGenerationRestarts;
+    this.remainingHeaderProgressDatabaseGenerationRestarts =
+      maxProgressDatabaseGenerationRestarts;
     this.forcedCoreVerificationResourceIds = new Set(
       options.forceCoreVerificationResourceIds ?? [],
     );
@@ -556,6 +605,12 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
     this.oversizedSettlements.clear();
     this.options.onOversizedSettlementRetained?.(0);
     this.headerMaterializationSweep = null;
+    this.headerProgressDatabaseFingerprint = null;
+    this.headerProgressHighWater = null;
+    this.bubbleProgressHighWater = null;
+    this.cursorProgressFrozen = false;
+    this.remainingHeaderProgressDatabaseGenerationRestarts =
+      this.maxHeaderProgressDatabaseGenerationRestarts;
     this.settledScan = null;
   }
 
@@ -611,6 +666,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
       observedHeaderGeneration: this.oversizedSettlementHeaderGeneration,
     });
     this.pendingSnapshots.delete(resourceId);
+    this.advanceScanProgress();
     // The completed item capture already proved both fingerprints stable. The
     // whole scan may still have deferred another large chat, so it is not safe
     // to depend on (or synthesize) a globally settled scan here.
@@ -698,6 +754,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         this.bubbleCountAuditSweep === null &&
         this.headerMaterializationSweep === null,
       deferredResourceIds: [...deferred].sort(),
+      progressToken: this.scanProgressRevision,
     };
   }
 
@@ -707,6 +764,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
     const databaseFingerprint = await stateVscdbFingerprint(
       this.paths.globalDatabase,
     );
+    let repositoryAcknowledged = false;
     for (const [resourceId, settlement] of this.oversizedSettlements) {
       const projection = known[resourceId];
       const representedByRepository =
@@ -716,6 +774,8 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
       if (representedByRepository) {
         this.oversizedSettlements.delete(resourceId);
         this.settledScan = null;
+        this.advanceScanProgress();
+        repositoryAcknowledged = true;
       }
     }
     const acknowledgedPendingSnapshots = new Set<string>();
@@ -728,8 +788,14 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
       ) {
         acknowledgedPendingSnapshots.add(resourceId);
         this.pendingSnapshots.delete(resourceId);
+        this.advanceScanProgress();
+        repositoryAcknowledged = true;
       }
     }
+    this.prepareHeaderProgressEpoch(
+      databaseFingerprint,
+      repositoryAcknowledged,
+    );
     const settledScan = this.settledScan;
     const now = this.options.now?.() ?? Date.now();
     const periodicDeepVerification =
@@ -785,6 +851,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         needsAnotherPass: false,
         databaseFingerprint,
       };
+      this.bubbleProgressHighWater = null;
     }
     const activeSweep = this.deepVerificationSweep;
     if (
@@ -810,6 +877,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         nextCursor: null,
         needsAnotherPass: false,
         databaseFingerprint,
+        seenForcedCoreVerificationResourceIds: new Set<string>(),
       };
     }
     const activeHeaderSweep = this.headerMaterializationSweep;
@@ -1098,6 +1166,15 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           continue;
         }
         const resourceId = `chat/${composerId}`;
+        if (this.forcedCoreVerificationResourceIds.has(resourceId)) {
+          // Mark presence before interpreting isSubagent or materializing the
+          // header. A present-but-malformed target must remain blocked; only a
+          // complete stable generation that never saw the exact ID proves
+          // local absence.
+          activeHeaderSweep.seenForcedCoreVerificationResourceIds.add(
+            resourceId,
+          );
+        }
         const headerKind = headerIsMainComposer(rawHeader);
         if (headerKind === false) {
           // A valid non-zero isSubagent row is intentionally outside the
@@ -1808,7 +1885,9 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         );
       }
       for (const resourceId of nonReconstructablePendingSnapshots) {
-        this.pendingSnapshots.delete(resourceId);
+        if (this.pendingSnapshots.delete(resourceId)) {
+          this.advanceScanProgress();
+        }
       }
       for (const deletion of candidateDeletions) {
         if (this.forcedCoreVerificationResourceIds.has(deletion.resourceId)) {
@@ -1816,7 +1895,9 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         }
       }
       for (const resourceId of completedForcedVerifications) {
-        this.forcedCoreVerificationResourceIds.delete(resourceId);
+        if (this.forcedCoreVerificationResourceIds.delete(resourceId)) {
+          this.advanceScanProgress();
+        }
       }
     }
     if (!databaseStable) {
@@ -1825,13 +1906,38 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
     activeHeaderSweep.databaseFingerprint =
       afterDatabaseFingerprint ?? databaseFingerprint;
     activeHeaderSweep.nextCursor = headerLastProcessedCursor;
+    this.recordHeaderPageProgress(headerLastProcessedCursor);
     if (headerPageReachedEnd) {
       if (activeHeaderSweep.needsAnotherPass) {
         activeHeaderSweep.nextCursor = null;
         activeHeaderSweep.needsAnotherPass = false;
+        activeHeaderSweep.seenForcedCoreVerificationResourceIds.clear();
+        // The prior prefix straddled database generations. The queued stable
+        // pass gets one new frontier. Repeated external fingerprint churn in
+        // the same work epoch cannot keep manufacturing progress forever.
+        this.prepareHeaderMutationRetry(
+          activeHeaderSweep.databaseFingerprint,
+        );
         this.beginOversizedSettlementHeaderGeneration();
         captureWorkDeferred = true;
       } else {
+        if (databaseStable) {
+          // Chats are additive-only. After one complete stable header
+          // generation, an exact forced target that was never observed is
+          // safely absent locally and cannot be overwritten by the inbound
+          // apply. Present malformed targets were marked above and stay
+          // blocked for fail-closed handling.
+          for (const resourceId of this.forcedCoreVerificationResourceIds) {
+            if (
+              !activeHeaderSweep.seenForcedCoreVerificationResourceIds.has(
+                resourceId,
+              ) &&
+              this.forcedCoreVerificationResourceIds.delete(resourceId)
+            ) {
+              this.advanceScanProgress();
+            }
+          }
+        }
         const overflowNeedsOneFittingRebuild =
           this.finishOversizedSettlementHeaderGeneration();
         if (overflowNeedsOneFittingRebuild) {
@@ -1839,6 +1945,10 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           // omitted identity. One bounded rebuild can now admit it into the
           // space just released by stable-generation cleanup.
           activeHeaderSweep.nextCursor = null;
+          activeHeaderSweep.seenForcedCoreVerificationResourceIds.clear();
+          // Stale settlements were actually removed, so this one fitting
+          // rebuild is a new bounded-work epoch rather than a retry failure.
+          this.resetHeaderProgressEpoch(activeHeaderSweep.databaseFingerprint);
           this.beginOversizedSettlementHeaderGeneration();
           captureWorkDeferred = true;
         } else {
@@ -1873,6 +1983,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
       activeBubbleCountSweep.databaseFingerprint =
         afterDatabaseFingerprint ?? databaseFingerprint;
       activeBubbleCountSweep.nextCursor = bubbleNextCursor;
+      this.recordBubblePageProgress(bubbleNextCursor);
       if (bubblePageReachedEnd) {
         if (activeBubbleCountSweep.needsAnotherPass) {
           activeBubbleCountSweep.nextCursor = null;
@@ -1926,6 +2037,93 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
     }
     this.deferredResourceIds = deferredResourceIds;
     return result;
+  }
+
+  private advanceScanProgress(): void {
+    if (this.scanProgressRevision < Number.MAX_SAFE_INTEGER) {
+      this.scanProgressRevision += 1;
+    }
+  }
+
+  private prepareHeaderProgressEpoch(
+    databaseFingerprint: string,
+    repositoryAcknowledged: boolean,
+  ): void {
+    if (repositoryAcknowledged) {
+      this.resetHeaderProgressEpoch(databaseFingerprint);
+      return;
+    }
+    if (this.headerProgressDatabaseFingerprint === null) {
+      this.resetHeaderProgressEpoch(databaseFingerprint);
+      return;
+    }
+    if (
+      this.headerMaterializationSweep === null &&
+      this.headerProgressDatabaseFingerprint !== databaseFingerprint
+    ) {
+      this.prepareHeaderMutationRetry(databaseFingerprint);
+    }
+  }
+
+  private resetHeaderProgressEpoch(databaseFingerprint: string): void {
+    this.headerProgressDatabaseFingerprint = databaseFingerprint;
+    this.headerProgressHighWater = null;
+    this.bubbleProgressHighWater = null;
+    this.cursorProgressFrozen = false;
+    this.remainingHeaderProgressDatabaseGenerationRestarts =
+      this.maxHeaderProgressDatabaseGenerationRestarts;
+  }
+
+  private prepareHeaderMutationRetry(databaseFingerprint: string): void {
+    if (this.headerProgressDatabaseFingerprint === databaseFingerprint) {
+      return;
+    }
+    this.headerProgressDatabaseFingerprint = databaseFingerprint;
+    if (this.remainingHeaderProgressDatabaseGenerationRestarts > 0) {
+      this.headerProgressHighWater = null;
+      this.bubbleProgressHighWater = null;
+      this.cursorProgressFrozen = false;
+      this.remainingHeaderProgressDatabaseGenerationRestarts -= 1;
+    } else {
+      // A continually changing file is not a finite cursor. Freeze both scan
+      // frontiers so appending ever-higher rowids cannot evade the helper's
+      // consecutive no-progress bound.
+      this.cursorProgressFrozen = true;
+    }
+  }
+
+  private recordHeaderPageProgress(
+    cursor: HeaderMetadataCursor | null,
+  ): void {
+    if (this.cursorProgressFrozen) {
+      return;
+    }
+    const rowId = cursorRowId(cursor);
+    if (
+      rowId !== null &&
+      (this.headerProgressHighWater === null ||
+        rowId > this.headerProgressHighWater)
+    ) {
+      this.headerProgressHighWater = rowId;
+      this.advanceScanProgress();
+    }
+  }
+
+  private recordBubblePageProgress(
+    cursor: HeaderMetadataCursor | null,
+  ): void {
+    if (this.cursorProgressFrozen) {
+      return;
+    }
+    const rowId = cursorRowId(cursor);
+    if (
+      rowId !== null &&
+      (this.bubbleProgressHighWater === null ||
+        rowId > this.bubbleProgressHighWater)
+    ) {
+      this.bubbleProgressHighWater = rowId;
+      this.advanceScanProgress();
+    }
   }
 
   private retainBubbleCountMismatch(resourceId: string): boolean {
@@ -3619,6 +3817,15 @@ function headerMetadataCursor(
     throw new Error("composer header row ID is invalid.");
   }
   return { rowId };
+}
+
+function cursorRowId(cursor: HeaderMetadataCursor | null): bigint | null {
+  if (cursor === null) {
+    return null;
+  }
+  return typeof cursor.rowId === "bigint"
+    ? cursor.rowId
+    : BigInt(cursor.rowId);
 }
 
 const MAX_COMPOSER_ID_BYTES = 128;

@@ -2907,32 +2907,82 @@ describeWithBackup("offline database helper", () => {
     }
   });
 
-  it("materializes a wholly absent enriched chat and its reachable blobs", async () => {
+  it.each([undefined, false])(
+    "keeps a wholly absent chat core absent for legacy blob-only enrichment (%s)",
+    async (appliesCore) => {
+      const fixture = await createFixture();
+      const composerId =
+        appliesCore === false
+          ? "acacacac-acac-4cac-8cac-acacacacacac"
+          : "abababab-abab-4bab-8bab-abababababab";
+      const blob = Buffer.from("portable blob", "utf8");
+      const source = agentKvSnapshot(composerId, ["first", "second"], [blob]);
+      const change = agentKvEnrichmentChange(source);
+      if (appliesCore === false) {
+        change.change.metadata = {
+          ...change.change.metadata,
+          agentKvEnrichmentAppliesCore: false,
+        };
+      }
+
+      const result = await applyGlobalDatabaseChanges(fixture.request, [change]);
+      expect(result.applied).toEqual([`chat/${composerId}`]);
+      expect(result.localChatCoreHashes[`chat/${composerId}`]).toBeNull();
+      const database = new DatabaseSync(fixture.databasePath, {
+        readOnly: true,
+      });
+      try {
+        expect(readKv(database, `composerData:${composerId}`)).toBeUndefined();
+        expect(readKv(database, `bubbleId:${composerId}:b0`)).toBeUndefined();
+        expect(readKv(database, `bubbleId:${composerId}:b1`)).toBeUndefined();
+        expect(readKv(database, `agentKv:blob:${sha256(blob)}`)).toBe(
+          blob.toString("utf8"),
+        );
+        expect(
+          database
+            .prepare("SELECT value FROM composerHeaders WHERE composerId = ?")
+            .get(composerId),
+        ).toBeUndefined();
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  it("rejects a hash-invalid blob without materializing an absent chat core", async () => {
     const fixture = await createFixture();
-    const composerId = "abababab-abab-4bab-8bab-abababababab";
-    const blob = Buffer.from("portable blob", "utf8");
-    const source = agentKvSnapshot(composerId, ["first", "second"], [blob]);
+    const composerId = "adadadad-adad-4dad-8dad-adadadadadad";
+    const validBlob = Buffer.from("valid portable blob", "utf8");
+    const source = agentKvSnapshot(composerId, ["source core"], [validBlob]);
+    source.agentKv.blobs[0]!.valueBase64 = Buffer.from(
+      "bytes that do not match the content-addressed key",
+      "utf8",
+    ).toString("base64");
 
     const result = await applyGlobalDatabaseChanges(fixture.request, [
       agentKvEnrichmentChange(source),
     ]);
-    expect(result.applied).toEqual([`chat/${composerId}`]);
-    expect(Object.hasOwn(result.localChatCoreHashes, `chat/${composerId}`)).toBe(
-      false,
+
+    expect(result.applied).toEqual([]);
+    expect(result.skipped.join("\n")).toContain(
+      "Chat snapshot agentKv content address is invalid",
     );
     const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
     try {
-      expect(readKv(database, `composerData:${composerId}`)).toBe("repo-data");
-      expect(readKv(database, `bubbleId:${composerId}:b0`)).toBe("first");
-      expect(readKv(database, `bubbleId:${composerId}:b1`)).toBe("second");
-      expect(readKv(database, `agentKv:blob:${sha256(blob)}`)).toBe(
-        blob.toString("utf8"),
-      );
       expect(
         database
           .prepare("SELECT value FROM composerHeaders WHERE composerId = ?")
           .get(composerId),
-      ).toEqual({ value: "repo-header" });
+      ).toBeUndefined();
+      expect(readKv(database, `composerData:${composerId}`)).toBeUndefined();
+      expect(readKv(database, `bubbleId:${composerId}:b0`)).toBeUndefined();
+      expect(
+        database
+          .prepare(
+            "SELECT value FROM cursorDiskKV WHERE key LIKE 'agentKv:blob:%'",
+          )
+          .get(),
+      ).toBeUndefined();
     } finally {
       database.close();
     }

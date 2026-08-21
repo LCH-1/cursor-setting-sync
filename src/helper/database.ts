@@ -701,7 +701,7 @@ async function recoverRestoreJournal(
     validateDatabaseFile(journal.databasePath, contract);
     journal.status = "failed";
     journal.error =
-      "An interrupted restore was found more than a day after it started and was NOT replayed; run \"Cursor Setting Sync: Restore Backup\" again if you still want it. The live database was left untouched.";
+      "An interrupted restore was found more than a day after it started and was NOT replayed; open \"Cursor Setting Sync: Manage\" and choose \"Restore Database Backup\" again if you still want it. The live database was left untouched.";
     notice(journal.error);
   } else {
     try {
@@ -1128,14 +1128,7 @@ function applyPreparedChange(
           throw new Error("Chat enrichment requires a schema v2 snapshot.");
         }
         if (!metadataBoolean(change.metadata, "agentKvEnrichmentAppliesCore")) {
-          return applyAgentKvEnrichment(
-            database,
-            request,
-            localWorkspaces,
-            snapshot,
-            change.metadata,
-            change.semanticHash,
-          );
+          return applyAgentKvEnrichment(database, request, snapshot);
         }
       }
       if (automaticRepair) {
@@ -1459,19 +1452,20 @@ function updateCanonicalStringArrayHash(
  * Applies a repository-tip enrichment without rolling a locally pruned or
  * independently growing conversation back to the repository's core rows.
  * The synthetic event exists only to carry newly recovered content-addressed
- * blobs. A wholly absent chat may still be materialized, because there is no
- * local core whose shape could be lost.
+ * blobs. It never writes header/composerData/bubble rows, even when the chat is
+ * wholly absent: only an authenticated enrichment with
+ * `agentKvEnrichmentAppliesCore: true` reaches ordinary core apply above.
  */
 function applyAgentKvEnrichment(
   database: DatabaseSync,
   request: HelperRequest,
-  localWorkspaces: WorkspaceIdentity[],
   snapshot: PortableChatSnapshotV2,
-  sourceMetadata: Record<string, JsonValue> | undefined,
-  publishedHash: string,
 ): ChangeOutcome {
   const presence = chatRowPresence(database, snapshot.composerId);
-  if (presence.header || presence.composerData || presence.bubble) {
+  const hasLocalCore =
+    presence.header || presence.composerData || presence.bubble;
+  let localChatCoreHash: string | null = null;
+  if (hasLocalCore) {
     const current = readSyntheticApplyLocalChat(
       database,
       request,
@@ -1486,43 +1480,26 @@ function applyAgentKvEnrichment(
     // is safe to remember. A pruned B111 copy remains protected by its lower
     // bubble count, while an equal-count divergence is deliberately re-read
     // and republished on the next deep verification pass.
-    const localChatCoreHash =
+    localChatCoreHash =
       observedLocalCoreHash === sourceCoreHash ? sourceCoreHash : null;
-    // Blob-only enrichment never serializes a written chat snapshot. Building
-    // an "effective" payload here would Base64-encode every hash-valid local
-    // blob only to discard it, multiplying peak memory for large conversations.
-    const result = upsertAgentKvBlobs(
-      database,
-      snapshot.agentKv,
-      request.syncOptions.maxPayloadBytes,
-    );
-    return result.changed > 0
-      ? { status: "applied", localChatCoreHash }
-      : {
-          status: "retained-local",
-          reason:
-            "the local conversation core was preserved and every supplied agentKv blob was already valid",
-          localChatCoreHash,
-        };
   }
-
-  const sourceWorkspaceId = snapshot.header.workspaceId;
-  const targetWorkspaceId =
-    sourceWorkspaceId === null
-      ? null
-      : resolveTargetWorkspace(
-          sourceWorkspaceId,
-          metadataStringOrNull(sourceMetadata, "workspaceUri"),
-          localWorkspaces,
-          request.workspaceMappings,
-        ) ?? sourceWorkspaceId;
-  const writtenHash = upsertChat(
+  // Blob-only enrichment never serializes a written chat snapshot. Building
+  // an "effective" payload here would Base64-encode every hash-valid local
+  // blob only to discard it, multiplying peak memory for large conversations.
+  const result = upsertAgentKvBlobs(
     database,
-    snapshot,
-    targetWorkspaceId,
+    snapshot.agentKv,
     request.syncOptions.maxPayloadBytes,
   );
-  return chatAppliedOutcome(publishedHash, writtenHash);
+  return result.changed > 0
+    ? { status: "applied", localChatCoreHash }
+    : {
+        status: "retained-local",
+        reason: hasLocalCore
+          ? "the local conversation core was preserved and every supplied agentKv blob was already valid"
+          : "the absent conversation core was not materialized and every supplied agentKv blob was already valid",
+        localChatCoreHash,
+      };
 }
 
 function isAgentKvEnrichmentMetadata(
@@ -1676,7 +1653,7 @@ function repairUnavailableChatBubbles(
   const isOrigin = localDeviceId === repairOriginDeviceId;
   if (isOrigin && currentAudit.fingerprint !== expectedFingerprint) {
     throw new Error(
-      'The chat changed after repair was planned; run "Cursor Setting Sync: Repair Unavailable Chats" again.',
+      'The chat changed after repair was planned; open "Cursor Setting Sync: Manage" and choose "Repair Unavailable Chats" again.',
     );
   }
   if (

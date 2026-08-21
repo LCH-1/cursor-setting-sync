@@ -15,7 +15,11 @@ import {
 } from "../src/helper/main";
 import { EventReconciler } from "../src/protocol/reconciler";
 import { SyncRepository } from "../src/protocol/repository";
-import { sha256 } from "../src/protocol/canonical";
+import { canonicalBytes, sha256 } from "../src/protocol/canonical";
+import {
+  portableChatCoreHash,
+  type PortableChatSnapshotV2,
+} from "../src/chat/stateVscdb";
 import type {
   EventProducer,
   JsonValue,
@@ -44,6 +48,8 @@ describe("preparing a helper batch", () => {
       workspaceId: "workspace",
       lastUpdatedAt: 59,
       bubbleCount: 1,
+      chatSnapshotSchemaVersion: 2,
+      agentKvMissingCount: 0,
     };
     const eligible = (
       metadata: Record<string, JsonValue>,
@@ -115,6 +121,79 @@ describe("preparing a helper batch", () => {
     ]) {
       expect(eligible(specialMetadata)).toBe(false);
     }
+  });
+
+  it("refuses incomplete ordinary chats in both explicit and shutdown helper paths", () => {
+    const projection = (
+      index: number,
+      metadata: Record<string, JsonValue>,
+    ): ResourceProjection => {
+      const composerId = `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+      const eventHash = String(index).repeat(64);
+      return {
+        resourceId: `chat/${composerId}`,
+        changed: true,
+        tip: {
+          versionId: `${eventHash}#0`,
+          eventHash,
+          changeIndex: 0,
+          kind: "chat",
+          lamport: index,
+          deviceId: "source-device",
+          operation: "put",
+          semanticHash: "f".repeat(64),
+          parents: [],
+          metadata,
+          producer: PRODUCER,
+        },
+      };
+    };
+    const legacy = projection(1, { chatSnapshotSchemaVersion: 1 });
+    const partial = projection(2, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvMissingCount: 1,
+    });
+    const complete = projection(3, {
+      chatSnapshotSchemaVersion: 2,
+      agentKvMissingCount: 0,
+    });
+    const projections = [legacy, partial, complete];
+    const asChange = ({ resourceId, tip }: ResourceProjection): HelperChange => ({
+      eventHash: tip.eventHash,
+      changeIndex: tip.changeIndex,
+      sourceDeviceId: tip.deviceId,
+      resourceId,
+      kind: tip.kind,
+      operation: tip.operation,
+      semanticHash: tip.semanticHash,
+      ...(tip.metadata === undefined ? {} : { metadata: tip.metadata }),
+    });
+
+    expect(
+      helperMainTesting.isEligible(asChange(legacy), projections, []),
+    ).toBe(false);
+    expect(
+      helperMainTesting.isEligible(asChange(partial), projections, []),
+    ).toBe(false);
+    expect(
+      helperMainTesting.isEligible(asChange(complete), projections, []),
+    ).toBe(true);
+
+    const repository = {
+      state: {
+        pendingDatabaseChanges: projections.map(({ resourceId, tip }) => ({
+          resourceId,
+          kind: tip.kind,
+          eventHash: tip.eventHash,
+          changeIndex: tip.changeIndex,
+        })),
+      },
+    } as unknown as SyncRepository;
+    expect(
+      helperMainTesting
+        .shutdownApplyBatch(repository, projections)
+        .map((change) => change.resourceId),
+    ).toEqual([complete.resourceId]);
   });
 
   it("accepts checkpointed repair authority only when its provenance binds the sole parent", () => {
@@ -240,6 +319,66 @@ describe("preparing a helper batch", () => {
       // rather than re-offered forever.
       expect(Object.keys(result.failureByResourceId)).toEqual([bad.resourceId]);
       expect(result.skipped.join("\n")).toContain(bad.resourceId);
+    });
+  });
+
+  it("verifies the authenticated continuation closure before preparing a core apply", async () => {
+    await withRepository(async (repository) => {
+      const complete = await publishPortableChat(
+        repository,
+        portableChat("10000000-0000-4000-8000-000000000001"),
+      );
+
+      const omittedLeafId = sha256("omitted continuation descendant");
+      const rootBytes = Buffer.concat([
+        Buffer.from([0x0a, 0x22, 0x12, 0x20]),
+        Buffer.from(omittedLeafId, "hex"),
+      ]);
+      const rootId = sha256(rootBytes);
+      const falseComplete = await publishPortableChat(
+        repository,
+        portableChat("10000000-0000-4000-8000-000000000002", {
+          conversationState: `~${Buffer.concat([
+            Buffer.from([0x42, 0x20]),
+            Buffer.from(rootId, "hex"),
+          ]).toString("base64")}`,
+          blobs: [
+            {
+              key: `agentKv:blob:${rootId}`,
+              valueBase64: rootBytes.toString("base64"),
+              valueType: "blob",
+            },
+          ],
+        }),
+      );
+      const missingRootId = sha256("declared missing active root");
+      const forgedMetadata = await publishPortableChat(
+        repository,
+        portableChat("10000000-0000-4000-8000-000000000003", {
+          conversationState: `~${Buffer.concat([
+            Buffer.from([0x0a, 0x20]),
+            Buffer.from(missingRootId, "hex"),
+          ]).toString("base64")}`,
+          missingIds: [missingRootId],
+        }),
+        { agentKvMissingCount: 0 },
+      );
+
+      const result = await prepareChanges(repository, [
+        helperChange(complete),
+        helperChange(falseComplete),
+        helperChange(forgedMetadata),
+      ]);
+
+      expect(result.prepared.map((item) => item.change.resourceId)).toEqual([
+        complete.resourceId,
+      ]);
+      expect(result.failureByResourceId[falseComplete.resourceId]).toContain(
+        "closure could not be verified (invalid/reachable-id-not-declared)",
+      );
+      expect(result.failureByResourceId[forgedMetadata.resourceId]).toContain(
+        "metadata does not match its payload",
+      );
     });
   });
 
@@ -593,6 +732,92 @@ interface PublishedTip {
   tip: ResourceTip;
 }
 
+function portableChat(
+  composerId: string,
+  graph: {
+    conversationState?: string;
+    blobs?: PortableChatSnapshotV2["agentKv"]["blobs"];
+    missingIds?: string[];
+  } = {},
+): PortableChatSnapshotV2 {
+  const blobs = [...(graph.blobs ?? [])];
+  const missingIds = [...(graph.missingIds ?? [])];
+  const referencedIds = [
+    ...blobs.map((row) => row.key.slice("agentKv:blob:".length)),
+    ...missingIds,
+  ].sort();
+  return {
+    schemaVersion: 2,
+    composerId,
+    header: {
+      composerId,
+      workspaceId: "workspace",
+      createdAt: 1,
+      lastUpdatedAt: 2,
+      isArchived: 0,
+      isSubagent: 0,
+      recency: 1,
+      checkpointAt: null,
+      value: JSON.stringify({ name: "Helper closure fixture" }),
+    },
+    composerData: {
+      key: `composerData:${composerId}`,
+      valueBase64: Buffer.from(
+        JSON.stringify({
+          fullConversationHeadersOnly: [],
+          ...(graph.conversationState === undefined
+            ? {}
+            : { conversationState: graph.conversationState }),
+        }),
+        "utf8",
+      ).toString("base64"),
+      valueType: "text",
+    },
+    bubbles: [],
+    agentKv: {
+      blobs,
+      referencedIds,
+      missingIds,
+    },
+  };
+}
+
+async function publishPortableChat(
+  repository: SyncRepository,
+  snapshot: PortableChatSnapshotV2,
+  metadataOverride: Record<string, JsonValue> = {},
+): Promise<PublishedTip> {
+  const content = canonicalBytes(snapshot);
+  const resourceId = `chat/${snapshot.composerId}`;
+  const portable: ResourceSnapshot = {
+    resourceId,
+    kind: "chat",
+    content,
+    semanticHash: sha256(content),
+    metadata: {
+      composerId: snapshot.composerId,
+      workspaceId: snapshot.header.workspaceId,
+      chatSnapshotSchemaVersion: 2,
+      chatCoreHash: portableChatCoreHash(snapshot),
+      agentKvBlobCount: snapshot.agentKv.blobs.length,
+      agentKvReferencedCount: snapshot.agentKv.referencedIds.length,
+      agentKvMissingCount: snapshot.agentKv.missingIds.length,
+      ...metadataOverride,
+    },
+  };
+  await repository.publish([portable], []);
+  new EventReconciler().reconcile(
+    await repository.listEvents(),
+    repository.state,
+    null,
+  );
+  const tip = (repository.state.tips[resourceId] ?? [])[0];
+  if (tip === undefined) {
+    throw new Error(`publish did not create a tip for ${resourceId}`);
+  }
+  return { resourceId, tip };
+}
+
 async function publish(
   repository: SyncRepository,
   name: string,
@@ -632,6 +857,9 @@ function helperChange(published: PublishedTip): HelperChange {
   };
   if (tip.payload !== undefined) {
     change.payload = tip.payload;
+  }
+  if (tip.metadata !== undefined) {
+    change.metadata = tip.metadata;
   }
   return change;
 }

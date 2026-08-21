@@ -11,6 +11,7 @@
 !icon.png
 
 .gitignore
+.github/**
 .vscode/**
 src/**
 tests/**

@@ -1,9 +1,10 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as sqlite from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as GitModule from "../src/platform/git";
+import * as chatEnrichment from "../src/chat/enrichment";
 
 const gitRuntime = vi.hoisted(() => ({
   isGitRepository: vi.fn(),
@@ -45,6 +46,7 @@ vi.mock("../src/platform/git", async () => {
 
 import {
   BACKGROUND_GIT_PULL_INTERVAL_MS,
+  INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON,
   SyncManager,
   backgroundGitPullDue,
   markSuppressedSnapshotProjection,
@@ -53,6 +55,7 @@ import {
   withRequiredFileLock,
 } from "../src/sync/manager";
 import {
+  APPLY_FAILURE_BLOCK_PREFIX,
   MAX_HELPER_APPLY_WORK_BYTES,
   MAX_RUNNING_APPLY_PAYLOAD_BYTES,
 } from "../src/constants";
@@ -70,6 +73,7 @@ import type { ResourceAdapter } from "../src/resources/resource";
 import type {
   CompatibilityReport,
   LocalProjection,
+  ResourceSnapshot,
   ResourceTip,
 } from "../src/types";
 import type { ConflictController } from "../src/ui/conflicts";
@@ -104,6 +108,50 @@ afterEach(async () => {
 });
 
 describe("pending helper request work envelope", () => {
+  it("never sends a stale unblocked incomplete chat to the offline helper", () => {
+    const resourceId = "chat/01234567-89ab-4cde-8fab-0123456789ab";
+    const eventHash = "9".repeat(64);
+    const repository = {
+      state: {
+        pendingDatabaseChanges: [
+          {
+            eventHash,
+            changeIndex: 0,
+            resourceId,
+            kind: "chat",
+          },
+        ],
+        tips: {
+          [resourceId]: [
+            {
+              versionId: `${eventHash}#0`,
+              eventHash,
+              changeIndex: 0,
+              kind: "chat",
+              lamport: 1,
+              deviceId: "remote-device",
+              operation: "put",
+              semanticHash: eventHash,
+              payload: {
+                deviceId: "remote-device",
+                objectId: eventHash,
+                compressedBytes: 1,
+                plainBytes: 1024,
+              },
+              parents: [],
+              metadata: { chatSnapshotSchemaVersion: 1 },
+            } satisfies ResourceTip,
+          ],
+        },
+      },
+    } as unknown as SyncRepository;
+
+    expect(pendingHelperBatch(repository)).toEqual({
+      changes: [],
+      deferredForBatchLimit: 0,
+    });
+  });
+
   it("keeps one individually oversized change visible while paging a small sibling", () => {
     const oversized = helperTip(
       "settings/default/oversized",
@@ -161,6 +209,175 @@ describe("pending helper request work envelope", () => {
       ),
     ).toBeLessThanOrEqual(MAX_HELPER_APPLY_WORK_BYTES);
     expect(batch.deferredForBatchLimit).toBeGreaterThan(0);
+  });
+});
+
+describe("workspace mapping and chat continuation blocks", () => {
+  it.each([
+    { label: "workspace-less", workspaceId: null, resolved: false },
+    { label: "unmapped", workspaceId: "source-workspace", resolved: false },
+    { label: "resolved", workspaceId: "source-workspace", resolved: true },
+  ])(
+    "keeps an incomplete $label chat blocked when the mapping pass finishes",
+    async ({ workspaceId, resolved }) => {
+      const temporaryRoot = await mkdtemp(
+        join(tmpdir(), "cursor-manager-chat-mapping-"),
+      );
+      temporaryRoots.push(temporaryRoot);
+      const workspaceStorageRoot = join(temporaryRoot, "workspaceStorage");
+      await mkdir(workspaceStorageRoot, { recursive: true });
+      const workspaceMappings: Record<string, string> = {};
+      if (resolved) {
+        const targetWorkspaceId = "target-workspace";
+        const targetDirectory = join(workspaceStorageRoot, targetWorkspaceId);
+        await mkdir(targetDirectory, { recursive: true });
+        await writeFile(
+          join(targetDirectory, "workspace.json"),
+          JSON.stringify({ folder: "file:///target/project" }),
+        );
+        workspaceMappings["source-workspace"] = targetWorkspaceId;
+      }
+      const resourceId = "chat/01234567-89ab-4cde-8fab-0123456789ab";
+      const eventHash = "8".repeat(64);
+      const tip = {
+        versionId: `${eventHash}#0`,
+        eventHash,
+        changeIndex: 0,
+        kind: "chat",
+        lamport: 1,
+        deviceId: "remote-device",
+        operation: "put",
+        semanticHash: "7".repeat(64),
+        parents: [],
+        producer: {
+          extensionVersion: "0.0.61",
+          cursorVersion: "3.15.6",
+          vscodeVersion: "1.125.0",
+        },
+        metadata: {
+          chatSnapshotSchemaVersion: 1,
+          workspaceId,
+          workspaceUri:
+            workspaceId === null ? null : "file:///source/project",
+        },
+      } satisfies ResourceTip;
+      const repository = {
+        state: {
+          pendingDatabaseChanges: [
+            {
+              resourceId,
+              kind: "chat",
+              eventHash,
+              changeIndex: 0,
+              blockedReason: INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON,
+            },
+          ],
+          tips: { [resourceId]: [tip] },
+        },
+      } as unknown as SyncRepository;
+      const manager = createManager({
+        paths: {
+          workspaceStorageRoot,
+          extensionStorage: join(temporaryRoot, "extension-storage"),
+          helperScript: join(temporaryRoot, "helper.js"),
+        } as unknown as CursorPaths,
+        configuration: {
+          syncChat: true,
+          syncWorkspaceStorage: true,
+          effectiveIgnoredWorkspaces: [],
+          workspaceMappings,
+          setWorkspaceMapping: vi.fn(async () => undefined),
+        } as unknown as ExtensionConfiguration,
+      });
+      const internals = manager as unknown as {
+        ensureWorkspaceMappings(repository: SyncRepository): Promise<void>;
+      };
+
+      await internals.ensureWorkspaceMappings(repository);
+
+      expect(
+        repository.state.pendingDatabaseChanges[0]?.blockedReason,
+      ).toBe(INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON);
+      expect(pendingHelperBatch(repository).changes).toEqual([]);
+      manager.dispose();
+    },
+  );
+
+  it("still clears a mapping-owned block after a complete v2 chat no longer needs it", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-manager-chat-mapping-complete-"),
+    );
+    temporaryRoots.push(temporaryRoot);
+    const workspaceStorageRoot = join(temporaryRoot, "workspaceStorage");
+    await mkdir(workspaceStorageRoot, { recursive: true });
+    const resourceId = "chat/12345678-89ab-4cde-8fab-0123456789ab";
+    const eventHash = "6".repeat(64);
+    const tip = {
+      versionId: `${eventHash}#0`,
+      eventHash,
+      changeIndex: 0,
+      kind: "chat",
+      lamport: 1,
+      deviceId: "remote-device",
+      operation: "put",
+      semanticHash: "5".repeat(64),
+      parents: [],
+      producer: {
+        extensionVersion: "0.0.61",
+        cursorVersion: "3.15.6",
+        vscodeVersion: "1.125.0",
+      },
+      metadata: {
+        chatSnapshotSchemaVersion: 2,
+        agentKvMissingCount: 0,
+        workspaceId: null,
+      },
+    } satisfies ResourceTip;
+    const repository = {
+      state: {
+        pendingDatabaseChanges: [
+          {
+            resourceId,
+            kind: "chat",
+            eventHash,
+            changeIndex: 0,
+            blockedReason:
+              "Workspace mapping is required for incoming workspace storage.",
+          },
+        ],
+        tips: { [resourceId]: [tip] },
+      },
+    } as unknown as SyncRepository;
+    const manager = createManager({
+      paths: {
+        workspaceStorageRoot,
+        extensionStorage: join(temporaryRoot, "extension-storage"),
+        helperScript: join(temporaryRoot, "helper.js"),
+      } as unknown as CursorPaths,
+      configuration: {
+        syncChat: true,
+        syncWorkspaceStorage: true,
+        effectiveIgnoredWorkspaces: [],
+        workspaceMappings: {},
+      } as unknown as ExtensionConfiguration,
+    });
+    const internals = manager as unknown as {
+      ensureWorkspaceMappings(repository: SyncRepository): Promise<void>;
+    };
+
+    await internals.ensureWorkspaceMappings(repository);
+
+    expect(
+      repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBeUndefined();
+
+    const applyFailure = `${APPLY_FAILURE_BLOCK_PREFIX}: prior database write failed`;
+    repository.state.pendingDatabaseChanges[0]!.blockedReason = applyFailure;
+    await internals.ensureWorkspaceMappings(repository);
+    expect(
+      repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBe(applyFailure);
+    manager.dispose();
   });
 });
 
@@ -1035,6 +1252,61 @@ describe("background Git commit gating", () => {
     expect(await partial.repository.countEvents()).toBe(1);
     expect(gitRuntime.commitAndPush).toHaveBeenCalledTimes(1);
     await partial.manager.shutdown();
+  });
+
+  it("does not enrich an attempted chat tip after its ordinary publish reports failure", async () => {
+    const content = Buffer.from("new local v1 chat", "utf8");
+    const snapshot = {
+      resourceId: "chat/23456789-89ab-4cde-8fab-0123456789ab",
+      kind: "chat",
+      content,
+      semanticHash: sha256(content),
+      metadata: {
+        chatSnapshotSchemaVersion: 1,
+        workspaceId: null,
+      },
+    } satisfies ResourceSnapshot;
+    const adapter: ResourceAdapter = {
+      id: "test-chat-publish-failure",
+      kinds: ["chat"],
+      appliesWhileRunning: false,
+      scanStatus: () => ({ complete: true, deferredResourceIds: [] }),
+      scan: async () => ({ snapshots: [snapshot], deletions: [], warnings: [] }),
+      apply: async () => undefined,
+    };
+    const fixture = await createSyncHarness(adapter);
+    const managerInternals = fixture.manager as unknown as {
+      configuration: { syncChat: boolean };
+    };
+    managerInternals.configuration.syncChat = true;
+    const enrich = vi
+      .spyOn(chatEnrichment, "enrichCurrentChatTipsFromLiveDatabase")
+      .mockResolvedValue({
+        attempted: 1,
+        published: 0,
+        cursor: { afterResourceId: null },
+        warnings: [],
+        publishedResourceIds: [],
+      });
+    const publish = fixture.repository.publish.bind(fixture.repository);
+    vi.spyOn(fixture.repository, "publish").mockImplementation(
+      async (...args) => {
+        const result = await publish(...args);
+        if (result.eventHash !== null) {
+          throw new Error("simulated failure after the chat event write");
+        }
+        return result;
+      },
+    );
+
+    await fixture.performSync(false, "all");
+
+    expect(await fixture.repository.countEvents()).toBe(1);
+    // The ordinary pre-scan migration probe always runs. A second call would
+    // be the post-publish target built from the chat whose publish just failed.
+    expect(enrich).toHaveBeenCalledTimes(1);
+    expect(enrich.mock.calls[0]?.[2].candidateIndex).toEqual([]);
+    await fixture.manager.shutdown();
   });
 
   it("keeps degraded health through throttled idle polls and retries on the next probe", async () => {

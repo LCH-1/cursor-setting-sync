@@ -123,6 +123,199 @@ describe("recovery catalog", () => {
     ]);
   });
 
+  it("migrates identical duplicate image paths and reruns a 10-reference, 9-file artifact", async () => {
+    const root = await temporaryStorage();
+    const artifact = await createArtifact(
+      root,
+      COMPOSER_A,
+      Buffer.from("0.0.66 duplicate-path transcript", "utf8"),
+    );
+    const uniqueImages = await Promise.all(
+      Array.from({ length: 9 }, async (_unused, index) => {
+        const bytes = Buffer.from(`png fixture ${index}`, "utf8");
+        const hash = sha256(bytes);
+        const path = join(
+          root,
+          artifactRelativePath(COMPOSER_A, "image", hash, ".png"),
+        );
+        await writeFile(path, bytes);
+        return {
+          path,
+          hash,
+          mimeType: "image/png" as const,
+          byteLength: bytes.byteLength,
+        };
+      }),
+    );
+    const duplicatedImage = uniqueImages[8];
+    if (duplicatedImage === undefined) {
+      throw new Error("Expected the ninth image fixture.");
+    }
+    const duplicatePathArtifact: VisibleChatRecoveryArtifact = {
+      ...artifact,
+      imageAttachments: [...uniqueImages, { ...duplicatedImage }],
+    };
+    const storedImages = duplicatePathArtifact.imageAttachments.map((image) => ({
+      relativePath: artifactRelativePath(
+        COMPOSER_A,
+        "image",
+        image.hash,
+        ".png",
+      ),
+      sha256: image.hash,
+      byteLength: image.byteLength,
+      mimeType: "image/png" as const,
+    }));
+    const legacy066Manifest: RecoveryCatalogManifestV1 = {
+      schemaVersion: 1,
+      entries: [
+        {
+          composerId: COMPOSER_A,
+          composerStorageClass: "text",
+          chatCoreHash: CORE_A,
+          damageFingerprint: DAMAGE_A,
+          title: "campaign hierarchy",
+          lastUpdatedAt: 203,
+          status: "ready",
+          artifact: {
+            transcript: {
+              relativePath: artifactRelativePath(
+                COMPOSER_A,
+                "visible",
+                artifact.transcriptHash,
+                ".md",
+              ),
+              sha256: artifact.transcriptHash,
+              byteLength: Buffer.byteLength(
+                "0.0.66 duplicate-path transcript",
+                "utf8",
+              ),
+            },
+            images: storedImages,
+          },
+        },
+      ],
+    };
+    const manifestPath = join(root, "recovery-transcripts", "catalog-v1.json");
+    await writeFile(manifestPath, JSON.stringify(legacy066Manifest));
+
+    const migrated = await readRecoveryCatalog(root);
+    const migratedEntry = migrated.manifest.entries[0];
+    expect(migratedEntry?.status).toBe("ready");
+    if (migratedEntry?.status !== "ready") {
+      throw new Error("Expected a migrated ready entry.");
+    }
+    expect(migratedEntry.artifact.images).toHaveLength(9);
+    expect(migrated.capacity.readyArtifactBytes).toBe(
+      Buffer.byteLength("0.0.66 duplicate-path transcript", "utf8") +
+        uniqueImages.reduce((total, image) => total + image.byteLength, 0),
+    );
+    const persisted = JSON.parse(await readFile(manifestPath, "utf8")) as {
+      entries: Array<{ artifact: { images: unknown[] } }>;
+    };
+    expect(persisted.entries[0]?.artifact.images).toHaveLength(9);
+
+    const rerun = await upsertRecoveryCatalogEntry(
+      root,
+      readyInput(
+        COMPOSER_A,
+        CORE_A,
+        DAMAGE_A,
+        duplicatePathArtifact,
+        203,
+        "campaign hierarchy",
+      ),
+    );
+    const rerunEntry = rerun.manifest.entries[0];
+    expect(rerunEntry?.status).toBe("ready");
+    if (rerunEntry?.status !== "ready") {
+      throw new Error("Expected a ready entry after the rerun.");
+    }
+    expect(rerunEntry.artifact.images).toHaveLength(9);
+    expect(await recoveryCatalogEntryArtifactPaths(root, rerunEntry)).toHaveLength(
+      10,
+    );
+  });
+
+  it("rejects duplicate image paths whose stored metadata conflicts", async () => {
+    const root = await temporaryStorage();
+    const artifact = await createArtifact(
+      root,
+      COMPOSER_A,
+      Buffer.from("conflict transcript", "utf8"),
+      Buffer.from("conflict image", "utf8"),
+    );
+    const image = artifact.imageAttachments[0];
+    if (image === undefined) {
+      throw new Error("Expected an image fixture.");
+    }
+    const conflictingArtifact: VisibleChatRecoveryArtifact = {
+      ...artifact,
+      imageAttachments: [image, { ...image, byteLength: image.byteLength + 1 }],
+    };
+
+    await expect(
+      upsertRecoveryCatalogEntry(
+        root,
+        readyInput(COMPOSER_A, CORE_A, DAMAGE_A, conflictingArtifact),
+      ),
+    ).rejects.toThrow(/one image path conflicting metadata/iu);
+    expect((await readRecoveryCatalog(root)).manifest.entries).toEqual([]);
+  });
+
+  it("leaves a stored manifest unchanged when duplicate image metadata conflicts", async () => {
+    const root = await temporaryStorage();
+    const transcriptHash = sha256("stored conflict transcript");
+    const imageHash = sha256("stored conflict image");
+    const image = {
+      relativePath: artifactRelativePath(
+        COMPOSER_A,
+        "image",
+        imageHash,
+        ".png",
+      ),
+      sha256: imageHash,
+      byteLength: 10,
+      mimeType: "image/png" as const,
+    };
+    const conflicting: RecoveryCatalogManifestV1 = {
+      schemaVersion: 1,
+      entries: [
+        {
+          composerId: COMPOSER_A,
+          composerStorageClass: "text",
+          chatCoreHash: CORE_A,
+          damageFingerprint: DAMAGE_A,
+          title: null,
+          lastUpdatedAt: null,
+          status: "ready",
+          artifact: {
+            transcript: {
+              relativePath: artifactRelativePath(
+                COMPOSER_A,
+                "visible",
+                transcriptHash,
+                ".md",
+              ),
+              sha256: transcriptHash,
+              byteLength: 1,
+            },
+            images: [image, { ...image, byteLength: 11 }],
+          },
+        },
+      ],
+    };
+    const manifestPath = join(root, "recovery-transcripts", "catalog-v1.json");
+    await mkdir(dirname(manifestPath), { recursive: true });
+    const raw = Buffer.from(JSON.stringify(conflicting), "utf8");
+    await writeFile(manifestPath, raw);
+
+    await expect(readRecoveryCatalog(root)).rejects.toThrow(
+      /one image path conflicting metadata/iu,
+    );
+    expect(await readFile(manifestPath)).toEqual(raw);
+  });
+
   it("keeps one current generation per exact composer and retains superseded files", async () => {
     const root = await temporaryStorage();
     const firstArtifact = await createArtifact(

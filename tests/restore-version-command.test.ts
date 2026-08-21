@@ -4,6 +4,31 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+const testUri = vi.hoisted(
+  () =>
+    (value: string): {
+      scheme: string;
+      authority: string;
+      path: string;
+      query: string;
+      fragment: string;
+      fsPath: string;
+      toString(): string;
+    } => {
+      const parsed = new URL(value);
+      const path = decodeURIComponent(parsed.pathname);
+      return {
+        scheme: parsed.protocol.slice(0, -1),
+        authority: parsed.host,
+        path,
+        query: parsed.search.slice(1),
+        fragment: parsed.hash.slice(1),
+        fsPath: path,
+        toString: () => value,
+      };
+    },
+);
+
 const ui = vi.hoisted(() => ({
   answers: [] as Array<((labels: string[]) => number | undefined) | undefined>,
   offered: [] as Array<{ title: string; labels: string[] }>,
@@ -22,7 +47,7 @@ vi.mock("vscode", () => ({
   workspace: {
     get workspaceFolders() {
       return ui.workspaceUris.map((value) => ({
-        uri: { toString: () => value },
+        uri: testUri(value),
       }));
     },
     registerTextDocumentContentProvider: () => ({ dispose: () => undefined }),
@@ -56,6 +81,7 @@ vi.mock("vscode", () => ({
       const index = answer === undefined ? undefined : answer(labels);
       return index === undefined ? undefined : items[index];
     },
+    showOpenDialog: async () => undefined,
     showWarningMessage: async (message: string, ...args: unknown[]) => {
       ui.confirmations.push(message);
       ui.warningOffers.push(
@@ -82,8 +108,15 @@ vi.mock("vscode", () => ({
   },
   commands: { executeCommand: async () => undefined },
   Uri: {
-    parse: (value: string) => ({ toString: () => value }),
-    file: (value: string) => ({ fsPath: value, toString: () => `file://${value}` }),
+    parse: (value: string) => testUri(value),
+    file: (value: string) => {
+      const path = value.replaceAll("\\", "/");
+      return testUri(
+        /^[A-Za-z]:\//u.test(path)
+          ? `file:///${path}`
+          : `file://${path.startsWith("/") ? "" : "/"}${path}`,
+      );
+    },
   },
 }));
 
@@ -445,7 +478,7 @@ describe("Repair Unavailable Chats command", () => {
         "1 additional damaged conversation was deferred by the command memory safety limit",
       );
       expect(ui.information.at(-1)).toContain(
-        "run Repair Unavailable Chats again to inspect the next batch",
+        'open "Cursor Setting Sync: Manage" and choose "Repair Unavailable Chats" again to inspect the next batch',
       );
       expect(
         ui.information.some((message) =>
@@ -855,10 +888,10 @@ describe("Repair Unavailable Chats command", () => {
         "this PC and the synchronized legacy history lack the continuation blobs",
       );
       expect(warning).toContain(
-        "run Sync Now on a PC where the affected chat still continues",
+        "Update Cursor Setting Sync on a PC where the affected chat still continues",
       );
       expect(warning).toContain(
-        "then run Sync Now on this PC and choose Restart to Apply",
+        "then let this PC synchronize and close Cursor normally to apply, or choose Manage → Apply Queued Changes",
       );
       expect(warning).not.toContain(fixture.rootId);
       expect(ui.warningOffers[0]).toEqual([
@@ -1041,7 +1074,7 @@ describe("Repair Unavailable Chats command", () => {
         "1 Cursor conversation has 1 unavailable continuation blob",
       );
       expect(warning).toContain(
-        "run Sync Now on a PC where the affected chat still continues",
+        "Update Cursor Setting Sync on a PC where the affected chat still continues",
       );
       expect(warning).not.toContain("Restore Version History");
       expect(warning).not.toContain("inspect the next batch");
@@ -1188,6 +1221,28 @@ describe("Repair Unavailable Chats command", () => {
     }
   });
 
+  it("rejects a missing0 v2 repair source that omits a reachable descendant", async () => {
+    const fixture = await createContinuationRepairFixture(
+      "closure-incomplete-current",
+    );
+    try {
+      const restart = vi
+        .spyOn(fixture.manager, "restartToApply")
+        .mockResolvedValue(undefined);
+
+      await fixture.manager.repairUnavailableChats();
+
+      expect(restart).not.toHaveBeenCalled();
+      expect(fixture.repository.state.pendingDatabaseChanges).toEqual([]);
+      expect(ui.information).toEqual([]);
+      expect(ui.confirmations.at(-1)).toContain(
+        "does not have a complete synchronized v2 copy queued here",
+      );
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
+
   it("does not queue an ordinary complete v2 tip whose chat core differs from the live chat", async () => {
     const fixture = await createContinuationRepairFixture(
       "complete-current-divergent-core",
@@ -1250,7 +1305,7 @@ describe("Repair Unavailable Chats command", () => {
         "does not have a complete synchronized v2 copy queued here",
       );
       expect(ui.confirmations[0]).toContain(
-        "run Sync Now on a PC where the affected chat still continues",
+        "Update Cursor Setting Sync on a PC where the affected chat still continues",
       );
       expect(ui.confirmations[0]).not.toContain(fixture.rootId);
     } finally {
@@ -1295,6 +1350,7 @@ describe("Repair Unavailable Chats command", () => {
 type ContinuationRepairFixtureMode =
   | "missing"
   | "complete-current"
+  | "closure-incomplete-current"
   | "complete-current-divergent-core"
   | "complete-enrichment-divergent-core"
   | "complete-pending"
@@ -1321,9 +1377,19 @@ async function createContinuationRepairFixture(
     producer,
   );
   const composerId = "66666666-6666-4666-8666-666666666666";
-  const blob = Buffer.from("portable continuation root", "utf8");
+  const omittedDescendantId = sha256("omitted continuation descendant");
+  const blob =
+    mode === "closure-incomplete-current"
+      ? Buffer.concat([
+          Buffer.from([0x0a, 0x22, 0x12, 0x20]),
+          Buffer.from(omittedDescendantId, "hex"),
+        ])
+      : Buffer.from("portable continuation root", "utf8");
   const rootId = sha256(blob);
-  const state = serializedRootState(rootId);
+  const state =
+    mode === "closure-incomplete-current"
+      ? serializedTurnRootState(rootId)
+      : serializedRootState(rootId);
   const storedBlob =
     mode === "divergent-pending"
       ? Buffer.from("another conversation root", "utf8")
@@ -1332,6 +1398,7 @@ async function createContinuationRepairFixture(
   const storedState = serializedRootState(storedRootId);
   const completeV2 =
     mode === "complete-current" ||
+    mode === "closure-incomplete-current" ||
     mode === "complete-current-divergent-core" ||
     mode === "complete-enrichment-divergent-core" ||
     mode === "complete-pending" ||
@@ -1581,6 +1648,13 @@ function continuationChatSnapshot(
 
 function serializedRootState(rootId: string): string {
   return serializedRootStates([rootId]);
+}
+
+function serializedTurnRootState(rootId: string): string {
+  return `~${Buffer.concat([
+    Buffer.from([0x42, 0x20]),
+    Buffer.from(rootId, "hex"),
+  ]).toString("base64")}`;
 }
 
 function serializedRootStates(rootIds: readonly string[]): string {

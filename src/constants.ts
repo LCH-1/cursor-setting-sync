@@ -109,20 +109,17 @@ export const COMMAND_LOCK_WAIT_MS = 60_000;
  */
 export const LOCK_SKIP_REMINDER_MS = 5 * 60_000;
 
+/** The extension's single public Command Palette entry. */
+export const MANAGE_COMMAND = "cursorSync.manage";
+export const MANAGE_TITLE = "Cursor Setting Sync: Manage";
+
 /**
- * The command that writes queued database changes, spelled exactly as the
- * palette contributes it.
- *
- * Chat, chat transcripts, UI state, extensions, profiles and workspaceStorage
- * can only be written while Cursor is not running, and the shutdown finalizer
- * deliberately exports without applying - so quitting and reopening Cursor,
- * which is what "waiting for restart" reads as, provably does nothing. A user
- * lost 146 incoming chats to that reading, force-quitting and relaunching
- * repeatedly while the queue sat untouched. Every affordance that mentions the
- * queue therefore names this command instead of the word "restart".
+ * Queued database writes are normally applied by the shutdown finalizer. These
+ * compatibility names point every exceptional retry affordance at the one
+ * public management command and name the exact action inside it.
  */
-export const RESTART_TO_APPLY_COMMAND = "cursorSync.restartToApply";
-export const RESTART_TO_APPLY_TITLE = "Cursor Setting Sync: Restart to Apply";
+export const RESTART_TO_APPLY_COMMAND = MANAGE_COMMAND;
+export const RESTART_TO_APPLY_TITLE = `${MANAGE_TITLE} → Apply Queued Changes`;
 
 /**
  * How often the apply's preparation repeats the phase it is still on.

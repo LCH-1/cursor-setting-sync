@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SyncRepository } from "../src/protocol/repository";
 import { restoreDatabaseBackup } from "../src/helper/database";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
+import { portableChatCoreHash } from "../src/chat/stateVscdb";
 import { pathExists, readJsonFile, writeJsonAtomic } from "../src/platform/files";
 import type { HelperChange, HelperRequest, HelperResult } from "../src/helper/types";
 import type { CursorPaths } from "../src/platform/paths";
@@ -85,7 +86,8 @@ describeBuilt("the offline helper, end to end", () => {
     const fixture = await createFixture();
 
     // A change published by "the other computer".
-    const body = canonicalBytes(chatSnapshot());
+    const snapshot = chatSnapshot();
+    const body = canonicalBytes(snapshot);
     const published = await fixture.repository.publish(
       [
         {
@@ -93,7 +95,15 @@ describeBuilt("the offline helper, end to end", () => {
           kind: "chat",
           content: body,
           semanticHash: sha256(body),
-          metadata: { composerId: COMPOSER, workspaceId: null },
+          metadata: {
+            composerId: COMPOSER,
+            workspaceId: null,
+            chatSnapshotSchemaVersion: 2,
+            agentKvBlobCount: 0,
+            agentKvReferencedCount: 0,
+            agentKvMissingCount: 0,
+            chatCoreHash: portableChatCoreHash(snapshot),
+          },
         },
       ],
       [],
@@ -431,7 +441,7 @@ function readComposerIds(databasePath: string): string[] {
 
 function chatSnapshot() {
   return {
-    schemaVersion: 1 as const,
+    schemaVersion: 2 as const,
     composerId: COMPOSER,
     header: {
       composerId: COMPOSER,
@@ -450,5 +460,10 @@ function chatSnapshot() {
       valueType: "text" as const,
     },
     bubbles: [],
+    agentKv: {
+      blobs: [],
+      referencedIds: [],
+      missingIds: [],
+    },
   };
 }

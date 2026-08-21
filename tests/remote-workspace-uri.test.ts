@@ -32,6 +32,17 @@ describe("the two spellings of one SSH host", () => {
     ).toBe(false);
   });
 
+  it("keeps Remote-SSH paths case-sensitive even in a Windows UI host", () => {
+    const upper =
+      "vscode-remote://ssh-remote%2Bgeekdive_local2/home/ubuntu/Project/App";
+    const lower =
+      "vscode-remote://ssh-remote%2Bgeekdive_local2/home/ubuntu/project/app";
+    expect(normalizeWorkspaceUri(upper, "win32")).not.toBe(
+      normalizeWorkspaceUri(lower, "win32"),
+    );
+    expect(workspaceUriMatchesAny(upper, [lower], "win32")).toBe(false);
+  });
+
   it("maps an incoming remote workspace onto the local one on the same server", () => {
     // Without this the two are unrelated workspaces, and every chat written in
     // that folder stops at a mapping prompt with no answerable option.
@@ -76,6 +87,29 @@ describe("the two spellings of one SSH host", () => {
     expect(normalizeWorkspaceUri(noHost, "linux")).toBe(
       "vscode-remote://ssh-remote+7b22706f7274223a32327d/home/x",
     );
+  });
+
+  it("does not collapse descriptors carrying a different connection identity", () => {
+    const descriptor = Buffer.from(
+      JSON.stringify({ hostName: "geekdive_local2", port: 2222 }),
+      "utf8",
+    ).toString("hex");
+    const withPort = `vscode-remote://ssh-remote%2B${descriptor}/home/ubuntu/servers/linchpinedu/backend`;
+    expect(normalizeWorkspaceUri(withPort, "win32")).not.toBe(
+      normalizeWorkspaceUri(ALIAS_URI, "win32"),
+    );
+    expect(workspaceUriMatchesAny(withPort, [ALIAS_URI], "win32")).toBe(
+      false,
+    );
+  });
+
+  it("does not inject an unsafe hostName from a descriptor into the URI", () => {
+    const descriptor = Buffer.from(
+      JSON.stringify({ hostName: "server/other-path" }),
+      "utf8",
+    ).toString("hex");
+    const unsafe = `vscode-remote://ssh-remote%2B${descriptor}/home/project`;
+    expect(normalizeWorkspaceUri(unsafe, "win32")).toContain(descriptor);
   });
 
   it("rejects and memoizes a structurally hostile descriptor before parsing", () => {

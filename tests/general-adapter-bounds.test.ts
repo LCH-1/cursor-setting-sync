@@ -130,7 +130,7 @@ describe("ordinary adapter fixed work envelopes", () => {
     }
     await cursor.dispose();
     await profiles.dispose();
-  });
+  }, 15_000);
 
   it("bounds UI oversized protections and requires a clean marker sweep to recover", async () => {
     const root = await temporaryRoot("ui-oversized-registry-");

@@ -3,6 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as sqlite from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("vscode", () => ({
+  window: {},
+  extensions: { all: [] },
+}));
+
 import {
   enrichCurrentChatTipsFromLiveDatabase,
   type ChatTipEnrichmentCursor,
@@ -17,20 +23,32 @@ import {
   isPortableChatSnapshotV2,
   parsePortableChatSnapshot,
   portableChatCoreHash,
+  StateVscdbChatAdapter,
   type PortableChatSnapshot,
   type PortableChatSnapshotV1,
+  type PortableChatSnapshotV2,
   type PortableKvRow,
 } from "../src/chat/stateVscdb";
 import {
   applyGlobalDatabaseChanges,
   type PreparedHelperChange,
 } from "../src/helper/database";
+import { markAppliedProjections, prepareChanges } from "../src/helper/main";
 import type { HelperRequest } from "../src/helper/types";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
-import { EventReconciler } from "../src/protocol/reconciler";
+import {
+  EventReconciler,
+  type ReconcileResult,
+} from "../src/protocol/reconciler";
 import { SyncRepository } from "../src/protocol/repository";
+import {
+  autoMergeConflicts,
+  pendingHelperBatch,
+  queuePending,
+} from "../src/sync/manager";
 import type {
   EventProducer,
+  JsonValue,
   ResourceSnapshot,
   ResourceTip,
 } from "../src/types";
@@ -73,10 +91,12 @@ describeWithBackup("cross-device chat continuation recovery", () => {
     createGlobalDatabase(aDatabasePath);
     createGlobalDatabase(bDatabasePath);
 
-    const aLeaf = contentBlob("A-only continuation leaf");
-    const aRoot = contentBlob(protobufIds([aLeaf.id]));
-    const bLeaf = contentBlob("B healthy continuation leaf");
-    const bRoot = contentBlob(protobufIds([bLeaf.id]));
+    const aLeaf = contentBlob(conversationStepBytes("A-only continuation leaf"));
+    const aRoot = contentBlob(conversationTurnBytes([aLeaf.id]));
+    const bLeaf = contentBlob(
+      conversationStepBytes("B healthy continuation leaf"),
+    );
+    const bRoot = contentBlob(conversationTurnBytes([bLeaf.id]));
     const aCore = chatSnapshot({
       bubbleCount: 5,
       composerRootId: bRoot.id,
@@ -235,6 +255,220 @@ describeWithBackup("cross-device chat continuation recovery", () => {
     expect(secondIdle).toMatchObject({ attempted: 0, published: 0, warnings: [] });
     expect(readVersion).not.toHaveBeenCalled();
   });
+
+  it("carries a complete frozen-timestamp B continuation through the repository and resumes the same A composer", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-chat-same-core-e2e-"));
+    temporaryRoots.push(root);
+    const repositoryRoot = join(root, "repository");
+    const firstDevice = await SyncRepository.create(
+      repositoryRoot,
+      join(root, "repository-state-first"),
+      PASSPHRASE,
+      4 * 1024 * 1024,
+      PRODUCER,
+    );
+    const aDatabasePath = join(root, "device-a-state.vscdb");
+    createGlobalDatabase(aDatabasePath);
+
+    const frozenTimestamp = 1_700_000_000_000;
+    const baseLeaf = contentBlob(
+      conversationStepBytes("shared base continuation leaf"),
+    );
+    const baseRoot = contentBlob(conversationTurnBytes([baseLeaf.id]));
+    const bLeaf = contentBlob(
+      conversationStepBytes("B continued conversation leaf"),
+    );
+    const bRoot = contentBlob(conversationTurnBytes([bLeaf.id]));
+    const baseCore = chatSnapshot({
+      bubbleCount: 1,
+      composerRootId: baseRoot.id,
+      label: "shared-base",
+      lastUpdatedAt: frozenTimestamp,
+      recency: 1,
+    });
+    const bCore = chatSnapshot({
+      bubbleCount: 3,
+      composerRootId: bRoot.id,
+      label: "B-complete",
+      lastUpdatedAt: frozenTimestamp,
+      recency: 3,
+    });
+    const baseV2 = completeChatSnapshot(baseCore, [baseRoot, baseLeaf]);
+    const bV2 = completeChatSnapshot(bCore, [bRoot, bLeaf]);
+    const staleAFork: PortableChatSnapshotV2 = {
+      ...baseV2,
+      header: {
+        ...baseV2.header,
+        // Make A's stale fork byte-distinct and replicated-newest without
+        // changing its visible sequence or Cursor's frozen update timestamp.
+        recency: 99,
+      },
+    };
+    seedChat(aDatabasePath, baseCore, [baseRoot, baseLeaf]);
+
+    const baseVersionId = await publishExactChat(firstDevice, baseV2, []);
+    await reconcileResult(firstDevice);
+
+    const secondDevice = await SyncRepository.openWithMasterKey(
+      repositoryRoot,
+      join(root, "repository-state-second"),
+      firstDevice.repository,
+      Buffer.from(firstDevice.masterKey),
+      4 * 1024 * 1024,
+      PRODUCER,
+    );
+    expect(secondDevice.state.device.deviceId).not.toBe(
+      firstDevice.state.device.deviceId,
+    );
+    await reconcileResult(secondDevice);
+
+    // Replicated tips with equal Lamports sort by descending device ID. Give
+    // the stale target side that deterministic first position so this test
+    // fails under the old "first equal-timestamp tip wins" behavior no matter
+    // which random device IDs the repositories received.
+    const [deviceA, deviceB] =
+      firstDevice.state.device.deviceId > secondDevice.state.device.deviceId
+        ? [firstDevice, secondDevice]
+        : [secondDevice, firstDevice];
+    const bVersionId = await publishExactChat(deviceB, bV2, [baseVersionId]);
+
+    // A has not reconciled B's event, so both children of the shared base are
+    // concurrent at the same Lamport. A's stale child nevertheless sorts
+    // first by the deterministic device-ID tie-break established above.
+    const staleAVersionId = await publishExactChat(deviceA, staleAFork, [
+      baseVersionId,
+    ]);
+    await deviceA.refreshState();
+    const fork = await reconcileResult(deviceA);
+    const forkTips = deviceA.state.tips[`chat/${COMPOSER_ID}`] ?? [];
+    expect(forkTips.map((tip) => tip.versionId)).toEqual([
+      staleAVersionId,
+      bVersionId,
+    ]);
+    expect(fork.conflicts).toHaveLength(1);
+    expect(fork.conflicts[0]?.baseVersionId).toBe(baseVersionId);
+    expect(forkTips[0]?.metadata?.lastUpdatedAt).toBe(frozenTimestamp);
+    expect(forkTips[1]?.metadata?.lastUpdatedAt).toBe(frozenTimestamp);
+
+    expect(await autoMergeConflicts(deviceA, fork.conflicts)).toBe(true);
+    const mergedResult = await reconcileResult(deviceA);
+    expect(mergedResult.conflicts).toEqual([]);
+    const mergedProjection = mergedResult.projections.find(
+      (projection) => projection.resourceId === `chat/${COMPOSER_ID}`,
+    );
+    expect(mergedProjection).toBeDefined();
+    if (mergedProjection === undefined) {
+      throw new Error("Missing merged chat projection");
+    }
+    expect(mergedProjection.changed).toBe(true);
+
+    const mergedTip = onlyTip(deviceA);
+    expect(new Set(mergedTip.parents)).toEqual(
+      new Set([bVersionId, staleAVersionId]),
+    );
+    const merged = await readTipChat(deviceA, mergedTip);
+    expect(isPortableChatSnapshotV2(merged)).toBe(true);
+    if (!isPortableChatSnapshotV2(merged)) {
+      throw new Error("Frozen-timestamp merge did not retain chat schema v2");
+    }
+    expect(core(merged)).toEqual(core(bCore));
+    expect(merged.agentKv).toMatchObject({ missingIds: [] });
+    expect(merged.agentKv.referencedIds).toEqual(
+      [baseLeaf.id, baseRoot.id, bLeaf.id, bRoot.id].sort(),
+    );
+    expect(merged.agentKv.blobs.map(blobId)).toEqual(
+      [baseLeaf.id, baseRoot.id, bLeaf.id, bRoot.id].sort(),
+    );
+    expect(mergedTip.metadata).toMatchObject({
+      composerId: COMPOSER_ID,
+      lastUpdatedAt: frozenTimestamp,
+      bubbleCount: 3,
+      chatCoreHash: portableChatCoreHash(bCore),
+      chatSnapshotSchemaVersion: 2,
+      agentKvBlobCount: 4,
+      agentKvReferencedCount: 4,
+      agentKvMissingCount: 0,
+    });
+
+    expect(queuePending(deviceA, mergedProjection)).toBe(true);
+    expect(deviceA.state.pendingDatabaseChanges).toHaveLength(1);
+    expect(
+      deviceA.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBeUndefined();
+    const batch = pendingHelperBatch(deviceA);
+    expect(batch.deferredForBatchLimit).toBe(0);
+    expect(batch.changes.map((change) => change.resourceId)).toEqual([
+      `chat/${COMPOSER_ID}`,
+    ]);
+
+    const request = helperRequest(root, aDatabasePath);
+    const prepared = await prepareChanges(deviceA, batch.changes);
+    expect(prepared.skipped).toEqual([]);
+    expect(prepared.failureByResourceId).toEqual({});
+    expect(prepared.prepared.map(({ change }) => change.resourceId)).toEqual([
+      `chat/${COMPOSER_ID}`,
+    ]);
+    const applyResult = await applyGlobalDatabaseChanges(
+      request,
+      prepared.prepared,
+    );
+    expect(applyResult.applied).toEqual([`chat/${COMPOSER_ID}`]);
+    expect(applyResult.skipped).toEqual([]);
+    expect(applyResult.failureByResourceId).toEqual({});
+    markAppliedProjections(
+      deviceA,
+      batch.changes,
+      applyResult.applied,
+      new Set(applyResult.retainedLocal),
+      applyResult.retainedLocalHashes,
+      applyResult.localChatCoreHashes,
+      applyResult.failureByResourceId,
+    );
+    expect(deviceA.state.pendingDatabaseChanges).toEqual([]);
+
+    expect(readComposerIds(aDatabasePath)).toEqual([COMPOSER_ID]);
+    const appliedA = readDatabaseChat(aDatabasePath);
+    expect(appliedA.composerId).toBe(COMPOSER_ID);
+    expect(core(appliedA)).toEqual(core(bCore));
+    expect(portableChatCoreHash(appliedA)).toBe(portableChatCoreHash(bCore));
+    const resumedA = await auditDatabaseChat(aDatabasePath);
+    expectKnownAudit(resumedA.audit);
+    expect(resumedA.audit).toMatchObject({
+      unavailableRootIds: [],
+      probedRootCount: 2,
+    });
+    expect(resumedA.audit.referencedRootIds).toEqual(
+      [bLeaf.id, bRoot.id].sort(),
+    );
+
+    const adapter = new StateVscdbChatAdapter(request.paths, {
+      periodicDeepVerification: false,
+    });
+    adapter.setMaxPayloadBytes(deviceA.maxPayloadBytes);
+    const firstIdle = await adapter.scan(deviceA.state.projections);
+    const secondIdle = await adapter.scan(deviceA.state.projections);
+    expect(firstIdle.snapshots).toEqual([]);
+    expect(firstIdle.deletions).toEqual([]);
+    expect(secondIdle.snapshots).toEqual([]);
+    expect(secondIdle.deletions).toEqual([]);
+    expect(adapter.scanStatus().complete).toBe(true);
+
+    const quiet = await reconcileResult(deviceA);
+    const quietProjection = quiet.projections.find(
+      (projection) => projection.resourceId === `chat/${COMPOSER_ID}`,
+    );
+    expect(quietProjection?.changed).toBe(false);
+    for (const projection of quiet.projections.filter(
+      (candidate) => candidate.changed,
+    )) {
+      queuePending(deviceA, projection);
+    }
+    expect(deviceA.state.pendingDatabaseChanges).toEqual([]);
+    expect(pendingHelperBatch(deviceA)).toEqual({
+      changes: [],
+      deferredForBatchLimit: 0,
+    });
+  });
 });
 
 interface ContentBlob {
@@ -257,11 +491,50 @@ function contentBlob(value: string | Buffer): ContentBlob {
   };
 }
 
+function conversationTurnBytes(stepIds: readonly string[]): Buffer {
+  return protobufBytesField(
+    1,
+    Buffer.concat(
+      stepIds.map((id) => protobufBytesField(2, Buffer.from(id, "hex"))),
+    ),
+  );
+}
+
+function conversationStepBytes(text: string): Buffer {
+  return protobufBytesField(
+    1,
+    protobufBytesField(1, Buffer.from(text, "utf8")),
+  );
+}
+
+function protobufBytesField(
+  fieldNumber: number,
+  payload: Uint8Array,
+): Buffer {
+  return Buffer.concat([
+    protobufVarint(BigInt(fieldNumber * 8 + 2)),
+    protobufVarint(BigInt(payload.byteLength)),
+    Buffer.from(payload),
+  ]);
+}
+
+function protobufVarint(input: bigint): Buffer {
+  let value = input;
+  const bytes: number[] = [];
+  do {
+    let byte = Number(value & 0x7fn);
+    value >>= 7n;
+    if (value !== 0n) {
+      byte |= 0x80;
+    }
+    bytes.push(byte);
+  } while (value !== 0n);
+  return Buffer.from(bytes);
+}
+
 function protobufIds(ids: readonly string[]): Buffer {
   return Buffer.concat(
-    ids.map((id) =>
-      Buffer.concat([Buffer.from([0x0a, 0x20]), Buffer.from(id, "hex")]),
-    ),
+    ids.map((id) => protobufBytesField(8, Buffer.from(id, "hex"))),
   );
 }
 
@@ -274,6 +547,8 @@ function chatSnapshot(options: {
   composerRootId: string;
   errorBubbleRootId?: string;
   label: string;
+  lastUpdatedAt?: number;
+  recency?: number;
 }): PortableChatSnapshotV1 {
   const bubbleIds = Array.from(
     { length: options.bubbleCount },
@@ -286,10 +561,10 @@ function chatSnapshot(options: {
       composerId: COMPOSER_ID,
       workspaceId: "workspace",
       createdAt: 1,
-      lastUpdatedAt: options.bubbleCount,
+      lastUpdatedAt: options.lastUpdatedAt ?? options.bubbleCount,
       isArchived: 0,
       isSubagent: 0,
-      recency: options.bubbleCount,
+      recency: options.recency ?? options.bubbleCount,
       checkpointAt: null,
       value: JSON.stringify({ name: TITLE }),
     },
@@ -315,6 +590,25 @@ function chatSnapshot(options: {
           : {}),
       }),
     ),
+  };
+}
+
+function completeChatSnapshot(
+  snapshot: PortableChatSnapshotV1,
+  blobs: readonly ContentBlob[],
+): PortableChatSnapshotV2 {
+  const rows = blobs
+    .map((blob) => blob.row)
+    .sort((left, right) => left.key.localeCompare(right.key));
+  const referencedIds = rows.map(blobId).sort();
+  return {
+    ...snapshot,
+    schemaVersion: 2,
+    agentKv: {
+      blobs: rows,
+      referencedIds,
+      missingIds: [],
+    },
   };
 }
 
@@ -417,6 +711,23 @@ function readDatabaseChat(databasePath: string): PortableChatSnapshot {
       throw new Error(`Missing test chat in ${databasePath}`);
     }
     return snapshot;
+  } finally {
+    database.close();
+  }
+}
+
+function readComposerIds(databasePath: string): string[] {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const rows = database
+      .prepare("SELECT composerId FROM composerHeaders ORDER BY composerId")
+      .all() as Array<{ composerId?: unknown }>;
+    return rows.map((row) => {
+      if (typeof row.composerId !== "string") {
+        throw new Error("Invalid composer ID in test database");
+      }
+      return row.composerId;
+    });
   } finally {
     database.close();
   }
@@ -549,11 +860,58 @@ function resourceSnapshot(
 }
 
 async function reconcile(repository: SyncRepository): Promise<void> {
-  new EventReconciler().reconcile(
+  await reconcileResult(repository);
+}
+
+async function reconcileResult(
+  repository: SyncRepository,
+): Promise<ReconcileResult> {
+  return new EventReconciler().reconcile(
     await repository.listEvents(),
     repository.state,
     null,
   );
+}
+
+async function publishExactChat(
+  repository: SyncRepository,
+  chat: PortableChatSnapshot,
+  parents: string[],
+): Promise<string> {
+  const published = await repository.publish(
+    [
+      {
+        ...resourceSnapshot(chat, parents),
+        metadata: exactChatMetadata(chat),
+      },
+    ],
+    [],
+  );
+  if (published.eventHash === null) {
+    throw new Error("Exact chat publish did not create an event");
+  }
+  return `${published.eventHash}#0`;
+}
+
+function exactChatMetadata(
+  chat: PortableChatSnapshot,
+): Record<string, JsonValue> {
+  const metadata: Record<string, JsonValue> = {
+    composerId: chat.composerId,
+    workspaceId: chat.header.workspaceId,
+    workspaceUri: null,
+    lastUpdatedAt: chat.header.lastUpdatedAt,
+    bubbleCount: chat.bubbles.length,
+    title: TITLE,
+    chatCoreHash: portableChatCoreHash(chat),
+    chatSnapshotSchemaVersion: chat.schemaVersion,
+  };
+  if (isPortableChatSnapshotV2(chat)) {
+    metadata.agentKvBlobCount = chat.agentKv.blobs.length;
+    metadata.agentKvReferencedCount = chat.agentKv.referencedIds.length;
+    metadata.agentKvMissingCount = chat.agentKv.missingIds.length;
+  }
+  return metadata;
 }
 
 function onlyTip(repository: SyncRepository): ResourceTip {

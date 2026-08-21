@@ -238,20 +238,25 @@ export async function upsertRecoveryCatalogEntry(
 }
 
 /**
- * Loads and strictly validates the bounded v1 manifest. The derived index is
- * healed atomically when absent or stale, so callers can immediately open the
- * returned `indexPath` after a process restart.
+ * Loads and strictly validates the bounded v1 manifest. Identical repeated
+ * content-addressed image references are canonicalized atomically, and the
+ * derived index is healed when absent or stale, so callers can immediately
+ * open the returned `indexPath` after a process restart.
  */
 export async function readRecoveryCatalog(
   extensionStorage: string,
 ): Promise<RecoveryCatalogResult> {
   return withRecoveryCatalogLock(extensionStorage, async (root) => {
     const loaded = await loadRecoveryCatalog(root);
-    if (loaded.bytes === null) {
+    const canonicalManifestBytes = encodeManifest(loaded.manifest);
+    if (
+      loaded.bytes === null ||
+      !loaded.bytes.equals(canonicalManifestBytes)
+    ) {
       await writeFileAtomicWithinRoot(
         root,
         MANIFEST_RELATIVE_PATH,
-        encodeManifest(loaded.manifest),
+        canonicalManifestBytes,
       );
     }
     await writeCatalogIndex(root, loaded.manifest);
@@ -919,13 +924,19 @@ function validateStoredArtifact(
       composerStorageClass,
     ),
   );
-  const paths = new Set<string>();
+  const imagesByPath = new Map<string, RecoveryCatalogStoredImage>();
   let totalImageBytes = 0;
   for (const image of images) {
-    if (paths.has(image.relativePath)) {
-      throw new Error("Recovery catalog artifact contains a duplicate image path.");
+    const existing = imagesByPath.get(image.relativePath);
+    if (existing !== undefined) {
+      assertSameStoredFileMetadata(
+        existing,
+        image,
+        "Recovery catalog artifact gives one image path conflicting metadata.",
+      );
+      continue;
     }
-    paths.add(image.relativePath);
+    imagesByPath.set(image.relativePath, image);
     totalImageBytes += image.byteLength;
     if (
       totalImageBytes >
@@ -936,7 +947,7 @@ function validateStoredArtifact(
   }
   return {
     transcript,
-    images: images.sort((left, right) =>
+    images: [...imagesByPath.values()].sort((left, right) =>
       compareText(left.relativePath, right.relativePath),
     ),
   };
@@ -1117,8 +1128,7 @@ async function materializeArtifact(
   ) {
     throw new Error("Recovery artifact exceeds its image count limit.");
   }
-  const images: RecoveryCatalogStoredImage[] = [];
-  const paths = new Set<string>();
+  const imagesByPath = new Map<string, RecoveryCatalogStoredImage>();
   let totalImageBytes = 0;
   for (const image of artifact.imageAttachments) {
     if (image.mimeType !== "image/png") {
@@ -1138,10 +1148,22 @@ async function materializeArtifact(
     ) {
       throw new Error("Recovery image path is not content-addressed.");
     }
-    if (paths.has(relativePath)) {
-      throw new Error("Recovery artifact contains a duplicate image path.");
+    const storedImage: RecoveryCatalogStoredImage = {
+      relativePath,
+      sha256: hash,
+      byteLength,
+      mimeType: "image/png",
+    };
+    const existing = imagesByPath.get(relativePath);
+    if (existing !== undefined) {
+      assertSameStoredFileMetadata(
+        existing,
+        storedImage,
+        "Recovery artifact gives one image path conflicting metadata.",
+      );
+      continue;
     }
-    paths.add(relativePath);
+    imagesByPath.set(relativePath, storedImage);
     totalImageBytes += byteLength;
     if (
       totalImageBytes >
@@ -1153,16 +1175,10 @@ async function materializeArtifact(
     if (bytes.byteLength !== byteLength || sha256(bytes) !== hash) {
       throw new Error("Recovery image read-back verification failed.");
     }
-    images.push({
-      relativePath,
-      sha256: hash,
-      byteLength,
-      mimeType: "image/png",
-    });
   }
   return {
     transcript,
-    images: images.sort((left, right) =>
+    images: [...imagesByPath.values()].sort((left, right) =>
       compareText(left.relativePath, right.relativePath),
     ),
   };
@@ -1375,8 +1391,8 @@ function catalogReadyArtifactBytes(
   manifest: RecoveryCatalogManifestV1,
 ): number {
   let total = 0;
-  for (const byteLength of catalogArtifactPaths(manifest).values()) {
-    total += byteLength;
+  for (const file of catalogArtifactPaths(manifest).values()) {
+    total += file.byteLength;
   }
   return total;
 }
@@ -1384,8 +1400,11 @@ function catalogReadyArtifactBytes(
 /** Unique content-addressed paths referenced by the current catalog only. */
 function catalogArtifactPaths(
   manifest: RecoveryCatalogManifestV1,
-): Map<string, number> {
-  const paths = new Map<string, number>();
+): Map<string, RecoveryCatalogStoredFile | RecoveryCatalogStoredImage> {
+  const paths = new Map<
+    string,
+    RecoveryCatalogStoredFile | RecoveryCatalogStoredImage
+  >();
   for (const entry of manifest.entries) {
     if (entry.status !== "ready") {
       continue;
@@ -1395,17 +1414,38 @@ function catalogArtifactPaths(
       ...entry.artifact.images,
     ]) {
       const existing = paths.get(file.relativePath);
-      if (existing !== undefined && existing !== file.byteLength) {
-        throw new Error(
-          "Recovery catalog gives one artifact path conflicting byte lengths.",
+      if (existing !== undefined) {
+        assertSameStoredFileMetadata(
+          existing,
+          file,
+          "Recovery catalog gives one artifact path conflicting metadata.",
         );
+        continue;
       }
-      if (existing === undefined) {
-        paths.set(file.relativePath, file.byteLength);
-      }
+      paths.set(file.relativePath, file);
     }
   }
   return paths;
+}
+
+function assertSameStoredFileMetadata(
+  left: RecoveryCatalogStoredFile | RecoveryCatalogStoredImage,
+  right: RecoveryCatalogStoredFile | RecoveryCatalogStoredImage,
+  message: string,
+): void {
+  if (
+    left.sha256 !== right.sha256 ||
+    left.byteLength !== right.byteLength ||
+    storedFileMimeType(left) !== storedFileMimeType(right)
+  ) {
+    throw new Error(message);
+  }
+}
+
+function storedFileMimeType(
+  file: RecoveryCatalogStoredFile | RecoveryCatalogStoredImage,
+): RecoveryCatalogStoredImage["mimeType"] | null {
+  return "mimeType" in file ? file.mimeType : null;
 }
 
 function expectedArtifactRelativePath(

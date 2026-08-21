@@ -6,13 +6,18 @@ vi.mock("vscode", () => ({
 }));
 
 import {
+  INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON,
   WORKSPACE_MAPPING_BLOCK_REASON,
   queuePending,
 } from "../src/sync/manager";
 import { APPLY_FAILURE_BLOCK_PREFIX } from "../src/constants";
 import type { SyncRepository } from "../src/protocol/repository";
 import type { ResourceProjection } from "../src/protocol/reconciler";
-import type { PendingDatabaseChange, ResourceTip } from "../src/types";
+import type {
+  JsonValue,
+  PendingDatabaseChange,
+  ResourceTip,
+} from "../src/types";
 
 const WORKSPACE_ID = "703f151ce2095257aebae8e68adf30c0";
 const RESOURCE_ID = `workspace-storage/${encodeURIComponent(
@@ -145,6 +150,91 @@ describe("the queued-change block a workspace mapping owns", () => {
   });
 });
 
+describe("cross-device chat continuation queueing", () => {
+  it("blocks an ordinary v1 chat until its complete v2 child arrives", () => {
+    const repository = repositoryWith([]);
+
+    queuePending(repository, chatProjection({ chatSnapshotSchemaVersion: 1 }));
+
+    expect(repository.state.pendingDatabaseChanges).toEqual([
+      expect.objectContaining({
+        resourceId: "chat/01234567-89ab-4cde-8fab-0123456789ab",
+        blockedReason: INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON,
+      }),
+    ]);
+  });
+
+  it("blocks a partial v2 chat but admits a complete v2 chat", () => {
+    const partialRepository = repositoryWith([]);
+    queuePending(
+      partialRepository,
+      chatProjection({
+        chatSnapshotSchemaVersion: 2,
+        agentKvMissingCount: 1,
+      }),
+    );
+    expect(
+      partialRepository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBe(INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON);
+
+    const completeRepository = repositoryWith([]);
+    queuePending(
+      completeRepository,
+      chatProjection({
+        chatSnapshotSchemaVersion: 2,
+        agentKvMissingCount: 0,
+      }),
+    );
+    expect(
+      completeRepository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBeUndefined();
+  });
+
+  it("keeps the existing one-shot continuation recapture path for body repair", () => {
+    const repository = repositoryWith([]);
+    queuePending(
+      repository,
+      chatProjection({
+        syncOrigin: "automatic-chat-repair",
+        chatSnapshotSchemaVersion: 1,
+      }),
+    );
+    expect(repository.state.pendingDatabaseChanges[0]?.blockedReason).toBeUndefined();
+  });
+
+  it("allows legacy blob-only enrichment without applying its partial core", () => {
+    const repository = repositoryWith([]);
+    const projection = chatProjection({
+      syncOrigin: "agent-kv-enrichment",
+      chatSnapshotSchemaVersion: 2,
+      agentKvMissingCount: 1,
+    });
+
+    expect(queuePending(repository, projection)).toBe(true);
+    expect(repository.state.pendingDatabaseChanges).toHaveLength(1);
+    expect(
+      repository.state.pendingDatabaseChanges[0],
+    ).not.toHaveProperty("blockedReason");
+  });
+
+  it("blocks a core-applying enrichment until its graph is complete", () => {
+    const repository = repositoryWith([]);
+    queuePending(
+      repository,
+      chatProjection({
+        syncOrigin: "agent-kv-enrichment",
+        agentKvEnrichmentAppliesCore: true,
+        chatSnapshotSchemaVersion: 2,
+        agentKvMissingCount: 1,
+      }),
+    );
+
+    expect(repository.state.pendingDatabaseChanges[0]?.blockedReason).toBe(
+      INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON,
+    );
+  });
+});
+
 function projection(): ResourceProjection {
   const tip: ResourceTip = {
     kind: "workspace-storage",
@@ -166,6 +256,23 @@ function projection(): ResourceProjection {
     },
   };
   return { resourceId: RESOURCE_ID, tip, changed: true };
+}
+
+function chatProjection(metadata: Record<string, JsonValue>): ResourceProjection {
+  const composerId = "01234567-89ab-4cde-8fab-0123456789ab";
+  const tip: ResourceTip = {
+    kind: "chat",
+    versionId: "chat-v1",
+    eventHash: "b".repeat(64),
+    changeIndex: 0,
+    operation: "put",
+    semanticHash: "c".repeat(64),
+    lamport: 1,
+    deviceId: "bf423e19",
+    parents: [],
+    metadata,
+  };
+  return { resourceId: `chat/${composerId}`, tip, changed: true };
 }
 
 /**

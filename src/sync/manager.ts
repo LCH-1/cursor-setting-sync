@@ -162,6 +162,7 @@ import {
   type PortableKvRow,
 } from "../chat/stateVscdb";
 import { AGENT_KV_BLOB_PREFIX } from "../chat/agentKv";
+import { verifyPortableChatContinuationClosure } from "../chat/continuationClosure";
 import {
   CHAT_AUTO_MERGE_MAX_WORK_BYTES,
   extractBoundedChatCoreAgentKvRoots,
@@ -196,6 +197,7 @@ import {
   extractVisibleChatRecoveryTranscript,
   prepareVisibleRecoveryAgent,
   writeVisibleChatRecoveryArtifact,
+  type VisibleChatRecoveryArtifact,
   type VisibleChatRecoveryTranscript,
 } from "../chat/visibleRecovery";
 import {
@@ -213,6 +215,15 @@ import {
   type RecoveryCatalogStatus,
   type RecoveryCatalogUpsertInput,
 } from "../chat/recoveryCatalog";
+import {
+  RecoveryStagingError,
+  stageRecoveryArtifacts,
+  verifyStagedRecovery,
+  type RecoveryStagingBridge,
+  type RecoveryStagingResult,
+  type RecoveryStagingSource,
+  type RecoveryStagingUri,
+} from "../chat/recoveryStaging";
 import {
   discoverWorkspaces,
   resolveTargetWorkspace,
@@ -271,6 +282,14 @@ import {
   publishInBatches,
   shouldPublishSnapshot,
 } from "./versionPolicy";
+import {
+  chatContinuationApplyBlockReason,
+  INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON,
+} from "./chatContinuationPolicy";
+export {
+  chatContinuationApplyBlockReason,
+  INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON,
+} from "./chatContinuationPolicy";
 import { assertSafeRepositoryLocation } from "./repositoryPath";
 import {
   AUTO_MERGE_WARNING_SOURCE,
@@ -757,7 +776,7 @@ export class SyncManager implements vscode.Disposable {
     let openedRepository: SyncRepository;
     try {
       openedRepository = await this.withProgress(
-        "Cursor Setting Sync: Setup",
+        "Cursor Setting Sync: Setup or Reconfigure",
         async (report) => {
           report(
             exists
@@ -833,7 +852,7 @@ export class SyncManager implements vscode.Disposable {
       { force: true },
     ).catch(() => {});
     await this.refreshAdapters();
-    await this.withProgress("Cursor Setting Sync: Setup", async (report) => {
+    await this.withProgress("Cursor Setting Sync: Setup or Reconfigure", async (report) => {
       if (await this.gitModeFor(root)) {
         report("Committing the initial repository...");
         await this.commitGitWindow(true, root, "initial sync repository");
@@ -1044,7 +1063,7 @@ export class SyncManager implements vscode.Disposable {
       return true;
     }
     const remoteUrl = url.trim();
-    await this.withProgress("Cursor Setting Sync: Setup", async (report) => {
+    await this.withProgress("Cursor Setting Sync: Setup or Reconfigure", async (report) => {
       if (choice.value === "clone") {
         report(`Cloning ${remoteUrl}...`);
         await cloneRepository(remoteUrl, root);
@@ -1082,7 +1101,7 @@ export class SyncManager implements vscode.Disposable {
     );
   }
 
-  /** The `cursorSync.syncNow` command: a manual sync with visible progress. */
+  /** The Manage → Sync Now action: a manual sync with visible progress. */
   async syncNowCommand(): Promise<void> {
     await this.withProgress("Cursor Setting Sync", async (report) => {
       report("Synchronizing...");
@@ -1103,13 +1122,13 @@ export class SyncManager implements vscode.Disposable {
   async disconnect(): Promise<void> {
     if (this.configuration.repositoryPath === null) {
       void vscode.window.showInformationMessage(
-        'Cursor Setting Sync is not connected to a repository, so there is nothing to disconnect. Run "Cursor Setting Sync: Setup" to connect one.',
+        'Cursor Setting Sync is not connected to a repository, so there is nothing to disconnect. Open "Cursor Setting Sync: Manage" and choose "Setup or Reconfigure" to connect one.',
       );
       return;
     }
     const proceed = "Disconnect";
     const confirmed = await vscode.window.showWarningMessage(
-      `Stop synchronizing with ${this.configuration.repositoryPath}? The shared folder and its history are left untouched; this device forgets the repository, its encryption key and its workspace mappings. Run Setup again to reconnect.`,
+      `Stop synchronizing with ${this.configuration.repositoryPath}? The shared folder and its history are left untouched; this device forgets the repository, its encryption key and its workspace mappings. Open Cursor Setting Sync: Manage and choose Setup or Reconfigure to reconnect.`,
       { modal: true },
       proceed,
     );
@@ -1165,7 +1184,7 @@ export class SyncManager implements vscode.Disposable {
     this.status.setStatus("unconfigured");
     this.status.log("Disconnected from the synchronization repository.");
     void vscode.window.showInformationMessage(
-      "Cursor Setting Sync is disconnected. Run \"Cursor Setting Sync: Setup\" to connect again.",
+      'Cursor Setting Sync is disconnected. Open "Cursor Setting Sync: Manage" and choose "Setup or Reconfigure" to connect again.',
     );
   }
 
@@ -1207,7 +1226,9 @@ export class SyncManager implements vscode.Disposable {
       this.maintenanceRequested ||
       reconcileWarnings.length > 0 ||
       unresolvedConflicts(repository).length > 0 ||
-      repository.state.pendingDatabaseChanges.length > 0 ||
+      pendingDatabaseChangesBlockMaintenance(
+        repository.state.pendingDatabaseChanges,
+      ) ||
       Date.now() - this.automaticMaintenanceAt < AUTOMATIC_CHECKPOINT_COOLDOWN_MS
     ) {
       return;
@@ -1903,7 +1924,7 @@ export class SyncManager implements vscode.Disposable {
           observation,
         })),
         {
-          title: "Continue Unavailable Chat Safely",
+          title: "Choose a Conversation for Safe Recovery",
           placeHolder:
             "Choose a conversation to preserve as context in a new Agent",
         },
@@ -1931,6 +1952,39 @@ export class SyncManager implements vscode.Disposable {
         );
       },
     );
+    const openWorkspaceUri = matchingOpenWorkspaceUri(transcript.workspaceUri);
+    if (openWorkspaceUri === null) {
+      throw new Error(
+        'Open the conversation\'s original workspace in this Cursor window, then open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select the safe successor fallback again.',
+      );
+    }
+    const artifact = await writeVisibleChatRecoveryArtifact(
+      this.paths.extensionStorage,
+      this.paths.workspaceStorageRoot,
+      transcript,
+    );
+    const transcriptInfo = await stat(artifact.path);
+    if (!transcriptInfo.isFile()) {
+      throw new Error("The verified recovery transcript is not a regular file.");
+    }
+    const localPaths = [
+      artifact.path,
+      ...artifact.imageAttachments.map((image) => image.path),
+    ];
+    const prepared = await prepareRecoveryResources(
+      openWorkspaceUri,
+      localPaths,
+      stagingSourcesForVisibleArtifact(artifact, transcriptInfo.size),
+    );
+    if (prepared === null) {
+      return;
+    }
+    if (
+      prepared.remoteStaging !== null &&
+      !(await reverifyRemoteStagingBeforeAgent(prepared.remoteStaging))
+    ) {
+      return;
+    }
     const freshness = await this.withProgress(
       "Cursor Setting Sync",
       async (report) => {
@@ -1949,42 +2003,46 @@ export class SyncManager implements vscode.Disposable {
         !freshness.limitReached
       ) {
         void vscode.window.showInformationMessage(
-          "The selected conversation's continuation data is now complete. No recovery file or new Agent was created.",
+          `The selected conversation's continuation data is now complete. No new Agent was created and nothing was attached or sent. The verified local recovery files remain in the local recovery-transcripts folder until you explicitly delete them.${remoteStagingRetention(prepared.remoteStaging)}`,
         );
         return;
       }
-      throw new Error(
-        "The selected conversation could not be safely rechecked; no recovery file or new Agent was created.",
+      void vscode.window.showWarningMessage(
+        `The selected conversation could not be safely rechecked. No new Agent was created and nothing was attached or sent.${remoteStagingRetention(prepared.remoteStaging)}`,
       );
+      return;
     }
     if (
       freshDamage.chatCoreHash !== inspectedSelection.chatCoreHash ||
       freshDamage.fingerprint !== inspectedSelection.fingerprint
     ) {
-      throw new Error(
-        "The selected conversation changed after inspection; run Continue Unavailable Chat Safely again.",
+      void vscode.window.showWarningMessage(
+        `The selected conversation changed after inspection; open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select the safe successor fallback again. No new Agent was created and nothing was attached or sent.${remoteStagingRetention(prepared.remoteStaging)}`,
       );
+      return;
     }
-    if (!workspaceUriIsOpen(transcript.workspaceUri)) {
-      throw new Error(
-        "Open the conversation's original workspace in this Cursor window, then run Continue Unavailable Chat Safely again.",
+    const freshWorkspaceUri = matchingOpenWorkspaceUri(transcript.workspaceUri);
+    if (
+      freshWorkspaceUri === null ||
+      freshWorkspaceUri.scheme !== openWorkspaceUri.scheme ||
+      freshWorkspaceUri.authority !== openWorkspaceUri.authority
+    ) {
+      void vscode.window.showWarningMessage(
+        `The conversation's original workspace changed or closed during verification. Open it in this Cursor window, then open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select the safe successor fallback again. No new Agent was created and nothing was attached or sent.${remoteStagingRetention(prepared.remoteStaging)}`,
       );
+      return;
     }
-    const artifact = await writeVisibleChatRecoveryArtifact(
-      this.paths.extensionStorage,
-      this.paths.workspaceStorageRoot,
-      transcript,
-    );
-    const resource = vscode.Uri.file(artifact.path);
-    const resources = [
-      resource,
-      ...artifact.imageAttachments.map((image) => vscode.Uri.file(image.path)),
-    ];
     const mode = await prepareVisibleRecoveryAgent(
       vscode.commands,
-      resources,
+      prepared.resources,
     );
     const summary = `${transcript.userRecordCount} user message(s), ${transcript.assistantTextRecordCount} assistant text message(s), ${transcript.toolCallCount} inert tool-call summary record(s), and ${artifact.imageAttachments.length} verified selected image(s)`;
+    if (prepared.remoteStaging !== null && mode !== "manual") {
+      void vscode.window.showInformationMessage(
+        `Cursor opened a new Agent and was asked to attach the verified remote START-HERE.md and recovery transcript (${summary}). The selected PNGs were copied to the same remote staging directory and are listed by exact remote path in START-HERE.md; they were not attached as generic file chips. Verify the two Markdown attachment chips before continuing. Nothing was sent, and this extension did not rewrite the original conversation; Cursor may persist the newly opened empty Agent.${remoteStagingRetention(prepared.remoteStaging)}`,
+      );
+      return;
+    }
     if (mode === "glass") {
       void vscode.window.showInformationMessage(
         `Cursor opened a new Agent and was asked to attach the verified Markdown recovery context and selected images (${summary}). Verify that its .md and image attachment chips are visible. The suggested continuation instruction is embedded near the top of the transcript; nothing was sent, and the original conversation was not changed. The plaintext files remain in the local recovery-transcripts folder until you explicitly delete those recovery files.`,
@@ -1999,11 +2057,16 @@ export class SyncManager implements vscode.Disposable {
     }
     const open = "Open Recovery Transcript";
     const choice = await vscode.window.showWarningMessage(
-      `Cursor's supported new-Agent context command was unavailable or rejected on this build. The verified Markdown recovery context and selected images were saved locally (${summary}); open the Markdown file and attach it plus every image listed in its verified attachment manifest to a new Agent. Its suggested continuation instruction is embedded near the top. Nothing was sent, the original conversation was not changed, and the plaintext files remain in the local recovery-transcripts folder until you explicitly delete those recovery files.`,
+      prepared.remoteStaging === null
+        ? `Cursor's supported new-Agent context command was unavailable or rejected on this build. The verified Markdown recovery context and selected images were saved locally (${summary}); open the Markdown file and attach it plus every image listed in its verified attachment manifest to a new Agent. Its suggested continuation instruction is embedded near the top. Nothing was sent, the original conversation was not changed, and the plaintext files remain in the local recovery-transcripts folder until you explicitly delete those recovery files.`
+        : `Cursor's supported new-Agent context command was unavailable or rejected on this build. It may have partially opened an empty Agent or attached only some files before rejecting. Open the remote START-HERE.md and attach it plus the remote transcript manually; selected PNGs are listed there by exact remote path and should not be attached as generic file chips. Nothing was sent, and this extension did not rewrite the original conversation; Cursor may have persisted a partially prepared Agent.${remoteStagingRetention(prepared.remoteStaging)}`,
       open,
     );
     if (choice === open) {
-      await vscode.commands.executeCommand("vscode.open", resource);
+      await vscode.commands.executeCommand(
+        "vscode.open",
+        prepared.primaryResource,
+      );
     }
   }
 
@@ -2031,7 +2094,7 @@ export class SyncManager implements vscode.Disposable {
     const result = await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Notification,
-        title: "Cursor Setting Sync: Preserve All Recoverable Chats Safely",
+        title: "Cursor Setting Sync: Building Recovery Catalog",
         cancellable: true,
       },
       async (progress, cancellationToken) =>
@@ -2042,7 +2105,7 @@ export class SyncManager implements vscode.Disposable {
     );
     if (result === null) {
       void vscode.window.showInformationMessage(
-        "Another Cursor window is already building the recovery catalog. Let that command finish, then run Preserve All Recoverable Chats Safely again.",
+        'Another Cursor window is already building the recovery catalog. Let it finish, then open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select "Preserve All Safely".',
       );
       return;
     }
@@ -2087,7 +2150,7 @@ export class SyncManager implements vscode.Disposable {
     );
     if (ready.length === 0) {
       void vscode.window.showInformationMessage(
-        "The local recovery catalog has no verified chat artifact ready to open. Run Preserve All Recoverable Chats Safely first.",
+        'The local recovery catalog has no verified chat artifact ready to open. Open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select "Preserve All Safely" first.',
       );
       return;
     }
@@ -2134,15 +2197,31 @@ export class SyncManager implements vscode.Disposable {
         composerCursor,
       },
     );
-    if (!workspaceUriIsOpen(transcript.workspaceUri)) {
+    const openWorkspaceUri = matchingOpenWorkspaceUri(transcript.workspaceUri);
+    if (openWorkspaceUri === null) {
       void vscode.window.showWarningMessage(
-        "Open the recovered conversation's original workspace in this Cursor window, then run Open Recovered Chat Safely again. No Agent was created and nothing was attached or sent.",
+        'Open the recovered conversation\'s original workspace in this Cursor window, then open "Cursor Setting Sync: Manage" and choose "Open Recovered Chat" again. No Agent was created and nothing was attached or sent.',
       );
       return;
     }
+    const prepared = await prepareRecoveryResources(
+      openWorkspaceUri,
+      paths,
+      stagingSourcesForCatalogEntry(choice.entry, paths),
+    );
+    if (prepared === null) {
+      return;
+    }
+    if (
+      prepared.remoteStaging !== null &&
+      !(await reverifyRemoteStagingBeforeAgent(prepared.remoteStaging))
+    ) {
+      return;
+    }
     // This is deliberately the final awaited preflight. Artifact reads and
-    // transcript extraction may take time; a Cursor write during either must
-    // be observed before any new Agent is prepared.
+    // transcript extraction and optional remote staging may take time; a
+    // Cursor write during any of them must be observed before a new Agent is
+    // prepared.
     const freshness = await inspectBrokenCursorChatContinuations(this.paths, {
       composerCursor,
       limits: { maxSnapshotBytesPerChat: 32 * 1024 * 1024 },
@@ -2159,31 +2238,48 @@ export class SyncManager implements vscode.Disposable {
           ? "The selected conversation could not be safely re-audited."
           : "The selected conversation is now complete or changed since this catalog entry was created.";
       void vscode.window.showWarningMessage(
-        `${detail} This preserved entry remains in the catalog, but it cannot be opened automatically. No Agent was created and nothing was attached or sent.`,
+        `${detail} This preserved entry remains in the catalog, but it cannot be opened automatically. No Agent was created and nothing was attached or sent.${remoteStagingRetention(prepared.remoteStaging)}`,
       );
       return;
     }
-    if (!workspaceUriIsOpen(transcript.workspaceUri)) {
+    const freshWorkspaceUri = matchingOpenWorkspaceUri(transcript.workspaceUri);
+    if (
+      freshWorkspaceUri === null ||
+      freshWorkspaceUri.scheme !== openWorkspaceUri.scheme ||
+      freshWorkspaceUri.authority !== openWorkspaceUri.authority
+    ) {
       void vscode.window.showWarningMessage(
-        "The recovered conversation's original workspace changed or closed during verification. Open it in this Cursor window, then run Open Recovered Chat Safely again. No Agent was created and nothing was attached or sent.",
+        `The recovered conversation's original workspace changed or closed during verification. Open it in this Cursor window, then open "Cursor Setting Sync: Manage" and choose "Open Recovered Chat" again. No Agent was created and nothing was attached or sent.${remoteStagingRetention(prepared.remoteStaging)}`,
       );
       return;
     }
-    const resources = paths.map((path) => vscode.Uri.file(path));
-    const mode = await prepareVisibleRecoveryAgent(vscode.commands, resources);
+    const mode = await prepareVisibleRecoveryAgent(
+      vscode.commands,
+      prepared.resources,
+    );
     if (mode !== "manual") {
       void vscode.window.showInformationMessage(
-        "Cursor opened a new Agent and was asked to attach the verified recovery transcript and images. Verify the attachment chips before continuing. Nothing was sent, and the original chat was not changed.",
+        prepared.remoteStaging === null
+          ? "Cursor opened a new Agent and was asked to attach the verified recovery transcript and images. Verify the attachment chips before continuing. Nothing was sent, and the original chat was not changed."
+          : `Cursor opened a new Agent and was asked to attach the verified remote START-HERE.md and recovery transcript. Selected PNGs were staged on the same remote authority and are listed by exact remote path in START-HERE.md; they were not attached as generic file chips. Verify the two Markdown attachment chips before continuing. Nothing was sent, and this extension did not rewrite the original chat; Cursor may persist the newly opened empty Agent.${remoteStagingRetention(prepared.remoteStaging)}`,
       );
       return;
     }
-    const openTranscript = "Open Recovery Transcript";
+    const openTranscript =
+      prepared.remoteStaging === null
+        ? "Open Recovery Transcript"
+        : "Open Remote START-HERE";
     const manualChoice = await vscode.window.showWarningMessage(
-      "Cursor's supported new-Agent context command was unavailable or rejected on this build. It may have partially opened an empty Agent or attached only some files before rejecting. The catalog artifact was reverified and nothing was sent; inspect the current Agent before opening the transcript, then attach the transcript plus every listed image exactly once.",
+      prepared.remoteStaging === null
+        ? "Cursor's supported new-Agent context command was unavailable or rejected on this build. It may have partially opened an empty Agent or attached only some files before rejecting. The catalog artifact was reverified and nothing was sent; inspect the current Agent before opening the transcript, then attach the transcript plus every listed image exactly once."
+        : `Cursor's supported new-Agent context command was unavailable or rejected on this build. It may have partially opened an empty Agent or attached only some files before rejecting. The remote staged files were reverified and nothing was sent; inspect the current Agent before opening START-HERE.md, then attach START-HERE.md and the transcript only. Read selected PNGs through the exact remote paths listed there instead of attaching generic image file chips.${remoteStagingRetention(prepared.remoteStaging)}`,
       openTranscript,
     );
     if (manualChoice === openTranscript) {
-      await vscode.commands.executeCommand("vscode.open", resources[0]);
+      await vscode.commands.executeCommand(
+        "vscode.open",
+        prepared.primaryResource,
+      );
     }
   }
 
@@ -2798,6 +2894,18 @@ export class SyncManager implements vscode.Disposable {
               ) {
                 continue;
               }
+              const continuationClosure =
+                await verifyPortableChatContinuationClosure(snapshot, {
+                  limits: {
+                    maxNodes: MAX_CHAT_REPAIR_AGENT_KV_IDS,
+                    maxBytes: MAX_CHAT_REPAIR_AGENT_KV_BYTES,
+                    maxDepth: 256,
+                    maxProtobufDepth: 64,
+                  },
+                });
+              if (continuationClosure.status !== "complete") {
+                continue;
+              }
               const sourceOrigin = effectiveSyncOrigin(source.change.metadata);
               if (
                 sourceOrigin !== "agent-kv-enrichment" &&
@@ -2885,7 +2993,7 @@ export class SyncManager implements vscode.Disposable {
           lackingSourceCount === 1 ? "" : "s"
         } ${lackingSourceCount === 1 ? "does" : "do"} not have a complete synchronized v2 copy queued here: this PC and the synchronized legacy history lack the continuation blobs needed to resume ${
           lackingSourceCount === 1 ? "it" : "them"
-        }. Nothing was changed.${oversizedSourceDetail} Update Cursor Setting Sync and run Sync Now on a PC where the affected chat still continues; then run Sync Now on this PC and choose Restart to Apply. Preserve All Safely catalogs only definite continuation-damaged chats whose visible message bodies can still be verified; separately reported missing message-body chats still require a source PC or database backup.${
+        }. Nothing was changed.${oversizedSourceDetail} Update Cursor Setting Sync on a PC where the affected chat still continues and let its automatic cycle finish (or choose Manage → Sync Now); then let this PC synchronize and close Cursor normally to apply, or choose Manage → Apply Queued Changes. Preserve All Safely catalogs only definite continuation-damaged chats whose visible message bodies can still be verified; separately reported missing message-body chats still require a source PC or database backup.${
           incompleteDetail.length === 0 ? "" : ` ${incompleteDetail}`
         }`;
       const continueSafely = "Continue Safely in New Agent";
@@ -3540,7 +3648,7 @@ export class SyncManager implements vscode.Disposable {
             confirmationBudgetDeferred === 0
               ? ""
               : `, or ${confirmationBudgetDeferred} repair${confirmationBudgetDeferred === 1 ? " exceeded" : "s exceeded"} the bounded history/output memory limit`
-          }. Nothing was changed; run Repair Unavailable Chats again.${
+          }. Nothing was changed; open "Cursor Setting Sync: Manage" and choose "Repair Unavailable Chats" again.${
             freshInspectionDetail.length === 0
               ? ""
               : ` ${freshInspectionDetail}`
@@ -3574,7 +3682,7 @@ export class SyncManager implements vscode.Disposable {
         changedWhileConfirming === 0
           ? "."
           : `; ${changedWhileConfirming} changed or exceeded a bounded repair memory limit during confirmation and was left untouched.`
-      } Run "Cursor Setting Sync: Restart to Apply" when you are ready to close Cursor and apply the transactional repair.${
+      } Open "${RESTART_TO_APPLY_TITLE}" when you are ready to close Cursor and apply the transactional repair.${
         [
           deferredInspectionDetail,
           freshInspectionDetail,
@@ -3931,7 +4039,7 @@ export class SyncManager implements vscode.Disposable {
         )
       ) {
         void vscode.window.showWarningMessage(
-          `${resourceId} changed while the version was being selected; run Restore Version History again.`,
+          `${resourceId} changed while the version was being selected; open "Cursor Setting Sync: Manage" and choose "Restore Version History" again.`,
         );
         return;
       }
@@ -4004,7 +4112,7 @@ export class SyncManager implements vscode.Disposable {
     await this.syncNow(true);
     if (isDatabaseBackedKind(selectedVersion.summary.kind)) {
       void vscode.window.showInformationMessage(
-        `The restored version of "${selectedResource.label}" is queued for the offline helper. Run "Cursor Setting Sync: Restart to Apply" to write it into the Cursor databases.`,
+        `The restored version of "${selectedResource.label}" is queued for the offline helper. Open "${RESTART_TO_APPLY_TITLE}" to write it into the Cursor databases.`,
       );
     } else {
       void vscode.window.showInformationMessage(
@@ -4454,85 +4562,12 @@ export class SyncManager implements vscode.Disposable {
     );
   }
 
-  async showRepositoryUsage(): Promise<void> {
-    const repository = this.requireRepository();
-    const bytes = await directorySize(repository.root);
-    void vscode.window.showInformationMessage(
-      `Cursor Setting Sync repository uses ${formatBytes(bytes)}. v1 does not automatically delete immutable events or tombstones.`,
-    );
-    if (await this.gitModeFor(repository.root)) {
-      await this.warnAboutLargeFiles(repository.root, false);
-    }
-  }
-
-  async compactRepository(): Promise<void> {
-    await this.withProgress(
-      "Cursor Setting Sync: Compact Safe Orphans",
-      async (report) => {
-        report("Reading the repository...");
-        await this.compactSafeOrphans();
-      },
-    );
-  }
-
-  private async compactSafeOrphans(): Promise<void> {
-    const repository = this.requireRepository();
-    const lock = await this.takeCommandLock(repository);
-    try {
-      const gitActive = await this.openGitWindow(repository);
-      await repository.refreshState();
-      const reconciler = new EventReconciler();
-      const checkpoint = await absorbedCheckpointManifest(repository);
-      const result = reconciler.reconcile(
-        await repository.listReconciliationEvents(checkpoint),
-        repository.state,
-        checkpoint,
-      );
-      if (result.warnings.length > 0) {
-        throw new Error(
-          `Compaction requires a fully propagated repository; resolve this stream warning first: ${result.warnings[0]}`,
-        );
-      }
-      const compacted = await repository.compactOwnOrphans(true);
-      await this.commitGitWindow(gitActive, repository.root, "compact");
-      void vscode.window.showInformationMessage(
-        `Removed ${compacted.removedFiles} safe staging/orphan file(s) and reclaimed ${formatBytes(compacted.reclaimedBytes)}. Finalized events, tombstones, and checkpoint-referenced objects were retained.`,
-      );
-    } finally {
-      await lock.release();
-    }
-  }
-
-  async checkpointRepository(): Promise<void> {
-    const repository = this.requireRepository();
-    // The full sync throws on any rollback error; residual stream warnings are
-    // caught by the reconcile gate inside each phase run.
-    await this.syncNow(true);
-    let outcome = await this.runCheckpointPhases(repository, false);
-    if (isAgeGateAbort(outcome.prune)) {
-      const confirmed = await vscode.window.showWarningMessage(
-        "Every visible device has absorbed the checkpoint, but it is younger than 24 hours. A device that has not appeared in the shared folder yet would fall back to the checkpoint content and lose granular history. Prune now anyway?",
-        { modal: true },
-        "Prune Now Anyway",
-      );
-      if (confirmed === "Prune Now Anyway") {
-        const second = await this.runCheckpointPhases(repository, true);
-        outcome = {
-          created: outcome.created ?? second.created,
-          prune: second.prune,
-          gitSquash: second.gitSquash ?? outcome.gitSquash,
-        };
-      }
-    }
-    this.reportCheckpointOutcome(outcome);
-  }
-
   private async runCheckpointPhases(
     repository: SyncRepository,
     overrideAgeGate: boolean,
   ): Promise<CheckpointCommandOutcome> {
     return this.withProgress(
-      "Cursor Setting Sync: Checkpoint & Prune History",
+      "Cursor Setting Sync: Automatic Repository Maintenance",
       async (report) => this.checkpointPhases(repository, overrideAgeGate, report),
     );
   }
@@ -4591,7 +4626,7 @@ export class SyncManager implements vscode.Disposable {
         report("Waiting for every device to absorb the current checkpoint...");
         this.status.log(
           `Kept the existing checkpoint rather than adding another: ${lagging.join("; ")}. ` +
-            'Run "Cursor Setting Sync: Forget Device" for a computer that is gone.',
+            'Open "Cursor Setting Sync: Manage" and choose "Forget Device" for a computer that is gone.',
         );
       }
       if (created === null && repository.state.checkpoint === undefined) {
@@ -4662,54 +4697,6 @@ export class SyncManager implements vscode.Disposable {
     }
   }
 
-  private reportCheckpointOutcome(outcome: CheckpointCommandOutcome): void {
-    const { created, prune, gitSquash } = outcome;
-    const parts: string[] = [];
-    if (created !== null) {
-      parts.push(
-        `Checkpoint ${created.checkpointHash.slice(0, 12)} created with ${created.resourceCount} folded resource(s) (${formatBytes(created.fileBytes)}).`,
-      );
-    }
-    if (prune === null) {
-      void vscode.window.showInformationMessage(
-        created === null
-          ? "The repository has no events to checkpoint yet."
-          : parts.join(" "),
-      );
-      return;
-    }
-    if (prune.status === "pruned") {
-      for (const warning of prune.warnings) {
-        this.status.log(`Warning: ${warning}`);
-      }
-      parts.push(
-        `Pruned ${prune.eventsDeleted} event file(s), removed ${prune.checkpointFilesDeleted} superseded checkpoint file(s), and reclaimed ${formatBytes(prune.reclaimedBytes)}.`,
-      );
-      if (
-        gitSquash !== null &&
-        gitSquash.bytesBefore !== null &&
-        gitSquash.bytesAfter !== null
-      ) {
-        parts.push(
-          `Git history squashed, reclaiming ${formatBytes(
-            Math.max(0, gitSquash.bytesBefore - gitSquash.bytesAfter),
-          )}.`,
-        );
-      }
-      void vscode.window.showInformationMessage(parts.join(" "));
-      return;
-    }
-    const lagging =
-      prune.laggingDevices.length === 0
-        ? ""
-        : ` Lagging device(s): ${prune.laggingDevices.join("; ")}.`;
-    void vscode.window.showWarningMessage(
-      `${parts.length === 0 ? "" : `${parts.join(" ")} `}Pruning was skipped: ${
-        prune.reason ?? "unknown reason"
-      }${lagging}`,
-    );
-  }
-
   async archiveRepository(): Promise<void> {
     const repository = this.requireRepository();
     const selected = await vscode.window.showOpenDialog({
@@ -4736,7 +4723,7 @@ export class SyncManager implements vscode.Disposable {
       throw new Error("The archive destination must be outside the live repository.");
     }
     await this.withProgress(
-      "Cursor Setting Sync: Archive Repository",
+      "Cursor Setting Sync: Archiving Repository",
       async (report) => {
         // Held for the whole copy: without it this window's own 30-second
         // poll, automatic maintenance, or the offline helper deletes event
@@ -4884,8 +4871,8 @@ export class SyncManager implements vscode.Disposable {
       if (manual) {
         void vscode.window.showInformationMessage(
           unconfigured
-            ? "Cursor Setting Sync is not configured yet. Run \"Cursor Setting Sync: Setup\" first."
-            : "Cursor Setting Sync is locked. Run \"Cursor Setting Sync: Setup\" and enter your passphrase to unlock it.",
+            ? 'Cursor Setting Sync is not configured yet. Open "Cursor Setting Sync: Manage" and choose "Setup or Reconfigure" first.'
+            : 'Cursor Setting Sync is locked. Open "Cursor Setting Sync: Manage", choose "Setup or Reconfigure", and enter your passphrase to unlock it.',
         );
       }
       return;
@@ -5195,7 +5182,7 @@ export class SyncManager implements vscode.Disposable {
       );
       const publishedCount =
         publishable.snapshots.length + publishable.deletions.length;
-      const totalPublishedCount = publishedCount + agentKvEnrichedCount;
+      let totalPublishedCount = publishedCount + agentKvEnrichedCount;
       // A publish failure must not stop this device from *receiving*. The
       // publish call used to sit in front of applyProjections, so one
       // unpublishable resource stopped every other device's changes from being
@@ -5236,6 +5223,86 @@ export class SyncManager implements vscode.Disposable {
       autoMergedPublished ||= postPublishAutoMerged;
       if (postPublishAutoMerged) {
         result = await this.reconcileCurrentRepository(repository, checkpoint);
+      }
+      // Enrichment normally runs before the local scan so an old v1 tip can be
+      // upgraded without re-reading every chat. A brand-new/changed chat does
+      // not have a repository tip at that point: the old ordering published a
+      // renderable v1 body, returned from Sync Now, and left its continuation
+      // graph for the *next* cycle. A peer could apply that intermediate tip
+      // first and create the exact "conversation renders, next prompt fails"
+      // state this transport is meant to prevent.
+      //
+      // Revisit only the chats this cycle successfully published. A failed
+      // batch can leave the repository tip at an older version; enriching
+      // that tip would not complete the chat this scan tried to publish and
+      // would make the same-cycle guarantee/reporting false.
+      //
+      // existing enrichment gate keeps complete v2 tips out, caps the batch at
+      // two recent chats/32 MiB, reads the repository core rather than a local
+      // substitute, and publishes only hash-verified reachable blobs. Larger
+      // backlogs remain on the normal resumable round-robin; the active chat
+      // becomes complete in the same manual/background cycle whenever B still
+      // owns its graph.
+      const justPublishedChatIds = new Set(
+        publishable.snapshots
+          .filter((snapshot) => snapshot.kind === "chat")
+          .map((snapshot) => snapshot.resourceId),
+      );
+      if (
+        publishError === null &&
+        justPublishedChatIds.size > 0 &&
+        this.configuration.syncChat &&
+        this.compatibility.databaseCapabilities["global-chat"].available
+      ) {
+        const tips = Object.create(null) as Record<string, ResourceTip[]>;
+        for (const resourceId of justPublishedChatIds) {
+          tips[resourceId] = repository.state.tips[resourceId] ?? [];
+        }
+        const candidateIndex = buildChatTipEnrichmentCandidateIndex(tips);
+        if (candidateIndex.length > 0) {
+          try {
+            const enriched = await enrichCurrentChatTipsFromLiveDatabase(
+              repository,
+              this.paths.globalDatabase,
+              {
+                cursor: { afterResourceId: null },
+                candidateIndex,
+                candidateGeneration: repository.sharedGraphGeneration,
+                maxPayloadBytes: repository.maxPayloadBytes,
+                attemptCache: this.chatTipEnrichmentAttempts,
+                forceRetry: manual,
+                tipAllowed: (tip) =>
+                  this.resourceApplyBlockReason(tip) === null,
+              },
+            );
+            for (const warning of enriched.warnings) {
+              this.status.log(warning);
+            }
+            if (enriched.published > 0) {
+              agentKvEnrichedCount += enriched.published;
+              totalPublishedCount += enriched.published;
+              // The child tips changed both the shared graph and the exact
+              // projections A will queue. Reconcile before any apply decision;
+              // a later poll must never be required merely to see this cycle's
+              // complete v2 child.
+              result = await this.reconcileCurrentRepository(
+                repository,
+                checkpoint,
+              );
+              this.chatTipEnrichmentIndex = null;
+              this.chatTipEnrichmentCursor = { afterResourceId: null };
+            }
+          } catch (error) {
+            // The ordinary chat body is already durable. Keep synchronization
+            // moving, but the receiving-side completeness block below ensures
+            // no peer materializes this intermediate tip as resume-ready.
+            this.status.log(
+              `Post-publish agent blob enrichment was skipped: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+        }
       }
       // Warnings are deduped per source. A cycle that did not run an adapter
       // leaves that adapter's bucket untouched, so an alternating files/chat
@@ -5413,7 +5480,10 @@ export class SyncManager implements vscode.Disposable {
       .showErrorMessage(detail, RESTART_TO_APPLY_TITLE)
       .then((choice) => {
         if (choice === RESTART_TO_APPLY_TITLE) {
-          return vscode.commands.executeCommand(RESTART_TO_APPLY_COMMAND);
+          return vscode.commands.executeCommand(
+            RESTART_TO_APPLY_COMMAND,
+            "apply",
+          );
         }
         return undefined;
       });
@@ -5975,7 +6045,7 @@ export class SyncManager implements vscode.Disposable {
             );
             block(
               snapshot.resourceId,
-              `A local edit to ${snapshot.resourceId} was captured before the queued database write. Synchronize again and resolve the resulting conversation conflict before retrying Restart to Apply.`,
+              `A local edit to ${snapshot.resourceId} was captured before the queued database write. Synchronize again and resolve the resulting conversation conflict before retrying Cursor Setting Sync: Manage → Apply Queued Changes.`,
             );
           } catch (error) {
             block(
@@ -6081,8 +6151,9 @@ export class SyncManager implements vscode.Disposable {
       const sourceWorkspaceUri = tip.metadata?.workspaceUri;
       if (pending.kind === "chat" && sourceWorkspaceId === null) {
         // A workspace-less composer has nothing to map; the helper writes its
-        // NULL workspaceId straight back.
-        delete pending.blockedReason;
+        // NULL workspaceId straight back. Mapping is resolved, but continuation
+        // completeness is an independent apply gate and must survive.
+        clearWorkspaceMappingOwnedBlock(pending, tip);
         continue;
       }
       if (typeof sourceWorkspaceId !== "string") {
@@ -6136,7 +6207,7 @@ export class SyncManager implements vscode.Disposable {
         // not free, because the modal had to be answered before ANY queued
         // change could apply. On a two-machine setup that is how 146 incoming
         // conversations stayed undelivered behind a list of unrelated projects.
-        delete pending.blockedReason;
+        clearWorkspaceMappingOwnedBlock(pending, tip);
         continue;
       }
       if (handled.has(sourceWorkspaceId)) {
@@ -6212,7 +6283,7 @@ export class SyncManager implements vscode.Disposable {
         continue;
       }
       if (reason === null) {
-        delete pending.blockedReason;
+        clearWorkspaceMappingOwnedBlock(pending, tip);
       } else if (pending.kind === "workspace-storage") {
         // Only workspaceStorage is held back for a missing mapping. A chat is
         // written under the workspace ID it came with, so declining to map a
@@ -6516,7 +6587,7 @@ export class SyncManager implements vscode.Disposable {
       repositoryFile.repositoryId !== expectedRepositoryId
     ) {
       throw new Error(
-        "The configured folder now contains a different repository. Point Setup at the original folder, or run \"Cursor Setting Sync: Disconnect\" to clear the stored repository and connect to this one.",
+        'The configured folder now contains a different repository. Use "Cursor Setting Sync: Manage" → "Setup or Reconfigure" to point at the original folder, or choose "Disconnect This PC" to clear the stored repository before connecting to this one.',
       );
     }
     // Keep the candidate key private to this attempt. Publishing it on the
@@ -6874,7 +6945,7 @@ export class SyncManager implements vscode.Disposable {
       } else {
         this.status.setStatus(
           "up-to-date",
-          "Another Cursor window owns background synchronization. Run Sync Now or another repository command to load state in this window.",
+          'Another Cursor window owns background synchronization. Open "Cursor Setting Sync: Manage" and choose "Sync Now" to load state in this window.',
         );
       }
     }
@@ -7441,7 +7512,7 @@ export class SyncManager implements vscode.Disposable {
           );
         } else if (request?.mode === "restore-backup") {
           void vscode.window.showWarningMessage(
-            "The requested restore never reported a result and may not have run. Check the data and run \"Cursor Setting Sync: Restore Backup\" again if needed.",
+            'The requested restore never reported a result and may not have run. Check the data, then open "Cursor Setting Sync: Manage" and choose "Restore Database Backup" again if needed.',
           );
         }
       } else {
@@ -7449,7 +7520,7 @@ export class SyncManager implements vscode.Disposable {
         // user explicitly confirmed is not: name it even then.
         if (request?.mode === "restore-backup") {
           this.status.log(
-            `Cleared a queued restore (${name}) whose helper was removed by an extension update; run "Cursor Setting Sync: Restore Backup" again.`,
+            `Cleared a queued restore (${name}) whose helper was removed by an extension update; open "Cursor Setting Sync: Manage" and choose "Restore Database Backup" again.`,
           );
         }
       }
@@ -8022,7 +8093,7 @@ export function settledStatus(input: {
       input.helperWarnings > 0
         ? "partial"
         : "up-to-date",
-    detail: `${details.join(" ")} Run "Cursor Setting Sync: Show Diagnostics".`,
+    detail: `${details.join(" ")} Open "Cursor Setting Sync: Manage" and choose "Show Diagnostics".`,
   };
 }
 
@@ -8555,7 +8626,7 @@ function chatRepairDeferredInspectionDetail(
             deferredBrokenChats === 1 ? " was" : "s were"
           } deferred by the command memory safety limit.`;
     detail.push(
-      `${deferred} Apply or otherwise resolve this batch, then run Repair Unavailable Chats again to inspect the next batch.`,
+      `${deferred} Apply or otherwise resolve this batch, then open "Cursor Setting Sync: Manage" and choose "Repair Unavailable Chats" again to inspect the next batch.`,
     );
   }
   if (oversizedChats > 0) {
@@ -8643,7 +8714,7 @@ function recoveryCatalogCompletionSummary(
     : result.quotaReached !== null
       ? `Stopped cleanly at the bounded recovery catalog ${recoveryCatalogQuotaLabel(result.quotaReached)} quota after cataloguing ${processed} conversation${processed === 1 ? "" : "s"}. Completed catalog checkpoints were kept.${recoveryCatalogQuotaDetail(result.quotaReached)}`
       : result.databaseChanged
-        ? `Cursor's live chat database changed during the multi-page audit. ${processed} verified catalog checkpoint${processed === 1 ? " was" : "s were"} kept, but the result is intentionally incomplete; run Preserve All Recoverable Chats Safely again for a stable full pass.`
+        ? `Cursor's live chat database changed during the multi-page audit. ${processed} verified catalog checkpoint${processed === 1 ? " was" : "s were"} kept, but the result is intentionally incomplete; open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select "Preserve All Safely" for a stable full pass.`
       : result.incomplete
       ? `Stopped at the bounded bulk command limit after cataloguing ${processed} conversation${processed === 1 ? "" : "s"}. Completed catalog checkpoints were kept.`
       : `Finished the bounded audit of ${result.examinedChats} continuation record${result.examinedChats === 1 ? "" : "s"} and catalogued ${processed} definite continuation-damaged conversation${processed === 1 ? "" : "s"}.`;
@@ -8914,7 +8985,7 @@ function chatRepairFreshInspectionDetail(
     detail.push(
       `The final memory-bounded recheck deferred ${deferred}; ${
         deferredBrokenChats === 1 ? "it was" : "they were"
-      } left unchanged. Run Repair Unavailable Chats again to re-evaluate ${
+      } left unchanged. Open "Cursor Setting Sync: Manage" and choose "Repair Unavailable Chats" again to re-evaluate ${
         deferredBrokenChats === 1 ? "it" : "them"
       }.`,
     );
@@ -9010,6 +9081,15 @@ export function helperFailureDetail(error: string | null): string {
   return summary.length === 0
     ? `The offline helper failed. ${retry}`
     : `${summary} Nothing was applied, so the queued changes are still here. ${retry}`;
+}
+
+/** Permanent machine-local exclusions are not outstanding repository work. */
+export function pendingDatabaseChangesBlockMaintenance(
+  pending: readonly PendingDatabaseChange[],
+): boolean {
+  return pending.some(
+    (change) => !isPermanentExclusionReason(change.blockedReason),
+  );
 }
 
 /**
@@ -9322,14 +9402,6 @@ function checkpointCoversStreams(
     }
   }
   return true;
-}
-
-function isAgeGateAbort(prune: PruneResult | null): boolean {
-  return (
-    prune !== null &&
-    prune.status === "aborted" &&
-    (prune.reason?.includes("younger than 24 hours") ?? false)
-  );
 }
 
 function historyPreviewText(
@@ -10031,9 +10103,42 @@ const WORKSPACE_MAPPING_BLOCK_PREFIX =
 
 export const WORKSPACE_MAPPING_BLOCK_REASON =
   `${WORKSPACE_MAPPING_BLOCK_PREFIX} workspace storage. ` +
-  'Run "Cursor Setting Sync: Restart to Apply" to be asked again, after opening the folder on this computer.';
+  `Open "${RESTART_TO_APPLY_TITLE}" to be asked again, after opening the folder on this computer.`;
 
 const FOLDERLESS_WORKSPACE_BLOCK_REASON = PERMANENT_EXCLUSION_REASONS[3];
+
+/**
+ * Clears only the block owned by workspace mapping.
+ *
+ * Chat continuation completeness is independent of where the chat is stored.
+ * The mapping pass used to delete that derived block for workspace-less,
+ * unmapped, and successfully mapped chats immediately before persisting the
+ * offline queue. Re-derive it here so every mapping-clear path has the same
+ * fail-closed result.
+ */
+function clearWorkspaceMappingOwnedBlock(
+  pending: PendingDatabaseChange,
+  tip: ResourceTip,
+): void {
+  const current = pending.blockedReason;
+  if (
+    current !== undefined &&
+    !current.startsWith(WORKSPACE_MAPPING_BLOCK_PREFIX) &&
+    current !== FOLDERLESS_WORKSPACE_BLOCK_REASON &&
+    current !== INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON
+  ) {
+    // Apply failures, live-payload failures and other owners survive a mapping
+    // pass. Resolving a workspace must not silently re-offer a change whose
+    // prior database write failed.
+    return;
+  }
+  const continuationBlock = chatContinuationApplyBlockReason(tip);
+  if (continuationBlock === undefined) {
+    delete pending.blockedReason;
+  } else {
+    pending.blockedReason = continuationBlock;
+  }
+}
 
 /**
  * True for a block the workspace-mapping pass set, which the per-cycle queueing
@@ -10076,6 +10181,8 @@ export function queuePending(
   blockedReason?: string,
 ): boolean {
   const tip = projection.tip;
+  const effectiveBlockedReason =
+    blockedReason ?? chatContinuationApplyBlockReason(tip);
   if (
     isPolicyExcludedUiStateResource(projection.resourceId, tip.kind) ||
     isUnscannableIncomingResource(projection.resourceId, tip.kind, tip.metadata)
@@ -10098,7 +10205,7 @@ export function queuePending(
       pending.changeIndex === tip.changeIndex,
   );
   if (existing !== undefined) {
-    if (blockedReason === undefined) {
+    if (effectiveBlockedReason === undefined) {
       // A workspace-mapping block outlives this pass; only the mapping pass
       // clears it, and it does so the moment the workspace resolves. See
       // isWorkspaceMappingBlockReason for what deleting it here used to cost.
@@ -10110,10 +10217,10 @@ export function queuePending(
         return true;
       }
     } else {
-      if (existing.blockedReason === blockedReason) {
+      if (existing.blockedReason === effectiveBlockedReason) {
         return false;
       }
-      existing.blockedReason = blockedReason;
+      existing.blockedReason = effectiveBlockedReason;
       return true;
     }
     return false;
@@ -10123,11 +10230,24 @@ export function queuePending(
     changeIndex: tip.changeIndex,
     resourceId: projection.resourceId,
     kind: tip.kind,
-    ...(blockedReason === undefined ? {} : { blockedReason }),
+    ...(effectiveBlockedReason === undefined
+      ? {}
+      : { blockedReason: effectiveBlockedReason }),
   });
   return true;
 }
 
+/**
+ * Never materialize an ordinary cross-device chat before its continuation
+ * graph is complete. A legacy/v1 or partial-v2 body can render perfectly while
+ * Cursor rejects the very next prompt with `Conversation data missing`; the
+ * complete child tip supersedes this blocked entry as soon as the source PC
+ * publishes its hash-verified graph.
+ *
+ * Automatic message-body repair is deliberately exempt. It repairs a chat
+ * that is already unavailable and the helper records a one-shot live graph
+ * recapture request for that exact core.
+ */
 function prunePending(
   repository: SyncRepository,
   projections: ResourceProjection[],
@@ -10186,6 +10306,13 @@ export function pendingHelperBatch(repository: SyncRepository): PendingHelperBat
         pending.changeIndex,
       );
       if (tip === undefined) {
+        continue;
+      }
+      if (chatContinuationApplyBlockReason(tip) !== undefined) {
+        // A stale state file from an older build can still contain an
+        // unblocked v1/partial-v2 entry. This last gate keeps it out of the
+        // offline helper even before the next normal reconciliation rewrites
+        // its queued block reason.
         continue;
       }
       if (
@@ -10678,7 +10805,7 @@ export async function autoMergeConflicts(
       onWarning(
         `The automatic merge of ${conflict.resourceId} failed (${
           error instanceof Error ? error.message : String(error)
-        }), so the conflict is waiting for "Cursor Setting Sync: Resolve Conflicts".`,
+        }), so the conflict is waiting for "Cursor Setting Sync: Manage" → "Resolve Conflicts".`,
       );
       continue;
     }
@@ -11253,7 +11380,7 @@ async function publishAutoMerge(
           repository.maxPayloadBytes,
         )} The automatic merge of ${conflict.resourceId} produced more than ` +
           'either side did, so the conflict is waiting for "Cursor Setting ' +
-          'Sync: Resolve Conflicts".',
+          'Sync: Manage" → "Resolve Conflicts".',
       );
       return false;
     }
@@ -11265,7 +11392,7 @@ async function publishAutoMerge(
     onWarning(
       `The automatic merge of ${conflict.resourceId} could not be published (${
         error instanceof Error ? error.message : String(error)
-      }), so the conflict is waiting for "Cursor Setting Sync: Resolve Conflicts".`,
+      }), so the conflict is waiting for "Cursor Setting Sync: Manage" → "Resolve Conflicts".`,
     );
     return false;
   }
@@ -11445,7 +11572,7 @@ function warnAutoMergeWorkDeferred(
       workBudget < CHAT_AUTO_MERGE_MAX_WORK_BYTES
         ? " Increase cursorSettingSync.maxPayloadMiB only if you intend to allow larger per-resource work; the fixed interactive cap still applies."
         : ""
-    } The conflict is waiting for "Cursor Setting Sync: Resolve Conflicts".`,
+    } The conflict is waiting for "Cursor Setting Sync: Manage" → "Resolve Conflicts".`,
   );
 }
 
@@ -11466,21 +11593,289 @@ function isNotepadsTipMetadata(metadata: ResourceTip["metadata"]): boolean {
   );
 }
 
-function workspaceUriIsOpen(expected: string | null): boolean {
-  if (expected === null) {
+interface PreparedRecoveryResources {
+  readonly resources: readonly vscode.Uri[];
+  readonly primaryResource: vscode.Uri;
+  readonly remoteStaging: RecoveryStagingResult | null;
+}
+
+async function prepareRecoveryResources(
+  workspaceUri: vscode.Uri,
+  localPaths: readonly string[],
+  stagingSources: readonly RecoveryStagingSource[],
+): Promise<PreparedRecoveryResources | null> {
+  if (workspaceUri.scheme === "file") {
+    const resources = localPaths.map((path) => vscode.Uri.file(path));
+    const primaryResource = resources[0];
+    if (primaryResource === undefined) {
+      throw new Error("The verified recovery artifact has no transcript.");
+    }
+    return { resources, primaryResource, remoteStaging: null };
+  }
+
+  const selected = await vscode.window.showOpenDialog({
+    // The extension runs in the local UI host. Supplying the recovered
+    // workspace URI is what selects the remote filesystem provider instead of
+    // opening a native local file dialog. A second modal protects against
+    // accidentally keeping the chosen destination inside the workspace.
+    defaultUri: workspaceUri,
+    canSelectFiles: false,
+    canSelectFolders: true,
+    canSelectMany: false,
+    openLabel: "Choose Remote Staging Folder",
+    title: "Choose a Remote Recovery Staging Folder",
+  });
+  const selectedRemoteBaseUri = selected?.[0];
+  if (selectedRemoteBaseUri === undefined) {
+    return null;
+  }
+  if (
+    selected?.length !== 1 ||
+    selectedRemoteBaseUri.scheme !== workspaceUri.scheme ||
+    selectedRemoteBaseUri.authority !== workspaceUri.authority
+  ) {
+    await vscode.window.showWarningMessage(
+      `The selected folder is not on the recovered workspace's exact remote authority (${workspaceUri.scheme}://${workspaceUri.authority}). No recovery files were copied, no Agent was created, and nothing was attached or sent.`,
+    );
+    return null;
+  }
+
+  const sourceBytes = stagingSources.reduce((total, source) => {
+    if (
+      !Number.isSafeInteger(source.byteLength) ||
+      source.byteLength < 0 ||
+      total > Number.MAX_SAFE_INTEGER - source.byteLength
+    ) {
+      throw new Error("Recovery staging source bytes are invalid.");
+    }
+    return total + source.byteLength;
+  }, 0);
+  const stage = "Stage Recovery Files";
+  const confirmation = await vscode.window.showWarningMessage(
+    `Copy exactly ${sourceBytes} bytes (${formatBytes(sourceBytes)}) of verified recovery source data as plaintext to remote authority ${JSON.stringify(selectedRemoteBaseUri.authority)} under path ${JSON.stringify(selectedRemoteBaseUri.path)}? Choose a private remote folder whose permissions you trust: this extension cannot verify or enforce remote permissions or ACLs, and any account or process with access to that path may read the copies.`,
+    {
+      modal: true,
+      detail:
+        "Cursor Setting Sync will create one new isolated recovery subfolder containing content-addressed transcript and PNG files, START-HERE.md, and a small ownership record. The plaintext may contain source code or secrets and remains on that remote host until you explicitly delete the staging folder. The remote provider controls permissions and ACLs; the extension cannot make the selected parent private. Only START-HERE.md and the transcript will be attached to a new Agent; no prompt is sent, this extension does not rewrite the original conversation, and Cursor may persist the newly opened empty Agent.",
+    },
+    stage,
+  );
+  if (confirmation !== stage) {
+    return null;
+  }
+
+  if (remoteFolderIsInsideOpenWorkspace(selectedRemoteBaseUri)) {
+    const insideWorkspace = "Stage inside workspace anyway";
+    const insideConfirmation = await vscode.window.showWarningMessage(
+      `The selected remote folder ${JSON.stringify(selectedRemoteBaseUri.path)} is inside an open workspace. Recovery plaintext could be indexed, committed, or read by workspace tools.`,
+      {
+        modal: true,
+        detail:
+          "Choose this only if you accept storing the recovery transcript and selected images inside the workspace. Nothing has been written yet.",
+      },
+      insideWorkspace,
+    );
+    if (insideConfirmation !== insideWorkspace) {
+      return null;
+    }
+  }
+
+  let remoteStaging: RecoveryStagingResult;
+  try {
+    remoteStaging = await stageRecoveryArtifacts({
+      workspaceUri,
+      selectedRemoteBaseUri,
+      sources: stagingSources,
+      bridge: createRecoveryStagingBridge(),
+    });
+  } catch (error) {
+    const possibleDirectory =
+      error instanceof RecoveryStagingError
+        ? error.possiblyWrittenDirectory
+        : null;
+    const retention =
+      possibleDirectory === null
+        ? ""
+        : ` Plaintext or a bounded partial file may remain on remote authority ${JSON.stringify(possibleDirectory.authority)} under path ${JSON.stringify(possibleDirectory.path)}; inspect that exact path before deleting it.`;
+    await vscode.window.showWarningMessage(
+      `Remote recovery staging failed before an Agent was created: ${recoveryCatalogErrorMessage(error)}.${retention} Nothing was attached or sent, and this extension did not write Cursor's database.`,
+    );
+    return null;
+  }
+  const resources = remoteStaging.agentResources.map((resource) =>
+    vscode.Uri.parse(resource.toString(), true),
+  );
+  const primaryResource = resources[0];
+  if (primaryResource === undefined) {
+    throw new Error("Remote recovery staging returned no start document.");
+  }
+  return { resources, primaryResource, remoteStaging };
+}
+
+function createRecoveryStagingBridge(): RecoveryStagingBridge {
+  return {
+    joinPath: (base, ...segments) =>
+      vscode.Uri.joinPath(vscode.Uri.parse(base.toString(), true), ...segments),
+    stat: async (uri) => {
+      const result = await vscode.workspace.fs.stat(toVscodeUri(uri));
+      return { kind: recoveryStagingFileKind(result.type), size: result.size };
+    },
+    createDirectory: async (uri) => {
+      await vscode.workspace.fs.createDirectory(toVscodeUri(uri));
+    },
+    readFile: async (uri) => vscode.workspace.fs.readFile(toVscodeUri(uri)),
+    writeFile: async (uri, bytes) => {
+      await vscode.workspace.fs.writeFile(toVscodeUri(uri), bytes);
+    },
+    rename: async (source, target, options) => {
+      await vscode.workspace.fs.rename(
+        toVscodeUri(source),
+        toVscodeUri(target),
+        options,
+      );
+    },
+    delete: async (uri, options) => {
+      await vscode.workspace.fs.delete(toVscodeUri(uri), options);
+    },
+    readDirectory: async (uri) =>
+      (await vscode.workspace.fs.readDirectory(toVscodeUri(uri))).map(
+        ([name, type]) => ({ name, kind: recoveryStagingFileKind(type) }),
+      ),
+  };
+}
+
+async function reverifyRemoteStagingBeforeAgent(
+  staging: RecoveryStagingResult,
+): Promise<boolean> {
+  try {
+    await verifyStagedRecovery(staging, createRecoveryStagingBridge());
+    return true;
+  } catch (error) {
+    await vscode.window.showWarningMessage(
+      `The remote recovery staging files changed or failed final read-back verification. No Agent was created and nothing was attached or sent. Inspect the exact remote directory at ${JSON.stringify(staging.directory.path)} on authority ${JSON.stringify(staging.directory.authority)} before deleting it. ${recoveryCatalogErrorMessage(error)}`,
+    );
     return false;
+  }
+}
+
+function toVscodeUri(uri: RecoveryStagingUri): vscode.Uri {
+  return vscode.Uri.parse(uri.toString(), true);
+}
+
+function recoveryStagingFileKind(
+  type: vscode.FileType,
+): "file" | "directory" | "symbolic-link" | "other" {
+  if ((type & vscode.FileType.SymbolicLink) !== 0) {
+    return "symbolic-link";
+  }
+  if ((type & vscode.FileType.File) !== 0) {
+    return "file";
+  }
+  if ((type & vscode.FileType.Directory) !== 0) {
+    return "directory";
+  }
+  return "other";
+}
+
+function remoteFolderIsInsideOpenWorkspace(selected: vscode.Uri): boolean {
+  return (vscode.workspace.workspaceFolders ?? []).some(({ uri }) => {
+    if (
+      uri.scheme !== selected.scheme ||
+      uri.authority !== selected.authority
+    ) {
+      return false;
+    }
+    const rootPath = uri.path.replace(/\/+$/u, "") || "/";
+    const selectedPath = selected.path.replace(/\/+$/u, "") || "/";
+    return (
+      selectedPath === rootPath ||
+      (rootPath === "/"
+        ? selectedPath.startsWith("/")
+        : selectedPath.startsWith(`${rootPath}/`))
+    );
+  });
+}
+
+function remoteStagingRetention(result: RecoveryStagingResult | null): string {
+  return result === null
+    ? ""
+    : ` The remote plaintext staging directory on authority ${JSON.stringify(result.directory.authority)} at path ${JSON.stringify(result.directory.path)} remains until you explicitly delete it.`;
+}
+
+function stagingSourcesForVisibleArtifact(
+  artifact: VisibleChatRecoveryArtifact,
+  transcriptByteLength: number,
+): RecoveryStagingSource[] {
+  return [
+    {
+      kind: "transcript",
+      localPath: artifact.path,
+      sha256: artifact.transcriptHash,
+      byteLength: transcriptByteLength,
+      mimeType: "text/markdown",
+    },
+    ...artifact.imageAttachments.map((image) => ({
+      kind: "image" as const,
+      localPath: image.path,
+      sha256: image.hash,
+      byteLength: image.byteLength,
+      mimeType: "image/png" as const,
+    })),
+  ];
+}
+
+function stagingSourcesForCatalogEntry(
+  entry: RecoveryCatalogReadyEntry,
+  paths: readonly string[],
+): RecoveryStagingSource[] {
+  const transcriptPath = paths[0];
+  if (transcriptPath === undefined) {
+    throw new Error("The verified recovery catalog entry has no transcript.");
+  }
+  if (paths.length !== entry.artifact.images.length + 1) {
+    throw new Error("The recovery catalog artifact list is inconsistent.");
+  }
+  return [
+    {
+      kind: "transcript",
+      localPath: transcriptPath,
+      sha256: entry.artifact.transcript.sha256,
+      byteLength: entry.artifact.transcript.byteLength,
+      mimeType: "text/markdown",
+    },
+    ...entry.artifact.images.map((image, index) => {
+      const localPath = paths[index + 1];
+      if (localPath === undefined) {
+        throw new Error("The recovery catalog image list is inconsistent.");
+      }
+      return {
+        kind: "image" as const,
+        localPath,
+        sha256: image.sha256,
+        byteLength: image.byteLength,
+        mimeType: "image/png" as const,
+      };
+    }),
+  ];
+}
+
+function matchingOpenWorkspaceUri(expected: string | null): vscode.Uri | null {
+  if (expected === null) {
+    return null;
   }
   let expectedUri: vscode.Uri;
   try {
     expectedUri = vscode.Uri.parse(expected, true);
   } catch {
-    return false;
+    return null;
   }
-  return workspaceUriMatchesAny(
-    expectedUri.toString(),
-    (vscode.workspace.workspaceFolders ?? []).map((folder) =>
-      folder.uri.toString(),
-    ),
+  return (
+    (vscode.workspace.workspaceFolders ?? []).find((folder) =>
+      workspaceUriMatchesAny(
+        expectedUri.toString(),
+        [folder.uri.toString()],
+      ),
+    )?.uri ?? null
   );
 }
 

@@ -19,6 +19,12 @@
 
 `repo.json` is created once. Every device writes only inside its own device directory. Final event and object names are immutable. `head.json` and `acks.json` are diagnostic hints and are not synchronization authority.
 
+## Automatic execution and manual control
+
+An elected extension host watches the repository and runs bounded reconciliation cycles automatically, with polling as a fallback. Eligible file resources are validated and applied while Cursor is running. Database-backed resources remain queued until every Cursor process exits normally; the shutdown helper then exports the stopped local state, reconciles, backs up each target database, and applies the queued SQL changes offline. Checkpointing, pruning, git-history compaction, and safe-orphan cleanup are automatic maintenance.
+
+The only public command is `Cursor Setting Sync: Manage`. Its menu contains all on-demand setup and reconfiguration, diagnostics, forced synchronization and queued application, conflict resolution, unavailable-chat repair and recovered-chat opening, synchronized-version and database-backup restore, repository archive, device retirement or restoration, and local disconnect actions. These actions enter the same bounded protocol paths; they do not create alternate synchronization formats.
+
 ## Event streams and resource DAGs
 
 Each device has an increasing sequence whose event header includes the previous event hash. Receivers wait for missing sequence numbers and reject stream forks.
@@ -95,11 +101,11 @@ A git repository is a transport under the same append-only model, not a differen
 
 Deletion is a payload-free tombstone event. Chat, transcript, store, and workspace-storage tombstones prevent resurrection but do not automatically delete local Cursor records or files in protocol v1. Workspace-storage adapters do not originate deletion events. Bounded Cursor user-file, profile-file, settings, extension, and UI-state scanners are also additive-only: their fixed-memory pages do not claim that an unvisited or concurrently changing path/key was deleted. They still understand authenticated historical tombstones on apply; they simply do not originate new ones without a stable whole-generation proof.
 
-Finalized events and tombstones are retained until they are folded into a checkpoint and pruned (see below). `Compact Safe Orphans` requires a warning-free reconcile and removes only old partial files owned by the current device and objects that neither an event nor the absorbed checkpoint references.
+Finalized events and tombstones are retained until they are folded into a checkpoint and pruned (see below). Automatic safe-orphan compaction requires a warning-free reconcile and removes only old partial files owned by the current device and objects that neither an event nor the absorbed checkpoint references.
 
 ## Checkpoints
 
-`Cursor Setting Sync: Checkpoint & Prune History` folds the entire reconciled state into one encrypted checkpoint file so that the event files it covers can later be deleted.
+Automatic checkpoint maintenance folds the entire reconciled state into one encrypted checkpoint file so that the event files it covers can later be deleted. It becomes eligible once the event log passes 500 files. A running extension host waits at least six hours between attempts; restarting Cursor may re-evaluate sooner, but reconciliation, actionable-pending-database, conflict, acknowledgement, and age gates still apply.
 
 ### Format
 
@@ -120,14 +126,14 @@ Every repository open and every state refresh runs load-state → discover/absor
 
 ### Version-2 event headers
 
-Once a device has absorbed a checkpoint, it writes event headers with `protocolVersion: 2`. Builds that predate checkpoints accept only version 1 and fail loudly on the first v2 event instead of silently reconstructing a partial history, and after a prune a marker event guarantees that at least one v2 event exists even for fresh installs. `repo.json` is never rewritten because its authenticated header binds the protocol version to the key unwrap. **Upgrade every device to a checkpoint-aware build before running Checkpoint & Prune for the first time.**
+Once a device has absorbed a checkpoint, it writes event headers with `protocolVersion: 2`. Builds that predate checkpoints accept only version 1 and fail loudly on the first v2 event instead of silently reconstructing a partial history, and after a prune a marker event guarantees that at least one v2 event exists even for fresh installs. `repo.json` is never rewritten because its authenticated header binds the protocol version to the key unwrap. **Upgrade every device to a checkpoint-aware build before automatic checkpoint maintenance first absorbs a checkpoint.**
 
 ### Prune gates
 
 Event files are deleted only under the machine-local sync lock — which does not serialize devices, so all cross-device safety comes from these gates — and only after:
 
 1. **G1 — absorption identity.** Every visible non-retired device's `acks.json` must acknowledge the target checkpoint itself or a checkpoint whose `predecessorHash` ancestry contains it. A plain newer-than comparison is insufficient because a concurrent same-generation checkpoint can compare newer without covering the target's cursors. Missing acks, old acks, or an acknowledged hash the pruner cannot load abort the prune and report which device lags.
-2. **G2 — age.** The checkpoint must be older than 24 hours unless the user explicitly confirms an immediate prune. This protects devices that have not yet appeared in the shared folder.
+2. **G2 — age.** The checkpoint must be older than 24 hours. This protects devices that have not yet appeared in the shared folder.
 
 Only events at or below the checkpoint's per-device cursors are deleted, then superseded checkpoint files are removed. Object compaction runs only when a subsequent reconcile reports zero warnings and never deletes another device's blobs.
 

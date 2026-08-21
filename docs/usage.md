@@ -1,8 +1,10 @@
 # Usage and recovery
 
+Normal operation is automatic after setup: the extension watches and polls the shared repository, applies eligible file resources while Cursor is running, applies queued database-backed resources after every Cursor window closes normally, and performs bounded repository maintenance in the background. All on-demand operations are consolidated under the single public command `Cursor Setting Sync: Manage`. In the instructions below, **open Manage** means run that command and select the named action.
+
 ## Create a repository
 
-1. Install the extension and run `Cursor Setting Sync: Setup`.
+1. Install the extension, open **Manage**, and choose **Setup or Reconfigure**.
 2. Select an empty directory: either inside OneDrive, Syncthing, or another
    shared folder, or anywhere on disk when a git remote provides the transport.
 3. Choose how the empty folder stores the repository:
@@ -23,18 +25,18 @@ The passphrase is required to decrypt the repository and cannot be recovered.
 
 ## Join from another PC
 
-1. Install the extension and run `Cursor Setting Sync: Setup`.
+1. Install the extension, open **Manage**, and choose **Setup or Reconfigure**.
 2. Select the existing shared repository.
 3. Enter the same passphrase.
 4. File resources apply automatically when they do not conflict.
-5. Run `Cursor Setting Sync: Restart to Apply` when database or workspace storage changes are pending.
+5. Close every Cursor window normally when database or workspace-storage changes are pending; the shutdown helper applies them automatically. To apply them immediately, open **Manage** and choose **Apply Queued Changes**.
 6. Select a local workspace mapping if incoming chat or workspace data references a different path.
 
 If a pending database change was created by a newer Cursor, VS Code base, or extension version, it remains deferred. Update the receiving PC and synchronize again. Portable file resources continue synchronizing while the database change is deferred.
 
 ## Git repository
 
-The repository folder can be a git worktree instead of (or in addition to) a OneDrive or Syncthing folder. When `Cursor Setting Sync: Setup` is pointed at an empty folder it offers three choices:
+The repository folder can be a git worktree instead of (or in addition to) a OneDrive or Syncthing folder. When **Setup or Reconfigure** in Manage is pointed at an empty folder it offers three choices:
 
 - **Plain shared folder** — the existing behavior; git is not involved.
 - **Clone an existing git repository** — enter a remote URL; the folder is cloned and setup continues by joining the cloned repository with the shared passphrase.
@@ -54,7 +56,7 @@ A git remote emits no filesystem events, so incoming remote commits are detected
 
 ### Repository size
 
-GitHub rejects individual files over 100 MB and recommends keeping repositories below a few gigabytes. The extension scans the repository in git mode (during `Show Repository Usage` and at most once per hour after a publishing sync) and warns with the offending file and its size — lower `cursorSettingSync.maxPayloadMiB` or disable chat sync for such a repository. Because git history retains deleted event files, `Cursor Setting Sync: Checkpoint & Prune History` also squashes the git history into a single commit after a successful prune, force-pushes it, and reports the reclaimed space; other devices recover from the rewritten history automatically without losing their unpushed work.
+GitHub rejects individual files over 100 MB and recommends keeping repositories below a few gigabytes. The extension scans the repository in git mode at most once per hour after a publishing sync, warns with the offending file and its size, and includes the repository usage in **Show Diagnostics** under Manage — lower `cursorSettingSync.maxPayloadMiB` or disable chat sync for such a repository. Because git history retains deleted event files, automatic maintenance also squashes the git history into a single commit after a successful checkpoint prune, force-pushes it, and reports the reclaimed space; other devices recover from the rewritten history automatically without losing their unpushed work.
 
 ## Platform support
 
@@ -64,7 +66,7 @@ Windows, macOS, and Linux are supported. The offline helper behaves identically 
 
 Before moving from PC A to PC B:
 
-1. Run `Cursor Setting Sync: Sync Now` on PC A.
+1. Let PC A's normal synchronization cycle finish. To force an immediate bounded cycle, open **Manage** and choose **Sync Now**.
 2. Wait until the extension reports that the local repository write completed.
 3. Close every Cursor window normally. The shutdown helper then captures database and workspace-storage changes.
 4. Wait until OneDrive or Syncthing reports that the final repository files have uploaded.
@@ -82,18 +84,18 @@ The shutdown finalizer performs one last database export after Cursor exits norm
 
 `workspace.json` is read only to discover the workspace identity and URI. Its contents are not stored or restored as a payload. Explicit and automatically resolved workspace mappings canonicalize related workspace IDs into one synchronized resource identity while each PC retains its own local association.
 
-Workspace storage is deliberately not scanned or applied while Cursor is running. After all Cursor processes exit, the shutdown helper captures the local allowlist. Incoming versions remain pending until `Cursor Setting Sync: Restart to Apply`; the helper exports the stopped local state first, checks for conflicts, validates incoming data, and then applies eligible files or database rows offline.
+Workspace storage is deliberately not scanned or applied while Cursor is running. After all Cursor processes exit normally, the shutdown helper captures the local allowlist, exports the stopped local state first, checks for conflicts, validates incoming data, and applies eligible files or database rows offline. Incoming versions remain pending until that shutdown boundary; **Apply Queued Changes** in Manage starts the same close-and-apply flow when it is needed immediately.
 
 Transient SQLite files (`*-wal`, `*-shm`, and `*-journal`), prior database backups, renamed or corrupt database copies, and cache/session data are not backed up. This includes `anysphere.cursor-browser-extension`, `anysphere.cursor-retrieval`, `ms-vscode.js-debug`, and other non-allowlisted extension directories. File and workspace-directory deletions are never propagated because valid workspace sets commonly differ between PCs.
 
 ## Resolve conflicts
 
-1. Run `Cursor Setting Sync: Resolve Conflicts`.
+1. Open **Manage** and choose **Resolve Conflicts**.
 2. Every conflict is listed on one screen, named and with both sides' values beside it — `Setting: editor.fontSize · This PC: 14 vs Other PC: 16` — along with which PC wrote each side and when.
 3. Answer the whole list at once with **Keep the version written later everywhere**, **Keep this PC's version everywhere** or **Keep the other PC's version everywhere**, or pick a single entry to open its diff and decide it on its own. **Decide later** leaves everything as it is.
 4. The extension publishes a resolution event referencing every conflicting tip, batching the whole set into one event.
 
-Nothing is lost by deferring: both versions stay in the repository until the conflict is resolved, and `Cursor Setting Sync: Restore Version History` can recover a side that lost.
+Nothing is lost by deferring: both versions stay in the repository until the conflict is resolved, and **Restore Version History** in Manage can recover a side that lost.
 
 A bulk answer only applies to the conflicts it names. With three or more PCs, a conflict between two *other* machines has no "this PC" side, so that conflict is left alone and reported rather than being given a different answer than the one asked for.
 
@@ -115,63 +117,69 @@ Chat resolves on its own too, but by combining the two sides rather than choosin
 
 The offline helper waits for Cursor to exit, acquires a lock, validates each database, and creates a recovery backup before modification. Live database files and sidecars are never replaced. Global, store, extension-state, and workspace changes use prepared SQL in `BEGIN IMMEDIATE`; integrity checks run before commit and failures use SQLite rollback. Workspace imports update or insert incoming keys while preserving target-only rows, unknown tables, and newer schema columns.
 
-Apply payloads are limited to 512 MiB per restart. If pending items remain, run `Cursor Setting Sync: Restart to Apply` again.
+Apply payloads are limited to 512 MiB per restart. If pending items remain, close every Cursor window normally again or choose **Apply Queued Changes** from Manage.
 
 ## Restore a backup
 
-1. Run `Cursor Setting Sync: Restore Backup`.
+1. Open **Manage** and choose **Restore Database Backup**.
 2. Select a `state-*.vscdb` backup.
 3. Confirm **Import and Restart**. The backup is queried as a read source and is never installed over the live database file.
 
 ## Restore a previous version
 
-1. Run `Cursor Setting Sync: Restore Version History`.
+1. Open **Manage** and choose **Restore Version History**.
 2. Select the data type. For a normal conversation that disappeared or lost messages, select **Cursor conversations**. **Agent transcripts** are separate raw files produced by agent runs and are not the main chat list.
 3. When offered, select the workspace or project. Large chat and transcript sets are narrowed here before individual resources are shown.
 4. Select a resource. Only resources with at least one earlier eligible `put` are listed, newest first, with a readable title/path, workspace, message count, and date. Active conflicts, disabled kinds, current-only resources, and version-incompatible resources are omitted. If its encrypted object has not arrived from the shared-folder provider yet, the final payload check stops safely and asks you to try again later.
 5. Select a version. Only non-current `put` versions compatible with this Cursor installation are offered. A diff preview of the current content against the selected version opens automatically.
 6. Confirm **Restore Version**. The dialog repeats the resource and version details, then the old content is re-published as a new version on top of the existing history; nothing is rewritten.
-7. Database-backed kinds (chat, Cursor User Rules, workspace storage, and similar) are applied offline; run `Cursor Setting Sync: Restart to Apply`.
+7. Database-backed kinds (chat, Cursor User Rules, workspace storage, and similar) are applied automatically after every Cursor window closes normally; choose **Apply Queued Changes** from Manage to start that flow immediately.
 
 A restored version keeps the original version's producer metadata, so the newer-version database safety gate keeps judging the version it came from. If another device pruned the selected version while it was being picked, the restore aborts cleanly; refresh the history and pick again.
 
 Restore also requires a complete, reconciled repository event stream. If the shared-folder provider is still delivering a missing event or exposes a fork, let it settle and synchronize again; unaccepted events are never offered as recoverable history.
 
-## Repair unavailable Cursor conversations automatically
+## Repair unavailable Cursor conversations safely
 
-Run `Cursor Setting Sync: Repair Unavailable Chats` when a conversation renders partway and then reports that conversation data is missing. The command does not ask you to identify an internal chat ID or choose a historical version.
+Open **Manage** and choose **Repair Unavailable Chats** when a conversation renders partway and then reports that conversation data is missing. The repair action does not ask you to identify an internal chat ID or choose a historical version.
 
-1. The live database is audited read-only. The command checks both `composerData.fullConversationHeadersOnly` references to visible `bubbleId:` rows and the top-level content-addressed continuation roots in `conversationState` together with their reachable descendant graph. Body-less list entries, unreferenced/orphan rows, deleted conversations, subagents, and unknown state shapes are not guessed into an automatic repair.
-2. For every definitely damaged chat, the command validates the trusted current snapshot or reads its current-tip ancestry once. A stream gap/fork, active conflict, missing encrypted object, incompatible producer, or disagreement in newer trusted data leaves that chat unchanged.
-3. One confirmation covers all unambiguous repairs. **Repair and Restart** publishes the additive repair, synchronizes it, and starts the existing offline apply flow; **Queue Repair** publishes it without closing Cursor, for a later `Cursor Setting Sync: Restart to Apply`.
+1. The live database is audited read-only. The repair action checks both `composerData.fullConversationHeadersOnly` references to visible `bubbleId:` rows and the top-level content-addressed continuation roots in `conversationState` together with their reachable descendant graph. Body-less list entries, unreferenced/orphan rows, deleted conversations, subagents, and unknown state shapes are not guessed into an automatic repair.
+2. For every definitely damaged chat, the repair action validates the trusted current snapshot or reads its current-tip ancestry once. A stream gap/fork, active conflict, missing encrypted object, incompatible producer, or disagreement in newer trusted data leaves that chat unchanged.
+3. One confirmation covers all unambiguous repairs. **Repair and Restart** publishes the additive repair, synchronizes it, and starts the existing offline apply flow; **Queue Repair** publishes it without closing Cursor for automatic application after the next normal shutdown.
 4. After all Cursor processes exit, the helper re-reads each live chat inside the write transaction. On the PC that created the repair, the original reference fingerprint must still match. A different PC may materialize the complete snapshot only when that chat is truly absent, or add unavailable rows when its composerData is identical; a header-only, body-only, or divergent local chat is left untouched. The live header, composerData, existing valid bubbles, unrelated chats, and orphan rows are never deleted or replaced.
-5. The normal pre-apply SQLite backup, journal, transaction, per-chat savepoint, postcondition check, and `integrity_check` all apply. Running the command again after a successful repair is a no-op.
+5. The normal pre-apply SQLite backup, journal, transaction, per-chat savepoint, postcondition check, and `integrity_check` all apply. Running the repair action again after a successful repair is a no-op.
 
-Chats first synchronized by 0.0.62 or earlier do not have continuation blobs in repository history, so the target PC cannot invent them. Update and run **Sync Now** on a PC where the affected conversation can still submit a new prompt. Version 0.0.63 enriches the exact current repository chat with that PC's hash-verified blobs without replacing a newer target-side conversation body. Then run **Sync Now** on the target and use **Repair Unavailable Chats**; when a complete compatible snapshot is available, it can be queued for the normal offline apply.
+Chats first synchronized by 0.0.62 or earlier do not have continuation blobs in repository history, so the target PC cannot invent them. Update the extension on a PC where the affected conversation can still submit a new prompt, then let automatic synchronization finish or choose **Sync Now** from Manage. Version 0.0.63 and later enrich the exact current repository chat with that PC's hash-verified blobs without replacing a newer target-side conversation body. Let the target synchronize, then choose **Repair Unavailable Chats** from Manage; when a complete compatible snapshot is available, it can be queued for the normal offline apply.
 
-The full reference audit is intentionally command-only. Running it every 30 seconds would fight Cursor's normal pruning and add a large database scan back to every open window.
+When no exact synchronized source or backup can repair a damaged chat in place, the same **Repair Unavailable Chats** flow offers safe local fallbacks: prepare one bounded recoverable context for a new empty Agent, or preserve all recoverable chats in a bounded local catalog. Neither fallback rewrites the damaged originals or submits a prompt. Choose **Open Recovered Chat** from Manage later to prepare a catalog entry in an empty Agent.
 
-## Checkpoint and prune history
+The full reference audit is intentionally on-demand. Running it every 30 seconds would fight Cursor's normal pruning and add a large database scan back to every open window.
 
-`Cursor Setting Sync: Checkpoint & Prune History` folds the current state of every resource into one encrypted checkpoint file and, once every device has absorbed that checkpoint, deletes the event files it covers.
+## Automatic checkpoint and prune maintenance
 
-**Upgrade every device to a checkpoint-aware build before the first run.** After the first checkpoint is absorbed, events are written with a newer protocol version, and older builds fail loudly instead of silently rebuilding a partial history.
+Once the event log passes 500 files, the extension automatically folds the current state of every resource into one encrypted checkpoint file. A later eligible maintenance pass deletes the event files it covers once every device has absorbed that checkpoint. A running extension host waits at least six hours between maintenance attempts; restarting Cursor may re-evaluate the work sooner, but the same safety gates below still apply.
 
-- The command requires a clean, fully propagated synchronization (no stream warnings) and no unresolved conflicts.
-- Creating the checkpoint is the first phase; pruning becomes available only after every visible device has recorded the checkpoint in its acknowledgements. The command reports which device is still lagging.
-- Pruning additionally waits until the checkpoint is 24 hours old so that devices that have not yet appeared in the shared folder are protected. An explicit confirmation can override the age gate when every device is known to be current.
-- **History loss caveat:** pruned per-version history is unrecoverable. `Restore Version History` can then only reach versions still present as events or as the checkpoint's folded content, and conflicts whose common base was pruned degrade to manual resolution with a two-way diff.
+**Upgrade every device to a checkpoint-aware build before the first automatic checkpoint is absorbed.** After that point, events are written with a newer protocol version, and older builds fail loudly instead of silently rebuilding a partial history.
 
-## Diagnostics and maintenance
+- Automatic maintenance requires a clean, fully propagated synchronization (no stream warnings), no unresolved conflicts, and no actionable pending database changes. Permanent machine-local exclusions do not block it.
+- Creating the checkpoint is the first phase; pruning becomes available only after every visible device has recorded the checkpoint in its acknowledgements. Diagnostics reports which device is still lagging.
+- Pruning additionally waits until the checkpoint is 24 hours old so that devices that have not yet appeared in the shared folder are protected.
+- **History loss caveat:** pruned per-version history is unrecoverable. The **Restore Version History** action can then only reach versions still present as events or as the checkpoint's folded content, and conflicts whose common base was pruned degrade to manual resolution with a two-way diff.
 
-- `Cursor Setting Sync: Show Diagnostics` shows versions, database capabilities, schema results, the last error, and — for anything that is stuck — the reason rather than only a count: each pending change with what is blocking it, the conflicting resource IDs, every `cursorSettingSync.*` value actually in force (legacy-namespace fallbacks resolved), the machine-specific exclusion set, the git mode, the workspace mappings, and the adapters currently running. It also lists every standing warning with the adapter that produced it, how long it has been standing, and whether it blocks compaction and checkpointing. Standing warnings are logged once when they appear and then restated only once an hour, so this list — not the output channel — is the place to see what is currently true.
-- `Cursor Setting Sync: Show Repository Usage` calculates shared repository size.
-- `Cursor Setting Sync: Restore Version History` re-publishes an older version of a resource as the new current content.
-- `Cursor Setting Sync: Compact Safe Orphans` removes safe local-device partials and objects that neither an event nor the absorbed checkpoint references; it requires a warning-free reconcile.
-- `Cursor Setting Sync: Checkpoint & Prune History` folds history into a checkpoint and prunes covered event files once every device has absorbed it. The same fold also runs on its own once the event log passes 500 files, at most once every six hours, behind exactly the gates listed above — so the repository does not grow without bound just because nobody ran the command.
-- `Cursor Setting Sync: Disconnect` clears this device's stored repository path, encryption key, and workspace mappings. The shared folder is untouched, so another device keeps synchronizing and this one can rejoin through `Setup`.
-- `Cursor Setting Sync: Archive Repository` copies the complete repository to a separate directory.
-- `Cursor Setting Sync: Forget Device` retires a device stream locally.
+## Manage menu and automatic maintenance
+
+Manage contains every on-demand action:
+
+- **Show Diagnostics** shows versions, database capabilities, schema results, shared repository usage, the last error, and — for anything that is stuck — the reason rather than only a count: each pending change with what is blocking it, the conflicting resource IDs, every `cursorSettingSync.*` value actually in force (legacy-namespace fallbacks resolved), the machine-specific exclusion set, the git mode, the workspace mappings, and the adapters currently running. It also lists every standing warning with the adapter that produced it, how long it has been standing, and whether it blocks compaction and checkpointing. Standing warnings are logged once when they appear and then restated only once an hour, so this list — not the output channel — is the place to see what is currently true.
+- **Sync Now** forces one bounded synchronization cycle; routine synchronization remains automatic.
+- **Apply Queued Changes** starts the close-and-apply flow immediately; queued database work otherwise applies automatically after every Cursor window closes normally.
+- **Resolve Conflicts**, **Repair Unavailable Chats**, and **Open Recovered Chat** handle the exceptional cases described above.
+- **Restore Version History** re-publishes an older synchronized resource version, and **Restore Database Backup** imports a pre-apply SQLite backup while Cursor is closed.
+- **Archive Repository** copies the complete encrypted repository to a separate directory.
+- **Forget Device** retires or restores a device stream.
+- **Setup or Reconfigure** connects this PC to a repository, and **Disconnect This PC** clears only this PC's stored repository path, encryption key, and workspace mappings. Disconnecting leaves the shared folder untouched, so another device keeps synchronizing and this one can rejoin later.
+
+Checkpoint creation and pruning, git-history compaction, and removal of old local-device partials and objects that neither an event nor the absorbed checkpoint references are automatic. Object cleanup requires a subsequent warning-free reconcile.
 
 ## Device-local authentication
 

@@ -488,9 +488,17 @@ export function normalizeWorkspaceUri(
   platform: NodeJS.Platform = process.platform,
 ): string {
   const decoded = normalizeRemoteHost(decodeWorkspaceUri(uri));
-  const separated = platform === "win32" ? decoded.replaceAll("\\", "/") : decoded;
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/u.exec(decoded)?.[1]?.toLowerCase();
+  // The extension runs in the local UI host. A Windows UI host does not make
+  // a Linux Remote-SSH path case-insensitive: only local file (or legacy raw
+  // local-path) identities inherit the host platform's path semantics.
+  const isLocalPathIdentity = scheme === undefined || scheme === "file";
+  const separated =
+    platform === "win32" && isLocalPathIdentity
+      ? decoded.replaceAll("\\", "/")
+      : decoded;
   const trimmed = separated.replace(/\/+$/, "");
-  return isCaseInsensitivePathPlatform(platform)
+  return isLocalPathIdentity && isCaseInsensitivePathPlatform(platform)
     ? trimmed.toLocaleLowerCase("en-US")
     : trimmed;
 }
@@ -568,9 +576,22 @@ function remoteHostFromDescriptor(encoded: string): string | null {
     rememberRemoteHostDescriptor(memoKey, null);
     return null;
   }
+  // Only the exact legacy shape observed alongside the plain SSH alias is
+  // equivalent. Dropping a port, user, or any future connection field could
+  // map recovery plaintext onto a different SSH endpoint.
+  if (
+    Object.keys(parsed).length !== 1 ||
+    !Object.hasOwn(parsed, "hostName")
+  ) {
+    rememberRemoteHostDescriptor(memoKey, null);
+    return null;
+  }
   const hostName = (parsed as { hostName?: unknown }).hostName;
   const result =
-    typeof hostName === "string" && hostName.length > 0 ? hostName : null;
+    typeof hostName === "string" &&
+    /^[A-Za-z0-9._-]{1,255}$/u.test(hostName)
+      ? hostName
+      : null;
   rememberRemoteHostDescriptor(memoKey, result);
   return result;
 }

@@ -1,4 +1,8 @@
 import { canonicalBytes, sha256 } from "../protocol/canonical";
+import {
+  createJsonStructureBudget,
+  type JsonStructureBudget,
+} from "../protocol/jsonStructure";
 import type { MergeOutcome } from "../types";
 import type {
   PortableAgentKvPayload,
@@ -59,10 +63,13 @@ class ChatMergeWorkBudgetError extends Error {}
  *  - **The header and `composerData` come from one side whole.** They describe
  *    the conversation's shape — its title, ordering and checkpoint — and half of
  *    one plus half of the other describes no conversation at all. The side that
- *    wins is the one with the greater `header.lastUpdatedAt`, which is the
- *    newer capture of the same conversation. Orphaned bubbles that the winning
- *    `composerData` does not reference are inert rows, so a union costs storage,
- *    never correctness.
+ *    wins is normally the one with the greater `header.lastUpdatedAt`. Cursor
+ *    can leave that timestamp frozen while a conversation grows, though, so an
+ *    equal timestamp is resolved only by a provable one-sided base change or a
+ *    complete strict extension of the visible message sequence. Ambiguous
+ *    equal-timestamp shapes remain a manual conflict. Orphaned bubbles that the
+ *    winning `composerData` does not reference are inert rows, so merely
+ *    unioning them cannot recover from choosing the stale shape.
  *
  * `ordered` must already be in the caller's replicated tip order (newest
  * first). Both devices sort the same two tips with the same comparator and hand
@@ -133,17 +140,40 @@ export function mergeChatSnapshotBuffers(
     // manual resolution instead.
     return { status: "conflict" };
   }
-  // `lastUpdatedAt` comes out of the payloads both devices read, so electing on
-  // it is as replicated as electing on the tip order and it is better data: it
-  // names the newer capture of the conversation rather than the later publish.
-  // A `null` timestamp carries no ordering information, so it never outranks a
-  // real one; two nulls, or a tie, fall back to the replicated tip order.
-  const winnerIndex = compareLastUpdatedAt(firstSnapshot, secondSnapshot) >= 0 ? 0 : 1;
+  // A real timestamp difference keeps the established behavior. On equality,
+  // tip order is not evidence of conversation recency: Cursor commonly stamps
+  // the header near the start and streams later messages without updating it.
+  // Elect only from bounded, structural evidence in the two cores (and their
+  // readable base), otherwise leave both original tips available for manual
+  // resolution instead of making one side's unioned bubbles inert.
+  const timestampComparison = compareLastUpdatedAt(
+    firstSnapshot,
+    secondSnapshot,
+  );
+  let winnerIndex: 0 | 1;
+  if (timestampComparison > 0) {
+    winnerIndex = 0;
+  } else if (timestampComparison < 0) {
+    winnerIndex = 1;
+  } else {
+    const equalTimestampWinner = electEqualTimestampCore(
+      baseSnapshot,
+      firstSnapshot,
+      secondSnapshot,
+      workBudget,
+    );
+    if (equalTimestampWinner === null) {
+      return { status: "conflict" };
+    }
+    winnerIndex = equalTimestampWinner;
+  }
   const winner = winnerIndex === 0 ? firstSnapshot : secondSnapshot;
-  const emitsV2 =
-    (baseSnapshot !== null && isPortableChatSnapshotV2(baseSnapshot)) ||
-    isPortableChatSnapshotV2(firstSnapshot) ||
-    isPortableChatSnapshotV2(secondSnapshot);
+  // A v1 elected core has no verified declaration of its active continuation
+  // graph. Inheriting a losing/base v2 root blob can make an omitted descendant
+  // look falsely complete, so keep the merged core v1 and let normal live
+  // enrichment reconstruct and verify its graph. A v2 winner carries the only
+  // declarations we can safely preserve as active.
+  const emitsV2 = isPortableChatSnapshotV2(winner);
   // This scan is deliberately conservative and happens before the first merge
   // Map/Set. Disjoint but individually valid tips can otherwise allocate the
   // three indexes, a union Set, sorted arrays and a canonical copy before the
@@ -199,6 +229,7 @@ export function mergeChatSnapshotBuffers(
           baseSnapshot,
           firstSnapshot,
           secondSnapshot,
+          winner,
           coreRoots,
         ),
       } satisfies PortableChatSnapshotV2;
@@ -256,14 +287,18 @@ function workBudgetConflict(): ChatMergeResult {
 }
 
 /**
- * Content-addressed rows are immutable, so unlike bubbles they are always an
- * additive union. A blob supplied by either side satisfies the other side's
- * missing reference; only references absent from both payloads remain missing.
+ * Content-addressed rows are immutable, so unlike bubbles their materialized
+ * rows are always an additive union. Reference-only declarations are core
+ * specific, however: carrying a losing core's unavailable orphan forward
+ * makes a complete elected core look incomplete forever. Retain every actual
+ * hash-valid blob, but take non-materialized declarations only from the elected
+ * v2 payload and from roots discovered in the elected core.
  */
 function mergeAgentKvPayload(
   base: PortableChatSnapshot | null,
   first: PortableChatSnapshot,
   second: PortableChatSnapshot,
+  winner: PortableChatSnapshot,
   coreRoots: readonly string[],
 ): PortableAgentKvPayload {
   const referenced = new Set<string>();
@@ -272,9 +307,6 @@ function mergeAgentKvPayload(
   for (const snapshot of [base, first, second]) {
     if (snapshot === null || !isPortableChatSnapshotV2(snapshot)) {
       continue;
-    }
-    for (const id of snapshot.agentKv.referencedIds) {
-      addBoundedAgentKvReference(referenced, id);
     }
     for (const blob of snapshot.agentKv.blobs) {
       // The parser proved both values hash to the ID. Keeping the first storage
@@ -296,6 +328,20 @@ function mergeAgentKvPayload(
         blobs.set(blob.key, blob);
         decodedBlobBytes += blobBytes;
       }
+    }
+  }
+  // Retained materialized blobs remain declared even when they came from a
+  // losing/base core. They are inert but useful recovery material, and because
+  // their bytes are present they cannot inflate `missingIds`.
+  for (const key of blobs.keys()) {
+    addBoundedAgentKvReference(
+      referenced,
+      key.slice("agentKv:blob:".length),
+    );
+  }
+  if (isPortableChatSnapshotV2(winner)) {
+    for (const id of winner.agentKv.referencedIds) {
+      addBoundedAgentKvReference(referenced, id);
     }
   }
   for (const id of coreRoots) {
@@ -387,6 +433,206 @@ function parseBaseSnapshot(
   } catch {
     return null;
   }
+}
+
+interface EqualTimestampElectionBudget {
+  /** Aggregate decoded-row structural work; separate from the outer envelope. */
+  structure: JsonStructureBudget;
+  /** Bounds Base64 decoding even when row JSON consists mostly of strings. */
+  remainingDecodedBytes: number;
+}
+
+type MergeJsonInspection =
+  | { status: "usable"; value: unknown }
+  | { status: "unusable" | "limit" };
+
+/**
+ * Elects a whole header/composerData pair when timestamps carry no ordering.
+ *
+ * Returning null is deliberate: replicated tip order says which publish was
+ * later, not which frozen-timestamp conversation is more complete. The caller
+ * keeps the fork manual unless one of these bounded proofs succeeds.
+ */
+function electEqualTimestampCore(
+  base: PortableChatSnapshot | null,
+  first: PortableChatSnapshot,
+  second: PortableChatSnapshot,
+  workBudget: number,
+): 0 | 1 | null {
+  // Identical shape/state makes either side safe. Keep replicated tip order so
+  // machine-local header fields still converge deterministically.
+  if (sameRow(first.composerData, second.composerData)) {
+    return 0;
+  }
+
+  const budget: EqualTimestampElectionBudget = {
+    structure: createJsonStructureBudget({
+      maxStructuralTokens: CHAT_AUTO_MERGE_MAX_JSON_STRUCTURAL_TOKENS,
+      maxNestingDepth: CHAT_AUTO_MERGE_MAX_JSON_NESTING_DEPTH,
+    }),
+    remainingDecodedBytes: workBudget,
+  };
+
+  if (base !== null) {
+    const firstIsBase = sameRow(first.composerData, base.composerData);
+    const secondIsBase = sameRow(second.composerData, base.composerData);
+    if (firstIsBase !== secondIsBase) {
+      const changedIndex: 0 | 1 = firstIsBase ? 1 : 0;
+      const changed = changedIndex === 0 ? first : second;
+      const baseReferences = visibleBubbleKeys(base, budget);
+      const changedReferences = visibleBubbleKeys(changed, budget);
+      // A one-sided composerData change is recency evidence only when its
+      // visible shape stayed put (for example, conversationState advanced) or
+      // appended messages. Cursor exposes no per-message deletion; a strict
+      // shrink is local pruning, while a divergence is a real branch.
+      if (
+        baseReferences === null ||
+        changedReferences === null ||
+        (!sameSequence(baseReferences, changedReferences) &&
+          !isStrictPrefix(baseReferences, changedReferences))
+      ) {
+        return null;
+      }
+      return visibleBubblesAreCompleteAndUsable(
+        changed,
+        changedReferences,
+        budget,
+      )
+        ? changedIndex
+        : null;
+    }
+  }
+
+  const firstReferences = visibleBubbleKeys(first, budget);
+  const secondReferences = visibleBubbleKeys(second, budget);
+  if (firstReferences === null || secondReferences === null) {
+    return null;
+  }
+  if (isStrictPrefix(firstReferences, secondReferences)) {
+    return visibleBubblesAreCompleteAndUsable(
+      second,
+      secondReferences,
+      budget,
+    )
+      ? 1
+      : null;
+  }
+  if (isStrictPrefix(secondReferences, firstReferences)) {
+    return visibleBubblesAreCompleteAndUsable(
+      first,
+      firstReferences,
+      budget,
+    )
+      ? 0
+      : null;
+  }
+  return null;
+}
+
+/** Cursor's ordered visible conversation shape, or null when not provable. */
+function visibleBubbleKeys(
+  snapshot: PortableChatSnapshot,
+  budget: EqualTimestampElectionBudget,
+): string[] | null {
+  const inspected = inspectMergeJsonRow(snapshot.composerData, budget);
+  if (
+    inspected.status !== "usable" ||
+    inspected.value === null ||
+    typeof inspected.value !== "object" ||
+    Array.isArray(inspected.value)
+  ) {
+    return null;
+  }
+  const headers = (inspected.value as Record<string, unknown>)[
+    "fullConversationHeadersOnly"
+  ];
+  if (
+    !Array.isArray(headers) ||
+    headers.length > CHAT_AUTO_MERGE_MAX_BUBBLE_ROW_WORK
+  ) {
+    return null;
+  }
+  const seen = new Set<string>();
+  const keys: string[] = [];
+  for (const header of headers) {
+    if (header === null || typeof header !== "object" || Array.isArray(header)) {
+      return null;
+    }
+    const bubbleId = (header as Record<string, unknown>)["bubbleId"];
+    if (
+      typeof bubbleId !== "string" ||
+      bubbleId.length === 0 ||
+      seen.has(bubbleId)
+    ) {
+      return null;
+    }
+    seen.add(bubbleId);
+    keys.push(`bubbleId:${snapshot.composerId}:${bubbleId}`);
+  }
+  return keys;
+}
+
+/** The dominant shape may win only if it renders from its own captured rows. */
+function visibleBubblesAreCompleteAndUsable(
+  snapshot: PortableChatSnapshot,
+  references: readonly string[],
+  budget: EqualTimestampElectionBudget,
+): boolean {
+  const bubbles = indexBubbles(snapshot.bubbles);
+  for (const key of references) {
+    const row = bubbles.get(key);
+    if (
+      row === undefined ||
+      inspectMergeJsonRow(row, budget).status !== "usable"
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function inspectMergeJsonRow(
+  row: PortableKvRow,
+  budget: EqualTimestampElectionBudget,
+): MergeJsonInspection {
+  if (row.valueType === "null") {
+    return { status: "unusable" };
+  }
+  const byteLength = decodedBase64Bytes(row.valueBase64);
+  if (byteLength > budget.remainingDecodedBytes) {
+    return { status: "limit" };
+  }
+  budget.remainingDecodedBytes -= byteLength;
+  const bytes = Buffer.from(row.valueBase64, "base64");
+  const text = bytes.toString("utf8");
+  if (
+    !Buffer.from(text, "utf8").equals(bytes) ||
+    !budget.structure.consume(text)
+  ) {
+    return { status: "limit" };
+  }
+  try {
+    return { status: "usable", value: JSON.parse(text) as unknown };
+  } catch {
+    return { status: "unusable" };
+  }
+}
+
+function isStrictPrefix(
+  shorter: readonly string[],
+  longer: readonly string[],
+): boolean {
+  return (
+    shorter.length < longer.length &&
+    shorter.every((key, index) => key === longer[index])
+  );
+}
+
+function sameSequence(left: readonly string[], right: readonly string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((key, index) => key === right[index])
+  );
 }
 
 function compareLastUpdatedAt(
@@ -615,9 +861,9 @@ function chatMergeStructureFitsBudget(
           return false;
         }
       }
-      // The output carries every unique reference once and at most the same
-      // set again as missing. Counting every occurrence twice is conservative
-      // and avoids allocating a preflight Set.
+      // Only the elected payload's declarations are emitted, but counting
+      // every input occurrence twice (referenced + possibly missing) is a
+      // conservative preflight that avoids allocating a Set here.
       for (const id of snapshot.agentKv.referencedIds) {
         const encoded = canonicalJsonStringByteLength(id) + 1;
         if (!add(encoded) || !add(encoded)) {

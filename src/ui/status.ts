@@ -1,5 +1,8 @@
 import * as vscode from "vscode";
-import { RESTART_TO_APPLY_TITLE } from "../constants";
+import {
+  MANAGE_COMMAND,
+  RESTART_TO_APPLY_TITLE,
+} from "../constants";
 
 export type SyncStatus =
   | "unconfigured"
@@ -55,21 +58,21 @@ export class StatusController implements vscode.Disposable {
 function statusPresentation(status: SyncStatus): {
   text: string;
   tooltip: string;
-  command: string;
+  command: vscode.Command;
 } {
   switch (status) {
     case "unconfigured":
       return {
         text: "$(cloud) Cursor Setting Sync: Setup",
         tooltip: "Select a shared folder and configure encryption.",
-        command: "cursorSync.setup",
+        command: managementAction("setup", "Set up Cursor Setting Sync"),
       };
     case "locked":
       return {
         text: "$(lock) Cursor Setting Sync",
         tooltip:
-          "The repository key is not available on this device. Click to re-enter the passphrase, or run \"Cursor Setting Sync: Disconnect\" to clear the local configuration.",
-        command: "cursorSync.setup",
+          "The repository key is not available on this device. Click to re-enter the passphrase, or open Manage and choose Disconnect This PC to clear the local configuration.",
+        command: managementAction("setup", "Unlock Cursor Setting Sync"),
       };
     case "disabled":
       // A configured repository with automatic sync switched off used to show
@@ -79,7 +82,7 @@ function statusPresentation(status: SyncStatus): {
         text: "$(circle-slash) Cursor Setting Sync: Paused",
         tooltip:
           "Automatic synchronization is off (cursorSettingSync.enabled). Click to synchronize once.",
-        command: "cursorSync.syncNow",
+        command: managementAction("sync", "Synchronize now"),
       };
     case "syncing":
       // Says the word, not just a spinning glyph. A cycle on a large repository
@@ -89,13 +92,13 @@ function statusPresentation(status: SyncStatus): {
       return {
         text: "$(sync~spin) Cursor Setting Sync: Syncing...",
         tooltip: "Synchronization is in progress.",
-        command: "cursorSync.showDiagnostics",
+        command: managementAction("diagnostics", "Show sync diagnostics"),
       };
     case "up-to-date":
       return {
         text: "$(check) Cursor Setting Sync",
         tooltip: "All locally available events are applied.",
-        command: "cursorSync.syncNow",
+        command: managementAction("sync", "Synchronize now"),
       };
     case "partial":
       // Everything that can sync is in sync, but whole resource kinds are
@@ -105,7 +108,7 @@ function statusPresentation(status: SyncStatus): {
         text: "$(warning) Cursor Setting Sync: Partial",
         tooltip:
           "Some resource kinds are not synchronizing. Open diagnostics for details.",
-        command: "cursorSync.showDiagnostics",
+        command: managementAction("diagnostics", "Show sync diagnostics"),
       };
     case "pending-restart":
       // Describes the state, and only the state.
@@ -121,22 +124,29 @@ function statusPresentation(status: SyncStatus): {
       return {
         text: "$(debug-restart) Cursor Setting Sync: Queued",
         tooltip:
-          "Changes from another device are waiting to be written. " +
-          `Run "${RESTART_TO_APPLY_TITLE}" from the command palette to apply them - quitting and reopening Cursor does not, ` +
-          "because only that command applies the queue. Clicking here opens diagnostics.",
-        command: "cursorSync.showDiagnostics",
+          "Changes from another device are waiting to be written. They apply automatically after every Cursor window closes. " +
+          `To apply them immediately, open "${RESTART_TO_APPLY_TITLE}". Clicking here opens diagnostics.`,
+        command: managementAction("diagnostics", "Show queued changes"),
       };
     case "conflict":
       return {
         text: "$(warning) Cursor Setting Sync",
         tooltip: "One or more synchronization conflicts require attention.",
-        command: "cursorSync.resolveConflicts",
+        command: managementAction("conflicts", "Resolve sync conflicts"),
       };
     case "error":
       return {
         text: "$(error) Cursor Setting Sync",
         tooltip: "Synchronization failed. Open diagnostics for details.",
-        command: "cursorSync.showDiagnostics",
+        command: managementAction("diagnostics", "Show sync diagnostics"),
       };
   }
+}
+
+function managementAction(action: string, title: string): vscode.Command {
+  return {
+    command: MANAGE_COMMAND,
+    title,
+    arguments: [action],
+  };
 }

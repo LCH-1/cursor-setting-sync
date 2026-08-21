@@ -51,8 +51,16 @@ import {
   publishInBatches,
   shouldPublishSnapshot,
 } from "../sync/versionPolicy";
+import { chatContinuationApplyBlockReason } from "../sync/chatContinuationPolicy";
 import { canonicalBytes, sha256 } from "../protocol/canonical";
-import { StateVscdbChatAdapter } from "../chat/stateVscdb";
+import {
+  StateVscdbChatAdapter,
+  isPortableChatSnapshotV2,
+  parsePortableChatSnapshot,
+  portableChatCoreHash,
+  type PortableChatSnapshot,
+} from "../chat/stateVscdb";
+import { verifyPortableChatContinuationClosure } from "../chat/continuationClosure";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
 import {
@@ -708,6 +716,10 @@ async function exportFinalChanges(
       // but it must not start the extension host's periodic equal-count sweep
       // from zero on every launch. That full sweep is stateful polling work.
       periodicDeepVerification: false,
+      // One concurrent database generation gets a fresh stable pass. If an
+      // external writer keeps changing the supposedly offline database, the
+      // monotonic frontier then stabilizes and the 32-pass guard fails closed.
+      maxProgressDatabaseGenerationRestarts: 1,
       forceCoreVerificationResourceIds,
     });
     adapters.push(
@@ -826,9 +838,18 @@ async function exportFinalChanges(
       const status = adapter.scanStatus?.();
       const progressToken = status?.progressToken;
       const progressAware = progressToken !== undefined;
-      const nextPageKnown = progressAware
-        ? localProjectionOverlay(repository.state.projections)
-        : scanKnown;
+      const pageNeedsAcknowledgement =
+        result.snapshots.length > 0 || result.deletions.length > 0;
+      // Keep the exact same overlay identity on a zero-emission page. Bounded
+      // adapters use reference identity to distinguish a repository ACK from
+      // another look at the same local failure. Rebuilding the proxy every
+      // pass made a permanent oversized overflow start a fresh header sweep,
+      // manufacture a new progress token, and bypass the 32-stagnant-pass
+      // fail-closed guard forever.
+      const nextPageKnown =
+        progressAware && pageNeedsAcknowledgement
+          ? localProjectionOverlay(repository.state.projections)
+          : scanKnown;
       for (const snapshot of result.snapshots) {
         const provisional = provisionalLocalProjection(
           snapshot,
@@ -906,6 +927,7 @@ async function exportFinalChanges(
           scanKnown,
         );
       }
+      break;
     }
   }
   // This is the ONLY path that backs up workspaceStorage, so it must survive an
@@ -1391,6 +1413,15 @@ export async function prepareChanges(
         failureByResourceId[change.resourceId] = message;
         continue;
       }
+      const continuationFailure = await preparedChatContinuationFailure(
+        change,
+        content,
+      );
+      if (continuationFailure !== null) {
+        skipped.push(`${change.resourceId}: ${continuationFailure}`);
+        failureByResourceId[change.resourceId] = continuationFailure;
+        continue;
+      }
       totalBytes += declaredBytes;
       prepared.push({
         change,
@@ -1409,6 +1440,69 @@ export async function prepareChanges(
     }
   }
   return { prepared, skipped, failureByResourceId };
+}
+
+/**
+ * Authenticated event metadata is an index, not proof that the payload closes
+ * over Cursor's continuation graph. Re-parse and walk the exact object before
+ * it can enter the offline database transaction. This also protects a stale
+ * helper hand-off produced before the extension-host queue gate existed.
+ */
+async function preparedChatContinuationFailure(
+  change: HelperChange,
+  content: Buffer,
+): Promise<string | null> {
+  if (change.kind !== "chat" || change.operation !== "put") {
+    return null;
+  }
+  if (sha256(content) !== change.semanticHash) {
+    return "the chat payload hash does not match its authenticated event semantic hash";
+  }
+  const origin = effectiveSyncOrigin(change.metadata);
+  if (
+    origin === "automatic-chat-repair" ||
+    (origin === "agent-kv-enrichment" &&
+      change.metadata?.agentKvEnrichmentAppliesCore !== true)
+  ) {
+    // These recipes do not replace an existing live core. Automatic repair
+    // has its own exact fingerprint/race checks; legacy enrichment writes only
+    // hash-valid blob rows.
+    return null;
+  }
+
+  let snapshot: PortableChatSnapshot;
+  try {
+    snapshot = parsePortableChatSnapshot(content);
+  } catch {
+    return "the chat continuation snapshot is not a valid portable payload";
+  }
+  if (!isPortableChatSnapshotV2(snapshot)) {
+    return "the chat has no complete schema-v2 continuation snapshot";
+  }
+  const metadata = change.metadata;
+  if (
+    metadata?.chatSnapshotSchemaVersion !== 2 ||
+    metadata.agentKvBlobCount !== snapshot.agentKv.blobs.length ||
+    metadata.agentKvReferencedCount !== snapshot.agentKv.referencedIds.length ||
+    metadata.agentKvMissingCount !== snapshot.agentKv.missingIds.length ||
+    metadata.chatCoreHash !== portableChatCoreHash(snapshot)
+  ) {
+    return "the authenticated chat continuation metadata does not match its payload";
+  }
+  if (snapshot.agentKv.missingIds.length !== 0) {
+    return "the chat continuation snapshot still declares unavailable content";
+  }
+  const closure = await verifyPortableChatContinuationClosure(snapshot, {
+    limits: {
+      maxNodes: 4_096,
+      maxBytes: MAX_HELPER_APPLY_WORK_BYTES,
+      maxDepth: 256,
+      maxProtobufDepth: 64,
+    },
+  });
+  return closure.status === "complete"
+    ? null
+    : `the chat continuation closure could not be verified (${closure.status}/${closure.reason})`;
 }
 
 /**
@@ -1447,6 +1541,13 @@ function shutdownApplyBatch(
       continue;
     }
     const tip = projection.tip;
+    if (chatContinuationApplyBlockReason(tip) !== undefined) {
+      // A repository state written by an older extension can still contain an
+      // unblocked legacy/partial chat. The shutdown helper independently
+      // rebuilds its page from that durable queue, so it needs the same final
+      // continuation gate as the live extension host.
+      continue;
+    }
     const payloadBytes = tip.payload?.plainBytes ?? 0;
     if (
       changes.length >= 256 ||
@@ -1503,6 +1604,12 @@ function isEligible(
   }
 
   const tip = projection.tip;
+  if (chatContinuationApplyBlockReason(tip) !== undefined) {
+    // The hand-off request is not authority. Re-bind it to the freshly
+    // reconciled tip and refuse an incomplete ordinary chat even if an older
+    // extension wrote an unblocked request before this helper started.
+    return false;
+  }
   if (
     tip.kind !== change.kind ||
     tip.operation !== change.operation ||

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 
 vi.mock("vscode", () => ({
   window: {},
@@ -8,11 +9,14 @@ vi.mock("vscode", () => ({
 import {
   lockSkipResumedLine,
   noteLockSkip,
+  pendingDatabaseChangesBlockMaintenance,
   pendingRestartDetail,
   type LockSkipState,
 } from "../src/sync/manager";
 import {
   LOCK_SKIP_REMINDER_MS,
+  MANAGE_COMMAND,
+  MANAGE_TITLE,
   RESTART_TO_APPLY_COMMAND,
   RESTART_TO_APPLY_TITLE,
 } from "../src/constants";
@@ -228,18 +232,75 @@ describe("the queued-changes status detail", () => {
       expect(isPermanentExclusionReason(reason)).toBe(false);
     }
   });
+
+  it("lets permanent local exclusions coexist with automatic maintenance", () => {
+    const excluded = pending("workspace-storage", 3, true).map((change) => ({
+      ...change,
+      blockedReason: EXCLUDED_WORKSPACE_REASON,
+    }));
+    expect(pendingDatabaseChangesBlockMaintenance(excluded)).toBe(false);
+    expect(
+      pendingDatabaseChangesBlockMaintenance([
+        ...excluded,
+        ...pending("chat", 1),
+      ]),
+    ).toBe(true);
+    expect(
+      pendingDatabaseChangesBlockMaintenance([
+        ...excluded,
+        ...pending("chat", 1, true),
+      ]),
+    ).toBe(true);
+  });
 });
 
-describe("the command the affordances name", () => {
+describe("the single public management command", () => {
   it("is spelled exactly as the palette contributes it", () => {
-    // A renamed palette title with a stale constant would put the user back
-    // where they started: told to run a command that does not exist.
     const contributed = manifest.contributes.commands.find(
-      (command) => command.command === RESTART_TO_APPLY_COMMAND,
+      (command) => command.command === MANAGE_COMMAND,
     );
-    expect(contributed?.title).toBe(RESTART_TO_APPLY_TITLE);
+    expect(contributed?.title).toBe(MANAGE_TITLE);
     expect(manifest.activationEvents).toContain(
-      `onCommand:${RESTART_TO_APPLY_COMMAND}`,
+      `onCommand:${MANAGE_COMMAND}`,
     );
+    expect(RESTART_TO_APPLY_COMMAND).toBe(MANAGE_COMMAND);
+    expect(RESTART_TO_APPLY_TITLE).toContain(MANAGE_TITLE);
+    expect(RESTART_TO_APPLY_TITLE).toContain("Apply Queued Changes");
+  });
+
+  it("exposes only the intentional public command surface", () => {
+    expect(
+      manifest.contributes.commands.map((command) => command.command),
+    ).toEqual([MANAGE_COMMAND]);
+    expect(manifest.activationEvents).toEqual([
+      "onStartupFinished",
+      ...manifest.contributes.commands.map(
+        (command) => `onCommand:${command.command}`,
+      ),
+    ]);
+
+    const extensionSource = readFileSync("src/extension.ts", "utf8");
+    expect(extensionSource).toContain("registerCommand(MANAGE_COMMAND");
+    for (const removed of [
+      "cursorSync.setup",
+      "cursorSync.syncNow",
+      "cursorSync.restartToApply",
+      "cursorSync.resolveConflicts",
+      "cursorSync.showDiagnostics",
+      "cursorSync.restoreBackup",
+      "cursorSync.forgetDevice",
+      "cursorSync.repositoryUsage",
+      "cursorSync.compactRepository",
+      "cursorSync.restoreVersion",
+      "cursorSync.repairUnavailableChats",
+      "cursorSync.continueUnavailableChatSafely",
+      "cursorSync.preserveAllUnavailableChatsSafely",
+      "cursorSync.openRecoveredChatSafely",
+      "cursorSync.checkpointRepository",
+      "cursorSync.archiveRepository",
+      "cursorSync.disconnect",
+    ]) {
+      expect(extensionSource).not.toContain(`"${removed}"`);
+    }
   });
 });

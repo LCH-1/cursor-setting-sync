@@ -194,7 +194,7 @@ export class ConflictController
         )
       ) {
         deferred.push(
-          `${selection.resourceId}: The conflict changed while it was being resolved; run Resolve Conflicts again.`,
+          `${selection.resourceId}: The conflict changed while it was being resolved; open "Cursor Setting Sync: Manage" and choose "Resolve Conflicts" again.`,
         );
         continue;
       }

@@ -1725,13 +1725,13 @@ describe("Cursor chat reference audit", () => {
     createSchema(database);
     const childBytes = Buffer.from("leaf:missing-child", "utf8");
     const childId = sha256(childBytes);
-    const rootBytes = protobufIds([childId]);
+    const rootBytes = conversationTurnBytes([childId]);
     const rootId = sha256(rootBytes);
     insertChatWithConversationState(
       database,
       COMPOSER,
       "Missing descendant",
-      serializedConversationState([rootId]),
+      serializedTurnState([rootId]),
     );
     database
       .prepare("INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)")
@@ -1761,13 +1761,13 @@ describe("Cursor chat reference audit", () => {
     createSchema(database);
     const childBytes = Buffer.from("leaf:unreadable-child", "utf8");
     const childId = sha256(childBytes);
-    const rootBytes = protobufIds([childId]);
+    const rootBytes = conversationTurnBytes([childId]);
     const rootId = sha256(rootBytes);
     insertChatWithConversationState(
       database,
       COMPOSER,
       "Unreadable descendant",
-      serializedConversationState([rootId]),
+      serializedTurnState([rootId]),
     );
     const insert = database.prepare(
       "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)",
@@ -2197,4 +2197,41 @@ function protobufIds(ids: readonly string[]): Buffer {
       Buffer.concat([Buffer.from([0x0a, 0x20]), Buffer.from(id, "hex")]),
     ),
   );
+}
+
+function serializedTurnState(ids: readonly string[]): string {
+  return `~${Buffer.concat(
+    ids.map((id) => protobufField(8, Buffer.from(id, "hex"))),
+  ).toString("base64")}`;
+}
+
+function conversationTurnBytes(stepIds: readonly string[]): Buffer {
+  return protobufField(
+    1,
+    Buffer.concat(
+      stepIds.map((id) => protobufField(2, Buffer.from(id, "hex"))),
+    ),
+  );
+}
+
+function protobufField(fieldNumber: number, payload: Uint8Array): Buffer {
+  return Buffer.concat([
+    protobufVarint(BigInt(fieldNumber * 8 + 2)),
+    protobufVarint(BigInt(payload.byteLength)),
+    Buffer.from(payload),
+  ]);
+}
+
+function protobufVarint(input: bigint): Buffer {
+  let value = input;
+  const bytes: number[] = [];
+  do {
+    let byte = Number(value & 0x7fn);
+    value >>= 7n;
+    if (value !== 0n) {
+      byte |= 0x80;
+    }
+    bytes.push(byte);
+  } while (value !== 0n);
+  return Buffer.from(bytes);
 }

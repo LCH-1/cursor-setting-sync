@@ -2,6 +2,46 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [0.0.71] - 2026-08-22
+
+### Fixed
+
+- **Cursor continuation closure checks no longer mistake arbitrary 32-byte protobuf values for missing `agentKv` blobs.** Traversal now follows only schema-recognized reference fields, so tool-result content, scalar strings, and embedded messages do not create false missing edges. Accepted references remain hash-verified and bounded, while unknown schemas fail closed instead of being guessed.
+
+### Changed
+
+- **The public Command Palette surface is reduced from 17 commands to one: `Cursor Setting Sync: Manage`.** Every on-demand setup or reconfiguration, diagnostic, forced sync or queued apply, conflict resolution, unavailable-chat repair or recovered-chat opening, synchronized-version or database-backup restore, repository archive, device retirement or restoration, and local disconnect action now lives in that menu. Routine synchronization, eligible live file application, shutdown-time database application, checkpointing, pruning, git-history compaction, and safe-orphan cleanup remain automatic.
+
+## [0.0.70] - 2026-08-21
+
+### Fixed
+
+- **The offline `state.vscdb` final-export helper can now drain a large advancing backlog without stopping after 32 total passes.** A monotonic progress token resets the stagnation counter only when a bounded pass advances the remaining work. After 32 consecutive stagnant passes, the fail-closed branch now terminates the helper loop as intended instead of allowing another pass. Existing per-pass row, chat, byte, and work limits are unchanged.
+- **Forced inbound targets are cleared only after a stable full-pass scan proves the corresponding database row is truly absent.** A present but malformed row remains blocked, and repeated database churn freezes cursor progress until a stable scan can justify advancing it; neither case is mistaken for proven absence.
+
+## [0.0.69] - 2026-08-20
+
+### Fixed
+
+- **A conversation continued on PC B can now remain the same original conversation when applied on PC A.** New or changed chats admitted by the bounded two-chat enrichment work batch can receive continuation enrichment in the same synchronization cycle, and the receiving PC queues and applies a chat core only when its portable v2 continuation graph is complete. The offline helper independently verifies the authenticated payload metadata, hashes, and reachable closure before writing it. A legacy blob-only event still cannot materialize an absent core directly, but a closure-complete legacy payload is republished as a verified core-applying child so existing repositories can recover the original conversation. The original `composerId` is retained rather than replaced with a successor Agent.
+- **A stale chat core no longer wins merely because Cursor froze both copies at the same timestamp.** For equal timestamps, automatic election accepts only a provable, complete strict extension of the shared visible sequence. A shrink, divergence, malformed or unavailable visible body, or ambiguous fork fails closed and remains for manual resolution instead of silently replacing either side; incomplete continuation graphs remain blocked for bounded enrichment instead of being misclassified as a core conflict.
+
+### Changed
+
+- Continuation capture and application remain intentionally bounded. A recent newly published or changed chat is enriched in the same cycle only when admitted by the two-chat work batch; any remainder and a large legacy backlog are processed incrementally and are not guaranteed to finish in one **Sync Now**.
+
+## [0.0.68] - 2026-08-14
+
+### Fixed
+
+- **Recovered context is now actually readable in Remote SSH Agents instead of appearing as broken local attachment chips.** Safe continuation detects a matching non-local workspace, obtains explicit consent and a user-selected folder on the same remote authority, copies and hash-verifies the bounded transcript and PNGs there, and opens the empty Agent with remote `START-HERE.md` and transcript references only. The start document directs Cursor's image-capable read tool to each exact staged PNG. Cancellation, authority mismatch, transfer/read-back failure, or a last-moment chat change opens no Agent and sends nothing; the original conversation remains read-only.
+
+## [0.0.67] - 2026-08-13
+
+### Fixed
+
+- **Bulk chat preservation no longer aborts when one conversation selects identical image content more than once.** **Preserve All Recoverable Chats Safely** canonicalizes matching selected-image artifacts while retaining fail-closed validation for conflicting metadata, allowing the bounded recovery pass to continue through later damaged chats.
+
 ## [0.0.66] - 2026-08-13
 
 ### Added

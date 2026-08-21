@@ -594,8 +594,11 @@ async function verifySelectedImages(
     transcript.workspaceId,
     "recovery workspace ID",
   );
-  const verifiedByRelativePath = new Map<string, VerifiedSelectedImage>();
-  let totalBytes = 0;
+  const verifiedBySourceRelativePath = new Map<string, VerifiedSelectedImage>();
+  const verifiedByArtifactName = new Map<string, VerifiedSelectedImage>();
+  // Bound every distinct source file read, even when multiple source names
+  // contain identical bytes and later collapse to one content-addressed file.
+  let sourceTotalBytes = 0;
   for (const reference of transcript.selectedImages) {
     if (!isRecognizedAbsolutePath(reference.sourcePath)) {
       throw new Error("A selected image path is not absolute.");
@@ -611,7 +614,7 @@ async function verifySelectedImages(
     // different user profile. Never follow the stored absolute path. Bind its
     // safe basename to the selected composer's local workspace image root.
     const relativePath = `${workspaceId}/images/${name}`;
-    const existing = verifiedByRelativePath.get(relativePath);
+    const existing = verifiedBySourceRelativePath.get(relativePath);
     if (existing !== undefined) {
       assertStoredImageDimensions(reference, existing);
       existing.references.push({
@@ -625,11 +628,15 @@ async function verifySelectedImages(
       relativePath,
       transcript.maxSelectedImageBytes,
     );
-    if (totalBytes > transcript.maxSelectedImageTotalBytes - bytes.byteLength) {
+    if (
+      sourceTotalBytes >
+      transcript.maxSelectedImageTotalBytes - bytes.byteLength
+    ) {
       throw new Error("Selected images exceed the bounded aggregate size limit.");
     }
+    sourceTotalBytes += bytes.byteLength;
     const identified = identifyImage(bytes);
-    const verified: VerifiedSelectedImage = {
+    const candidate: VerifiedSelectedImage = {
       bytes,
       hash: sha256(bytes),
       ...identified,
@@ -637,11 +644,32 @@ async function verifySelectedImages(
         { recordNumber: reference.recordNumber, ordinal: reference.ordinal },
       ],
     };
-    assertStoredImageDimensions(reference, verified);
-    totalBytes += bytes.byteLength;
-    verifiedByRelativePath.set(relativePath, verified);
+    assertStoredImageDimensions(reference, candidate);
+    const artifactName = selectedImageFileName(candidate);
+    const artifactExisting = verifiedByArtifactName.get(artifactName);
+    if (artifactExisting !== undefined) {
+      // Keep every historical record/ordinal reference in the Markdown while
+      // reserving, writing, returning, and cataloging the physical PNG once.
+      if (
+        artifactExisting.hash !== candidate.hash ||
+        artifactExisting.mimeType !== candidate.mimeType ||
+        artifactExisting.suffix !== candidate.suffix ||
+        artifactExisting.width !== candidate.width ||
+        artifactExisting.height !== candidate.height ||
+        !artifactExisting.bytes.equals(candidate.bytes)
+      ) {
+        throw new Error(
+          "Selected images give one content-addressed output path conflicting metadata or bytes.",
+        );
+      }
+      artifactExisting.references.push(...candidate.references);
+      verifiedBySourceRelativePath.set(relativePath, artifactExisting);
+      continue;
+    }
+    verifiedBySourceRelativePath.set(relativePath, candidate);
+    verifiedByArtifactName.set(artifactName, candidate);
   }
-  return [...verifiedByRelativePath.values()];
+  return [...verifiedByArtifactName.values()];
 }
 
 function appendVerifiedImageManifest(

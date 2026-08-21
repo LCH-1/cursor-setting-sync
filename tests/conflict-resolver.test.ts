@@ -424,7 +424,9 @@ describe("conflict resolver overview", () => {
 
       expect(applied.resolved).toBe(0);
       expect(applied.deferred).toHaveLength(KEYS.length);
-      expect(applied.deferred[0]).toContain("run Resolve Conflicts again");
+      expect(applied.deferred[0]).toContain(
+        'Cursor Setting Sync: Manage" and choose "Resolve Conflicts',
+      );
     });
   });
 });

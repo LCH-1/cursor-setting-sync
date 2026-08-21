@@ -28,6 +28,7 @@ import {
   walkAgentKvReachability,
   type AgentKvBlobLookup,
 } from "./agentKv";
+import { verifyPortableChatContinuationClosure } from "./continuationClosure";
 
 /**
  * Repository chat payloads inspected in one synchronization cycle.
@@ -86,6 +87,12 @@ export interface ChatTipAgentKvCollection {
    * limit), not on the live DB/WAL generation.
    */
   cacheUntilTipOrPolicyChanges?: boolean;
+  /**
+   * Sorted unique source `missingIds` whose exact live-DB lookup returned
+   * `missing`. Only these IDs may be pruned from a portable source; omitted,
+   * over-budget, unreadable and raced probes never grant prune authority.
+   */
+  provenAbsentSourceMissingIds?: readonly string[];
 }
 
 export interface ChatTipAgentKvContext {
@@ -453,17 +460,21 @@ function validTipLastUpdatedAt(tip: ResourceTip): number | null {
 }
 
 function tipNeedsAgentKvEnrichment(tip: ResourceTip): boolean {
+  const origin = effectiveSyncOrigin(tip.metadata);
   if (
     tip.kind !== "chat" ||
     tip.operation !== "put" ||
     tip.payload === undefined ||
-    effectiveSyncOrigin(tip.metadata) === "automatic-chat-repair"
+    origin === "automatic-chat-repair"
   ) {
     return false;
   }
   const schemaVersion = tip.metadata?.chatSnapshotSchemaVersion;
   const missing = tip.metadata?.agentKvMissingCount;
   return (
+    (isCoreMigrationSourceTip(tip) &&
+      schemaVersion === 2 &&
+      missing === 0) ||
     schemaVersion !== 2 ||
     typeof missing !== "number" ||
     !Number.isSafeInteger(missing) ||
@@ -539,6 +550,23 @@ async function planChatTipEnrichment(
     return null;
   }
 
+  if (isSamePayloadCoreMigration(candidate.tip, source)) {
+    const closure = await verifyEnrichmentContinuationClosure(source);
+    if (closure.status === "complete") {
+      return plannedEnrichment(
+        candidate,
+        content,
+        source,
+        sourceCoreHash,
+        true,
+      );
+    }
+    // A legacy blob-only tip whose aggregate missing count is zero can still
+    // omit a reachable descendant. Fall through to the normal collector so a
+    // source device that owns that exact blob may complete it. Never publish
+    // the core-applying marker from metadata alone.
+  }
+
   const safelyEmptyLegacyGraph = emptyLegacyAgentKvPayload(
     source,
     sourceConversationStates,
@@ -575,6 +603,18 @@ async function planChatTipEnrichment(
   if (collected.agentKv === null) {
     return null;
   }
+  const pruneProof = validateSourceMissingPruneProof(
+    source,
+    collected.agentKv,
+    collected.provenAbsentSourceMissingIds,
+  );
+  if (!pruneProof.valid) {
+    rememberPolicyStableEnrichmentAttempt(candidate, options);
+    warnings.push(
+      `Skipped agent blob enrichment for ${candidate.resourceId}: ${pruneProof.reason}.`,
+    );
+    return null;
+  }
   const previousBlobIds = new Set(
     isPortableChatSnapshotV2(source)
       ? source.agentKv.blobs.map(agentKvBlobId)
@@ -592,12 +632,24 @@ async function planChatTipEnrichment(
     collected.agentKv.blobs.length === 0 &&
     collected.agentKv.referencedIds.length === 0 &&
     collected.agentKv.missingIds.length === 0;
-  if (addedBlobCount === 0 && !publishesAuditedEmptyGraph) {
+  const publishesOrphanCanonicalization = pruneProof.droppedIds.length > 0;
+  const publishesCorrectedCoreMigrationPartition =
+    isPortableChatSnapshotV2(source) &&
+    source.agentKv.missingIds.length === 0 &&
+    isCoreMigrationSourceTip(candidate.tip) &&
+    !sameAgentKvPayload(source.agentKv, collected.agentKv);
+  if (
+    addedBlobCount === 0 &&
+    !publishesAuditedEmptyGraph &&
+    !publishesOrphanCanonicalization &&
+    !publishesCorrectedCoreMigrationPartition
+  ) {
     return null;
   }
 
   let enrichedContent: Buffer;
   let enriched: PortableChatSnapshotV2;
+  let appliesCore: boolean;
   try {
     const candidateSnapshot: PortableChatSnapshotV2 = {
       ...source,
@@ -613,8 +665,29 @@ async function planChatTipEnrichment(
     if (enrichedCoreHash !== sourceCoreHash) {
       throw new Error("enrichment changed the repository chat core");
     }
-    assertAgentKvMonotonic(source, parsed);
     enriched = parsed;
+    const closure = await verifyEnrichmentContinuationClosure(enriched);
+    if (closure.status === "invalid" || closure.status === "unknown") {
+      throw new Error(
+        `enriched continuation closure is ${closure.status}: ${closure.reason}`,
+      );
+    }
+    const activeClosureComplete = closure.status === "complete";
+    appliesCore =
+      enriched.agentKv.missingIds.length === 0 && activeClosureComplete;
+    if (enriched.agentKv.missingIds.length === 0 && !appliesCore) {
+      throw new Error("enriched continuation closure is incomplete");
+    }
+    // An active-closure-complete payload may safely remove only source IDs
+    // whose exact local lookup proved absent. Retained unprobed IDs keep this
+    // child blob-only and eligible for the next bounded pass.
+    assertAgentKvMonotonic(
+      source,
+      enriched,
+      activeClosureComplete
+        ? new Set(pruneProof.droppedIds)
+        : new Set<string>(),
+    );
   } catch (error) {
     rememberPolicyStableEnrichmentAttempt(candidate, options);
     warnings.push(
@@ -634,21 +707,106 @@ async function planChatTipEnrichment(
     return null;
   }
 
+  return plannedEnrichment(
+    candidate,
+    enrichedContent,
+    enriched,
+    sourceCoreHash,
+    appliesCore,
+  );
+}
+
+function isSamePayloadCoreMigration(
+  tip: ResourceTip,
+  source: PortableChatSnapshot,
+): source is PortableChatSnapshotV2 {
+  return (
+    isCoreMigrationSourceTip(tip) &&
+    isPortableChatSnapshotV2(source) &&
+    source.agentKv.missingIds.length === 0
+  );
+}
+
+function isCoreMigrationSourceTip(tip: ResourceTip): boolean {
+  const origin = effectiveSyncOrigin(tip.metadata);
+  return (
+    origin === "auto-merge" ||
+    origin === "version-restore" ||
+    origin === "conflict-resolution" ||
+    (origin === "agent-kv-enrichment" &&
+      tip.metadata?.agentKvEnrichmentAppliesCore !== true)
+  );
+}
+
+function sameAgentKvPayload(
+  left: PortableAgentKvPayload,
+  right: PortableAgentKvPayload,
+): boolean {
+  return (
+    sameStrings(left.referencedIds, right.referencedIds) &&
+    sameStrings(left.missingIds, right.missingIds) &&
+    left.blobs.length === right.blobs.length &&
+    left.blobs.every((blob, index) => {
+      const other = right.blobs[index];
+      return (
+        other !== undefined &&
+        blob.key === other.key &&
+        blob.valueBase64 === other.valueBase64 &&
+        blob.valueType === other.valueType
+      );
+    })
+  );
+}
+
+function sameStrings(
+  left: readonly string[],
+  right: readonly string[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
+}
+
+async function verifyEnrichmentContinuationClosure(
+  snapshot: PortableChatSnapshotV2,
+) {
+  return verifyPortableChatContinuationClosure(snapshot, {
+    limits: {
+      maxNodes: Math.min(
+        CHAT_TIP_ENRICHMENT_MAX_NODES,
+        DEFAULT_AGENT_KV_WALK_LIMITS.maxNodes,
+      ),
+      maxBytes: Math.min(
+        CHAT_TIP_ENRICHMENT_MAX_WORK_BYTES,
+        DEFAULT_AGENT_KV_WALK_LIMITS.maxBytes,
+      ),
+      maxDepth: DEFAULT_AGENT_KV_WALK_LIMITS.maxDepth,
+      maxProtobufDepth: DEFAULT_AGENT_KV_WALK_LIMITS.maxProtobufDepth,
+    },
+  });
+}
+
+function plannedEnrichment(
+  candidate: ChatTipEnrichmentCandidate,
+  content: Buffer,
+  snapshot: PortableChatSnapshotV2,
+  coreHash: string,
+  appliesCore: boolean,
+): PlannedEnrichment {
   const originalProducer = effectiveTipProducer(candidate.tip);
   const metadata: Record<string, JsonValue> = {
     ...(candidate.tip.metadata ?? {}),
     chatSnapshotSchemaVersion: 2,
-    agentKvBlobCount: enriched.agentKv.blobs.length,
-    agentKvReferencedCount: enriched.agentKv.referencedIds.length,
-    agentKvMissingCount: enriched.agentKv.missingIds.length,
-    chatCoreHash: sourceCoreHash,
+    agentKvBlobCount: snapshot.agentKv.blobs.length,
+    agentKvReferencedCount: snapshot.agentKv.referencedIds.length,
+    agentKvMissingCount: snapshot.agentKv.missingIds.length,
+    chatCoreHash: coreHash,
     syncOrigin: "agent-kv-enrichment",
-    // The enriched payload still carries the exact parent chat core. A peer
-    // may see this child before it ever applied that parent, so the helper must
-    // use ordinary additive chat semantics rather than treating every
-    // enrichment as blob-only. Older/pre-release enrichment events without
-    // this authenticated flag retain the conservative blob-only behavior.
-    agentKvEnrichmentAppliesCore: true,
+    // Only a bounded, closure-complete payload may replace the chat core on a
+    // peer that never applied its parent. Partial children remain blob-only
+    // and eligible for a later source device to finish.
+    agentKvEnrichmentAppliesCore: appliesCore,
     enrichedFromVersionId: candidate.tip.versionId,
     enrichedFromSemanticHash: candidate.tip.semanticHash,
     ...(originalProducer === undefined
@@ -660,8 +818,8 @@ async function planChatTipEnrichment(
     snapshot: {
       resourceId: candidate.resourceId,
       kind: "chat",
-      content: enrichedContent,
-      semanticHash: sha256(enrichedContent),
+      content,
+      semanticHash: sha256(content),
       parents: [...candidate.expectedTipIds],
       metadata,
     },
@@ -782,13 +940,18 @@ function emptyLegacyAgentKvPayload(
 function assertAgentKvMonotonic(
   source: PortableChatSnapshot,
   enriched: PortableChatSnapshotV2,
+  allowedPrunedSourceMissing: ReadonlySet<string>,
 ): void {
   if (!isPortableChatSnapshotV2(source)) {
     return;
   }
   const enrichedReferences = new Set(enriched.agentKv.referencedIds);
+  const sourceMissing = new Set(source.agentKv.missingIds);
   for (const id of source.agentKv.referencedIds) {
-    if (!enrichedReferences.has(id)) {
+    if (
+      !enrichedReferences.has(id) &&
+      !(sourceMissing.has(id) && allowedPrunedSourceMissing.has(id))
+    ) {
       throw new Error("enrichment dropped a repository agentKv reference");
     }
   }
@@ -809,11 +972,76 @@ function assertAgentKvMonotonic(
   for (const id of source.agentKv.missingIds) {
     if (
       !enrichedMissing.has(id) &&
-      !enrichedBlobs.has(`${AGENT_KV_BLOB_PREFIX}${id}`)
+      !enrichedBlobs.has(`${AGENT_KV_BLOB_PREFIX}${id}`) &&
+      (!allowedPrunedSourceMissing.has(id) || enrichedReferences.has(id))
     ) {
-      throw new Error("enrichment dropped an unresolved repository agentKv ID");
+      throw new Error(
+        "enrichment left an unresolved repository agentKv reference unpartitioned",
+      );
     }
   }
+}
+
+type SourceMissingPruneProof =
+  | { valid: true; droppedIds: string[] }
+  | { valid: false; reason: string };
+
+function validateSourceMissingPruneProof(
+  source: PortableChatSnapshot,
+  enriched: PortableAgentKvPayload,
+  declaredProof: readonly string[] | undefined,
+): SourceMissingPruneProof {
+  const proof = declaredProof ?? [];
+  for (let index = 0; index < proof.length; index += 1) {
+    const id = proof[index];
+    const previous = proof[index - 1];
+    if (
+      typeof id !== "string" ||
+      (previous !== undefined && compareStrings(previous, id) >= 0)
+    ) {
+      return {
+        valid: false,
+        reason: "source-missing absence proof is not sorted and unique",
+      };
+    }
+  }
+  if (!isPortableChatSnapshotV2(source)) {
+    return proof.length === 0
+      ? { valid: true, droppedIds: [] }
+      : {
+          valid: false,
+          reason: "a legacy source carried an inapplicable absence proof",
+        };
+  }
+
+  const sourceMissing = new Set(source.agentKv.missingIds);
+  const references = new Set(enriched.referencedIds);
+  const missing = new Set(enriched.missingIds);
+  const blobs = new Set(enriched.blobs.map(agentKvBlobId));
+  const droppedIds = source.agentKv.missingIds.filter(
+    (id) => !references.has(id) && !missing.has(id) && !blobs.has(id),
+  );
+  const dropped = new Set(droppedIds);
+  const proven = new Set(proof);
+  if (proof.some((id) => !sourceMissing.has(id))) {
+    return {
+      valid: false,
+      reason: "source-missing absence proof names an ID outside the source",
+    };
+  }
+  if (droppedIds.some((id) => !proven.has(id))) {
+    return {
+      valid: false,
+      reason: "an unresolved source ID was pruned without exact absence proof",
+    };
+  }
+  if (proof.some((id) => !dropped.has(id) && !blobs.has(id))) {
+    return {
+      valid: false,
+      reason: "source-missing absence proof was neither pruned nor materialized",
+    };
+  }
+  return { valid: true, droppedIds };
 }
 
 function sameCurrentTips(
@@ -1107,6 +1335,7 @@ async function collectLiveAgentKv(
   // missing IDs separately, but debit the same node and raw-byte budgets; a
   // large or corrupt local row is rejected by the same metadata-first guarded
   // SELECT used by the graph walker before its value can be materialized.
+  const provenAbsentSourceMissingIds = new Set<string>();
   if (isPortableChatSnapshotV2(snapshot)) {
     const walkedIds = new Set([
       ...walked.blobs.map((blob) => blob.id),
@@ -1123,7 +1352,7 @@ async function collectLiveAgentKv(
       if (blobs.has(key) || walkedIds.has(id)) {
         continue;
       }
-      if (remainingNodes === 0 || remainingRawBytes === 0) {
+      if (remainingNodes === 0) {
         break;
       }
       remainingNodes -= 1;
@@ -1139,6 +1368,10 @@ async function collectLiveAgentKv(
         result = await lookupExactBlob(key, remainingRawBytes);
       } catch {
         retryableLookupFailure = true;
+        continue;
+      }
+      if (result.status === "missing") {
+        provenAbsentSourceMissingIds.add(id);
         continue;
       }
       if (
@@ -1164,10 +1397,13 @@ async function collectLiveAgentKv(
       remainingRawBytes -= result.bytes.byteLength;
     }
   }
+  // Canonical references consist of the elected core's active closure plus
+  // every blob row we actually retain. A prior merge may have carried an
+  // unresolved losing-core ID forever even though the elected core cannot
+  // reach it; dropping that declaration is safe. Materialized losing-core
+  // extras remain both as blobs and references so no recovered bytes vanish.
   const referencedIds = new Set(
-    isPortableChatSnapshotV2(snapshot)
-      ? snapshot.agentKv.referencedIds
-      : [],
+    [...blobs.keys()].map((key) => key.slice(AGENT_KV_BLOB_PREFIX.length)),
   );
   for (const id of [
     ...walked.roots,
@@ -1176,10 +1412,31 @@ async function collectLiveAgentKv(
   ]) {
     referencedIds.add(id);
   }
+  if (isPortableChatSnapshotV2(snapshot)) {
+    const activeClosureFullyWalked =
+      walked.missing.length === 0 &&
+      walked.tampered.length === 0 &&
+      walked.unreadable.length === 0;
+    for (const id of snapshot.agentKv.missingIds) {
+      // A missing exact-key result proves this losing-core declaration has no
+      // bytes to retain on this source. Unprobed, over-budget, unreadable, or
+      // raced IDs remain unresolved so exhausting a fixed probe budget never
+      // silently discards a potentially recoverable blob.
+      if (
+        !activeClosureFullyWalked ||
+        !provenAbsentSourceMissingIds.has(id)
+      ) {
+        referencedIds.add(id);
+      }
+    }
+  }
   const materializedIds = new Set(
     [...blobs.keys()].map((key) => key.slice(AGENT_KV_BLOB_PREFIX.length)),
   );
   const sortedReferences = [...referencedIds].sort(compareStrings);
+  const appliedAbsenceProof = [...provenAbsentSourceMissingIds]
+    .filter((id) => !referencedIds.has(id) && !materializedIds.has(id))
+    .sort(compareStrings);
   return {
     agentKv: {
       blobs: [...blobs.values()].sort((left, right) =>
@@ -1188,6 +1445,9 @@ async function collectLiveAgentKv(
       referencedIds: sortedReferences,
       missingIds: sortedReferences.filter((id) => !materializedIds.has(id)),
     },
+    ...(appliedAbsenceProof.length === 0
+      ? {}
+      : { provenAbsentSourceMissingIds: appliedAbsenceProof }),
     ...(retryableLookupFailure ? { retryable: true } : {}),
   };
 }
