@@ -79,14 +79,35 @@ function cursorIsRunning(): boolean {
             "CSV",
             "/NH",
           ]).toString()
-        : execFileSync("ps", ["-axo", "comm="]).toString();
+        : execFileSync("ps", ["-axo", "pid=,comm="]).toString();
     return parseCursorProcessIds(listing, process.platform).length > 0;
   } catch {
     return true;
   }
 }
 
-const describeBuilt = existsSync(HELPER) && !cursorIsRunning() ? describe : describe.skip;
+const releaseRun =
+  process.env.CI === "true" || process.env.REQUIRE_SQLITE_BACKUP === "1";
+const cursorRunning = cursorIsRunning();
+const describeBuilt = existsSync(HELPER) && !cursorRunning ? describe : describe.skip;
+
+describe("second-device helper prerequisites", () => {
+  it("has the built bundle and no running Cursor process for a release run", () => {
+    if (!releaseRun) {
+      return;
+    }
+    if (!existsSync(HELPER)) {
+      throw new Error(
+        'dist/helper.js is missing. Run "npm run build" before a release run.',
+      );
+    }
+    if (cursorRunning) {
+      throw new Error(
+        "Cursor is running, so the second-device helper suite would be silently skipped. Close Cursor before a release run.",
+      );
+    }
+  });
+});
 
 afterEach(async () => {
   await Promise.all(

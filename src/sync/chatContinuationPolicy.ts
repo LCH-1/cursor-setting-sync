@@ -8,7 +8,7 @@ import { effectiveSyncOrigin } from "./versionPolicy";
  * snapshot instead of materializing a legacy body that will fail on submit.
  */
 export const INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON =
-  'Waiting for a complete synchronized continuation snapshot. On a PC where this original chat can still continue, let automatic synchronization finish or open "Cursor Setting Sync: Manage" and choose "Sync Now".';
+  'Waiting for a complete synchronized continuation snapshot. On a PC where this original chat can still continue, let automatic synchronization finish or open "Cursor Setting Sync: Manage" and choose "Sync & Apply Now".';
 
 export function chatContinuationApplyBlockReason(
   tip: Pick<ResourceTip, "kind" | "operation" | "metadata">,

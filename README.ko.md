@@ -143,6 +143,9 @@ PC A는 완전한 portable v2 continuation graph에서만 채팅 core를 대기�
   "cursorSettingSync.autoApplyFiles": true,
   "cursorSettingSync.syncChat": true,
   "cursorSettingSync.syncWorkspaceStorage": true,
+  "cursorSettingSync.applyOnShutdown": true,
+  "cursorSettingSync.syncLocalWorkspaces": false,
+  "cursorSettingSync.ignoredWorkspaces": [],
   "cursorSettingSync.gitSync": true,
   "cursorSettingSync.ignoredSettings": [],
   "cursorSettingSync.useDefaultIgnoredSettings": true,
@@ -161,6 +164,7 @@ PC A는 완전한 portable v2 continuation graph에서만 채팅 core를 대기�
 | `autoApplyFiles` | `true` | Cursor 실행 중 충돌 없는 파일 리소스를 자동 적용할지. **Sync & Apply Now**의 동기화 단계는 이 값과 무관하게 적용합니다. |
 | `syncChat` | `true` | 지원되는 Cursor 채팅 저장소(composer 대화·에이전트 트랜스크립트·`store.db`) 동기화 여부. |
 | `syncWorkspaceStorage` | `true` | `workspaceStorage` 상태 백업 여부. 모든 Cursor 프로세스가 종료된 뒤에만 캡처됩니다. |
+| `applyOnShutdown` | `true` | Cursor를 정상 종료할 때 대기 중인 데이터베이스 작업을 자동 적용할지. 끄면 **Sync & Apply Now**로 명시적으로 적용합니다. 안전한 파일 작업은 계속 실행 중 적용되며, Cursor가 실행 중일 때 데이터베이스를 쓰지는 않습니다. |
 | `syncLocalWorkspaces` | `false` | 로컬 폴더 워크스페이스(`file://`)를 workspaceStorage 동기화에 포함할지. **기본은 끔**: 로컬 폴더는 경로로 식별되므로 두 컴퓨터가 같은 프로젝트를 똑같은 경로로 열지 않는 한 반대편에 내려앉을 곳이 없고, 실제로 벌어지는 일은 무관한 워크스페이스 수백 개를 나열하며 존재하지 않는 대상을 고르라는 프롬프트뿐입니다. 모든 컴퓨터에서 같은 프로젝트가 같은 경로에 있다면 켜세요. Remote-SSH 워크스페이스는 항상 동기화됩니다. **기기 범위.** |
 | `ignoredWorkspaces` | `[]` | 위 기본 제외에 **더해서** 이 컴퓨터가 백업도 쓰기도 하지 않을 워크스페이스. 워크스페이스 URI로 매칭하며 와일드카드가 됩니다: `vscode-remote://ssh-remote+staging*`. Cursor가 저장한 퍼센트 인코딩 형태도 사람이 쓰는 읽기 쉬운 패턴과 매칭됩니다. **기기 범위(machine scope)**라 다른 설정과 달리 컴퓨터 간에 전파되지 않습니다 — 어떤 프로젝트가 이 기기에 있는지는 그 기기의 사실이기 때문입니다. 채팅에는 영향이 없습니다. |
 | `gitSync` | `true` | 저장소 폴더가 git 워크트리일 때 읽기 전 pull·쓰기 후 commit/push를 사용할지. `git` CLI가 필요합니다. |

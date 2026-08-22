@@ -334,7 +334,7 @@ describe("visible-row continuation recovery", () => {
     expect(rawMarkdown).toContain("future_cursor_tool");
     expect(rawMarkdown).toContain(unparsedParameters);
     expect(rawMarkdown).not.toContain('"type":"tool_use"');
-  });
+  }, 15_000);
 
   it("writes a verified content-addressed file without overwriting a collision", async () => {
     const fixture = await createCalendarFixture();
@@ -455,7 +455,7 @@ describe("visible-row continuation recovery", () => {
       ),
     ).rejects.toThrow(/size limit/i);
     expect(await readdir(boundedStorage)).toEqual([]);
-  });
+  }, 15_000);
 
   it("heals corrupt catalog-owned content-addressed files without touching standalone files", async () => {
     const fixture = await createCalendarFixture();

@@ -1,66 +1,135 @@
 name: Publish Extension
 
 on:
-  release:
   push:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  publish-open-vsx:
-    name: Publish to Open VSX (Cursor)
+  package-release:
+    name: Verify and package release
     runs-on: ubuntu-latest
+    env:
+      CI: "true"
+      REQUIRE_SQLITE_BACKUP: "1"
+    outputs:
+      vsix_name: ${{ steps.release-metadata.outputs.vsix_name }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
 
       - run: npm ci
+
+      - name: Verify tag and prepare artifact name
+        id: release-metadata
+        shell: bash
+        run: |
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          EXPECTED_TAG="v${PACKAGE_VERSION}"
+          [[ "$GITHUB_REF_NAME" == "$EXPECTED_TAG" ]] || {
+            echo "Tag $GITHUB_REF_NAME != package.json $PACKAGE_VERSION"
+            exit 1
+          }
+          echo "vsix_name=cursor-setting-sync-${PACKAGE_VERSION}.vsix" >> "$GITHUB_OUTPUT"
+
       - run: npm run verify
 
-      - name: Verify tag equals package.json version
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          PKG_VER="$(node -p "require('./package.json').version")"
-          [[ "$TAG" == "v$PKG_VER" ]] || { echo "Tag $TAG != package.json $PKG_VER"; exit 1; }
+      - name: Package the verified VSIX
+        shell: bash
+        run: npx vsce package --out "${{ steps.release-metadata.outputs.vsix_name }}"
+
+      - name: Record artifact checksum
+        shell: bash
+        run: sha256sum "${{ steps.release-metadata.outputs.vsix_name }}"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cursor-setting-sync-vsix
+          path: ${{ steps.release-metadata.outputs.vsix_name }}
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-open-vsx:
+    name: Publish to Open VSX (Cursor)
+    needs: package-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download verified VSIX
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cursor-setting-sync-vsix
+          path: release-artifact
 
       - name: Publish to Open VSX
-        uses: HaaLeo/publish-vscode-extension@v2
+        uses: HaaLeo/publish-vscode-extension@4004fc217b5ac892b15a1c3cbe6458de97242dde # v2
         with:
           pat: ${{ secrets.OPEN_VSX_TOKEN }}
-          preRelease: ${{ github.event.release.prerelease || false }}
+          extensionFile: release-artifact/${{ needs.package-release.outputs.vsix_name }}
           skipDuplicate: true
 
   publish-vscode-marketplace:
     name: Publish to VS Code Marketplace
+    needs: package-release
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - name: Download verified VSIX
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          node-version: 24
-          cache: npm
-
-      - run: npm ci
-      - run: npm run verify
-
-      - name: Verify tag equals package.json version
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          PKG_VER="$(node -p "require('./package.json').version")"
-          [[ "$TAG" == "v$PKG_VER" ]] || { echo "Tag $TAG != package.json $PKG_VER"; exit 1; }
+          name: cursor-setting-sync-vsix
+          path: release-artifact
 
       - name: Publish to Visual Studio Marketplace
-        uses: HaaLeo/publish-vscode-extension@v2
+        uses: HaaLeo/publish-vscode-extension@4004fc217b5ac892b15a1c3cbe6458de97242dde # v2
         with:
           pat: ${{ secrets.VS_MARKETPLACE_TOKEN }}
+          extensionFile: release-artifact/${{ needs.package-release.outputs.vsix_name }}
           registryUrl: https://marketplace.visualstudio.com
           skipDuplicate: true
+
+  github-release:
+    name: Publish GitHub Release
+    needs:
+      - package-release
+      - publish-open-vsx
+      - publish-vscode-marketplace
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified VSIX
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: cursor-setting-sync-vsix
+          path: release-artifact
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VSIX_NAME: ${{ needs.package-release.outputs.vsix_name }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "release-artifact/${VSIX_NAME}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "release-artifact/${VSIX_NAME}" \
+              --verify-tag \
+              --title "Cursor Setting Sync ${GITHUB_REF_NAME}" \
+              --notes "First stable release of Cursor Setting Sync. It provides encrypted, bounded synchronization with one Manage command, automatic routine maintenance, offline-safe database application, and schema-aware chat continuation recovery. See CHANGELOG.md in the tagged source for complete details."
+          fi

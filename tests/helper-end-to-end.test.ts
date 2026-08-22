@@ -48,14 +48,17 @@ function cursorIsRunning(): boolean {
             "CSV",
             "/NH",
           ]).toString()
-        : execFileSync("ps", ["-axo", "comm="]).toString();
+        : execFileSync("ps", ["-axo", "pid=,comm="]).toString();
     return parseCursorProcessIds(listing, process.platform).length > 0;
   } catch {
     return true;
   }
 }
 
-const runnable = existsSync(HELPER) && !cursorIsRunning();
+const releaseRun =
+  process.env.CI === "true" || process.env.REQUIRE_SQLITE_BACKUP === "1";
+const cursorRunning = cursorIsRunning();
+const runnable = existsSync(HELPER) && !cursorRunning;
 const describeBuilt = runnable ? describe : describe.skip;
 
 // A silent skip here restores the exact blind spot this file documents: every
@@ -64,13 +67,20 @@ const describeBuilt = runnable ? describe : describe.skip;
 // bundle; a running Cursor is still a legitimate reason to skip.
 describe("helper end-to-end prerequisites", () => {
   it("has the built bundle when a release run demands it", () => {
-    const strict =
-      process.env.CI === "true" || process.env.REQUIRE_SQLITE_BACKUP === "1";
-    if (!strict || existsSync(HELPER)) {
+    if (!releaseRun || existsSync(HELPER)) {
       return;
     }
     throw new Error(
       `dist/helper.js is missing, so the end-to-end helper suite was silently skipped. Run "npm run build" before the suite, or clear CI/REQUIRE_SQLITE_BACKUP to accept the gap locally.`,
+    );
+  });
+
+  it("has no running Cursor process when a release run demands the helper suite", () => {
+    if (!releaseRun || !cursorRunning) {
+      return;
+    }
+    throw new Error(
+      "Cursor is running, so the end-to-end helper suite would be silently skipped. Close Cursor before a release run.",
     );
   });
 });

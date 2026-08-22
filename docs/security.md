@@ -8,7 +8,7 @@ The repository passphrase is not stored in the shared folder. `repo.json` contai
 
 ## Excluded data
 
-The extension excludes from database-backed UI-state synchronization:
+The extension excludes from database-backed synchronization:
 
 - `secret://*`
 - `mcpOAuth.*`

@@ -6946,7 +6946,7 @@ export class SyncManager implements vscode.Disposable {
       } else {
         this.status.setStatus(
           "up-to-date",
-          'Another Cursor window owns background synchronization. Open "Cursor Setting Sync: Manage" and choose "Sync Now" to load state in this window.',
+          'Another Cursor window owns background synchronization. Open "Cursor Setting Sync: Manage" and choose "Sync & Apply Now" to load state in this window.',
         );
       }
     }

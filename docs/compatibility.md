@@ -8,6 +8,10 @@
 
 The extension does not require an exact Cursor patch, minor, or VS Code base version. File-based resources are portable across supported installations.
 
+## Source build and release verification
+
+Building and running the complete test suite from source requires Node.js 24 or later. The published extension bundle still targets Node.js 20 and degrades to file-only synchronization when an older Cursor runtime lacks the required SQLite APIs, but Node.js 24 is required to exercise the offline-helper integration tests and `node:sqlite.backup` release gate without skips.
+
 ## Directional version policy
 
 Each event records the producing Cursor version, VS Code base version, and extension version.
@@ -47,7 +51,7 @@ Every nullable `composerHeaders` column and every `cursorDiskKV` chat value is t
 
 Portable Composer chat schema v2 additionally carries the reachable `agentKv:blob:<sha256>` continuation graph referenced by supported top-level `conversationState` fields in `composerData` and bubble rows, together with authenticated graph references retained by chat merges. Keys, hashes, reference partitions, counts, and byte limits are validated before apply. Version 0.0.62 and earlier can neither produce nor consume this graph and safely defer a v2 payload instead of applying only its legacy portion; legacy rows that already exist locally remain visible. Update every PC to 0.0.63 before relying on a restored conversation for continued prompting.
 
-If these checks fail, file synchronization remains active while profile, UI-state, extension-state, workspace storage, and database-backed chat resources are deferred. Diagnostics explain the failed capability or schema check.
+If these checks fail, file synchronization remains active while profile, Cursor User Rules, extension-state, workspace storage, and database-backed chat resources are deferred. Diagnostics explain the failed capability or schema check.
 
 ## Portable resources
 

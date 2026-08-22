@@ -38,7 +38,7 @@ This policy prioritizes forward migration and data safety. Reverse application t
 - A shared folder provided by OneDrive, Syncthing, or a similar file synchronization tool — or a git remote (the `git` CLI must be on PATH for git transport)
 - An optional repository passphrase (12+ characters when set; leaving it empty stores the key inside the repository, so only do that for a private local folder or a fully trusted private remote)
 
-File-based synchronization remains available when Cursor's embedded runtime does not provide the required SQLite capabilities. Profile, UI-state, extension-state, workspace storage, and database-backed chat synchronization require `node:sqlite`, online backup support, and a compatible local schema.
+File-based synchronization remains available when Cursor's embedded runtime does not provide the required SQLite capabilities. Profile, Cursor User Rules, extension-state, workspace storage, and database-backed chat synchronization require `node:sqlite`, online backup support, and a compatible local schema.
 
 ## Installation
 
@@ -143,6 +143,9 @@ Status-bar clicks route directly to the relevant internal action for setup, diag
   "cursorSettingSync.autoApplyFiles": true,
   "cursorSettingSync.syncChat": true,
   "cursorSettingSync.syncWorkspaceStorage": true,
+  "cursorSettingSync.applyOnShutdown": true,
+  "cursorSettingSync.syncLocalWorkspaces": false,
+  "cursorSettingSync.ignoredWorkspaces": [],
   "cursorSettingSync.gitSync": true,
   "cursorSettingSync.ignoredSettings": [],
   "cursorSettingSync.useDefaultIgnoredSettings": true,
@@ -161,6 +164,7 @@ Status-bar clicks route directly to the relevant internal action for setup, diag
 | `autoApplyFiles` | `true` | Whether non-conflicting file resources apply while Cursor runs. The synchronization phase of **Sync & Apply Now** applies regardless of this value. |
 | `syncChat` | `true` | Synchronize supported Cursor chat stores (composer conversations, agent transcripts, `store.db`). |
 | `syncWorkspaceStorage` | `true` | Back up `workspaceStorage` state. It is captured only after every Cursor process exits. |
+| `applyOnShutdown` | `true` | Apply queued database work automatically during a normal Cursor shutdown. Turn it off to apply explicitly through **Sync & Apply Now** instead. Files still apply live when safe; databases are never written while Cursor is running. |
 | `syncLocalWorkspaces` | `false` | Whether local folder workspaces (`file://`) take part in workspaceStorage sync. **Off by default**: a local folder is identified by its path, so unless both computers open the same project at the identical path there is nothing on the other side for it to land on — and the only thing that ever happened to those resources was a prompt listing hundreds of unrelated workspaces asking you to map one that does not exist. Turn it on if the same projects live at the same paths everywhere. Remote-SSH workspaces always synchronize. **Machine-scoped.** |
 | `ignoredWorkspaces` | `[]` | Further workspaces this computer neither backs up nor writes, matched against the workspace URI, on top of the built-in exclusion above. Wildcards work: `vscode-remote://ssh-remote+staging*`. The percent-encoded form Cursor stores is matched against the readable pattern you write. **Machine-scoped**: unlike every other setting here it does not travel between computers, because which projects live on a machine is a fact about that machine. Chats are unaffected. |
 | `gitSync` | `true` | When the repository folder is a git worktree, pull before reading and commit/push after writing. Requires the `git` CLI. |

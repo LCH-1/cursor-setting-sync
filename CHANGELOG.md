@@ -2,6 +2,19 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [1.0.0] - 2026-08-22
+
+### Stable release
+
+- **Cursor Setting Sync is now released as 1.0.0.** The stable release keeps the single public **Cursor Setting Sync: Manage** command and its six explicit management areas while routine polling, safe live-file application, shutdown-time database application, and bounded repository maintenance remain automatic.
+- **Cross-device chat continuation is fail-closed and schema-aware.** Portable chat cores retain their original composer identity, continuation blobs are exact-key and hash verified, unknown schemas remain deferred, and the offline helper rechecks compatible complete closures before changing a stopped Cursor database.
+- **The release pipeline now produces one verified VSIX for Open VSX, Visual Studio Marketplace, and GitHub Releases.** Tag and package versions must match, both stores receive the same artifact, and the GitHub release is created only after both store publications succeed.
+
+### Security and compliance
+
+- Updated the development and packaging dependency lock within the existing supported ranges, removing all known npm audit findings from both production and development dependencies at release time.
+- Added the required license notices for bundled third-party runtime libraries to the packaged extension.
+
 ## [0.0.71] - 2026-08-22
 
 ### Fixed
