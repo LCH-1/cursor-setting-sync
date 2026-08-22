@@ -2,6 +2,12 @@
 
 All notable changes to Cursor Setting Sync will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **Public releases now target Cursor only.** The release workflow publishes the verified VSIX to Open VSX for Cursor and attaches it to the GitHub Release. Visual Studio Marketplace publication and the local `vsce publish` scripts were removed.
+
 ## [1.0.0] - 2026-08-22
 
 ### Stable release

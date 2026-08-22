@@ -81,32 +81,11 @@ jobs:
           extensionFile: release-artifact/${{ needs.package-release.outputs.vsix_name }}
           skipDuplicate: true
 
-  publish-vscode-marketplace:
-    name: Publish to VS Code Marketplace
-    needs: package-release
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download verified VSIX
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: cursor-setting-sync-vsix
-          path: release-artifact
-
-      - name: Publish to Visual Studio Marketplace
-        uses: HaaLeo/publish-vscode-extension@4004fc217b5ac892b15a1c3cbe6458de97242dde # v2
-        with:
-          pat: ${{ secrets.VS_MARKETPLACE_TOKEN }}
-          extensionFile: release-artifact/${{ needs.package-release.outputs.vsix_name }}
-          registryUrl: https://marketplace.visualstudio.com
-          skipDuplicate: true
-
   github-release:
     name: Publish GitHub Release
     needs:
       - package-release
       - publish-open-vsx
-      - publish-vscode-marketplace
     runs-on: ubuntu-latest
     permissions:
       contents: write

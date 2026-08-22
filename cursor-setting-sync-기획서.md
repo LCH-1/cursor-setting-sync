@@ -214,7 +214,7 @@ lost_and_found(...)   -- ★ 과거 .recover(손상 복구) 흔적. 방어적 �
 | 변경 감지 | `composerHeaders.lastUpdatedAt` 워터마크(+ 보조로 contentHash) | 대화 단위 델타 추출, 행별 해시 불필요 |
 | 전송 포맷 | cid별 gzip JSON 스냅샷, append-only | 파일 충돌 제거 |
 | 싱글턴 | 락파일(atomic create + PID + stale 검출) | 창마다 확장호스트 존재 |
-| 배포 | VS Code Marketplace/Open VSX 및 VSIX | 모든 사용자가 설치 가능한 공개 배포 |
+| 배포 | Open VSX(Cursor) 및 GitHub Release VSIX | Cursor 사용자가 설치 가능한 공개 배포 |
 | 확장 ID | `lch.cursor-setting-sync` | 기존 `cursor-notepads`와 동일한 게시자 프로필 사용 |
 
 ---
@@ -265,7 +265,7 @@ lost_and_found(...)   -- ★ 과거 .recover(손상 복구) 흔적. 방어적 �
 - 충돌 정책, 스키마 드리프트 가드, 병합량 상한, 로깅/진단, 실패 복원 자동화.
 
 **M5 — 배포 패키징**
-- `lch` publisher의 Marketplace/Open VSX/VSIX 패키지, 다중 PC 실사용 검증.
+- `lch` publisher의 Open VSX(Cursor) 패키지와 GitHub Release VSIX, 다중 PC 실사용 검증.
 
 각 마일스톤은 **테스트 DB 사본**에서 먼저 검증 후 실 DB 적용.
 

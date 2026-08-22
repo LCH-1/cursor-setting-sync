@@ -166,10 +166,6 @@
     "test": "vitest run",
     "verify": "npm run check && npm run lint && npm run build && npm test",
     "package": "vsce package --out cursor-setting-sync.vsix",
-    "publish": "vsce publish",
-    "publish:patch": "vsce publish patch",
-    "publish:minor": "vsce publish minor",
-    "publish:major": "vsce publish major",
     "ovsx:publish": "npm run verify && npx ovsx publish --pat $OVSX_TOKEN"
   },
   "dependencies": {
