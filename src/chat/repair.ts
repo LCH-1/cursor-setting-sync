@@ -470,10 +470,7 @@ export async function inspectBrokenChatContinuationsInDatabase(
                FROM composerHeaders h
                JOIN cursorDiskKV d
                  ON d.key = 'composerData:' || CAST(h.composerId AS TEXT)
-              WHERE ((typeof(h.composerId) = 'text'
-                       AND h.composerId = ?1 COLLATE BINARY)
-                     OR (typeof(h.composerId) = 'blob'
-                         AND h.composerId = CAST(?1 AS BLOB)))
+              WHERE h.composerId COLLATE BINARY IN (?1, CAST(?1 AS BLOB))
                 AND COALESCE(h.isSubagent, 0) = 0
               LIMIT 2`,
           );

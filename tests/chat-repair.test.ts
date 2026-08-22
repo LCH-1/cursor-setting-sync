@@ -1109,7 +1109,8 @@ describe("Cursor chat reference audit", () => {
     const scopedSql = preparedSql.find((sql) =>
       sql.includes("FROM composerHeaders h"),
     );
-    expect(scopedSql).toContain("h.composerId = ?");
+    expect(scopedSql).toContain("h.composerId COLLATE BINARY IN (");
+    expect(scopedSql).toContain("CAST(?1 AS BLOB)");
     expect(scopedSql).not.toContain("ORDER BY");
     if (scopedSql === undefined) {
       throw new Error("Expected the scoped continuation query.");
@@ -1594,6 +1595,54 @@ describe("Cursor chat reference audit", () => {
     expect(upperTarget.broken[0]).toMatchObject({
       composerId: upperComposer,
       title: "Uppercase identity",
+    });
+    database.close();
+  });
+
+  it("overrides a legacy NOCASE composer identity with exact binary matching", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-chat-agentkv-nocase-"));
+    roots.push(root);
+    const database = new DatabaseSync(join(root, "nocase-identity.vscdb"));
+    database.exec(`
+      CREATE TABLE composerHeaders(
+        composerId TEXT COLLATE NOCASE PRIMARY KEY,
+        workspaceId TEXT,
+        createdAt INTEGER,
+        lastUpdatedAt INTEGER,
+        isArchived INTEGER,
+        isSubagent INTEGER,
+        recency INTEGER,
+        checkpointAt INTEGER,
+        value TEXT
+      );
+      CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value);
+    `);
+    const lowerComposer = "abcdefab-cdef-4abc-8def-abcdefabcdef";
+    const upperComposer = lowerComposer.toUpperCase();
+    insertChatWithConversationState(
+      database,
+      upperComposer,
+      "Uppercase legacy identity",
+      serializedConversationState([
+        sha256(Buffer.from("uppercase-legacy-identity-root", "utf8")),
+      ]),
+    );
+
+    const mismatchedTarget = await inspectBrokenChatContinuationsInDatabase(
+      database,
+      { composerIds: new Set([lowerComposer]) },
+    );
+    expect(mismatchedTarget.examinedChats).toBe(0);
+    expect(mismatchedTarget.broken).toEqual([]);
+
+    const exactTarget = await inspectBrokenChatContinuationsInDatabase(
+      database,
+      { composerIds: new Set([upperComposer]) },
+    );
+    expect(exactTarget.broken).toHaveLength(1);
+    expect(exactTarget.broken[0]).toMatchObject({
+      composerId: upperComposer,
+      title: "Uppercase legacy identity",
     });
     database.close();
   });
