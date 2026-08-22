@@ -119,7 +119,7 @@ export const MANAGE_TITLE = "Cursor Setting Sync: Manage";
  * public management command and name the exact action inside it.
  */
 export const RESTART_TO_APPLY_COMMAND = MANAGE_COMMAND;
-export const RESTART_TO_APPLY_TITLE = `${MANAGE_TITLE} → Apply Queued Changes`;
+export const RESTART_TO_APPLY_TITLE = `${MANAGE_TITLE} → Sync & Apply Now`;
 
 /**
  * How often the apply's preparation repeats the phase it is still on.

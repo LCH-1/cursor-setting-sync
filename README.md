@@ -42,17 +42,17 @@ File-based synchronization remains available when Cursor's embedded runtime does
 
 ## Installation
 
-Install **Cursor Setting Sync** from the Extensions view, then run the single Command Palette entry, `Cursor Setting Sync: Manage`, and choose **Setup or Reconfigure**.
+Install **Cursor Setting Sync** from the Extensions view, then run the single Command Palette entry, `Cursor Setting Sync: Manage`, and choose **Repository & Devices…** → **Setup or Reconfigure This PC…**.
 
 ## Setup
 
 ### Common (every transport)
 
-- Every transport starts from `Cursor Setting Sync: Manage` → **Setup or Reconfigure**.
+- Every transport starts from `Cursor Setting Sync: Manage` → **Repository & Devices…** → **Setup or Reconfigure This PC…**.
 - The passphrase is optional. If you set one, it must be at least 12 characters and identical on every PC. It is never stored in the shared repository and cannot be recovered.
 - Leaving the passphrase empty shows a security warning and then proceeds. The encryption key is then stored inside the repository next to the data, so anyone who can read the shared folder or git remote can decrypt everything. Use it only for a trusted local folder or a fully controlled private remote.
-- On additional PCs, file resources apply automatically when safe. Database and workspace-storage changes apply through the shutdown helper after all Cursor windows close normally; use **Apply Queued Changes** inside **Manage** only when you want to apply immediately.
-- Before setup, the status bar opens **Manage** directly at **Setup or Reconfigure**. Nothing is synchronized until a repository is configured.
+- On additional PCs, file resources apply automatically when safe. Database and workspace-storage changes apply through the shutdown helper after all Cursor windows close normally; use **Manage** → **Sync & Apply Now** only when you want to synchronize immediately and apply any resulting database queue. Cursor stays open when there is no offline work.
+- Before setup, the status bar opens the **Repository & Devices…** → **Setup or Reconfigure This PC…** flow inside **Manage**. Nothing is synchronized until a repository is configured.
 
 Pick a transport below, and check the [Storage options](#storage-options) table for provider-specific notes.
 
@@ -60,7 +60,7 @@ Pick a transport below, and check the [Storage options](#storage-options) table 
 
 **First PC**
 
-1. Run `Cursor Setting Sync: Manage` and choose **Setup or Reconfigure**.
+1. Run `Cursor Setting Sync: Manage` and choose **Repository & Devices…** → **Setup or Reconfigure This PC…**.
 2. Select an empty folder inside the shared (or local) location.
 3. Choose **Plain shared folder**.
 4. Enter a passphrase (at least 12 characters, or leave it empty to skip it).
@@ -68,7 +68,7 @@ Pick a transport below, and check the [Storage options](#storage-options) table 
 
 **Additional PCs**
 
-1. Install the extension, run `Cursor Setting Sync: Manage`, and choose **Setup or Reconfigure**.
+1. Install the extension, run `Cursor Setting Sync: Manage`, and choose **Repository & Devices…** → **Setup or Reconfigure This PC…**.
 2. Select the same shared folder (each PC's own local copy).
 3. Choose **Plain shared folder** and enter the same passphrase.
 
@@ -80,28 +80,28 @@ Pick a transport below, and check the [Storage options](#storage-options) table 
 
 **First PC (create the repository)**
 
-1. Run `Cursor Setting Sync: Manage` and choose **Setup or Reconfigure**.
+1. Run `Cursor Setting Sync: Manage` and choose **Repository & Devices…** → **Setup or Reconfigure This PC…**.
 2. Select an empty folder (any location).
 3. Choose **New git repository with remote** and enter the remote URL (leave it empty for a local-only git history).
 4. Enter a passphrase (at least 12 characters, or leave it empty to skip it). The first sync pushes to the remote.
 
 **Additional PCs (join the repository)**
 
-1. Install the extension, run `Cursor Setting Sync: Manage`, and choose **Setup or Reconfigure**.
+1. Install the extension, run `Cursor Setting Sync: Manage`, and choose **Repository & Devices…** → **Setup or Reconfigure This PC…**.
 2. Select an empty folder.
 3. Choose **Clone an existing git repository** and enter the same remote URL.
 4. Enter the same passphrase.
 
 ## Storage options
 
-The repository is a folder of encrypted, append-only files. What "sync" means depends on what carries that folder to your other PCs. From **Manage**, choose **Setup or Reconfigure**, point it at a folder, and pick the transport that matches how the folder travels.
+The repository is a folder of encrypted, append-only files. What "sync" means depends on what carries that folder to your other PCs. From **Manage**, choose **Repository & Devices…** → **Setup or Reconfigure This PC…**, point it at a folder, and pick the transport that matches how the folder travels.
 
 | Transport | How to set it up | What you get |
 | --- | --- | --- |
-| **OneDrive / Dropbox / iCloud Drive** | Choose **Plain shared folder** and select an empty folder inside the provider's synced location. Keep it on disk: OneDrive right-click → **"Always keep on this device"** (not "Free up space"; this is the Files On-Demand feature), Dropbox → turn off "online-only", iCloud Drive keeps files local by default. | Full multi-PC sync. The provider uploads the folder; each PC points **Setup or Reconfigure** at its own local copy of the same synced folder. |
+| **OneDrive / Dropbox / iCloud Drive** | Choose **Plain shared folder** and select an empty folder inside the provider's synced location. Keep it on disk: OneDrive right-click → **"Always keep on this device"** (not "Free up space"; this is the Files On-Demand feature), Dropbox → turn off "online-only", iCloud Drive keeps files local by default. | Full multi-PC sync. The provider uploads the folder; each PC points **Repository & Devices…** → **Setup or Reconfigure This PC…** at its own local copy of the same synced folder. |
 | **Google Drive** | In Google Drive for desktop use **"Mirror files"** mode (not stream-only) and right-click the folder → **"Available offline"**, then choose **Plain shared folder**. | Full multi-PC sync. In stream-only mode files are virtual placeholders, so file watching and reads are unreliable — Mirror files mode is required. |
 | **Syncthing / Resilio** | Point every PC's share at the same folder and choose **Plain shared folder**. | Full multi-PC sync with no cloud account. The extension already ignores `sync-conflict` copies. |
-| **Local folder (no cloud, no git)** | Choose **Plain shared folder** and select any local directory. | Single-PC versioned backup: full version history, **Restore Version History**, and **Restore Database Backup** all work. It just never reaches other PCs, because nothing carries the folder off the machine. |
+| **Local folder (no cloud, no git)** | Choose **Plain shared folder** and select any local directory. | Single-PC versioned backup: full version history and database-backup restore are available under **Restore Data…**. It just never reaches other PCs, because nothing carries the folder off the machine. |
 | **Git — clone existing** | Choose **Clone an existing git repository** and paste the repository URL (GitHub, GitLab, or a self-hosted remote). | Joins a repository other PCs already push to. Each cycle pulls before reading and commits/pushes after writing. |
 | **Git — new with remote** | Choose **New git repository with remote** and paste the remote URL. | Initializes git in the folder and connects the remote; the first sync pushes. Use this to start a fleet on GitHub/GitLab/self-hosted. |
 | **Git — local-only** | Choose **New git repository with remote** and leave the URL empty. | A local git history with no remote — like the local-folder case, but with git commits. Add a remote later to publish. |
@@ -112,8 +112,8 @@ Git transport requires the `git` CLI on `PATH`. Authentication uses your system 
 
 Use this flow when a conversation still continues normally on PC B and you want to continue that exact conversation on PC A, rather than create a successor Agent:
 
-1. Install the same current extension version on both PCs. On PC B, open the working original conversation and wait for the automatic cycle—and the shared-folder provider or git push—to finish. To force a cycle, open **Manage** and choose **Sync Now**.
-2. On PC A, wait for the automatic repository cycle. If a database change is queued, close every Cursor window normally, let the shutdown helper finish, and reopen Cursor. To apply immediately, choose **Apply Queued Changes** inside **Manage**. Chat database rows are never written while Cursor is running.
+1. Install the same current extension version on both PCs. On PC B, open the working original conversation and wait for the automatic cycle—and the shared-folder provider or git push—to finish. To force a cycle, open **Manage** and choose **Sync & Apply Now**; it synchronizes first and closes Cursor only if database work is queued.
+2. On PC A, wait for the automatic repository cycle. If a database change is queued, close every Cursor window normally, let the shutdown helper finish, and reopen Cursor. To apply immediately, choose **Manage** → **Sync & Apply Now**. Chat database rows are never written while Cursor is running.
 3. Reopen the same workspace and select the original conversation. Its exact `composerId` is retained; this flow does not create a new Agent.
 
 PC A queues and applies a chat core only from a complete portable v2 continuation graph, and the offline helper verifies its metadata and reachable closure again before writing. A legacy blob-only event itself may add blobs but never materializes an absent core; when that legacy payload is closure-complete, the current extension republishes a verified core-applying child so an existing repository can recover the original core. Materialized orphan blobs are retained, while missing declarations that are proven unreachable and absent are normalized in bounded passes. If Cursor gave both copies the same frozen timestamp, the complete longer copy wins automatically only when it is a provable strict extension of the shared visible sequence; an ambiguous fork remains unresolved for manual handling. Newly published or changed chats admitted by the bounded two-chat work batch receive continuation enrichment in the same cycle. A large backlog of older chats is still processed incrementally, so one cycle is not guaranteed to prepare every legacy conversation—allow additional automatic cycles on the PC that still has the working originals before applying them elsewhere.
@@ -122,15 +122,16 @@ PC A queues and applies a chat core only from a complete portable v2 continuatio
 
 The Command Palette exposes exactly one entry: **Cursor Setting Sync: Manage**. Normal operation needs no command: synchronization polls and watches automatically, safe file changes apply while Cursor runs, queued database changes apply after a normal full shutdown, and checkpoint/prune/orphan maintenance runs behind bounded safety gates.
 
-**Manage** opens one action list for the cases that still require a deliberate choice:
+**Manage** has exactly six top-level actions:
 
-- **Show Diagnostics**, **Sync Now**, and **Apply Queued Changes** for inspection or an immediate retry. The latter two are manual accelerators for automatic work.
-- **Resolve Conflicts** for data that cannot be merged without choosing a side.
-- **Repair Unavailable Chats** and **Open Recovered Chat** for bounded in-place repair or the safe transcript fallback. Repair never fabricates missing continuation data; if no exact source exists it leaves the original unchanged.
-- **Restore Version History** and **Restore Database Backup** for explicit rollback. A pre-restore backup is created so a mistaken database restore can be undone.
-- **Archive Repository**, **Forget Device**, **Setup or Reconfigure**, and **Disconnect This PC** for infrequent administration. Disconnect clears only this PC's path, key, and mappings; it does not alter the shared repository.
+- **Show Diagnostics** inspects status, warnings, pending work, and repository usage.
+- **Sync & Apply Now** runs one synchronization cycle, applies safe live-file work, and closes/relaunches Cursor only when database changes are queued. It is a manual accelerator for work that normally runs automatically.
+- **Resolve Conflicts** handles data that cannot be merged without choosing a side.
+- **Recover Chats…** contains **Check and Recover Current Chats** and **Open a Preserved Chat** for bounded in-place repair or the safe transcript fallback. The full recovery audit is deliberately user-initiated because it can scan a large live database; it never fabricates missing continuation data, and if no exact source exists it leaves the original unchanged.
+- **Restore Data…** contains **Restore a Synchronized Version** and **Restore a Local Database Backup (Emergency)** for explicit rollback. Both restore paths are deliberately user-initiated. Database restore quits Cursor and the restored state later synchronizes to other PCs; a pre-restore backup is created so a mistaken restore can be undone.
+- **Repository & Devices…** contains **Setup or Reconfigure This PC…**, **Archive Repository…**, **Retire or Restore Another Device…**, and **Disconnect This PC**. Disconnect clears only this PC's path, key, and mappings; it does not alter the shared repository.
 
-Status-bar clicks route to the relevant action inside **Manage**, so setup, diagnostics, queued apply, and conflict resolution remain one click away without adding separate palette commands.
+Status-bar clicks route directly to the relevant internal action for setup, diagnostics, synchronization, and conflict resolution. Queued database work still applies automatically on normal shutdown; the deliberate immediate path is the single top-level **Sync & Apply Now** action.
 
 ## Settings
 
@@ -157,7 +158,7 @@ Status-bar clicks route to the relevant action inside **Manage**, so setup, diag
 | `enabled` | `true` | Master switch that turns automatic synchronization on or off after setup. |
 | `pollIntervalSeconds` | `30` | Fallback polling interval (seconds, 10–3600) for scanning the shared repository. Git mode detects remote changes through this poll. |
 | `chatPollIntervalSeconds` | `30` | Interval (seconds, 10–3600) for checking Cursor chat metadata changes. |
-| `autoApplyFiles` | `true` | Whether non-conflicting file resources apply while Cursor runs. A manual `Sync Now` applies regardless of this value. |
+| `autoApplyFiles` | `true` | Whether non-conflicting file resources apply while Cursor runs. The synchronization phase of **Sync & Apply Now** applies regardless of this value. |
 | `syncChat` | `true` | Synchronize supported Cursor chat stores (composer conversations, agent transcripts, `store.db`). |
 | `syncWorkspaceStorage` | `true` | Back up `workspaceStorage` state. It is captured only after every Cursor process exits. |
 | `syncLocalWorkspaces` | `false` | Whether local folder workspaces (`file://`) take part in workspaceStorage sync. **Off by default**: a local folder is identified by its path, so unless both computers open the same project at the identical path there is nothing on the other side for it to land on — and the only thing that ever happened to those resources was a prompt listing hundreds of unrelated workspaces asking you to map one that does not exist. Turn it on if the same projects live at the same paths everywhere. Remote-SSH workspaces always synchronize. **Machine-scoped.** |
@@ -226,8 +227,8 @@ Shared-folder status only confirms a local file write. Always wait for OneDrive 
 ## Known limitations
 
 - Cursor/GitHub/Microsoft sign-in and MCP OAuth authorization must be completed separately on every PC.
-- A forced shutdown can prevent the final database and workspace-storage export from completing. If needed, open **Manage**, choose **Sync Now**, then close Cursor normally after important work.
-- Workspace storage is captured only after every Cursor process exits; the **Sync Now** action does not scan it while Cursor is running.
+- A forced shutdown can prevent the final database and workspace-storage export from completing. If needed, open **Manage** and choose **Sync & Apply Now**; it synchronizes first and performs any queued offline work through a normal close/relaunch.
+- Workspace storage is captured only after every Cursor process exits. The running-Cursor synchronization phase of **Sync & Apply Now** does not scan it; when offline work is queued, the shutdown helper captures it after Cursor closes.
 - Workspace database imports are upsert-only in protocol v1: target-only rows are preserved, and a missing incoming row never deletes local state.
 - Agent transcripts alone may not fully recreate every Cursor sidebar entry.
 - Finalized events and tombstones are retained by repository protocol v1 until automatic maintenance folds and removes them. Once the event log passes 500 files, a running extension host waits at least six hours between automatic attempts; restarting Cursor may re-evaluate sooner, but the propagation, age, pending-work, and conflict safety gates still apply.

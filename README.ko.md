@@ -42,17 +42,17 @@ Cursor 내장 런타임이 필요한 SQLite 기능을 제공하지 않을 때도
 
 ## 설치
 
-Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트의 유일한 항목인 `Cursor Setting Sync: Manage`를 실행하고 **Setup or Reconfigure**를 선택합니다.
+Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트의 유일한 항목인 `Cursor Setting Sync: Manage`를 실행하고 **Repository & Devices…** → **Setup or Reconfigure This PC…**를 선택합니다.
 
 ## 셋업
 
 ### 공통 (모든 방식 공통)
 
-- 어느 방식이든 `Cursor Setting Sync: Manage` → **Setup or Reconfigure**에서 시작합니다.
+- 어느 방식이든 `Cursor Setting Sync: Manage` → **Repository & Devices…** → **Setup or Reconfigure This PC…**에서 시작합니다.
 - 패스프레이즈는 선택 사항입니다. 입력한다면 12자 이상이어야 하고 모든 PC에서 동일해야 합니다. 공유 저장소에 저장되지 않으며, 복구할 수 없습니다.
 - 패스프레이즈를 비워 두면 보안 경고가 뜬 뒤 진행됩니다. 이 경우 암호화 키가 저장소 안(데이터 옆)에 놓여, 공유 폴더나 git 원격을 읽을 수 있는 사람은 누구나 복호화할 수 있습니다. 신뢰할 수 있는 로컬 폴더나 완전히 통제되는 비공개 원격에서만 사용하세요.
-- 추가 PC에서는 파일 리소스가 안전할 때 자동으로 적용됩니다. DB·워크스페이스 스토리지 변경은 모든 Cursor 창을 정상 종료하면 종료 헬퍼가 자동 적용합니다. 즉시 적용하려면 **Manage** 안의 **Apply Queued Changes**를 사용합니다.
-- 설정 전에는 상태바를 누르면 **Manage**의 **Setup or Reconfigure**로 바로 연결됩니다. 저장소가 설정되기 전까지는 아무것도 동기화되지 않습니다.
+- 추가 PC에서는 파일 리소스가 안전할 때 자동으로 적용됩니다. DB·워크스페이스 스토리지 변경은 모든 Cursor 창을 정상 종료하면 종료 헬퍼가 자동 적용합니다. 지금 동기화하고 생긴 DB 대기열까지 즉시 적용하려면 **Manage** → **Sync & Apply Now**를 사용합니다. 오프라인 작업이 없으면 Cursor를 종료하지 않습니다.
+- 설정 전에는 상태바를 누르면 **Manage**의 **Repository & Devices…** → **Setup or Reconfigure This PC…** 흐름으로 바로 연결됩니다. 저장소가 설정되기 전까지는 아무것도 동기화되지 않습니다.
 
 방식별 상세는 아래를 참고하고, 제공자별 주의사항은 [저장소 옵션](#저장소-옵션) 표를 확인하세요.
 
@@ -60,7 +60,7 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 
 **첫 번째 PC**
 
-1. `Cursor Setting Sync: Manage`를 실행하고 **Setup or Reconfigure**를 선택합니다.
+1. `Cursor Setting Sync: Manage`를 실행하고 **Repository & Devices…** → **Setup or Reconfigure This PC…**를 선택합니다.
 2. 공유 폴더(또는 로컬 폴더) 안의 빈 폴더를 선택합니다.
 3. **Plain shared folder**를 선택합니다.
 4. 패스프레이즈를 입력합니다(12자 이상, 또는 비워서 생략).
@@ -68,7 +68,7 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 
 **추가 PC**
 
-1. 확장을 설치하고 `Cursor Setting Sync: Manage`에서 **Setup or Reconfigure**를 선택합니다.
+1. 확장을 설치하고 `Cursor Setting Sync: Manage`에서 **Repository & Devices…** → **Setup or Reconfigure This PC…**를 선택합니다.
 2. 같은 공유 폴더(각 PC의 로컬 사본)를 선택합니다.
 3. **Plain shared folder**를 선택하고 같은 패스프레이즈를 입력합니다.
 
@@ -80,28 +80,28 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 
 **첫 번째 PC (새 저장소 생성)**
 
-1. `Cursor Setting Sync: Manage`를 실행하고 **Setup or Reconfigure**를 선택합니다.
+1. `Cursor Setting Sync: Manage`를 실행하고 **Repository & Devices…** → **Setup or Reconfigure This PC…**를 선택합니다.
 2. 빈 폴더를 선택합니다(위치는 자유).
 3. **New git repository with remote**를 선택하고 원격 URL을 입력합니다(비워두면 원격 없는 로컬 git 히스토리).
 4. 패스프레이즈를 입력합니다(12자 이상, 또는 비워서 생략). 첫 동기화에서 원격으로 push됩니다.
 
 **추가 PC (기존 저장소 합류)**
 
-1. 확장을 설치하고 `Cursor Setting Sync: Manage`에서 **Setup or Reconfigure**를 선택합니다.
+1. 확장을 설치하고 `Cursor Setting Sync: Manage`에서 **Repository & Devices…** → **Setup or Reconfigure This PC…**를 선택합니다.
 2. 빈 폴더를 선택합니다.
 3. **Clone an existing git repository**를 선택하고 같은 원격 URL을 입력합니다.
 4. 같은 패스프레이즈를 입력합니다.
 
 ## 저장소 옵션
 
-저장소는 암호화된 append-only 파일들이 담긴 폴더입니다. "동기화"의 의미는 그 폴더를 다른 PC로 무엇이 옮겨 주느냐에 따라 달라집니다. **Manage**의 **Setup or Reconfigure**에서 폴더를 지정하고, 폴더가 이동하는 방식에 맞는 전송을 선택하세요.
+저장소는 암호화된 append-only 파일들이 담긴 폴더입니다. "동기화"의 의미는 그 폴더를 다른 PC로 무엇이 옮겨 주느냐에 따라 달라집니다. **Manage**의 **Repository & Devices…** → **Setup or Reconfigure This PC…**에서 폴더를 지정하고, 폴더가 이동하는 방식에 맞는 전송을 선택하세요.
 
 | 전송 방식 | 설정 방법 | 결과 |
 | --- | --- | --- |
-| **OneDrive / Dropbox / iCloud Drive** | **Plain shared folder**를 선택하고, 제공자가 동기화하는 위치 안의 빈 폴더를 지정하세요. 폴더는 반드시 디스크에 실제로 유지해야 합니다. OneDrive는 폴더 우클릭 → **"항상 이 장치에 유지"**("공간 확보"는 사용 금지, 이것이 "파일 온디맨드" 기능입니다), Dropbox는 "온라인 전용"을 끄고, iCloud Drive는 기본적으로 파일을 로컬에 유지합니다. | 완전한 다중 PC 동기화. 제공자가 폴더를 업로드하고, 각 PC는 같은 동기 폴더의 자기 로컬 사본을 **Setup or Reconfigure**에서 가리킵니다. |
+| **OneDrive / Dropbox / iCloud Drive** | **Plain shared folder**를 선택하고, 제공자가 동기화하는 위치 안의 빈 폴더를 지정하세요. 폴더는 반드시 디스크에 실제로 유지해야 합니다. OneDrive는 폴더 우클릭 → **"항상 이 장치에 유지"**("공간 확보"는 사용 금지, 이것이 "파일 온디맨드" 기능입니다), Dropbox는 "온라인 전용"을 끄고, iCloud Drive는 기본적으로 파일을 로컬에 유지합니다. | 완전한 다중 PC 동기화. 제공자가 폴더를 업로드하고, 각 PC는 같은 동기 폴더의 자기 로컬 사본을 **Repository & Devices…** → **Setup or Reconfigure This PC…**에서 가리킵니다. |
 | **Google Drive** | 데스크톱용 Google Drive에서 **"파일 미러링"** 모드(스트리밍 전용 아님)를 쓰고, 폴더를 우클릭해 **"오프라인 액세스 가능"**으로 설정한 다음 **Plain shared folder**를 선택하세요. | 완전한 다중 PC 동기화. 스트리밍 전용 모드에서는 파일이 가상 placeholder라 파일 감시와 읽기가 불안정하므로 파일 미러링 모드가 필수입니다. |
 | **Syncthing / Resilio** | 모든 PC의 공유를 같은 폴더로 맞추고 **Plain shared folder**를 선택하세요. | 클라우드 계정 없이 완전한 다중 PC 동기화. 확장은 `sync-conflict` 사본을 이미 무시합니다. |
-| **로컬 폴더(클라우드·git 없음)** | **Plain shared folder**를 선택하고 아무 로컬 경로나 지정하세요. | 단일 PC 버전 백업. 전체 버전 히스토리, **Restore Version History**, **Restore Database Backup**이 모두 동작합니다. 폴더를 기기 밖으로 옮기는 주체가 없으므로 다른 PC로 전파되지 않을 뿐입니다. |
+| **로컬 폴더(클라우드·git 없음)** | **Plain shared folder**를 선택하고 아무 로컬 경로나 지정하세요. | 단일 PC 버전 백업. **Restore Data…**에서 전체 버전 히스토리와 DB 백업 복원을 모두 사용할 수 있습니다. 폴더를 기기 밖으로 옮기는 주체가 없으므로 다른 PC로 전파되지 않을 뿐입니다. |
 | **Git — clone existing** | **Clone an existing git repository**를 선택하고 저장소 URL(GitHub·GitLab·셀프호스팅 원격)을 붙여넣으세요. | 다른 PC들이 이미 push하는 저장소에 합류합니다. 매 주기마다 읽기 전에 pull하고 쓰기 후 commit/push합니다. |
 | **Git — new with remote** | **New git repository with remote**를 선택하고 원격 URL을 붙여넣으세요. | 폴더에 git을 초기화하고 원격을 연결하며, 첫 동기화에서 push합니다. GitHub/GitLab/셀프호스팅으로 여러 PC를 새로 시작할 때 쓰세요. |
 | **Git — local-only** | **New git repository with remote**를 선택하고 URL을 비워 두세요. | 원격 없는 로컬 git 히스토리 — 로컬 폴더와 같지만 git 커밋이 남습니다. 나중에 원격을 추가해 게시할 수 있습니다. |
@@ -112,8 +112,8 @@ Git 전송에는 `git` CLI가 `PATH`에 있어야 합니다. 인증은 시스템
 
 PC B에서는 대화가 정상적으로 이어지고 있고, 새 승계 Agent가 아니라 PC A에서 그 원본 대화를 그대로 이어 쓰려면 다음 순서로 진행합니다.
 
-1. 두 PC에 같은 최신 확장 버전을 설치합니다. PC B에서 정상 원본 대화를 연 뒤 자동 동기화와 공유 폴더 업로드 또는 git push가 모두 끝날 때까지 기다립니다. 즉시 한 주기를 강제하려면 **Manage**에서 **Sync Now**를 선택합니다.
-2. PC A에서 자동 저장소 갱신을 기다립니다. DB 변경이 대기하면 모든 Cursor 창을 정상 종료하고 종료 헬퍼가 끝난 뒤 다시 실행합니다. 즉시 적용하려면 **Manage**에서 **Apply Queued Changes**를 선택합니다. Cursor 실행 중에는 채팅 DB 행을 쓰지 않습니다.
+1. 두 PC에 같은 최신 확장 버전을 설치합니다. PC B에서 정상 원본 대화를 연 뒤 자동 동기화와 공유 폴더 업로드 또는 git push가 모두 끝날 때까지 기다립니다. 즉시 한 주기를 강제하려면 **Manage**에서 **Sync & Apply Now**를 선택합니다. 먼저 동기화하고 DB 작업이 대기 중일 때만 Cursor를 종료합니다.
+2. PC A에서 자동 저장소 갱신을 기다립니다. DB 변경이 대기하면 모든 Cursor 창을 정상 종료하고 종료 헬퍼가 끝난 뒤 다시 실행합니다. 즉시 적용하려면 **Manage** → **Sync & Apply Now**를 선택합니다. Cursor 실행 중에는 채팅 DB 행을 쓰지 않습니다.
 3. 같은 워크스페이스를 다시 열고 원본 대화를 선택합니다. 정확히 같은 `composerId`가 유지되며 새 Agent를 만들지 않습니다.
 
 PC A는 완전한 portable v2 continuation graph에서만 채팅 core를 대기열에 넣어 적용하고, 오프라인 헬퍼가 쓰기 직전에 메타데이터와 reachable closure를 다시 검증합니다. Legacy blob-only 이벤트 자체는 blob만 추가할 수 있고 없는 core를 직접 만들지는 않지만, 그 payload의 closure가 완전하면 현재 확장이 검증된 core-applying child로 다시 발행해 기존 저장소에서도 원본 core를 복구할 수 있게 합니다. 실제로 보존된 orphan blob은 유지하고, 현재 core에서 도달할 수 없으며 원본 PC에도 없다고 확인된 missing 선언만 bounded 단계로 정규화합니다. Cursor가 양쪽 사본에 같은 고정 timestamp를 부여했더라도, 더 긴 완전한 사본이 공통 visible sequence의 확실한 strict extension일 때만 자동으로 선택됩니다. 모호하게 갈라진 fork는 자동 덮어쓰기하지 않고 수동 처리를 위해 남깁니다. 새로 발행되거나 변경된 채팅도 bounded 두 개 작업 묶음에 포함된 경우에만 같은 동기화 주기 안에서 continuation enrichment를 받습니다. 다만 오래된 채팅이 매우 많으면 backlog는 점진적으로 처리되므로 한 주기로 모든 legacy 대화가 준비된다고 보장하지 않습니다. 정상 원본이 남은 PC에서 추가 자동 동기화 주기를 허용한 뒤 다른 PC에 적용하세요.
@@ -122,15 +122,16 @@ PC A는 완전한 portable v2 continuation graph에서만 채팅 core를 대기�
 
 명령 팔레트에는 **Cursor Setting Sync: Manage** 하나만 표시됩니다. 평소에는 명령이 필요 없습니다. 동기화는 폴링과 파일 감시로 자동 실행되고, 안전한 파일 변경은 Cursor 실행 중 적용되며, 대기 중인 DB 변경은 모든 Cursor 창을 정상 종료하면 적용됩니다. 체크포인트·프루닝·orphan 정리도 bounded 안전 조건 뒤에서 자동 실행됩니다.
 
-**Manage**에는 사람의 선택이 필요한 경우만 한 목록으로 모았습니다.
+**Manage**의 최상위 작업은 정확히 6개입니다.
 
-- **Show Diagnostics**, **Sync Now**, **Apply Queued Changes**: 상태 확인 또는 즉시 재시도용입니다. 뒤의 두 항목은 자동 작업을 앞당기는 수동 가속기입니다.
+- **Show Diagnostics**: 상태·경고·대기 작업·저장소 사용량을 확인합니다.
+- **Sync & Apply Now**: 한 번 동기화하고 안전한 라이브 파일 작업을 적용한 뒤, DB 변경이 대기 중일 때만 Cursor를 종료·적용·재실행합니다. 평소 자동 작업을 앞당기는 단일 작업입니다.
 - **Resolve Conflicts**: 안전하게 병합할 수 없는 데이터의 어느 쪽을 유지할지 선택합니다.
-- **Repair Unavailable Chats**, **Open Recovered Chat**: bounded 원위치 복구 또는 안전한 transcript 대체 경로입니다. 복구는 누락 continuation 데이터를 만들어내지 않으며 정확한 원본이 없으면 기존 채팅을 바꾸지 않습니다.
-- **Restore Version History**, **Restore Database Backup**: 명시적인 롤백입니다. DB 복원 전에는 되돌릴 수 있는 pre-restore 백업을 만듭니다.
-- **Archive Repository**, **Forget Device**, **Setup or Reconfigure**, **Disconnect This PC**: 드문 관리 작업입니다. Disconnect는 이 PC의 경로·키·매핑만 지우며 공유 저장소는 바꾸지 않습니다.
+- **Recover Chats…**: bounded 원위치 복구와 안전한 transcript 대체 경로인 **Check and Recover Current Chats**, **Open a Preserved Chat**을 담습니다. 전체 복구 감사는 큰 라이브 DB를 스캔할 수 있으므로 의도적으로 사용자가 시작하게 유지합니다. 누락 continuation 데이터를 만들어내지 않으며 정확한 원본이 없으면 기존 채팅을 바꾸지 않습니다.
+- **Restore Data…**: 명시적인 롤백인 **Restore a Synchronized Version**, **Restore a Local Database Backup (Emergency)**를 담습니다. 두 복원 경로 모두 의도적으로 사용자가 시작해야 합니다. DB 복원은 Cursor를 종료하고 이후 다른 PC에도 복원 상태가 동기화되며, 복원 전에는 되돌릴 수 있는 pre-restore 백업을 만듭니다.
+- **Repository & Devices…**: **Setup or Reconfigure This PC…**, **Archive Repository…**, **Retire or Restore Another Device…**, **Disconnect This PC**를 담습니다. Disconnect는 이 PC의 경로·키·매핑만 지우며 공유 저장소는 바꾸지 않습니다.
 
-상태바를 누르면 현재 상황에 맞는 **Manage** 작업으로 바로 연결되므로, 별도 팔레트 명령 없이도 설정·진단·대기열 적용·충돌 해결은 한 번의 클릭으로 열 수 있습니다.
+상태바를 누르면 설정·진단·동기화·충돌 해결에 맞는 내부 작업으로 바로 연결됩니다. 대기 중인 DB 작업은 정상 종료 시 계속 자동 적용되며, 지금 처리하려면 최상위 **Sync & Apply Now** 하나만 선택하면 됩니다.
 
 ## 설정 항목
 
@@ -157,7 +158,7 @@ PC A는 완전한 portable v2 continuation graph에서만 채팅 core를 대기�
 | `enabled` | `true` | Setup 이후 자동 동기화를 켜고 끄는 마스터 스위치. |
 | `pollIntervalSeconds` | `30` | 공유 저장소를 스캔하는 폴백 폴링 간격(초, 10–3600). git 모드는 원격 변경을 이 폴링으로 감지합니다. |
 | `chatPollIntervalSeconds` | `30` | Cursor 채팅 메타데이터 변경을 확인하는 간격(초, 10–3600). |
-| `autoApplyFiles` | `true` | Cursor 실행 중 충돌 없는 파일 리소스를 자동 적용할지. 수동 `Sync Now`는 이 값과 무관하게 적용합니다. |
+| `autoApplyFiles` | `true` | Cursor 실행 중 충돌 없는 파일 리소스를 자동 적용할지. **Sync & Apply Now**의 동기화 단계는 이 값과 무관하게 적용합니다. |
 | `syncChat` | `true` | 지원되는 Cursor 채팅 저장소(composer 대화·에이전트 트랜스크립트·`store.db`) 동기화 여부. |
 | `syncWorkspaceStorage` | `true` | `workspaceStorage` 상태 백업 여부. 모든 Cursor 프로세스가 종료된 뒤에만 캡처됩니다. |
 | `syncLocalWorkspaces` | `false` | 로컬 폴더 워크스페이스(`file://`)를 workspaceStorage 동기화에 포함할지. **기본은 끔**: 로컬 폴더는 경로로 식별되므로 두 컴퓨터가 같은 프로젝트를 똑같은 경로로 열지 않는 한 반대편에 내려앉을 곳이 없고, 실제로 벌어지는 일은 무관한 워크스페이스 수백 개를 나열하며 존재하지 않는 대상을 고르라는 프롬프트뿐입니다. 모든 컴퓨터에서 같은 프로젝트가 같은 경로에 있다면 켜세요. Remote-SSH 워크스페이스는 항상 동기화됩니다. **기기 범위.** |
@@ -226,8 +227,8 @@ VS Code 자체 Settings Sync가 기기 간에 전파하는 키는 의도적으�
 ## 알려진 제한
 
 - Cursor/GitHub/Microsoft 로그인과 MCP OAuth 인증은 PC마다 별도로 완료해야 합니다.
-- 강제 종료는 마지막 DB·워크스페이스 스토리지 내보내기를 못 끝낼 수 있습니다. 필요하면 **Manage**에서 **Sync Now**를 선택한 뒤 Cursor를 정상 종료하세요.
-- 워크스페이스 스토리지는 모든 Cursor 프로세스 종료 후에만 캡처됩니다. **Sync Now** 작업은 Cursor 실행 중에는 그것을 스캔하지 않습니다.
+- 강제 종료는 마지막 DB·워크스페이스 스토리지 내보내기를 못 끝낼 수 있습니다. 필요하면 **Manage**에서 **Sync & Apply Now**를 선택하세요. 먼저 동기화하고 대기 중인 오프라인 작업은 정상 종료·재실행 흐름으로 처리합니다.
+- 워크스페이스 스토리지는 모든 Cursor 프로세스 종료 후에만 캡처됩니다. **Sync & Apply Now**의 Cursor 실행 중 동기화 단계는 이를 스캔하지 않으며, 오프라인 작업이 대기 중이면 종료 후 헬퍼가 캡처합니다.
 - 워크스페이스 DB 가져오기는 프로토콜 v1에서 upsert 전용입니다. 대상에만 있는 행은 보존되며, 들어오지 않은 행이 로컬 상태를 삭제하지 않습니다.
 - 에이전트 트랜스크립트만으로는 모든 Cursor 사이드바 항목을 완전히 재현하지 못할 수 있습니다.
 - 확정된 이벤트와 툼스톤은 자동 유지보수가 체크포인트로 접어 제거할 때까지 저장소 프로토콜 v1에서 유지됩니다. 이벤트 로그 파일이 500개를 넘으면 실행 중인 extension host는 자동 시도 사이에 최소 6시간을 기다립니다. Cursor를 다시 시작하면 더 일찍 재평가할 수 있지만 전파·age·보류 작업·충돌 안전 조건은 그대로 적용됩니다.

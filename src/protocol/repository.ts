@@ -3733,7 +3733,7 @@ function validateEventHeader(header: EventHeader, repositoryId: string): void {
   }
   if (header.repositoryId !== repositoryId) {
     throw new Error(
-      "Event belongs to a different repository. This usually means Setup ran on two computers against the same folder before the cloud sync had copied either one's repository files: each created its own repository, and the folder now holds both. Keep one computer's setup; on the other, open \"Cursor Setting Sync: Manage\", choose \"Disconnect This PC\", delete the other device's folder under devices/ (and its repo.json conflict copy, if the cloud client made one), then use \"Setup or Reconfigure\" against this folder.",
+      "Event belongs to a different repository. This usually means Setup ran on two computers against the same folder before the cloud sync had copied either one's repository files: each created its own repository, and the folder now holds both. Keep one computer's setup; on the other, open \"Cursor Setting Sync: Manage\", choose \"Repository & Devices…\", then \"Disconnect This PC\". Delete the other device's folder under devices/ (and its repo.json conflict copy, if the cloud client made one), then use \"Setup or Reconfigure This PC…\" from the same menu against this folder.",
     );
   }
   assertSafeIdentifier(header.deviceId, "event device ID");

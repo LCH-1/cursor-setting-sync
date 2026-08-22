@@ -10,7 +10,7 @@ All notable changes to Cursor Setting Sync will be documented in this file.
 
 ### Changed
 
-- **The public Command Palette surface is reduced from 17 commands to one: `Cursor Setting Sync: Manage`.** Every on-demand setup or reconfiguration, diagnostic, forced sync or queued apply, conflict resolution, unavailable-chat repair or recovered-chat opening, synchronized-version or database-backup restore, repository archive, device retirement or restoration, and local disconnect action now lives in that menu. Routine synchronization, eligible live file application, shutdown-time database application, checkpointing, pruning, git-history compaction, and safe-orphan cleanup remain automatic.
+- **The public Command Palette surface is reduced from 17 commands to one: `Cursor Setting Sync: Manage`, with exactly six top-level actions.** **Show Diagnostics**, **Sync & Apply Now**, **Resolve Conflicts**, **Recover Chats…**, **Restore Data…**, and **Repository & Devices…** consolidate every on-demand operation without removing the bounded recovery and rollback paths. Routine synchronization, eligible live file application, shutdown-time database application, checkpointing, pruning, git-history compaction, and safe-orphan cleanup remain automatic. The potentially large live-database recovery audit and explicit version/database restore remain deliberately user-initiated; database restore still creates a fresh pre-restore backup before importing the selected state.
 
 ## [0.0.70] - 2026-08-21
 

@@ -701,7 +701,7 @@ async function recoverRestoreJournal(
     validateDatabaseFile(journal.databasePath, contract);
     journal.status = "failed";
     journal.error =
-      "An interrupted restore was found more than a day after it started and was NOT replayed; open \"Cursor Setting Sync: Manage\" and choose \"Restore Database Backup\" again if you still want it. The live database was left untouched.";
+      "An interrupted restore was found more than a day after it started and was NOT replayed; open \"Cursor Setting Sync: Manage\", choose \"Restore Data…\", then \"Restore a Local Database Backup (Emergency)\" if you still want it. The live database was left untouched.";
     notice(journal.error);
   } else {
     try {
@@ -1653,7 +1653,7 @@ function repairUnavailableChatBubbles(
   const isOrigin = localDeviceId === repairOriginDeviceId;
   if (isOrigin && currentAudit.fingerprint !== expectedFingerprint) {
     throw new Error(
-      'The chat changed after repair was planned; open "Cursor Setting Sync: Manage" and choose "Repair Unavailable Chats" again.',
+      'The chat changed after repair was planned; open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Check and Recover Current Chats" again.',
     );
   }
   if (

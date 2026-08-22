@@ -17,9 +17,16 @@ const SUPPORTED_PLATFORMS: ReadonlySet<NodeJS.Platform> = new Set([
 
 type ManagementAction =
   | "diagnostics"
+  | "sync-apply"
+  | "conflicts"
+  | "recover-chats"
+  | "restore-data"
+  | "repository-devices";
+
+type ManagementRoute =
+  | ManagementAction
   | "sync"
   | "apply"
-  | "conflicts"
   | "repair-chats"
   | "open-recovered"
   | "restore-version"
@@ -33,6 +40,10 @@ interface ManagementItem extends vscode.QuickPickItem {
   action: ManagementAction;
 }
 
+interface ManagementRouteItem extends vscode.QuickPickItem {
+  action: ManagementRoute;
+}
+
 const MANAGEMENT_ITEMS: readonly ManagementItem[] = [
   {
     label: "$(pulse) Show Diagnostics",
@@ -40,15 +51,10 @@ const MANAGEMENT_ITEMS: readonly ManagementItem[] = [
     action: "diagnostics",
   },
   {
-    label: "$(sync) Sync Now",
-    description: "normally automatic; force one bounded cycle now",
-    action: "sync",
-  },
-  {
-    label: "$(debug-restart) Apply Queued Changes",
+    label: "$(sync) Sync & Apply Now",
     description:
-      "quit Cursor, apply offline, then relaunch; normally automatic on shutdown",
-    action: "apply",
+      "sync first; quit, apply offline, and relaunch only when changes are queued",
+    action: "sync-apply",
   },
   {
     label: "$(diff) Resolve Conflicts",
@@ -56,46 +62,81 @@ const MANAGEMENT_ITEMS: readonly ManagementItem[] = [
     action: "conflicts",
   },
   {
-    label: "$(wrench) Repair Unavailable Chats",
-    description: "audit and safely repair or preserve damaged conversations",
+    label: "$(wrench) Recover Chats…",
+    description: "repair damaged chats or open a preserved recovery transcript",
+    action: "recover-chats",
+  },
+  {
+    label: "$(history) Restore Data…",
+    description: "restore synchronized history or an emergency database backup",
+    action: "restore-data",
+  },
+  {
+    label: "$(device-desktop) Repository & Devices…",
+    description: "set up, archive, manage peer streams, or disconnect this PC",
+    action: "repository-devices",
+  },
+];
+
+const RECOVER_CHAT_ITEMS: readonly ManagementRouteItem[] = [
+  {
+    label: "$(wrench) Check and Recover Current Chats",
+    description: "audit, repair, or safely preserve unavailable conversations",
     action: "repair-chats",
   },
   {
-    label: "$(comment-discussion) Open Recovered Chat",
-    description: "open one previously preserved recovery transcript",
+    label: "$(comment-discussion) Open a Preserved Chat",
+    description: "prepare one verified recovery transcript in an empty Agent",
     action: "open-recovered",
   },
+];
+
+const RESTORE_DATA_ITEMS: readonly ManagementRouteItem[] = [
   {
-    label: "$(history) Restore Version History",
-    description: "publish an earlier synchronized resource version",
+    label: "$(history) Restore a Synchronized Version",
+    description: "publish an earlier repository version as the newest state",
     action: "restore-version",
   },
   {
-    label: "$(database) Restore Database Backup",
-    description: "restore a pre-apply SQLite backup while Cursor is closed",
+    label: "$(database) Restore a Local Database Backup (Emergency)",
+    description: "quit Cursor and transactionally import a pre-apply backup",
     action: "restore-backup",
   },
+];
+
+const REPOSITORY_DEVICE_ITEMS: readonly ManagementRouteItem[] = [
   {
-    label: "$(archive) Archive Repository",
+    label: "$(settings-gear) Setup or Reconfigure This PC…",
+    description: "connect this PC or switch synchronization repositories",
+    action: "setup",
+  },
+  {
+    label: "$(archive) Archive Repository…",
     description: "copy the complete encrypted repository to a safe location",
     action: "archive",
   },
   {
-    label: "$(device-desktop) Forget Device",
-    description: "retire or restore a device stream",
+    label: "$(device-desktop) Retire or Restore Another Device…",
+    description: "change which peer streams this PC reads",
     action: "forget-device",
   },
   {
-    label: "$(settings-gear) Setup or Reconfigure",
-    description: "connect this PC to a sync repository",
-    action: "setup",
-  },
-  {
     label: "$(debug-disconnect) Disconnect This PC",
-    description: "clear only this PC's repository configuration and key",
+    description: "clear this PC's path, key, and mappings; shared data stays",
     action: "disconnect",
   },
 ];
+
+const MANAGEMENT_ROUTES: ReadonlySet<ManagementRoute> = new Set([
+  ...MANAGEMENT_ITEMS.map((item) => item.action),
+  ...RECOVER_CHAT_ITEMS.map((item) => item.action),
+  ...RESTORE_DATA_ITEMS.map((item) => item.action),
+  ...REPOSITORY_DEVICE_ITEMS.map((item) => item.action),
+  // Status-bar actions deliberately bypass the menu. A normal sync click must
+  // never inherit the top-level Sync & Apply action's potential Cursor quit.
+  "sync",
+  "apply",
+]);
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   if (!SUPPORTED_PLATFORMS.has(process.platform)) {
@@ -127,7 +168,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (activeManager === null) {
         return;
       }
-      const action = isManagementAction(requestedAction)
+      const action = isManagementRoute(requestedAction)
         ? requestedAction
         : (
             await vscode.window.showQuickPick(MANAGEMENT_ITEMS, {
@@ -138,7 +179,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             })
           )?.action;
       if (action !== undefined) {
-        await runManagementAction(activeManager, action);
+        await runManagementRoute(activeManager, action);
       }
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
@@ -243,14 +284,47 @@ function registerCommand(
   });
 }
 
-function isManagementAction(value: unknown): value is ManagementAction {
-  return MANAGEMENT_ITEMS.some((item) => item.action === value);
+function isManagementRoute(value: unknown): value is ManagementRoute {
+  return typeof value === "string" && MANAGEMENT_ROUTES.has(value as ManagementRoute);
 }
 
-async function runManagementAction(
+async function runManagementRoute(
   activeManager: SyncManager,
-  action: ManagementAction,
+  action: ManagementRoute,
 ): Promise<void> {
+  if (action === "recover-chats") {
+    const selected = await showManagementSubmenu(
+      "Recover Chats",
+      "Choose a verified repair or preserved-chat workflow",
+      RECOVER_CHAT_ITEMS,
+    );
+    if (selected !== undefined) {
+      await runManagementRoute(activeManager, selected);
+    }
+    return;
+  }
+  if (action === "restore-data") {
+    const selected = await showManagementSubmenu(
+      "Restore Data",
+      "Restores are explicit and never selected automatically",
+      RESTORE_DATA_ITEMS,
+    );
+    if (selected !== undefined) {
+      await runManagementRoute(activeManager, selected);
+    }
+    return;
+  }
+  if (action === "repository-devices") {
+    const selected = await showManagementSubmenu(
+      "Repository & Devices",
+      "Repository and device changes always require your explicit choice",
+      REPOSITORY_DEVICE_ITEMS,
+    );
+    if (selected !== undefined) {
+      await runManagementRoute(activeManager, selected);
+    }
+    return;
+  }
   if (action === "setup") {
     await activeManager.setup();
     return;
@@ -271,6 +345,7 @@ async function runManagementAction(
     case "sync":
       await activeManager.syncNowCommand();
       return;
+    case "sync-apply":
     case "apply":
       await activeManager.restartToApply();
       return;
@@ -293,4 +368,18 @@ async function runManagementAction(
       await activeManager.forgetDevice();
       return;
   }
+}
+
+async function showManagementSubmenu(
+  title: string,
+  placeHolder: string,
+  items: readonly ManagementRouteItem[],
+): Promise<ManagementRoute | undefined> {
+  return (
+    await vscode.window.showQuickPick(items, {
+      title: `${MANAGE_TITLE}: ${title}`,
+      placeHolder,
+      matchOnDescription: true,
+    })
+  )?.action;
 }

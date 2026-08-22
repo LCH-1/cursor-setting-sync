@@ -370,7 +370,7 @@ describe("bulk unavailable-chat recovery manager", () => {
       ui.answers.push(() => 0);
       await fixture.manager.openRecoveredChatSafely();
 
-      expect(ui.offered.at(-1)?.title).toBe("Open Recovered Chat Safely");
+      expect(ui.offered.at(-1)?.title).toBe("Open a Preserved Chat Safely");
       expect(ui.confirmations.at(-1)).toContain(
         "Open the recovered conversation's original workspace",
       );

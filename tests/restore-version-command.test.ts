@@ -478,7 +478,7 @@ describe("Repair Unavailable Chats command", () => {
         "1 additional damaged conversation was deferred by the command memory safety limit",
       );
       expect(ui.information.at(-1)).toContain(
-        'open "Cursor Setting Sync: Manage" and choose "Repair Unavailable Chats" again to inspect the next batch',
+        'open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Check and Recover Current Chats" again to inspect the next batch',
       );
       expect(
         ui.information.some((message) =>
@@ -891,7 +891,7 @@ describe("Repair Unavailable Chats command", () => {
         "Update Cursor Setting Sync on a PC where the affected chat still continues",
       );
       expect(warning).toContain(
-        "then let this PC synchronize and close Cursor normally to apply, or choose Manage → Apply Queued Changes",
+        "then let this PC synchronize and close Cursor normally to apply, or choose Manage → Sync & Apply Now",
       );
       expect(warning).not.toContain(fixture.rootId);
       expect(ui.warningOffers[0]).toEqual([
@@ -993,7 +993,7 @@ describe("Repair Unavailable Chats command", () => {
 
       await fixture.manager.openRecoveredChatSafely();
 
-      expect(ui.offered.at(-1)?.title).toBe("Open Recovered Chat Safely");
+      expect(ui.offered.at(-1)?.title).toBe("Open a Preserved Chat Safely");
       expect(ui.confirmations.at(-1)).toContain(
         "now complete or changed",
       );

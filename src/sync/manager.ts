@@ -1101,7 +1101,7 @@ export class SyncManager implements vscode.Disposable {
     );
   }
 
-  /** The Manage → Sync Now action: a manual sync with visible progress. */
+  /** A status-bar one-shot sync with visible progress and no forced quit. */
   async syncNowCommand(): Promise<void> {
     await this.withProgress("Cursor Setting Sync", async (report) => {
       report("Synchronizing...");
@@ -1122,13 +1122,13 @@ export class SyncManager implements vscode.Disposable {
   async disconnect(): Promise<void> {
     if (this.configuration.repositoryPath === null) {
       void vscode.window.showInformationMessage(
-        'Cursor Setting Sync is not connected to a repository, so there is nothing to disconnect. Open "Cursor Setting Sync: Manage" and choose "Setup or Reconfigure" to connect one.',
+        'Cursor Setting Sync is not connected to a repository, so there is nothing to disconnect. Open "Cursor Setting Sync: Manage", choose "Repository & Devices…", then "Setup or Reconfigure This PC…" to connect one.',
       );
       return;
     }
-    const proceed = "Disconnect";
+    const proceed = "Disconnect This PC";
     const confirmed = await vscode.window.showWarningMessage(
-      `Stop synchronizing with ${this.configuration.repositoryPath}? The shared folder and its history are left untouched; this device forgets the repository, its encryption key and its workspace mappings. Open Cursor Setting Sync: Manage and choose Setup or Reconfigure to reconnect.`,
+      `Disconnect this PC from ${this.configuration.repositoryPath}? Synchronization stops in every Cursor window on this PC, and this PC's stored repository path, encryption key, and workspace mappings are cleared. The shared repository, its history, and this PC's existing device stream remain unchanged. To reconnect, open Cursor Setting Sync: Manage, choose Repository & Devices…, then Setup or Reconfigure This PC….`,
       { modal: true },
       proceed,
     );
@@ -1184,7 +1184,7 @@ export class SyncManager implements vscode.Disposable {
     this.status.setStatus("unconfigured");
     this.status.log("Disconnected from the synchronization repository.");
     void vscode.window.showInformationMessage(
-      'Cursor Setting Sync is disconnected. Open "Cursor Setting Sync: Manage" and choose "Setup or Reconfigure" to connect again.',
+      'Cursor Setting Sync is disconnected. Open "Cursor Setting Sync: Manage", choose "Repository & Devices…", then "Setup or Reconfigure This PC…" to connect again.',
     );
   }
 
@@ -1955,7 +1955,7 @@ export class SyncManager implements vscode.Disposable {
     const openWorkspaceUri = matchingOpenWorkspaceUri(transcript.workspaceUri);
     if (openWorkspaceUri === null) {
       throw new Error(
-        'Open the conversation\'s original workspace in this Cursor window, then open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select the safe successor fallback again.',
+        'Open the conversation\'s original workspace in this Cursor window, then open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Check and Recover Current Chats", and select the safe successor fallback again.',
       );
     }
     const artifact = await writeVisibleChatRecoveryArtifact(
@@ -2017,7 +2017,7 @@ export class SyncManager implements vscode.Disposable {
       freshDamage.fingerprint !== inspectedSelection.fingerprint
     ) {
       void vscode.window.showWarningMessage(
-        `The selected conversation changed after inspection; open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select the safe successor fallback again. No new Agent was created and nothing was attached or sent.${remoteStagingRetention(prepared.remoteStaging)}`,
+        `The selected conversation changed after inspection; open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Check and Recover Current Chats", and select the safe successor fallback again. No new Agent was created and nothing was attached or sent.${remoteStagingRetention(prepared.remoteStaging)}`,
       );
       return;
     }
@@ -2028,7 +2028,7 @@ export class SyncManager implements vscode.Disposable {
       freshWorkspaceUri.authority !== openWorkspaceUri.authority
     ) {
       void vscode.window.showWarningMessage(
-        `The conversation's original workspace changed or closed during verification. Open it in this Cursor window, then open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select the safe successor fallback again. No new Agent was created and nothing was attached or sent.${remoteStagingRetention(prepared.remoteStaging)}`,
+        `The conversation's original workspace changed or closed during verification. Open it in this Cursor window, then open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Check and Recover Current Chats", and select the safe successor fallback again. No new Agent was created and nothing was attached or sent.${remoteStagingRetention(prepared.remoteStaging)}`,
       );
       return;
     }
@@ -2083,7 +2083,7 @@ export class SyncManager implements vscode.Disposable {
       {
         modal: true,
         detail:
-          "The recovered data is stored as plaintext in this extension's local recovery-transcripts folder until you explicitly delete those recovery files. This handles only definite continuation damage whose visible message bodies can still be verified; missing message-body chats reported separately by Repair Unavailable Chats still require a source PC or backup. This does not repair or change the original chats, create Agents, attach files to Agents, or send prompts.",
+          "The recovered data is stored as plaintext in this extension's local recovery-transcripts folder until you explicitly delete those recovery files. This handles only definite continuation damage whose visible message bodies can still be verified; missing message-body chats reported separately by the current-chat recovery audit still require a source PC or backup. This does not repair or change the original chats, create Agents, attach files to Agents, or send prompts.",
       },
       preserve,
     );
@@ -2105,7 +2105,7 @@ export class SyncManager implements vscode.Disposable {
     );
     if (result === null) {
       void vscode.window.showInformationMessage(
-        'Another Cursor window is already building the recovery catalog. Let it finish, then open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select "Preserve All Safely".',
+        'Another Cursor window is already building the recovery catalog. Let it finish, then open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Check and Recover Current Chats", and select "Preserve All Safely".',
       );
       return;
     }
@@ -2150,7 +2150,7 @@ export class SyncManager implements vscode.Disposable {
     );
     if (ready.length === 0) {
       void vscode.window.showInformationMessage(
-        'The local recovery catalog has no verified chat artifact ready to open. Open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select "Preserve All Safely" first.',
+        'The local recovery catalog has no verified chat artifact ready to open. Open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Check and Recover Current Chats", and select "Preserve All Safely" first.',
       );
       return;
     }
@@ -2168,7 +2168,7 @@ export class SyncManager implements vscode.Disposable {
       }));
     const choice = await vscode.window.showQuickPick(items,
       {
-        title: "Open Recovered Chat Safely",
+        title: "Open a Preserved Chat Safely",
         placeHolder:
           "Choose one verified recovery artifact to attach to a new Agent",
       },
@@ -2200,7 +2200,7 @@ export class SyncManager implements vscode.Disposable {
     const openWorkspaceUri = matchingOpenWorkspaceUri(transcript.workspaceUri);
     if (openWorkspaceUri === null) {
       void vscode.window.showWarningMessage(
-        'Open the recovered conversation\'s original workspace in this Cursor window, then open "Cursor Setting Sync: Manage" and choose "Open Recovered Chat" again. No Agent was created and nothing was attached or sent.',
+        'Open the recovered conversation\'s original workspace in this Cursor window, then open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Open a Preserved Chat" again. No Agent was created and nothing was attached or sent.',
       );
       return;
     }
@@ -2249,7 +2249,7 @@ export class SyncManager implements vscode.Disposable {
       freshWorkspaceUri.authority !== openWorkspaceUri.authority
     ) {
       void vscode.window.showWarningMessage(
-        `The recovered conversation's original workspace changed or closed during verification. Open it in this Cursor window, then open "Cursor Setting Sync: Manage" and choose "Open Recovered Chat" again. No Agent was created and nothing was attached or sent.${remoteStagingRetention(prepared.remoteStaging)}`,
+        `The recovered conversation's original workspace changed or closed during verification. Open it in this Cursor window, then open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Open a Preserved Chat" again. No Agent was created and nothing was attached or sent.${remoteStagingRetention(prepared.remoteStaging)}`,
       );
       return;
     }
@@ -2993,7 +2993,7 @@ export class SyncManager implements vscode.Disposable {
           lackingSourceCount === 1 ? "" : "s"
         } ${lackingSourceCount === 1 ? "does" : "do"} not have a complete synchronized v2 copy queued here: this PC and the synchronized legacy history lack the continuation blobs needed to resume ${
           lackingSourceCount === 1 ? "it" : "them"
-        }. Nothing was changed.${oversizedSourceDetail} Update Cursor Setting Sync on a PC where the affected chat still continues and let its automatic cycle finish (or choose Manage → Sync Now); then let this PC synchronize and close Cursor normally to apply, or choose Manage → Apply Queued Changes. Preserve All Safely catalogs only definite continuation-damaged chats whose visible message bodies can still be verified; separately reported missing message-body chats still require a source PC or database backup.${
+        }. Nothing was changed.${oversizedSourceDetail} Update Cursor Setting Sync on a PC where the affected chat still continues and let its automatic cycle finish (or choose Manage → Sync & Apply Now); then let this PC synchronize and close Cursor normally to apply, or choose Manage → Sync & Apply Now. Preserve All Safely catalogs only definite continuation-damaged chats whose visible message bodies can still be verified; separately reported missing message-body chats still require a source PC or database backup.${
           incompleteDetail.length === 0 ? "" : ` ${incompleteDetail}`
         }`;
       const continueSafely = "Continue Safely in New Agent";
@@ -3648,7 +3648,7 @@ export class SyncManager implements vscode.Disposable {
             confirmationBudgetDeferred === 0
               ? ""
               : `, or ${confirmationBudgetDeferred} repair${confirmationBudgetDeferred === 1 ? " exceeded" : "s exceeded"} the bounded history/output memory limit`
-          }. Nothing was changed; open "Cursor Setting Sync: Manage" and choose "Repair Unavailable Chats" again.${
+          }. Nothing was changed; open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Check and Recover Current Chats" again.${
             freshInspectionDetail.length === 0
               ? ""
               : ` ${freshInspectionDetail}`
@@ -4039,7 +4039,7 @@ export class SyncManager implements vscode.Disposable {
         )
       ) {
         void vscode.window.showWarningMessage(
-          `${resourceId} changed while the version was being selected; open "Cursor Setting Sync: Manage" and choose "Restore Version History" again.`,
+          `${resourceId} changed while the version was being selected; open "Cursor Setting Sync: Manage", choose "Restore Data…", then "Restore a Synchronized Version" again.`,
         );
         return;
       }
@@ -4503,7 +4503,7 @@ export class SyncManager implements vscode.Disposable {
       // this machine to a real peer forever. The same picker restores.
       for (const deviceId of [...repository.state.retiredDevices].sort()) {
         candidates.push({
-          label: `$(history) Restore forgotten device ${deviceId}`,
+          label: `$(history) Restore retired device ${deviceId}`,
           description: "start reading this device's events again",
           deviceId,
           action: "unforget",
@@ -4513,18 +4513,19 @@ export class SyncManager implements vscode.Disposable {
       await firstLock.release();
     }
     const selected = await vscode.window.showQuickPick(candidates, {
-      title: "Forget a retired synchronization device",
-      placeHolder: "Its immutable files remain in the repository.",
+      title: "Retire or Restore Another Device",
+      placeHolder: "This changes which peer streams this PC reads.",
     });
     if (selected === undefined) {
       return;
     }
     if (selected.action === "forget") {
-      const proceed = "Forget Device";
+      const proceed = "Retire Device";
       const confirmed = await vscode.window.showWarningMessage(
-        `Permanently stop reading events from device ${selected.deviceId} on this computer? ` +
-          "If that device is a real computer that is still joining or temporarily offline, its changes will silently never arrive here. " +
-          "You can restore it later from this same command.",
+        `Stop reading new events from device ${selected.deviceId} on this PC? ` +
+          "Shared repository files remain unchanged, and you can restore the device later. " +
+          "If it is still joining or only temporarily offline, its future changes will not arrive on this PC. " +
+          "Retiring it can also allow automatic maintenance on this PC to prune older shared history once the remaining safety gates pass.",
         { modal: true },
         proceed,
       );
@@ -4557,8 +4558,8 @@ export class SyncManager implements vscode.Disposable {
     }
     void vscode.window.showInformationMessage(
       selected.action === "forget"
-        ? `Device ${selected.deviceId} is now retired.`
-        : `Device ${selected.deviceId} is readable again; its events are picked up on the next sync.`,
+        ? `Device ${selected.deviceId} is now retired on this PC.`
+        : `Device ${selected.deviceId} is active on this PC again; its available events are picked up on the next sync.`,
     );
   }
 
@@ -4626,7 +4627,7 @@ export class SyncManager implements vscode.Disposable {
         report("Waiting for every device to absorb the current checkpoint...");
         this.status.log(
           `Kept the existing checkpoint rather than adding another: ${lagging.join("; ")}. ` +
-            'Open "Cursor Setting Sync: Manage" and choose "Forget Device" for a computer that is gone.',
+          'For a computer that is permanently gone, open "Cursor Setting Sync: Manage", choose "Repository & Devices…", then "Retire or Restore Another Device…".',
         );
       }
       if (created === null && repository.state.checkpoint === undefined) {
@@ -4871,8 +4872,8 @@ export class SyncManager implements vscode.Disposable {
       if (manual) {
         void vscode.window.showInformationMessage(
           unconfigured
-            ? 'Cursor Setting Sync is not configured yet. Open "Cursor Setting Sync: Manage" and choose "Setup or Reconfigure" first.'
-            : 'Cursor Setting Sync is locked. Open "Cursor Setting Sync: Manage", choose "Setup or Reconfigure", and enter your passphrase to unlock it.',
+            ? 'Cursor Setting Sync is not configured yet. Open "Cursor Setting Sync: Manage", choose "Repository & Devices…", then "Setup or Reconfigure This PC…" first.'
+            : 'Cursor Setting Sync is locked. Open "Cursor Setting Sync: Manage", choose "Repository & Devices…", then "Setup or Reconfigure This PC…" and enter your passphrase to unlock it.',
         );
       }
       return;
@@ -6045,7 +6046,7 @@ export class SyncManager implements vscode.Disposable {
             );
             block(
               snapshot.resourceId,
-              `A local edit to ${snapshot.resourceId} was captured before the queued database write. Synchronize again and resolve the resulting conversation conflict before retrying Cursor Setting Sync: Manage → Apply Queued Changes.`,
+              `A local edit to ${snapshot.resourceId} was captured before the queued database write. Synchronize again and resolve the resulting conversation conflict before retrying Cursor Setting Sync: Manage → Sync & Apply Now.`,
             );
           } catch (error) {
             block(
@@ -6587,7 +6588,7 @@ export class SyncManager implements vscode.Disposable {
       repositoryFile.repositoryId !== expectedRepositoryId
     ) {
       throw new Error(
-        'The configured folder now contains a different repository. Use "Cursor Setting Sync: Manage" → "Setup or Reconfigure" to point at the original folder, or choose "Disconnect This PC" to clear the stored repository before connecting to this one.',
+        'The configured folder now contains a different repository. Open "Cursor Setting Sync: Manage", choose "Repository & Devices…", then use "Setup or Reconfigure This PC…" to point at the original folder or "Disconnect This PC" to clear this PC\'s stored repository configuration before connecting to this one.',
       );
     }
     // Keep the candidate key private to this attempt. Publishing it on the
@@ -7512,7 +7513,7 @@ export class SyncManager implements vscode.Disposable {
           );
         } else if (request?.mode === "restore-backup") {
           void vscode.window.showWarningMessage(
-            'The requested restore never reported a result and may not have run. Check the data, then open "Cursor Setting Sync: Manage" and choose "Restore Database Backup" again if needed.',
+            'The requested restore never reported a result and may not have run. Check the data, then open "Cursor Setting Sync: Manage", choose "Restore Data…", then "Restore a Local Database Backup (Emergency)" again if needed.',
           );
         }
       } else {
@@ -7520,7 +7521,7 @@ export class SyncManager implements vscode.Disposable {
         // user explicitly confirmed is not: name it even then.
         if (request?.mode === "restore-backup") {
           this.status.log(
-            `Cleared a queued restore (${name}) whose helper was removed by an extension update; open "Cursor Setting Sync: Manage" and choose "Restore Database Backup" again.`,
+            `Cleared a queued restore (${name}) whose helper was removed by an extension update; open "Cursor Setting Sync: Manage", choose "Restore Data…", then "Restore a Local Database Backup (Emergency)" again.`,
           );
         }
       }
@@ -8626,12 +8627,12 @@ function chatRepairDeferredInspectionDetail(
             deferredBrokenChats === 1 ? " was" : "s were"
           } deferred by the command memory safety limit.`;
     detail.push(
-      `${deferred} Apply or otherwise resolve this batch, then open "Cursor Setting Sync: Manage" and choose "Repair Unavailable Chats" again to inspect the next batch.`,
+      `${deferred} Apply or otherwise resolve this batch, then open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Check and Recover Current Chats" again to inspect the next batch.`,
     );
   }
   if (oversizedChats > 0) {
     detail.push(
-      `${oversizedChats} conversation${oversizedChats === 1 ? "" : "s"} exceeded the hard ${formatBytes(snapshotByteLimit)} repair snapshot limit and ${oversizedChats === 1 ? "was" : "were"} not materialized or repaired automatically. Rerunning alone cannot make ${oversizedChats === 1 ? "it" : "them"} fit; use Restore Version History for manual recovery, or raise the repository payload limit when it is the smaller bound.`,
+      `${oversizedChats} conversation${oversizedChats === 1 ? "" : "s"} exceeded the hard ${formatBytes(snapshotByteLimit)} repair snapshot limit and ${oversizedChats === 1 ? "was" : "were"} not materialized or repaired automatically. Rerunning alone cannot make ${oversizedChats === 1 ? "it" : "them"} fit; use Restore Data… for manual recovery, or raise the repository payload limit when it is the smaller bound.`,
     );
   }
   return detail.join(" ");
@@ -8714,7 +8715,7 @@ function recoveryCatalogCompletionSummary(
     : result.quotaReached !== null
       ? `Stopped cleanly at the bounded recovery catalog ${recoveryCatalogQuotaLabel(result.quotaReached)} quota after cataloguing ${processed} conversation${processed === 1 ? "" : "s"}. Completed catalog checkpoints were kept.${recoveryCatalogQuotaDetail(result.quotaReached)}`
       : result.databaseChanged
-        ? `Cursor's live chat database changed during the multi-page audit. ${processed} verified catalog checkpoint${processed === 1 ? " was" : "s were"} kept, but the result is intentionally incomplete; open "Cursor Setting Sync: Manage", choose "Repair Unavailable Chats", and select "Preserve All Safely" for a stable full pass.`
+        ? `Cursor's live chat database changed during the multi-page audit. ${processed} verified catalog checkpoint${processed === 1 ? " was" : "s were"} kept, but the result is intentionally incomplete; open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Check and Recover Current Chats", and select "Preserve All Safely" for a stable full pass.`
       : result.incomplete
       ? `Stopped at the bounded bulk command limit after cataloguing ${processed} conversation${processed === 1 ? "" : "s"}. Completed catalog checkpoints were kept.`
       : `Finished the bounded audit of ${result.examinedChats} continuation record${result.examinedChats === 1 ? "" : "s"} and catalogued ${processed} definite continuation-damaged conversation${processed === 1 ? "" : "s"}.`;
@@ -8985,7 +8986,7 @@ function chatRepairFreshInspectionDetail(
     detail.push(
       `The final memory-bounded recheck deferred ${deferred}; ${
         deferredBrokenChats === 1 ? "it was" : "they were"
-      } left unchanged. Open "Cursor Setting Sync: Manage" and choose "Repair Unavailable Chats" again to re-evaluate ${
+      } left unchanged. Open "Cursor Setting Sync: Manage", choose "Recover Chats…", then "Check and Recover Current Chats" again to re-evaluate ${
         deferredBrokenChats === 1 ? "it" : "them"
       }.`,
     );
@@ -8997,7 +8998,7 @@ function chatRepairFreshInspectionDetail(
   }
   if (oversizedChats > 0) {
     detail.push(
-      `The final recheck found ${oversizedChats} planned conversation${oversizedChats === 1 ? "" : "s"} above the hard ${formatBytes(snapshotByteLimit)} repair snapshot limit; ${oversizedChats === 1 ? "it was" : "they were"} left unchanged without materializing the bubble values. Rerunning alone cannot repair ${oversizedChats === 1 ? "it" : "them"}; use Restore Version History for manual recovery.`,
+      `The final recheck found ${oversizedChats} planned conversation${oversizedChats === 1 ? "" : "s"} above the hard ${formatBytes(snapshotByteLimit)} repair snapshot limit; ${oversizedChats === 1 ? "it was" : "they were"} left unchanged without materializing the bubble values. Rerunning alone cannot repair ${oversizedChats === 1 ? "it" : "them"}; use Restore Data… for manual recovery.`,
     );
   }
   return detail.join(" ");

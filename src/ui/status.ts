@@ -71,7 +71,7 @@ function statusPresentation(status: SyncStatus): {
       return {
         text: "$(lock) Cursor Setting Sync",
         tooltip:
-          "The repository key is not available on this device. Click to re-enter the passphrase, or open Manage and choose Disconnect This PC to clear the local configuration.",
+          'The repository key is not available on this device. Click to re-enter the passphrase, or open Manage, choose "Repository & Devices…", then "Disconnect This PC" to clear the local configuration.',
         command: managementAction("setup", "Unlock Cursor Setting Sync"),
       };
     case "disabled":

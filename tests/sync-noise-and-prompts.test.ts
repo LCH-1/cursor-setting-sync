@@ -265,10 +265,11 @@ describe("the single public management command", () => {
     );
     expect(RESTART_TO_APPLY_COMMAND).toBe(MANAGE_COMMAND);
     expect(RESTART_TO_APPLY_TITLE).toContain(MANAGE_TITLE);
-    expect(RESTART_TO_APPLY_TITLE).toContain("Apply Queued Changes");
+    expect(RESTART_TO_APPLY_TITLE).toContain("Sync & Apply Now");
   });
 
   it("exposes only the intentional public command surface", () => {
+    expect(manifest.contributes.commands).toHaveLength(1);
     expect(
       manifest.contributes.commands.map((command) => command.command),
     ).toEqual([MANAGE_COMMAND]);
@@ -303,4 +304,102 @@ describe("the single public management command", () => {
       expect(extensionSource).not.toContain(`"${removed}"`);
     }
   });
+
+  it("presents exactly six fixed top-level management categories", () => {
+    const extensionSource = readFileSync("src/extension.ts", "utf8");
+    const topLevel = sourceSection(
+      extensionSource,
+      "const MANAGEMENT_ITEMS:",
+      "const RECOVER_CHAT_ITEMS:",
+    );
+
+    const topLevelLabels = quickPickValues(topLevel, "label");
+    expect(topLevelLabels).toEqual([
+      "$(pulse) Show Diagnostics",
+      "$(sync) Sync & Apply Now",
+      "$(diff) Resolve Conflicts",
+      "$(wrench) Recover Chats…",
+      "$(history) Restore Data…",
+      "$(device-desktop) Repository & Devices…",
+    ]);
+    expect(quickPickValues(topLevel, "action")).toEqual([
+      "diagnostics",
+      "sync-apply",
+      "conflicts",
+      "recover-chats",
+      "restore-data",
+      "repository-devices",
+    ]);
+
+    for (const removedTopLevelTitle of [
+      "Sync Now",
+      "Apply Queued Changes",
+      "Repair Unavailable Chats",
+      "Open Recovered Chat",
+      "Restore Version History",
+      "Restore Database Backup",
+      "Archive Repository",
+      "Forget Device",
+      "Setup or Reconfigure",
+      "Disconnect This PC",
+    ]) {
+      expect(topLevelLabels.map(plainQuickPickLabel)).not.toContain(
+        removedTopLevelTitle,
+      );
+    }
+  });
+
+  it("keeps consolidated recovery and repository capabilities in explicit submenus", () => {
+    const extensionSource = readFileSync("src/extension.ts", "utf8");
+    const recoverChats = sourceSection(
+      extensionSource,
+      "const RECOVER_CHAT_ITEMS:",
+      "const RESTORE_DATA_ITEMS:",
+    );
+    const restoreData = sourceSection(
+      extensionSource,
+      "const RESTORE_DATA_ITEMS:",
+      "const REPOSITORY_DEVICE_ITEMS:",
+    );
+    const repositoryDevices = sourceSection(
+      extensionSource,
+      "const REPOSITORY_DEVICE_ITEMS:",
+      "const MANAGEMENT_ROUTES:",
+    );
+
+    expect(quickPickValues(recoverChats, "action")).toEqual([
+      "repair-chats",
+      "open-recovered",
+    ]);
+    expect(quickPickValues(restoreData, "action")).toEqual([
+      "restore-version",
+      "restore-backup",
+    ]);
+    expect(quickPickValues(repositoryDevices, "action")).toEqual([
+      "setup",
+      "archive",
+      "forget-device",
+      "disconnect",
+    ]);
+  });
 });
+
+function sourceSection(source: string, start: string, end: string): string {
+  const startIndex = source.indexOf(start);
+  const endIndex = source.indexOf(end, startIndex + start.length);
+  expect(startIndex).toBeGreaterThanOrEqual(0);
+  expect(endIndex).toBeGreaterThan(startIndex);
+  return source.slice(startIndex, endIndex);
+}
+
+function quickPickValues(
+  source: string,
+  property: "label" | "action",
+): string[] {
+  const pattern = new RegExp(`${property}:\\s*"([^"]+)"`, "gu");
+  return [...source.matchAll(pattern)].map((match) => match[1] ?? "");
+}
+
+function plainQuickPickLabel(label: string): string {
+  return label.replace(/^\$\([^)]+\)\s*/u, "");
+}
