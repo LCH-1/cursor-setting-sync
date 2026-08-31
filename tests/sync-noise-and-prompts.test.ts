@@ -377,10 +377,14 @@ describe("the single public management command", () => {
     ]);
     expect(quickPickValues(repositoryDevices, "action")).toEqual([
       "setup",
+      "map-pending-workspaces",
       "archive",
       "forget-device",
       "disconnect",
     ]);
+    expect(quickPickValues(repositoryDevices, "label")).toContain(
+      "$(folder-opened) Map Pending Workspaces…",
+    );
   });
 });
 

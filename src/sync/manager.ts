@@ -223,8 +223,11 @@ import {
   type RecoveryStagingUri,
 } from "../chat/recoveryStaging";
 import {
-  discoverWorkspaces,
+  WORKSPACE_IDENTITY_LOOKUPS_PER_PAGE,
+  discoverWorkspacesDetailed,
+  lookupWorkspaceIdentitiesById,
   resolveTargetWorkspace,
+  type WorkspaceIdentity,
   workspaceUriMatchesAny,
 } from "../chat/workspace";
 import { HelperLauncher } from "../helper/launcher";
@@ -425,6 +428,32 @@ export type SyntheticApplyDecision =
   | { action: "apply" }
   | { action: "already-applied"; live: ResourceSnapshot }
   | { action: "drift" };
+
+interface PendingWorkspaceMappingChoice {
+  sourceWorkspaceId: string;
+  sourceWorkspaceUri: string;
+}
+
+interface WorkspaceMappingSelection extends PendingWorkspaceMappingChoice {
+  automatic: boolean;
+  targetWorkspaceId: string;
+  targetWorkspaceUri: string;
+}
+
+interface WorkspaceMappingPassResult {
+  automaticMappings: number;
+  localWorkspaces: WorkspaceIdentity[];
+  mappingStateChanged: boolean;
+  pendingWorkspaceStorage: number;
+  unreadableLocalWorkspaceIds: string[];
+  unreadableLocalWorkspaces: number;
+  unresolved: PendingWorkspaceMappingChoice[];
+}
+
+interface CollectedWorkspaceMappings {
+  selections: WorkspaceMappingSelection[];
+  skipped: number;
+}
 
 export class SyncManager implements vscode.Disposable {
   private repository: SyncRepository | null = null;
@@ -1274,13 +1303,362 @@ export class SyncManager implements vscode.Disposable {
     }
   }
 
+  /**
+   * Explicitly opens the manual workspace-mapping flow.
+   *
+   * Ordinary synchronization never asks the user to place workspaceStorage:
+   * exact identities are resolved automatically and everything else remains
+   * deferred. This separate entry point is the only path allowed to offer an
+   * unmatched workspace, after bounded discovery of every readable local
+   * identity; unreadable metadata stays omitted and explicitly reported.
+   */
+  async mapPendingWorkspaces(): Promise<void> {
+    const repository = this.requireRepository();
+    const expectedRepositoryId = this.configuration.repositoryId;
+    const expectedRepositoryPath = this.configuration.repositoryPath;
+    const initial = await this.cycles.withCommandFloor(async () => {
+      const initialLock = await this.withProgress(
+        "Cursor Setting Sync",
+        async (report) => {
+          report("Reading pending workspace mappings...");
+          return this.takeCommandLock(repository, report);
+        },
+      );
+      try {
+        await this.openGitWindow(repository);
+        await repository.refreshState();
+        const pass = await this.ensureWorkspaceMappings(repository);
+        await repository.saveState();
+        this.updateStatus(repository);
+        return pass;
+      } finally {
+        await initialLock.release();
+      }
+    });
+    if (initial.automaticMappings > 0 || initial.mappingStateChanged) {
+      await this.refreshWorkspaceMappingConsumers();
+    }
+
+    if (initial.unresolved.length === 0) {
+      if (initial.automaticMappings > 0) {
+        void vscode.window.showInformationMessage(
+          `${initial.automaticMappings} pending workspace mapping(s) were verified automatically. No manual choice is needed.`,
+        );
+      } else {
+        void vscode.window.showInformationMessage(
+          initial.pendingWorkspaceStorage === 0
+            ? "There are no pending workspace-storage changes to map."
+            : "No pending workspace-storage change needs a manual mapping.",
+        );
+      }
+      return;
+    }
+
+    const manualPass = await this.expandWorkspaceMappingCandidates(initial);
+    if (manualPass.localWorkspaces.length === 0) {
+      const incomplete =
+        manualPass.unreadableLocalWorkspaces === 0
+          ? ""
+          : ` ${manualPass.unreadableLocalWorkspaces} local workspace identity file(s) could not be read.`;
+      void vscode.window.showWarningMessage(
+        `${manualPass.unresolved.length} incoming workspace(s) still need a mapping, but no readable local workspace candidate is available.${incomplete} Open the intended project in Cursor, then run Map Pending Workspaces again.`,
+      );
+      return;
+    }
+
+    const automaticSelections =
+      this.automaticWorkspaceMappingSelections(manualPass);
+    const automaticSources = new Set(
+      automaticSelections.map((selection) => selection.sourceWorkspaceId),
+    );
+    const interactivePass: WorkspaceMappingPassResult = {
+      ...manualPass,
+      unresolved: manualPass.unresolved.filter(
+        (source) => !automaticSources.has(source.sourceWorkspaceId),
+      ),
+    };
+    // QuickPicks can remain open indefinitely. No synchronization lock is
+    // held while the user reads or answers them; the selected identities are
+    // treated only as proposals and rebound to fresh state below.
+    const collected =
+      interactivePass.unresolved.length === 0
+        ? { selections: [], skipped: 0 }
+        : await this.collectWorkspaceMappingSelections(interactivePass);
+    const proposedSelections = [
+      ...automaticSelections,
+      ...collected.selections,
+    ];
+    if (proposedSelections.length === 0) {
+      void vscode.window.showInformationMessage(
+        `${initial.unresolved.length} incoming workspace mapping(s) remain deferred. Nothing was mapped manually.`,
+      );
+      return;
+    }
+
+    if (
+      !this.workspaceMappingCommandIsCurrent(
+        repository,
+        expectedRepositoryId,
+        expectedRepositoryPath,
+      )
+    ) {
+      void vscode.window.showWarningMessage(
+        "Workspace mapping was cancelled because this PC's synchronization repository changed while the choices were open.",
+      );
+      return;
+    }
+
+    const outcome = await this.cycles.withCommandFloor(async () => {
+      const applyLock = await this.withProgress(
+        "Cursor Setting Sync",
+        async (report) => {
+          report("Verifying the selected workspace mappings...");
+          return this.takeCommandLock(repository, report);
+        },
+      );
+      let applied = 0;
+      let stale = 0;
+      let automaticMappings = 0;
+      let mappingStateChanged = false;
+      let remaining = initial.unresolved.length;
+      let commandStillCurrent: boolean;
+      try {
+        commandStillCurrent = this.workspaceMappingCommandIsCurrent(
+          repository,
+          expectedRepositoryId,
+          expectedRepositoryPath,
+        );
+        if (commandStillCurrent) {
+          await this.openGitWindow(repository);
+          await repository.refreshState();
+          commandStillCurrent = this.workspaceMappingCommandIsCurrent(
+            repository,
+            expectedRepositoryId,
+            expectedRepositoryPath,
+          );
+        }
+        if (commandStillCurrent) {
+          const fresh = await this.ensureWorkspaceMappings(repository);
+          automaticMappings += fresh.automaticMappings;
+          mappingStateChanged ||= fresh.mappingStateChanged;
+          commandStillCurrent = this.workspaceMappingCommandIsCurrent(
+            repository,
+            expectedRepositoryId,
+            expectedRepositoryPath,
+          );
+          if (commandStillCurrent) {
+            const freshBySource = new Map(
+              fresh.unresolved.map((choice) => [
+                choice.sourceWorkspaceId,
+                choice,
+              ]),
+            );
+            const freshTargetById = await this.lookupWorkspaceIdentitiesInPages(
+              proposedSelections.map(
+                (selection) => selection.targetWorkspaceId,
+              ),
+            );
+            for (const selection of proposedSelections) {
+              const source = freshBySource.get(selection.sourceWorkspaceId);
+              const target = freshTargetById.get(selection.targetWorkspaceId);
+              if (
+                source === undefined ||
+                target === undefined ||
+                !workspaceUriMatchesAny(selection.sourceWorkspaceUri, [
+                  source.sourceWorkspaceUri,
+                ]) ||
+                !workspaceUriMatchesAny(selection.targetWorkspaceUri, [
+                  target.uri,
+                ]) ||
+                (selection.automatic &&
+                  selection.targetWorkspaceId !==
+                    selection.sourceWorkspaceId &&
+                  !workspaceUriMatchesAny(source.sourceWorkspaceUri, [
+                    target.uri,
+                  ]))
+              ) {
+                stale += 1;
+                continue;
+              }
+              await this.configuration.setWorkspaceMapping(
+                selection.sourceWorkspaceId,
+                selection.targetWorkspaceId,
+              );
+              mappingStateChanged =
+                this.updateWorkspaceMappingBlocks(
+                  repository,
+                  selection.sourceWorkspaceId,
+                  null,
+                ) || mappingStateChanged;
+              applied += 1;
+            }
+            remaining = Math.max(0, fresh.unresolved.length - applied);
+            await repository.saveState();
+            this.updateStatus(repository);
+          }
+        }
+      } finally {
+        await applyLock.release();
+      }
+      return {
+        applied,
+        stale,
+        automaticMappings,
+        mappingStateChanged,
+        remaining,
+        commandStillCurrent,
+      };
+    });
+    const {
+      applied,
+      stale,
+      automaticMappings,
+      mappingStateChanged,
+      remaining,
+      commandStillCurrent,
+    } = outcome;
+
+    if (!commandStillCurrent) {
+      void vscode.window.showWarningMessage(
+        "Workspace mapping was cancelled because this PC's synchronization repository changed while the choices were open.",
+      );
+      return;
+    }
+    if (automaticMappings + applied > 0 || mappingStateChanged) {
+      await this.refreshWorkspaceMappingConsumers();
+    }
+    const incomplete =
+      manualPass.unreadableLocalWorkspaces === 0
+        ? ""
+        : ` ${manualPass.unreadableLocalWorkspaces} unreadable local workspace identity file(s) were omitted from the candidate list.`;
+    void vscode.window.showInformationMessage(
+      `Mapped ${applied} workspace(s); ${remaining} remain deferred${
+        stale === 0 ? "" : ` and ${stale} stale selection(s) were ignored`
+      }.${incomplete}`,
+    );
+  }
+
+  private workspaceMappingCommandIsCurrent(
+    repository: SyncRepository,
+    repositoryId: string | null,
+    repositoryPath: string | null,
+  ): boolean {
+    return (
+      !this.disposed &&
+      this.repository === repository &&
+      this.configuration.repositoryId === repositoryId &&
+      this.configuration.repositoryPath === repositoryPath
+    );
+  }
+
+  private async refreshWorkspaceMappingConsumers(): Promise<void> {
+    await this.refreshAdapters();
+    await this.startFinalizer();
+  }
+
+  private automaticWorkspaceMappingSelections(
+    pass: WorkspaceMappingPassResult,
+  ): WorkspaceMappingSelection[] {
+    if (pass.unreadableLocalWorkspaces > 0) {
+      return [];
+    }
+    const localWorkspaceById = new Map(
+      pass.localWorkspaces.map((workspace) => [workspace.id, workspace]),
+    );
+    const noExplicitMappings = Object.create(null) as Record<string, string>;
+    const selections: WorkspaceMappingSelection[] = [];
+    for (const source of pass.unresolved) {
+      const targetWorkspaceId = resolveTargetWorkspace(
+        source.sourceWorkspaceId,
+        source.sourceWorkspaceUri,
+        pass.localWorkspaces,
+        noExplicitMappings,
+      );
+      if (targetWorkspaceId === null) {
+        continue;
+      }
+      const target = localWorkspaceById.get(targetWorkspaceId);
+      if (target === undefined) {
+        continue;
+      }
+      selections.push({
+        ...source,
+        automatic: true,
+        targetWorkspaceId,
+        targetWorkspaceUri: target.uri,
+      });
+    }
+    return selections;
+  }
+
+  private async collectWorkspaceMappingSelections(
+    pass: WorkspaceMappingPassResult,
+  ): Promise<CollectedWorkspaceMappings> {
+    const selections: WorkspaceMappingSelection[] = [];
+    const incompleteDescription =
+      pass.unreadableLocalWorkspaces === 0
+        ? ""
+        : ` ${pass.unreadableLocalWorkspaces} unreadable local workspace identity file(s) are omitted.`;
+    for (let index = 0; index < pass.unresolved.length; index += 1) {
+      const source = pass.unresolved[index];
+      if (source === undefined) {
+        continue;
+      }
+      const items: Array<{
+        label: string;
+        description: string;
+        workspaceId: string | null;
+        workspaceUri: string | null;
+      }> = [
+        {
+          label: "$(close) Skip all remaining workspaces",
+          description: `Safe default: leave incoming workspace storage deferred.${incompleteDescription}`,
+          workspaceId: null,
+          workspaceUri: null,
+        },
+        ...pass.localWorkspaces.map((workspace) => ({
+          label: workspace.basename,
+          description: workspace.uri,
+          workspaceId: workspace.id,
+          workspaceUri: workspace.uri,
+        })),
+      ];
+      const selected = await vscode.window.showQuickPick(items, {
+        title: `Map incoming workspace storage ${source.sourceWorkspaceUri}`,
+        placeHolder:
+          pass.unreadableLocalWorkspaces === 0
+            ? "Select only a local workspace known to be the same project."
+            : `Select only a known match; ${pass.unreadableLocalWorkspaces} unreadable local identity file(s) are omitted.`,
+        ignoreFocusOut: true,
+      });
+      if (
+        selected === undefined ||
+        selected.workspaceId === null ||
+        selected.workspaceUri === null
+      ) {
+        return {
+          selections,
+          skipped: pass.unresolved.length - selections.length,
+        };
+      }
+      selections.push({
+        ...source,
+        automatic: false,
+        targetWorkspaceId: selected.workspaceId,
+        targetWorkspaceUri: selected.workspaceUri,
+      });
+    }
+    return { selections, skipped: 0 };
+  }
+
   async restartToApply(): Promise<void> {
     const repository = this.requireRepository();
     // A copy, not the live reference: Disconnect or a Setup re-run zeroes
     // this.masterKey in place, and this command parks for tens of seconds in
-    // sync, lock waits and mapping prompts before the key is serialized to
-    // the helper - a zeroed shared Buffer there meant the helper opened the
-    // repository with an all-zero key and failed after quitting Cursor.
+    // sync, lock waits and workspace mapping checks before the key is
+    // serialized to the helper - a zeroed shared Buffer there meant the helper
+    // opened the repository with an all-zero key and failed after quitting
+    // Cursor.
     const masterKey = Buffer.from(this.requireMasterKey());
     try {
       await this.cycles.withCommandFloor(() =>
@@ -1379,9 +1757,8 @@ export class SyncManager implements vscode.Disposable {
             // blocks a queued change is derived from the synchronous
             // `resourceApplyBlockReason` and reaches disk through the poll's
             // own save - but workspace mappings are exactly what that function
-            // cannot see, so without this the answer the user just gave a
-            // mapping prompt died with the process it was given to. The quit is
-            // seconds away.
+            // cannot see, so the automatic resolution and any mapping-owned
+            // blocks must be durable before the process exits seconds later.
             await repository.saveState();
             phase(report, "Preparing the batch...");
             return pendingHelperBatch(repository);
@@ -1394,16 +1771,16 @@ export class SyncManager implements vscode.Disposable {
         current = null;
       });
       if (this.disposed || this.repository !== repository || this.masterKey === null) {
-        // Disconnect or Setup ran while this command was parked in prompts or
-        // waits; quitting every window to apply into a repository this device
-        // just left is not what anyone asked for.
+        // Disconnect or Setup ran while this command was parked in waits;
+        // quitting every window to apply into a repository this device just
+        // left is not what anyone asked for.
         this.status.log(
           "Restart to Apply was abandoned: the synchronization configuration changed while it was being prepared. Nothing was applied.",
         );
         return;
       }
-      // The preparation above is unbounded (a maintenance checkpoint inside
-      // the sync, mapping prompts held open) while the claim's TTL is not.
+      // The preparation above can include an unbounded maintenance checkpoint
+      // inside the sync while the claim's TTL is not.
       // Re-stamp so a live preparer's marker never ages out mid-flight, and
       // verify no other window took the claim over in the meantime - if one
       // did, IT is committing this apply and this attempt must stand down.
@@ -6116,16 +6493,72 @@ export class SyncManager implements vscode.Disposable {
     }
   }
 
-  private async ensureWorkspaceMappings(repository: SyncRepository): Promise<void> {
-    const localWorkspaces = await discoverWorkspaces(this.paths);
+  private async lookupWorkspaceIdentitiesInPages(
+    workspaceIds: Iterable<string>,
+  ): Promise<Map<string, WorkspaceIdentity>> {
+    const ids = [...new Set(workspaceIds)];
+    const resolved = new Map<string, WorkspaceIdentity>();
+    for (
+      let offset = 0;
+      offset < ids.length;
+      offset += WORKSPACE_IDENTITY_LOOKUPS_PER_PAGE
+    ) {
+      const page = ids.slice(
+        offset,
+        offset + WORKSPACE_IDENTITY_LOOKUPS_PER_PAGE,
+      );
+      const identities = await lookupWorkspaceIdentitiesById(
+        this.paths,
+        page,
+        { maxLookups: page.length },
+      );
+      for (const [workspaceId, identity] of identities) {
+        resolved.set(workspaceId, identity);
+      }
+    }
+    return resolved;
+  }
+
+  private async expandWorkspaceMappingCandidates(
+    pass: WorkspaceMappingPassResult,
+  ): Promise<WorkspaceMappingPassResult> {
+    if (pass.unreadableLocalWorkspaceIds.length === 0) {
+      return pass;
+    }
+    // Manual discovery is read-only and runs without sync.lock or the command
+    // floor. Every cold identity gets one bounded direct lookup, so hundreds
+    // of historical workspaces do not require repeatedly invoking the command;
+    // genuinely unreadable files remain omitted and explicitly counted.
+    const recovered = await this.lookupWorkspaceIdentitiesInPages(
+      pass.unreadableLocalWorkspaceIds,
+    );
+    const localWorkspaceById = new Map(
+      pass.localWorkspaces.map((workspace) => [workspace.id, workspace]),
+    );
+    for (const [workspaceId, workspace] of recovered) {
+      localWorkspaceById.set(workspaceId, workspace);
+    }
+    const unreadableLocalWorkspaceIds =
+      pass.unreadableLocalWorkspaceIds.filter(
+        (workspaceId) => !recovered.has(workspaceId),
+      );
+    return {
+      ...pass,
+      localWorkspaces: [...localWorkspaceById.values()].sort((left, right) =>
+        left.id.localeCompare(right.id),
+      ),
+      unreadableLocalWorkspaceIds,
+      unreadableLocalWorkspaces: unreadableLocalWorkspaceIds.length,
+    };
+  }
+
+  private async ensureWorkspaceMappings(
+    repository: SyncRepository,
+  ): Promise<WorkspaceMappingPassResult> {
     const workspaceMappings = Object.assign(
       Object.create(null) as Record<string, string>,
       this.configuration.workspaceMappings,
     );
-    const handled = new Set<string>();
-    let skipRemainingPrompts = false;
-    // Recently updated workspaces are prompted first so stale ones can be
-    // skipped in one action.
     const pendingChanges = repository.state.pendingDatabaseChanges
       .map((pending) => ({
         pending,
@@ -6133,9 +6566,72 @@ export class SyncManager implements vscode.Disposable {
       }))
       .sort((left, right) => right.lastUpdatedAt - left.lastUpdatedAt)
       .map((entry) => entry.pending);
+
+    // Resolve every authenticated pending reference in fixed-size pages. A
+    // hard cap here stranded entries after the first 512 forever because the
+    // same newest entries occupied every later pass.
+    const targetedWorkspaceIds = new Set<string>();
+    for (const kind of ["workspace-storage", "chat"] as const) {
+      for (const pending of pendingChanges) {
+        if (pending.kind !== kind) {
+          continue;
+        }
+        const tip = findTip(
+          repository,
+          pending.resourceId,
+          pending.eventHash,
+          pending.changeIndex,
+        );
+        const sourceWorkspaceId = tip?.metadata?.workspaceId;
+        if (
+          tip === undefined ||
+          tip.operation === "delete" ||
+          typeof sourceWorkspaceId !== "string"
+        ) {
+          continue;
+        }
+        targetedWorkspaceIds.add(sourceWorkspaceId);
+        const storedTarget = workspaceMappings[sourceWorkspaceId];
+        if (typeof storedTarget === "string") {
+          targetedWorkspaceIds.add(storedTarget);
+        }
+      }
+    }
+
+    const discovery = await discoverWorkspacesDetailed(this.paths);
+    const targetedWorkspaces = await this.lookupWorkspaceIdentitiesInPages(
+      targetedWorkspaceIds,
+    );
+    const localWorkspaceById = new Map<string, WorkspaceIdentity>(
+      discovery.workspaces.map((workspace) => [workspace.id, workspace]),
+    );
+    // The targeted lookup checks ctime as well as mtime and therefore wins over
+    // a healthy discovery memo if workspace.json was rewritten in place.
+    for (const [workspaceId, workspace] of targetedWorkspaces) {
+      localWorkspaceById.set(workspaceId, workspace);
+    }
+    const unreadableLocalWorkspaceIds = discovery.unreadableIds.filter(
+      (workspaceId) => !targetedWorkspaces.has(workspaceId),
+    );
+    // A prior healthy memo is retained when workspace.json is torn. It is
+    // useful to the next scan, but not safe to offer as a current manual
+    // target until the direct read succeeds again.
+    for (const workspaceId of unreadableLocalWorkspaceIds) {
+      localWorkspaceById.delete(workspaceId);
+    }
+    const localWorkspaces = [...localWorkspaceById.values()].sort((left, right) =>
+      left.id.localeCompare(right.id),
+    );
+    const unresolved = new Map<string, PendingWorkspaceMappingChoice>();
+    let automaticMappings = 0;
+    let mappingStateChanged = false;
+    let pendingWorkspaceStorage = 0;
     for (const pending of pendingChanges) {
       if (pending.kind !== "chat" && pending.kind !== "workspace-storage") {
         continue;
+      }
+      if (pending.kind === "workspace-storage") {
+        pendingWorkspaceStorage += 1;
       }
       const tip = findTip(
         repository,
@@ -6157,35 +6653,46 @@ export class SyncManager implements vscode.Disposable {
         // A workspace-less composer has nothing to map; the helper writes its
         // NULL workspaceId straight back. Mapping is resolved, but continuation
         // completeness is an independent apply gate and must survive.
+        const previous = pending.blockedReason;
         clearWorkspaceMappingOwnedBlock(pending, tip);
+        mappingStateChanged ||= pending.blockedReason !== previous;
         continue;
       }
       if (typeof sourceWorkspaceId !== "string") {
         pending.blockedReason = "Incoming workspace metadata is missing a workspace ID.";
         continue;
       }
+      const exactSourceUri =
+        unreadableLocalWorkspaceIds.length === 0 &&
+        typeof sourceWorkspaceUri === "string"
+          ? sourceWorkspaceUri
+          : null;
       const resolved = resolveTargetWorkspace(
         sourceWorkspaceId,
-        typeof sourceWorkspaceUri === "string" ? sourceWorkspaceUri : null,
+        exactSourceUri,
         localWorkspaces,
         workspaceMappings,
       );
       if (resolved !== null) {
-        if (
-          workspaceMappings[sourceWorkspaceId] === undefined &&
-          resolved !== sourceWorkspaceId
-        ) {
+        const storedTarget = workspaceMappings[sourceWorkspaceId];
+        const mappingChanged =
+          storedTarget === undefined
+            ? resolved !== sourceWorkspaceId
+            : storedTarget !== resolved;
+        if (mappingChanged) {
           await this.configuration.setWorkspaceMapping(
             sourceWorkspaceId,
             resolved,
           );
           workspaceMappings[sourceWorkspaceId] = resolved;
+          automaticMappings += 1;
         }
-        this.updateWorkspaceMappingBlocks(
-          repository,
-          sourceWorkspaceId,
-          null,
-        );
+        mappingStateChanged =
+          this.updateWorkspaceMappingBlocks(
+            repository,
+            sourceWorkspaceId,
+            null,
+          ) || mappingStateChanged;
         continue;
       }
       if (pending.kind === "workspace-storage" && typeof sourceWorkspaceUri !== "string") {
@@ -6200,7 +6707,10 @@ export class SyncManager implements vscode.Disposable {
         // with a message about workspace storage - 69 conversations held back
         // by a rule that was never about them, reported under a reason that
         // could not be acted on.
-        pending.blockedReason = PERMANENT_EXCLUSION_REASONS[3];
+        if (pending.blockedReason !== PERMANENT_EXCLUSION_REASONS[3]) {
+          pending.blockedReason = PERMANENT_EXCLUSION_REASONS[3];
+          mappingStateChanged = true;
+        }
         continue;
       }
       if (pending.kind === "chat") {
@@ -6211,65 +6721,45 @@ export class SyncManager implements vscode.Disposable {
         // not free, because the modal had to be answered before ANY queued
         // change could apply. On a two-machine setup that is how 146 incoming
         // conversations stayed undelivered behind a list of unrelated projects.
+        const previous = pending.blockedReason;
         clearWorkspaceMappingOwnedBlock(pending, tip);
+        mappingStateChanged ||= pending.blockedReason !== previous;
         continue;
       }
-      if (handled.has(sourceWorkspaceId)) {
+      if (typeof sourceWorkspaceUri !== "string") {
         continue;
       }
-      handled.add(sourceWorkspaceId);
-      // Only workspaceStorage reaches here; chats returned above.
-      const resourceLabel = "workspace storage";
-      const items: Array<{
-        label: string;
-        description: string;
-        workspaceId: string | null;
-      }> = [
-        ...localWorkspaces.map((workspace) => ({
-          label: workspace.basename,
-          description: workspace.uri,
-          workspaceId: workspace.id,
-        })),
-        {
-          label: "$(close) Skip all remaining workspaces",
-          description: "Leave the remaining incoming changes blocked for this run.",
-          workspaceId: null,
-        },
-      ];
-      const selected: (typeof items)[number] | undefined = skipRemainingPrompts
-        ? undefined
-        : await vscode.window.showQuickPick(items, {
-            title: `Map incoming ${resourceLabel} workspace ${
-              typeof sourceWorkspaceUri === "string"
-                ? sourceWorkspaceUri
-                : sourceWorkspaceId
-            }`,
-            placeHolder: `Select the local workspace where this ${resourceLabel} should appear.`,
-            ignoreFocusOut: true,
-          });
-      if (selected === undefined || selected.workspaceId === null) {
-        skipRemainingPrompts ||= selected !== undefined;
+      mappingStateChanged =
         this.updateWorkspaceMappingBlocks(
           repository,
           sourceWorkspaceId,
           WORKSPACE_MAPPING_BLOCK_REASON,
-        );
-        continue;
+        ) || mappingStateChanged;
+      if (!unresolved.has(sourceWorkspaceId)) {
+        unresolved.set(sourceWorkspaceId, {
+          sourceWorkspaceId,
+          sourceWorkspaceUri,
+        });
       }
-      await this.configuration.setWorkspaceMapping(
-        sourceWorkspaceId,
-        selected.workspaceId,
-      );
-      workspaceMappings[sourceWorkspaceId] = selected.workspaceId;
-      this.updateWorkspaceMappingBlocks(repository, sourceWorkspaceId, null);
     }
+
+    return {
+      automaticMappings,
+      localWorkspaces,
+      mappingStateChanged,
+      pendingWorkspaceStorage,
+      unreadableLocalWorkspaceIds,
+      unreadableLocalWorkspaces: unreadableLocalWorkspaceIds.length,
+      unresolved: [...unresolved.values()],
+    };
   }
 
   private updateWorkspaceMappingBlocks(
     repository: SyncRepository,
     sourceWorkspaceId: string,
     reason: string | null,
-  ): void {
+  ): boolean {
+    let changed = false;
     for (const pending of repository.state.pendingDatabaseChanges) {
       if (pending.kind !== "chat" && pending.kind !== "workspace-storage") {
         continue;
@@ -6287,14 +6777,20 @@ export class SyncManager implements vscode.Disposable {
         continue;
       }
       if (reason === null) {
+        const previous = pending.blockedReason;
         clearWorkspaceMappingOwnedBlock(pending, tip);
+        changed ||= pending.blockedReason !== previous;
       } else if (pending.kind === "workspace-storage") {
         // Only workspaceStorage is held back for a missing mapping. A chat is
         // written under the workspace ID it came with, so declining to map a
         // workspace must not also withhold the conversations from it.
-        pending.blockedReason = reason;
+        if (pending.blockedReason !== reason) {
+          pending.blockedReason = reason;
+          changed = true;
+        }
       }
     }
+    return changed;
   }
 
   /**
@@ -6326,9 +6822,9 @@ export class SyncManager implements vscode.Disposable {
       return configuredBlock;
     }
     // Checked before the capability reasons so an excluded workspace never
-    // reaches `ensureWorkspaceMappings`, whose prompt is the whole point of
-    // excluding it: a local folder from another computer has no answer on this
-    // one, and the modal has to be answered before anything else can apply.
+    // reaches `ensureWorkspaceMappings`: a local folder from another computer
+    // has no answer on this one, and it should stay out of both automatic and
+    // explicitly requested candidate resolution.
     if (
       tip.kind === "workspace-storage" &&
       isIgnoredWorkspaceUri(
@@ -10036,7 +10532,8 @@ const WORKSPACE_MAPPING_BLOCK_PREFIX =
 
 export const WORKSPACE_MAPPING_BLOCK_REASON =
   `${WORKSPACE_MAPPING_BLOCK_PREFIX} workspace storage. ` +
-  `Open "${RESTART_TO_APPLY_TITLE}" to be asked again, after opening the folder on this computer.`;
+  "An exact local workspace has not been verified on this computer; its workspace storage remains deferred while conversations continue independently. " +
+  'To map it deliberately, open "Cursor Setting Sync: Manage" → "Repository & Devices…" → "Map Pending Workspaces…".';
 
 const FOLDERLESS_WORKSPACE_BLOCK_REASON = PERMANENT_EXCLUSION_REASONS[3];
 

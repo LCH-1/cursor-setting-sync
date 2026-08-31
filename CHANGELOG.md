@@ -4,6 +4,16 @@ All notable changes to Cursor Setting Sync will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-08-31
+
+### Fixed
+
+- **Routine `Sync & Apply Now` no longer stops at an ambiguous workspace-mapping picker.** Same workspace IDs, previously confirmed mappings, and unique exact normalized workspace URIs still resolve automatically. Unmatched or duplicate `workspaceStorage` targets are deferred without guessing from a basename, while conversations and every other ready resource continue independently.
+
+### Added
+
+- **`Repository & Devices…` now contains `Map Pending Workspaces…` for deliberate cross-path mappings.** The picker is shown only from this explicit action after bounded local workspace discovery; unreadable identities are omitted and reported instead of blocking known candidates. It is no longer part of ordinary synchronization.
+
 ## [1.0.1] - 2026-08-31
 
 ### Fixed

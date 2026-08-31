@@ -471,12 +471,21 @@ export function resolveTargetWorkspace(
     return null;
   }
   const normalizedSource = normalizeWorkspaceUri(sourceWorkspaceUri, platform);
-  const exact = localWorkspaces.find(
-    (workspace) =>
-      normalizeWorkspaceUri(workspace.uri, platform) === normalizedSource,
-  );
-  if (exact !== undefined) {
-    return exact.id;
+  let exactWorkspaceId: string | null = null;
+  for (const workspace of localWorkspaces) {
+    if (normalizeWorkspaceUri(workspace.uri, platform) !== normalizedSource) {
+      continue;
+    }
+    if (exactWorkspaceId === null) {
+      exactWorkspaceId = workspace.id;
+      continue;
+    }
+    if (workspace.id !== exactWorkspaceId) {
+      return null;
+    }
+  }
+  if (exactWorkspaceId !== null) {
+    return exactWorkspaceId;
   }
   // Basenames are display labels, not identities. Two unrelated projects can
   // both be named "app"; only an exact URI or explicit user mapping is safe.

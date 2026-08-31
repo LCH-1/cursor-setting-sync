@@ -13,6 +13,10 @@ const gitRuntime = vi.hoisted(() => ({
   largeFileWarnings: vi.fn(),
 }));
 
+const vscodeRuntime = vi.hoisted(() => ({
+  showQuickPick: vi.fn(),
+}));
+
 vi.mock("vscode", () => ({
   extensions: { all: [] },
   ProgressLocation: { Notification: 1 },
@@ -27,6 +31,7 @@ vi.mock("vscode", () => ({
     ) => task({ report: () => undefined }),
     showWarningMessage: async () => undefined,
     showInformationMessage: async () => undefined,
+    showQuickPick: vscodeRuntime.showQuickPick,
     showTextDocument: async () => undefined,
   },
 }));
@@ -48,6 +53,7 @@ import {
   BACKGROUND_GIT_PULL_INTERVAL_MS,
   INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON,
   SyncManager,
+  WORKSPACE_MAPPING_BLOCK_REASON,
   backgroundGitPullDue,
   markSuppressedSnapshotProjection,
   pendingHelperBatch,
@@ -85,6 +91,8 @@ const T0 = Date.parse("2026-08-08T00:00:00.000Z");
 const temporaryRoots: string[] = [];
 
 beforeEach(() => {
+  vscodeRuntime.showQuickPick.mockReset();
+  vscodeRuntime.showQuickPick.mockResolvedValue(undefined);
   gitRuntime.isGitRepository.mockReset().mockResolvedValue(true);
   gitRuntime.pullLatest.mockReset().mockResolvedValue({ status: "up-to-date" });
   gitRuntime.commitAndPush.mockReset().mockResolvedValue({
@@ -378,6 +386,663 @@ describe("workspace mapping and chat continuation blocks", () => {
       repository.state.pendingDatabaseChanges[0]?.blockedReason,
     ).toBe(applyFailure);
     manager.dispose();
+  });
+
+  it("keeps an unresolved workspace quiet while an exact sibling still progresses", async () => {
+    const fixture = await createWorkspaceMappingHarness();
+    await writeWorkspaceIdentity(
+      fixture.workspaceStorageRoot,
+      "local-exact",
+      "file:///C:/projects/exact",
+    );
+    const unresolved = workspaceStorageTip(
+      "remote-unresolved",
+      "vscode-remote://ssh-remote+server/home/ubuntu/unresolved",
+      "1",
+      T0 + 2,
+    );
+    const exact = workspaceStorageTip(
+      "remote-exact",
+      "file:///C:/projects/exact",
+      "2",
+      T0 + 1,
+      WORKSPACE_MAPPING_BLOCK_REASON,
+    );
+    const repository = workspaceMappingRepository([unresolved, exact]);
+
+    await fixture.ensureWorkspaceMappings(repository);
+
+    expect(vscodeRuntime.showQuickPick).not.toHaveBeenCalled();
+    expect(
+      repository.state.pendingDatabaseChanges.find(
+        (pending) => pending.resourceId === unresolved.pending.resourceId,
+      )?.blockedReason,
+    ).toBe(WORKSPACE_MAPPING_BLOCK_REASON);
+    expect(
+      repository.state.pendingDatabaseChanges.find(
+        (pending) => pending.resourceId === exact.pending.resourceId,
+      )?.blockedReason,
+    ).toBeUndefined();
+    expect(fixture.setWorkspaceMapping).toHaveBeenCalledOnce();
+    expect(fixture.setWorkspaceMapping).toHaveBeenCalledWith(
+      "remote-exact",
+      "local-exact",
+    );
+    fixture.manager.dispose();
+  });
+
+  it("persists an exact URI mapping without opening the picker", async () => {
+    const fixture = await createWorkspaceMappingHarness();
+    const sourceUri = "file:///C:/projects/exact-target";
+    await writeWorkspaceIdentity(
+      fixture.workspaceStorageRoot,
+      "local-target",
+      sourceUri,
+    );
+    const entry = workspaceStorageTip(
+      "remote-source",
+      sourceUri,
+      "3",
+      T0,
+      WORKSPACE_MAPPING_BLOCK_REASON,
+    );
+    const repository = workspaceMappingRepository([entry]);
+
+    await fixture.ensureWorkspaceMappings(repository);
+
+    expect(vscodeRuntime.showQuickPick).not.toHaveBeenCalled();
+    expect(fixture.setWorkspaceMapping).toHaveBeenCalledWith(
+      "remote-source",
+      "local-target",
+    );
+    expect(fixture.workspaceMappings).toEqual({
+      "remote-source": "local-target",
+    });
+    expect(
+      repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBeUndefined();
+    fixture.manager.dispose();
+  });
+
+  it("repairs a stale mapping when the exact URI now identifies another target", async () => {
+    const fixture = await createWorkspaceMappingHarness({
+      "remote-source": "missing-old-target",
+    });
+    const sourceUri = "file:///C:/projects/current-target";
+    await writeWorkspaceIdentity(
+      fixture.workspaceStorageRoot,
+      "current-target",
+      sourceUri,
+    );
+    const entry = workspaceStorageTip(
+      "remote-source",
+      sourceUri,
+      "4",
+      T0,
+      WORKSPACE_MAPPING_BLOCK_REASON,
+    );
+    const repository = workspaceMappingRepository([entry]);
+
+    await fixture.ensureWorkspaceMappings(repository);
+
+    expect(vscodeRuntime.showQuickPick).not.toHaveBeenCalled();
+    expect(fixture.setWorkspaceMapping).toHaveBeenCalledOnce();
+    expect(fixture.setWorkspaceMapping).toHaveBeenCalledWith(
+      "remote-source",
+      "current-target",
+    );
+    expect(fixture.workspaceMappings["remote-source"]).toBe("current-target");
+    expect(
+      repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBeUndefined();
+    fixture.manager.dispose();
+  });
+
+  it("resolves the same workspace ID without persisting or prompting", async () => {
+    const fixture = await createWorkspaceMappingHarness();
+    const workspaceId = "same-workspace";
+    const workspaceUri = "file:///C:/projects/same-workspace";
+    await writeWorkspaceIdentity(
+      fixture.workspaceStorageRoot,
+      workspaceId,
+      workspaceUri,
+    );
+    await writeWorkspaceIdentity(
+      fixture.workspaceStorageRoot,
+      "same-workspace-duplicate-uri",
+      `${workspaceUri}/`,
+    );
+    const entry = workspaceStorageTip(
+      workspaceId,
+      workspaceUri,
+      "7",
+      T0,
+      WORKSPACE_MAPPING_BLOCK_REASON,
+    );
+    const repository = workspaceMappingRepository([entry]);
+
+    await fixture.ensureWorkspaceMappings(repository);
+
+    expect(vscodeRuntime.showQuickPick).not.toHaveBeenCalled();
+    expect(fixture.setWorkspaceMapping).not.toHaveBeenCalled();
+    expect(
+      repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBeUndefined();
+    fixture.manager.dispose();
+  });
+
+  it("uses a valid stored workspace mapping without persisting or prompting", async () => {
+    const fixture = await createWorkspaceMappingHarness({
+      "stored-source": "stored-target",
+    });
+    const storedTargetUri = "file:///C:/projects/stored-target";
+    await writeWorkspaceIdentity(
+      fixture.workspaceStorageRoot,
+      "stored-target",
+      storedTargetUri,
+    );
+    await writeWorkspaceIdentity(
+      fixture.workspaceStorageRoot,
+      "stored-target-duplicate-uri",
+      `${storedTargetUri}/`,
+    );
+    const entry = workspaceStorageTip(
+      "stored-source",
+      storedTargetUri,
+      "8",
+      T0,
+      WORKSPACE_MAPPING_BLOCK_REASON,
+    );
+    const repository = workspaceMappingRepository([entry]);
+
+    await fixture.ensureWorkspaceMappings(repository);
+
+    expect(vscodeRuntime.showQuickPick).not.toHaveBeenCalled();
+    expect(fixture.setWorkspaceMapping).not.toHaveBeenCalled();
+    expect(
+      repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBeUndefined();
+    fixture.manager.dispose();
+  });
+
+  it("defers duplicate normalized URI candidates without prompting during routine sync", async () => {
+    const fixture = await createWorkspaceMappingHarness();
+    const sourceWorkspaceUri = "file:///C:/projects/duplicate-normalized-uri";
+    await Promise.all([
+      writeWorkspaceIdentity(
+        fixture.workspaceStorageRoot,
+        "duplicate-uri-a",
+        sourceWorkspaceUri,
+      ),
+      writeWorkspaceIdentity(
+        fixture.workspaceStorageRoot,
+        "duplicate-uri-b",
+        `${sourceWorkspaceUri}/`,
+      ),
+    ]);
+    const entry = workspaceStorageTip(
+      "duplicate-uri-source",
+      sourceWorkspaceUri,
+      "9",
+      T0,
+    );
+    const repository = workspaceMappingRepository([entry]);
+
+    await fixture.ensureWorkspaceMappings(repository);
+
+    expect(vscodeRuntime.showQuickPick).not.toHaveBeenCalled();
+    expect(fixture.setWorkspaceMapping).not.toHaveBeenCalled();
+    expect(
+      repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBe(WORKSPACE_MAPPING_BLOCK_REASON);
+    fixture.manager.dispose();
+  });
+
+  it("pages more than 512 source and stored-target identity references", async () => {
+    const mappings = Object.fromEntries(
+      Array.from({ length: 300 }, (_, index) => [
+        `paged-source-${index.toString().padStart(3, "0")}`,
+        `paged-target-${index.toString().padStart(3, "0")}`,
+      ]),
+    );
+    const fixture = await createWorkspaceMappingHarness(mappings);
+    await Promise.all(
+      Object.values(mappings).map((targetWorkspaceId) =>
+        writeWorkspaceIdentity(
+          fixture.workspaceStorageRoot,
+          targetWorkspaceId,
+          `file:///C:/projects/${targetWorkspaceId}`,
+        ),
+      ),
+    );
+    const entries = Object.keys(mappings).map((sourceWorkspaceId, index) =>
+      workspaceStorageTip(
+        sourceWorkspaceId,
+        `vscode-remote://ssh-remote+server/home/ubuntu/${sourceWorkspaceId}`,
+        (index % 10).toString(),
+        T0 + index,
+        WORKSPACE_MAPPING_BLOCK_REASON,
+      ),
+    );
+    const repository = workspaceMappingRepository(entries);
+
+    await fixture.ensureWorkspaceMappings(repository);
+
+    expect(vscodeRuntime.showQuickPick).not.toHaveBeenCalled();
+    expect(fixture.setWorkspaceMapping).not.toHaveBeenCalled();
+    expect(
+      repository.state.pendingDatabaseChanges.filter(
+        (pending) => pending.blockedReason !== undefined,
+      ),
+    ).toEqual([]);
+    fixture.manager.dispose();
+  });
+
+  it("defers ambiguous workspace storage while chat and settings remain applicable", async () => {
+    const fixture = await createWorkspaceMappingHarness();
+    const sourceWorkspaceId = "ambiguous-source";
+    const unresolved = workspaceStorageTip(
+      sourceWorkspaceId,
+      "vscode-remote://ssh-remote+server/home/ubuntu/ambiguous",
+      "9",
+      T0 + 2,
+    );
+    const repository = workspaceMappingRepository([unresolved]);
+    const chatResourceId = "chat/12345678-1234-4123-8123-1234567890ab";
+    const chatEventHash = "a".repeat(64);
+    const chatTip = {
+      versionId: `${chatEventHash}#0`,
+      eventHash: chatEventHash,
+      changeIndex: 0,
+      kind: "chat",
+      lamport: 1,
+      deviceId: "remote-device",
+      operation: "put",
+      semanticHash: chatEventHash,
+      payload: {
+        deviceId: "remote-device",
+        objectId: chatEventHash,
+        compressedBytes: 1,
+        plainBytes: 1,
+      },
+      parents: [],
+      producer: {
+        extensionVersion: "0.0.61",
+        cursorVersion: "3.15.6",
+        vscodeVersion: "1.125.0",
+      },
+      metadata: {
+        chatSnapshotSchemaVersion: 2,
+        agentKvMissingCount: 0,
+        workspaceId: sourceWorkspaceId,
+        workspaceUri:
+          "vscode-remote://ssh-remote+server/home/ubuntu/ambiguous",
+      },
+    } satisfies ResourceTip;
+    const settings = helperTip(
+      "settings/default/mixed-workspace-test",
+      "b".repeat(64),
+      1,
+    );
+    repository.state.pendingDatabaseChanges.push(
+      {
+        resourceId: chatResourceId,
+        kind: "chat",
+        eventHash: chatEventHash,
+        changeIndex: 0,
+        blockedReason: WORKSPACE_MAPPING_BLOCK_REASON,
+      },
+      settings.pending,
+    );
+    repository.state.tips[chatResourceId] = [chatTip];
+    repository.state.tips[settings.pending.resourceId] = [settings.tip];
+
+    await fixture.ensureWorkspaceMappings(repository);
+
+    expect(vscodeRuntime.showQuickPick).not.toHaveBeenCalled();
+    expect(
+      repository.state.pendingDatabaseChanges.find(
+        (pending) => pending.resourceId === unresolved.pending.resourceId,
+      )?.blockedReason,
+    ).toBe(WORKSPACE_MAPPING_BLOCK_REASON);
+    expect(
+      repository.state.pendingDatabaseChanges.find(
+        (pending) => pending.resourceId === chatResourceId,
+      )?.blockedReason,
+    ).toBeUndefined();
+    const applicable = pendingHelperBatch(repository).changes.map(
+      (change) => change.resourceId,
+    );
+    expect(applicable).toEqual([chatResourceId, settings.pending.resourceId]);
+    fixture.manager.dispose();
+  });
+
+  it("shows a picker only through the explicit public mapping command", async () => {
+    const fixture = await createManualWorkspaceMappingFixture();
+    vscodeRuntime.showQuickPick.mockImplementationOnce(
+      async (items: Array<{ workspaceId: string | null }>) =>
+        items.find((item) => item.workspaceId === fixture.targetWorkspaceId),
+    );
+
+    await fixture.manager.mapPendingWorkspaces();
+
+    expect(vscodeRuntime.showQuickPick).toHaveBeenCalledOnce();
+    expect(fixture.setWorkspaceMapping).toHaveBeenCalledWith(
+      fixture.sourceWorkspaceId,
+      fixture.targetWorkspaceId,
+    );
+    expect(
+      fixture.repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBeUndefined();
+    fixture.manager.dispose();
+  });
+
+  it("maps a unique exact candidate beyond the initial discovery page without a picker", async () => {
+    const sourceWorkspaceUri = "file:///C:/projects/expanded-exact-target";
+    const fixture = await createManualWorkspaceMappingFixture({
+      sourceWorkspaceUri,
+    });
+    const targetWorkspaceId = "zz-expanded-exact-target";
+    await seedExpandedWorkspaceCandidates(
+      fixture.workspaceStorageRoot,
+      targetWorkspaceId,
+      sourceWorkspaceUri,
+    );
+
+    await fixture.manager.mapPendingWorkspaces();
+
+    expect(vscodeRuntime.showQuickPick).not.toHaveBeenCalled();
+    expect(fixture.takeCommandLock).toHaveBeenCalledTimes(2);
+    expect(fixture.refreshState).toHaveBeenCalledTimes(2);
+    expect(fixture.setWorkspaceMapping).toHaveBeenCalledOnce();
+    expect(fixture.setWorkspaceMapping).toHaveBeenCalledWith(
+      fixture.sourceWorkspaceId,
+      targetWorkspaceId,
+    );
+    expect(
+      fixture.repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBeUndefined();
+    expect(fixture.refreshAdapters).toHaveBeenCalledOnce();
+    expect(fixture.startFinalizer).toHaveBeenCalledOnce();
+    fixture.manager.dispose();
+  });
+
+  it("ignores an expanded exact candidate that changes after the apply lock is reacquired", async () => {
+    const sourceWorkspaceUri = "file:///C:/projects/expanded-stale-target";
+    const fixture = await createManualWorkspaceMappingFixture({
+      sourceWorkspaceUri,
+    });
+    const targetWorkspaceId = "zz-expanded-stale-target";
+    await seedExpandedWorkspaceCandidates(
+      fixture.workspaceStorageRoot,
+      targetWorkspaceId,
+      sourceWorkspaceUri,
+    );
+    fixture.refreshState.mockImplementation(async () => {
+      if (fixture.refreshState.mock.calls.length === 2) {
+        await writeWorkspaceIdentity(
+          fixture.workspaceStorageRoot,
+          targetWorkspaceId,
+          "file:///C:/projects/replaced-expanded-target-with-different-length",
+        );
+      }
+    });
+
+    await fixture.manager.mapPendingWorkspaces();
+
+    expect(vscodeRuntime.showQuickPick).not.toHaveBeenCalled();
+    expect(fixture.takeCommandLock).toHaveBeenCalledTimes(2);
+    expect(fixture.refreshState).toHaveBeenCalledTimes(2);
+    expect(fixture.setWorkspaceMapping).not.toHaveBeenCalled();
+    expect(
+      fixture.repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBe(WORKSPACE_MAPPING_BLOCK_REASON);
+    expect(fixture.refreshAdapters).not.toHaveBeenCalled();
+    expect(fixture.startFinalizer).not.toHaveBeenCalled();
+    fixture.manager.dispose();
+  });
+
+  it("offers duplicate normalized URI candidates only through the safe manual picker", async () => {
+    const sourceWorkspaceUri = "file:///C:/projects/manual-duplicate-uri";
+    const fixture = await createManualWorkspaceMappingFixture({
+      sourceWorkspaceUri,
+    });
+    await Promise.all([
+      writeWorkspaceIdentity(
+        fixture.workspaceStorageRoot,
+        "manual-duplicate-a",
+        sourceWorkspaceUri,
+      ),
+      writeWorkspaceIdentity(
+        fixture.workspaceStorageRoot,
+        "manual-duplicate-b",
+        `${sourceWorkspaceUri}/`,
+      ),
+    ]);
+    let shownItems: Array<{
+      label: string;
+      workspaceId: string | null;
+    }> = [];
+    vscodeRuntime.showQuickPick.mockImplementationOnce(
+      async (
+        items: Array<{
+          label: string;
+          workspaceId: string | null;
+        }>,
+      ) => {
+        shownItems = items;
+        return items[0];
+      },
+    );
+
+    await fixture.manager.mapPendingWorkspaces();
+
+    expect(vscodeRuntime.showQuickPick).toHaveBeenCalledOnce();
+    expect(shownItems[0]?.workspaceId).toBeNull();
+    expect(shownItems[0]?.label).toContain("Skip");
+    expect(shownItems).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ workspaceId: "manual-duplicate-a" }),
+        expect.objectContaining({ workspaceId: "manual-duplicate-b" }),
+      ]),
+    );
+    expect(fixture.takeCommandLock).toHaveBeenCalledOnce();
+    expect(fixture.setWorkspaceMapping).not.toHaveBeenCalled();
+    expect(
+      fixture.repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBe(WORKSPACE_MAPPING_BLOCK_REASON);
+    fixture.manager.dispose();
+  });
+
+  it("refreshes mapping consumers when the public initial pass clears a same-ID block", async () => {
+    const fixture = await createManualWorkspaceMappingFixture();
+    await writeWorkspaceIdentity(
+      fixture.workspaceStorageRoot,
+      fixture.sourceWorkspaceId,
+      "vscode-remote://ssh-remote+server/home/ubuntu/manual-source",
+    );
+
+    await fixture.manager.mapPendingWorkspaces();
+
+    expect(vscodeRuntime.showQuickPick).not.toHaveBeenCalled();
+    expect(fixture.takeCommandLock).toHaveBeenCalledOnce();
+    expect(fixture.refreshState).toHaveBeenCalledOnce();
+    expect(fixture.setWorkspaceMapping).not.toHaveBeenCalled();
+    expect(
+      fixture.repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBeUndefined();
+    expect(fixture.refreshAdapters).toHaveBeenCalledOnce();
+    expect(fixture.startFinalizer).toHaveBeenCalledOnce();
+    fixture.manager.dispose();
+  });
+
+  it("releases the read lock while picking, then revalidates and refreshes helper consumers", async () => {
+    const fixture = await createManualWorkspaceMappingFixture();
+    vscodeRuntime.showQuickPick.mockImplementationOnce(
+      async (items: Array<{ workspaceId: string | null }>) => {
+        expect(fixture.firstLock.release).toHaveBeenCalledOnce();
+        expect(fixture.secondLock.release).not.toHaveBeenCalled();
+        expect(fixture.takeCommandLock).toHaveBeenCalledOnce();
+        return items.find(
+          (item) => item.workspaceId === fixture.targetWorkspaceId,
+        );
+      },
+    );
+
+    await fixture.manager.mapPendingWorkspaces();
+
+    expect(fixture.takeCommandLock).toHaveBeenCalledTimes(2);
+    expect(fixture.refreshState).toHaveBeenCalledTimes(2);
+    expect(fixture.setWorkspaceMapping).toHaveBeenCalledWith(
+      fixture.sourceWorkspaceId,
+      fixture.targetWorkspaceId,
+    );
+    expect(fixture.secondLock.release).toHaveBeenCalledOnce();
+    expect(fixture.refreshAdapters).toHaveBeenCalledOnce();
+    expect(fixture.startFinalizer).toHaveBeenCalledOnce();
+    fixture.manager.dispose();
+  });
+
+  it("ignores a selection when the pending source changes before the apply lock refresh", async () => {
+    const fixture = await createManualWorkspaceMappingFixture();
+    fixture.refreshState.mockImplementation(async () => {
+      if (fixture.refreshState.mock.calls.length !== 2) {
+        return;
+      }
+      const eventHash = "d".repeat(64);
+      const current = fixture.repository.state.tips[
+        fixture.entry.pending.resourceId
+      ]![0]!;
+      fixture.repository.state.pendingDatabaseChanges[0] = {
+        ...fixture.repository.state.pendingDatabaseChanges[0]!,
+        eventHash,
+      };
+      fixture.repository.state.tips[fixture.entry.pending.resourceId] = [
+        {
+          ...current,
+          versionId: `${eventHash}#0`,
+          eventHash,
+          semanticHash: eventHash,
+          metadata: {
+            ...current.metadata,
+            workspaceUri:
+              "vscode-remote://ssh-remote+server/home/ubuntu/replaced-source",
+          },
+        },
+      ];
+    });
+    vscodeRuntime.showQuickPick.mockImplementationOnce(
+      async (items: Array<{ workspaceId: string | null }>) =>
+        items.find((item) => item.workspaceId === fixture.targetWorkspaceId),
+    );
+
+    await fixture.manager.mapPendingWorkspaces();
+
+    expect(fixture.refreshState).toHaveBeenCalledTimes(2);
+    expect(fixture.setWorkspaceMapping).not.toHaveBeenCalled();
+    expect(fixture.refreshAdapters).not.toHaveBeenCalled();
+    expect(fixture.startFinalizer).not.toHaveBeenCalled();
+    fixture.manager.dispose();
+  });
+
+  it("ignores a selection when the target identity changes before revalidation", async () => {
+    const fixture = await createManualWorkspaceMappingFixture();
+    vscodeRuntime.showQuickPick.mockImplementationOnce(
+      async (items: Array<{ workspaceId: string | null }>) => {
+        await writeWorkspaceIdentity(
+          fixture.workspaceStorageRoot,
+          fixture.targetWorkspaceId,
+          "file:///C:/projects/replaced-target-with-a-different-uri",
+        );
+        return items.find(
+          (item) => item.workspaceId === fixture.targetWorkspaceId,
+        );
+      },
+    );
+
+    await fixture.manager.mapPendingWorkspaces();
+
+    expect(fixture.refreshState).toHaveBeenCalledTimes(2);
+    expect(fixture.setWorkspaceMapping).not.toHaveBeenCalled();
+    expect(fixture.refreshAdapters).not.toHaveBeenCalled();
+    expect(fixture.startFinalizer).not.toHaveBeenCalled();
+    fixture.manager.dispose();
+  });
+
+  it.each(["disconnected", "repository-changed"] as const)(
+    "ignores a selection after the manager is $mode",
+    async (mode) => {
+      const fixture = await createManualWorkspaceMappingFixture();
+      vscodeRuntime.showQuickPick.mockImplementationOnce(
+        async (items: Array<{ workspaceId: string | null }>) => {
+          fixture.internals.repository =
+            mode === "disconnected"
+              ? null
+              : ({
+                  ...fixture.repository,
+                  root: "replacement-repository",
+                } as SyncRepository);
+          return items.find(
+            (item) => item.workspaceId === fixture.targetWorkspaceId,
+          );
+        },
+      );
+
+      await fixture.manager.mapPendingWorkspaces();
+
+      expect(fixture.setWorkspaceMapping).not.toHaveBeenCalled();
+      expect(fixture.refreshAdapters).not.toHaveBeenCalled();
+      expect(fixture.startFinalizer).not.toHaveBeenCalled();
+      fixture.manager.dispose();
+    },
+  );
+
+  it("offers a safe first cancel item and known candidates during incomplete discovery", async () => {
+    const fixture = await createManualWorkspaceMappingFixture();
+    const unreadableDirectory = join(
+      fixture.workspaceStorageRoot,
+      "unreadable-target",
+    );
+    await mkdir(unreadableDirectory, { recursive: true });
+    await writeFile(
+      join(unreadableDirectory, "workspace.json"),
+      "{not valid workspace metadata",
+      "utf8",
+    );
+
+    let shownItems: Array<{
+      label: string;
+      workspaceId: string | null;
+    }> = [];
+    vscodeRuntime.showQuickPick.mockImplementationOnce(
+      async (
+        items: Array<{
+          label: string;
+          workspaceId: string | null;
+        }>,
+      ) => {
+        shownItems = items;
+        return items[0];
+      },
+    );
+
+    await fixture.manager.mapPendingWorkspaces();
+
+    expect(vscodeRuntime.showQuickPick).toHaveBeenCalledOnce();
+    expect(shownItems[0]?.workspaceId).toBeNull();
+    expect(shownItems[0]?.label).toContain("Skip");
+    expect(shownItems).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          workspaceId: fixture.targetWorkspaceId,
+        }),
+      ]),
+    );
+    expect(fixture.setWorkspaceMapping).not.toHaveBeenCalled();
+    expect(
+      fixture.repository.state.pendingDatabaseChanges[0]?.blockedReason,
+    ).toBe(WORKSPACE_MAPPING_BLOCK_REASON);
+    fixture.manager.dispose();
   });
 });
 
@@ -1815,6 +2480,270 @@ describe("automatic checkpoint maintenance", () => {
     }
   });
 });
+
+interface WorkspaceStorageTipEntry {
+  pending: {
+    eventHash: string;
+    changeIndex: number;
+    resourceId: string;
+    kind: "workspace-storage";
+    blockedReason?: string;
+  };
+  tip: ResourceTip;
+}
+
+async function createWorkspaceMappingHarness(
+  initialMappings: Record<string, string> = {},
+) {
+  const temporaryRoot = await mkdtemp(
+    join(tmpdir(), "cursor-manager-workspace-mapping-"),
+  );
+  temporaryRoots.push(temporaryRoot);
+  const workspaceStorageRoot = join(temporaryRoot, "workspaceStorage");
+  await mkdir(workspaceStorageRoot, { recursive: true });
+  const workspaceMappings = { ...initialMappings };
+  const setWorkspaceMapping = vi.fn(
+    async (sourceWorkspaceId: string, targetWorkspaceId: string) => {
+      workspaceMappings[sourceWorkspaceId] = targetWorkspaceId;
+    },
+  );
+  const manager = createManager({
+    paths: {
+      workspaceStorageRoot,
+      extensionStorage: join(temporaryRoot, "extension-storage"),
+      helperScript: join(temporaryRoot, "helper.js"),
+    } as unknown as CursorPaths,
+    configuration: {
+      syncChat: true,
+      syncWorkspaceStorage: true,
+      effectiveIgnoredWorkspaces: [],
+      workspaceMappings,
+      setWorkspaceMapping,
+    } as unknown as ExtensionConfiguration,
+  });
+  const internals = manager as unknown as {
+    ensureWorkspaceMappings(repository: SyncRepository): Promise<void>;
+  };
+  return {
+    manager,
+    workspaceStorageRoot,
+    workspaceMappings,
+    setWorkspaceMapping,
+    ensureWorkspaceMappings: internals.ensureWorkspaceMappings.bind(manager),
+  };
+}
+
+async function createManualWorkspaceMappingFixture(
+  options: { sourceWorkspaceUri?: string } = {},
+) {
+  const temporaryRoot = await mkdtemp(
+    join(tmpdir(), "cursor-manager-manual-workspace-mapping-"),
+  );
+  temporaryRoots.push(temporaryRoot);
+  const workspaceStorageRoot = join(temporaryRoot, "workspaceStorage");
+  await mkdir(workspaceStorageRoot, { recursive: true });
+  const sourceWorkspaceId = "manual-source";
+  const targetWorkspaceId = "manual-target";
+  const targetWorkspaceUri = "file:///C:/projects/manual-target";
+  await writeWorkspaceIdentity(
+    workspaceStorageRoot,
+    targetWorkspaceId,
+    targetWorkspaceUri,
+  );
+  const entry = workspaceStorageTip(
+    sourceWorkspaceId,
+    options.sourceWorkspaceUri ??
+      "vscode-remote://ssh-remote+server/home/ubuntu/manual-source",
+    "e",
+    T0,
+    WORKSPACE_MAPPING_BLOCK_REASON,
+  );
+  const repository = workspaceMappingRepository([entry]);
+  const repositoryRoot = join(temporaryRoot, "repository");
+  const repositoryId = "manual-mapping-repository";
+  const refreshState = vi.fn(async () => undefined);
+  const saveState = vi.fn(async () => undefined);
+  Object.assign(repository, {
+    root: repositoryRoot,
+    repository: { repositoryId },
+    setMaxPayloadBytes: vi.fn(),
+    refreshState,
+    saveState,
+  });
+  const workspaceMappings: Record<string, string> = {};
+  const setWorkspaceMapping = vi.fn(
+    async (sourceId: string, targetId: string) => {
+      workspaceMappings[sourceId] = targetId;
+    },
+  );
+  const manager = createManager({
+    paths: {
+      workspaceStorageRoot,
+      extensionStorage: join(temporaryRoot, "extension-storage"),
+      helperScript: join(temporaryRoot, "helper.js"),
+    } as unknown as CursorPaths,
+    configuration: {
+      repositoryPath: repositoryRoot,
+      repositoryId,
+      gitSync: false,
+      maxPayloadBytes: 4 * 1024 * 1024,
+      syncChat: true,
+      syncWorkspaceStorage: true,
+      effectiveIgnoredWorkspaces: [],
+      workspaceMappings,
+      setWorkspaceMapping,
+    } as unknown as ExtensionConfiguration,
+  });
+  const firstLock = {
+    path: "workspace-mapping-read.lock",
+    refresh: () => undefined,
+    release: vi.fn(async () => undefined),
+  } satisfies FileLock;
+  const secondLock = {
+    path: "workspace-mapping-apply.lock",
+    refresh: () => undefined,
+    release: vi.fn(async () => undefined),
+  } satisfies FileLock;
+  let lockIndex = 0;
+  const takeCommandLock = vi.fn(async () => {
+    const lock = [firstLock, secondLock][lockIndex];
+    lockIndex += 1;
+    if (lock === undefined) {
+      throw new Error("unexpected extra workspace mapping lock");
+    }
+    return lock;
+  });
+  const refreshAdapters = vi.fn(async () => undefined);
+  const startFinalizer = vi.fn(async () => undefined);
+  const internals = manager as unknown as {
+    repository: SyncRepository | null;
+    takeCommandLock(repository: SyncRepository): Promise<FileLock>;
+    openGitWindow(repository: SyncRepository): Promise<boolean>;
+    refreshAdapters(): Promise<void>;
+    startFinalizer(): Promise<void>;
+  };
+  internals.repository = repository;
+  internals.takeCommandLock = takeCommandLock;
+  internals.openGitWindow = vi.fn(async () => false);
+  internals.refreshAdapters = refreshAdapters;
+  internals.startFinalizer = startFinalizer;
+  return {
+    manager,
+    internals,
+    repository,
+    entry,
+    workspaceStorageRoot,
+    sourceWorkspaceId,
+    targetWorkspaceId,
+    firstLock,
+    secondLock,
+    takeCommandLock,
+    refreshState,
+    saveState,
+    setWorkspaceMapping,
+    refreshAdapters,
+    startFinalizer,
+  };
+}
+
+async function seedExpandedWorkspaceCandidates(
+  workspaceStorageRoot: string,
+  targetWorkspaceId: string,
+  targetWorkspaceUri: string,
+): Promise<void> {
+  await Promise.all([
+    ...Array.from({ length: 40 }, (_, index) =>
+      writeWorkspaceIdentity(
+        workspaceStorageRoot,
+        `aa-expanded-filler-${index.toString().padStart(2, "0")}`,
+        `file:///C:/projects/expanded-filler-${index}`,
+      ),
+    ),
+    writeWorkspaceIdentity(
+      workspaceStorageRoot,
+      targetWorkspaceId,
+      targetWorkspaceUri,
+    ),
+  ]);
+}
+
+async function writeWorkspaceIdentity(
+  workspaceStorageRoot: string,
+  workspaceId: string,
+  workspaceUri: string,
+): Promise<void> {
+  const directory = join(workspaceStorageRoot, workspaceId);
+  await mkdir(directory, { recursive: true });
+  await writeFile(
+    join(directory, "workspace.json"),
+    JSON.stringify({ folder: workspaceUri }),
+    "utf8",
+  );
+}
+
+function workspaceStorageTip(
+  sourceWorkspaceId: string,
+  workspaceUri: string,
+  hashCharacter: string,
+  lastUpdatedAt: number,
+  blockedReason?: string,
+): WorkspaceStorageTipEntry {
+  const eventHash = hashCharacter.repeat(64);
+  const relativePath = `${sourceWorkspaceId}/notepads.json`;
+  const resourceId = `workspace-storage/${encodeURIComponent(relativePath)}`;
+  const tip = {
+    versionId: `${eventHash}#0`,
+    eventHash,
+    changeIndex: 0,
+    kind: "workspace-storage",
+    lamport: 1,
+    deviceId: "remote-device",
+    operation: "put",
+    semanticHash: eventHash,
+    payload: {
+      deviceId: "remote-device",
+      objectId: eventHash,
+      compressedBytes: 1,
+      plainBytes: 1,
+    },
+    parents: [],
+    producer: {
+      extensionVersion: "0.0.61",
+      cursorVersion: "3.15.6",
+      vscodeVersion: "1.125.0",
+    },
+    metadata: {
+      relativePath,
+      workspaceId: sourceWorkspaceId,
+      workspaceUri,
+      lastUpdatedAt,
+    },
+  } satisfies ResourceTip;
+  return {
+    pending: {
+      eventHash,
+      changeIndex: 0,
+      resourceId,
+      kind: "workspace-storage",
+      ...(blockedReason === undefined ? {} : { blockedReason }),
+    },
+    tip,
+  };
+}
+
+function workspaceMappingRepository(
+  entries: readonly WorkspaceStorageTipEntry[],
+): SyncRepository {
+  return {
+    state: {
+      pendingDatabaseChanges: entries.map((entry) => ({ ...entry.pending })),
+      tips: Object.fromEntries(
+        entries.map((entry) => [entry.pending.resourceId, [entry.tip]]),
+      ),
+      conflicts: [],
+    },
+  } as unknown as SyncRepository;
+}
 
 interface SyncHarness {
   manager: SyncManager;

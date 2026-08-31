@@ -32,6 +32,7 @@ type ManagementRoute =
   | "restore-version"
   | "restore-backup"
   | "archive"
+  | "map-pending-workspaces"
   | "forget-device"
   | "setup"
   | "disconnect";
@@ -109,6 +110,11 @@ const REPOSITORY_DEVICE_ITEMS: readonly ManagementRouteItem[] = [
     label: "$(settings-gear) Setup or Reconfigure This PC…",
     description: "connect this PC or switch synchronization repositories",
     action: "setup",
+  },
+  {
+    label: "$(folder-opened) Map Pending Workspaces…",
+    description: "match synchronized workspace data to folders on this PC",
+    action: "map-pending-workspaces",
   },
   {
     label: "$(archive) Archive Repository…",
@@ -363,6 +369,9 @@ async function runManagementRoute(
       return;
     case "archive":
       await activeManager.archiveRepository();
+      return;
+    case "map-pending-workspaces":
+      await activeManager.mapPendingWorkspaces();
       return;
     case "forget-device":
       await activeManager.forgetDevice();

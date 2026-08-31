@@ -51,7 +51,7 @@ Extensions 뷰에서 **Cursor Setting Sync**를 설치한 뒤, 명령 팔레트�
 - 어느 방식이든 `Cursor Setting Sync: Manage` → **Repository & Devices…** → **Setup or Reconfigure This PC…**에서 시작합니다.
 - 패스프레이즈는 선택 사항입니다. 입력한다면 12자 이상이어야 하고 모든 PC에서 동일해야 합니다. 공유 저장소에 저장되지 않으며, 복구할 수 없습니다.
 - 패스프레이즈를 비워 두면 보안 경고가 뜬 뒤 진행됩니다. 이 경우 암호화 키가 저장소 안(데이터 옆)에 놓여, 공유 폴더나 git 원격을 읽을 수 있는 사람은 누구나 복호화할 수 있습니다. 신뢰할 수 있는 로컬 폴더나 완전히 통제되는 비공개 원격에서만 사용하세요.
-- 추가 PC에서는 파일 리소스가 안전할 때 자동으로 적용됩니다. DB·워크스페이스 스토리지 변경은 모든 Cursor 창을 정상 종료하면 종료 헬퍼가 자동 적용합니다. 지금 동기화하고 생긴 DB 대기열까지 즉시 적용하려면 **Manage** → **Sync & Apply Now**를 사용합니다. 오프라인 작업이 없으면 Cursor를 종료하지 않습니다.
+- 추가 PC에서는 파일 리소스가 안전할 때 자동으로 적용됩니다. DB·워크스페이스 스토리지 변경은 모든 Cursor 창을 정상 종료하면 종료 헬퍼가 자동 적용합니다. 지금 동기화하고 생긴 DB 대기열까지 즉시 적용하려면 **Manage** → **Sync & Apply Now**를 사용합니다. 오프라인 작업이 없으면 Cursor를 종료하지 않습니다. 수신 workspaceStorage는 같은 ID, 유일하게 정확히 일치하는 정규화 URI, 이전에 확정한 매핑일 때만 자동 연결되며, 모호한 워크스페이스는 채팅이나 다른 리소스를 막지 않고 보류됩니다.
 - 설정 전에는 상태바를 누르면 **Manage**의 **Repository & Devices…** → **Setup or Reconfigure This PC…** 흐름으로 바로 연결됩니다. 저장소가 설정되기 전까지는 아무것도 동기화되지 않습니다.
 
 방식별 상세는 아래를 참고하고, 제공자별 주의사항은 [저장소 옵션](#저장소-옵션) 표를 확인하세요.
@@ -129,7 +129,7 @@ PC A는 완전한 portable v2 continuation graph에서만 채팅 core를 대기�
 - **Resolve Conflicts**: 안전하게 병합할 수 없는 데이터의 어느 쪽을 유지할지 선택합니다.
 - **Recover Chats…**: bounded 원위치 복구와 안전한 transcript 대체 경로인 **Check and Recover Current Chats**, **Open a Preserved Chat**을 담습니다. 전체 복구 감사는 큰 라이브 DB를 스캔할 수 있으므로 의도적으로 사용자가 시작하게 유지합니다. 누락 continuation 데이터를 만들어내지 않으며 정확한 원본이 없으면 기존 채팅을 바꾸지 않습니다.
 - **Restore Data…**: 명시적인 롤백인 **Restore a Synchronized Version**, **Restore a Local Database Backup (Emergency)**를 담습니다. 두 복원 경로 모두 의도적으로 사용자가 시작해야 합니다. DB 복원은 Cursor를 종료하고 이후 다른 PC에도 복원 상태가 동기화되며, 복원 전에는 되돌릴 수 있는 pre-restore 백업을 만듭니다.
-- **Repository & Devices…**: **Setup or Reconfigure This PC…**, **Archive Repository…**, **Retire or Restore Another Device…**, **Disconnect This PC**를 담습니다. Disconnect는 이 PC의 경로·키·매핑만 지우며 공유 저장소는 바꾸지 않습니다.
+- **Repository & Devices…**: **Setup or Reconfigure This PC…**, **Map Pending Workspaces…**, **Archive Repository…**, **Retire or Restore Another Device…**, **Disconnect This PC**를 담습니다. 서로 다른 두 경로가 같은 프로젝트라는 사실을 알고 있을 때만 워크스페이스를 수동 매핑하세요. 일반 동기화는 폴더 이름만 보고 추정하지 않습니다. Disconnect는 이 PC의 경로·키·매핑만 지우며 공유 저장소는 바꾸지 않습니다.
 
 상태바를 누르면 설정·진단·동기화·충돌 해결에 맞는 내부 작업으로 바로 연결됩니다. 대기 중인 DB 작업은 정상 종료 시 계속 자동 적용되며, 지금 처리하려면 최상위 **Sync & Apply Now** 하나만 선택하면 됩니다.
 
@@ -165,7 +165,7 @@ PC A는 완전한 portable v2 continuation graph에서만 채팅 core를 대기�
 | `syncChat` | `true` | 지원되는 Cursor 채팅 저장소(composer 대화·에이전트 트랜스크립트·`store.db`) 동기화 여부. |
 | `syncWorkspaceStorage` | `true` | `workspaceStorage` 상태 백업 여부. 모든 Cursor 프로세스가 종료된 뒤에만 캡처됩니다. |
 | `applyOnShutdown` | `true` | Cursor를 정상 종료할 때 대기 중인 데이터베이스 작업을 자동 적용할지. 끄면 **Sync & Apply Now**로 명시적으로 적용합니다. 안전한 파일 작업은 계속 실행 중 적용되며, Cursor가 실행 중일 때 데이터베이스를 쓰지는 않습니다. |
-| `syncLocalWorkspaces` | `false` | 로컬 폴더 워크스페이스(`file://`)를 workspaceStorage 동기화에 포함할지. **기본은 끔**: 로컬 폴더는 경로로 식별되므로 두 컴퓨터가 같은 프로젝트를 똑같은 경로로 열지 않는 한 반대편에 내려앉을 곳이 없고, 실제로 벌어지는 일은 무관한 워크스페이스 수백 개를 나열하며 존재하지 않는 대상을 고르라는 프롬프트뿐입니다. 모든 컴퓨터에서 같은 프로젝트가 같은 경로에 있다면 켜세요. Remote-SSH 워크스페이스는 항상 동기화됩니다. **기기 범위.** |
+| `syncLocalWorkspaces` | `false` | 로컬 폴더 워크스페이스(`file://`)를 workspaceStorage 동기화에 포함할지. **기본은 끔**: 로컬 폴더는 경로로 식별되므로 두 컴퓨터가 같은 프로젝트를 똑같은 경로로 열지 않는 한 반대편에 내려앉을 곳이 없습니다. 일반 동기화에서는 일치하지 않는 데이터를 선택창 없이 보류하며, 서로 다른 두 경로가 같은 프로젝트임을 확실히 아는 경우에만 **Map Pending Workspaces…**를 사용하세요. Remote-SSH 워크스페이스는 항상 동기화됩니다. **기기 범위.** |
 | `ignoredWorkspaces` | `[]` | 위 기본 제외에 **더해서** 이 컴퓨터가 백업도 쓰기도 하지 않을 워크스페이스. 워크스페이스 URI로 매칭하며 와일드카드가 됩니다: `vscode-remote://ssh-remote+staging*`. Cursor가 저장한 퍼센트 인코딩 형태도 사람이 쓰는 읽기 쉬운 패턴과 매칭됩니다. **기기 범위(machine scope)**라 다른 설정과 달리 컴퓨터 간에 전파되지 않습니다 — 어떤 프로젝트가 이 기기에 있는지는 그 기기의 사실이기 때문입니다. 채팅에는 영향이 없습니다. |
 | `gitSync` | `true` | 저장소 폴더가 git 워크트리일 때 읽기 전 pull·쓰기 후 commit/push를 사용할지. `git` CLI가 필요합니다. |
 | `ignoredSettings` | `[]` | `settings.json`에서 동기화 제외할 설정 키 목록. API 키 등 민감한 값을 여기에 추가하세요. 각 항목은 정확한 키(`editor.fontSize`) 또는 와일드카드(`remote.SSH.*`)입니다. |
