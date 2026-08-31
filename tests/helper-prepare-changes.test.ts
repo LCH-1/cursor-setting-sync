@@ -27,6 +27,8 @@ import type {
   ResourceTip,
 } from "../src/types";
 import type { HelperChange, HelperRequest } from "../src/helper/types";
+import type { PreparedHelperChange } from "../src/helper/database";
+import { CursorReopenedError } from "../src/helper/resourceApply";
 import type { ResourceProjection } from "../src/protocol/reconciler";
 import { MAX_HELPER_APPLY_WORK_BYTES } from "../src/constants";
 
@@ -507,6 +509,480 @@ describe("preparing a helper batch", () => {
     ]);
   });
 
+  it("verifies the whole READY shutdown queue once while applying bounded pages", () => {
+    const projections = Array.from(
+      { length: 300 },
+      (_unused, index): ResourceProjection => {
+        const eventHash = index.toString(16).padStart(64, "0");
+        const resourceId = `settings/default/queued-${index}`;
+        return {
+          resourceId,
+          changed: true,
+          tip: {
+            versionId: `${eventHash}#0`,
+            eventHash,
+            changeIndex: 0,
+            kind: "settings",
+            lamport: index + 1,
+            deviceId: "source-device",
+            operation: "delete",
+            semanticHash: "d".repeat(64),
+            parents: [],
+          },
+        };
+      },
+    );
+    const repository = {
+      state: {
+        pendingDatabaseChanges: projections.map(({ resourceId, tip }) => ({
+          resourceId,
+          kind: tip.kind,
+          eventHash: tip.eventHash,
+          changeIndex: tip.changeIndex,
+        })),
+      },
+    } as unknown as SyncRepository;
+    const request = {
+      mode: "final-export",
+      changes: [],
+      syncOptions: { applyOnShutdown: true },
+    } as unknown as HelperRequest;
+
+    const verifiedTargets = helperMainTesting.finalExportTargetPage(
+      request,
+      repository,
+      projections,
+    );
+    const explicitTargets = helperMainTesting.finalExportTargetPage(
+      {
+        ...request,
+        mode: "apply-and-restart",
+      },
+      repository,
+      projections,
+    );
+    const firstApplyPage = helperMainTesting.shutdownApplyBatch(
+      repository,
+      projections,
+    );
+
+    expect(verifiedTargets).toHaveLength(300);
+    expect(explicitTargets).toEqual(verifiedTargets);
+    expect(firstApplyPage).toHaveLength(256);
+    expect(firstApplyPage).toEqual(verifiedTargets.slice(0, 256));
+  });
+
+  it("keeps policy-excluded stale entries out of every durable helper page", () => {
+    const entries: Array<{
+      resourceId: string;
+      kind: ResourceTip["kind"];
+      metadata?: ResourceTip["metadata"];
+      excluded: boolean;
+    }> = [
+      {
+        resourceId: `ui-state/${encodeURIComponent("workbench.activity.pinnedViewlets2")}`,
+        kind: "ui-state",
+        metadata: { key: "workbench.activity.pinnedViewlets2" },
+        excluded: true,
+      },
+      {
+        resourceId: "workspace-storage/folderless/state.vscdb",
+        kind: "workspace-storage",
+        metadata: { workspaceId: "folderless" },
+        excluded: true,
+      },
+      {
+        resourceId: "chat/empty-state-draft",
+        kind: "chat",
+        metadata: { composerId: "empty-state-draft" },
+        excluded: true,
+      },
+      {
+        resourceId: "chat/00000000-0000-4000-8000-000000000071",
+        kind: "chat",
+        metadata: {
+          composerId: "00000000-0000-4000-8000-000000000071",
+        },
+        excluded: false,
+      },
+    ];
+    const projections = entries.map(
+      (entry, index): ResourceProjection => {
+        const eventHash = (index + 1).toString(16).repeat(64);
+        return {
+          resourceId: entry.resourceId,
+          changed: true,
+          tip: {
+            versionId: `${eventHash}#0`,
+            eventHash,
+            changeIndex: 0,
+            kind: entry.kind,
+            lamport: index + 1,
+            deviceId: "source-device",
+            operation: "delete",
+            semanticHash: String(index + 5).repeat(64),
+            parents: [],
+            ...(entry.metadata === undefined
+              ? {}
+              : { metadata: entry.metadata }),
+          },
+        };
+      },
+    );
+    const repository = {
+      state: {
+        pendingDatabaseChanges: projections.map(({ resourceId, tip }) => ({
+          resourceId,
+          kind: tip.kind,
+          eventHash: tip.eventHash,
+          changeIndex: tip.changeIndex,
+        })),
+      },
+    } as unknown as SyncRepository;
+
+    expect(
+      helperMainTesting
+        .shutdownApplyCandidates(repository, projections)
+        .map((change) => change.resourceId),
+    ).toEqual([entries[3]?.resourceId]);
+    const valid = projections[3];
+    expect(valid).toBeDefined();
+    if (valid === undefined) {
+      throw new Error("The valid policy fixture is missing.");
+    }
+    const mismatchedRepository = {
+      state: {
+        pendingDatabaseChanges: [
+          {
+            resourceId: "chat/00000000-0000-4000-8000-000000000072",
+            kind: valid.tip.kind,
+            eventHash: valid.tip.eventHash,
+            changeIndex: valid.tip.changeIndex,
+          },
+          {
+            resourceId: valid.resourceId,
+            kind: "workspace-storage",
+            eventHash: valid.tip.eventHash,
+            changeIndex: valid.tip.changeIndex,
+          },
+        ],
+      },
+    } as unknown as SyncRepository;
+    expect(
+      helperMainTesting.shutdownApplyCandidates(
+        mismatchedRepository,
+        projections,
+      ),
+    ).toEqual([]);
+    for (const [index, projection] of projections.entries()) {
+      const tip = projection.tip;
+      expect(
+        helperMainTesting.isEligible(
+          {
+            eventHash: tip.eventHash,
+            changeIndex: tip.changeIndex,
+            sourceDeviceId: tip.deviceId,
+            resourceId: projection.resourceId,
+            kind: tip.kind,
+            operation: tip.operation,
+            semanticHash: tip.semanticHash,
+            ...(tip.metadata === undefined ? {} : { metadata: tip.metadata }),
+          },
+          projections,
+          [],
+        ),
+      ).toBe(!entries[index]?.excluded);
+    }
+  });
+
+  it("recognizes only pages that can mutate the global database", () => {
+    const prepared = (
+      kind: ResourceTip["kind"],
+      operation: HelperChange["operation"],
+      profileId?: string,
+    ): PreparedHelperChange => ({
+      change: {
+        eventHash: "a".repeat(64),
+        changeIndex: 0,
+        resourceId: `${kind}/candidate`,
+        kind,
+        operation,
+        semanticHash: "b".repeat(64),
+        ...(profileId === undefined ? {} : { metadata: { profileId } }),
+      },
+    });
+
+    expect(
+      helperMainTesting.pageMayMutateGlobalDatabase([
+        prepared("extension", "put", "default"),
+      ]),
+    ).toBe(true);
+    expect(
+      helperMainTesting.pageMayMutateGlobalDatabase([
+        prepared("extension", "delete", "default"),
+        prepared("extension", "put", "named-profile"),
+        prepared("chat-store", "delete"),
+      ]),
+    ).toBe(false);
+    expect(
+      helperMainTesting.pageMayMutateGlobalDatabase([
+        prepared("chat", "put"),
+      ]),
+    ).toBe(true);
+  });
+
+  it("pins only cross-page recovery points that later pages can reuse", () => {
+    const globalDatabase = "C:/Cursor/User/globalStorage/state.vscdb";
+    const paths = helperMainTesting.priorApplyBackupPaths(
+      {
+        backupPath: "shared-global.vscdb",
+        backups: [
+          {
+            backupPath: "workspace-page-one.vscdb",
+            contract: "workspace",
+            targetPath: "C:/Cursor/User/workspaceStorage/one/state.vscdb",
+          },
+          {
+            backupPath: "store-page-one.db",
+            contract: "store",
+            targetPath: "C:/Cursor/chats/one/store.db",
+          },
+          {
+            backupPath: "named-profile.vscdb",
+            contract: "item-table",
+            targetPath: "C:/Cursor/User/profiles/work/globalStorage/state.vscdb",
+          },
+          {
+            backupPath: "duplicate-default.vscdb",
+            contract: "item-table",
+            targetPath: globalDatabase,
+          },
+        ],
+      },
+      ["journal-recovery.vscdb"],
+      ["queued-restore-source.vscdb"],
+      globalDatabase,
+    );
+
+    expect(paths).toEqual([
+      "journal-recovery.vscdb",
+      "queued-restore-source.vscdb",
+      "shared-global.vscdb",
+      "named-profile.vscdb",
+    ]);
+  });
+
+  it("drains successive bounded pages without another user action", async () => {
+    const queue = Array.from({ length: 600 }, (_unused, index): HelperChange => ({
+      eventHash: index.toString(16).padStart(64, "0"),
+      changeIndex: 0,
+      resourceId: `settings/default/drain-${index}`,
+      kind: "settings",
+      operation: "delete",
+      semanticHash: "f".repeat(64),
+    }));
+    const pageSizes: number[] = [];
+    const beforePage = vi.fn(async () => {});
+
+    const result = await helperMainTesting.drainBoundedApplyPages(
+      () => queue.slice(0, 256),
+      async (page) => {
+        pageSizes.push(page.length);
+        queue.splice(0, page.length);
+        return true;
+      },
+      beforePage,
+    );
+
+    expect(result).toBe("drained");
+    expect(pageSizes).toEqual([256, 256, 88]);
+    expect(beforePage).toHaveBeenCalledTimes(3);
+    expect(queue).toEqual([]);
+  });
+
+  it("stops an automatic drain when a page cannot make progress", async () => {
+    const page: HelperChange[] = [
+      {
+        eventHash: "a".repeat(64),
+        changeIndex: 0,
+        resourceId: "settings/default/not-downloaded",
+        kind: "settings",
+        operation: "delete",
+        semanticHash: "b".repeat(64),
+      },
+    ];
+    const apply = vi.fn(async () => false);
+
+    const result = await helperMainTesting.drainBoundedApplyPages(
+      (attempted) =>
+        attempted.has(`${page[0]?.eventHash}#${page[0]?.changeIndex}`)
+          ? []
+          : page,
+      apply,
+    );
+
+    expect(result).toBe("no-progress");
+    expect(apply).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let a transient full-page payload starve later READY work", async () => {
+    const projection = (
+      name: string,
+      plainBytes: number,
+      index: number,
+    ): ResourceProjection => {
+      const eventHash = String(index + 1).repeat(64);
+      const resourceId = `snippet/${name}.json`;
+      return {
+        resourceId,
+        changed: true,
+        tip: {
+          versionId: `${eventHash}#0`,
+          eventHash,
+          changeIndex: 0,
+          kind: "snippet",
+          lamport: index + 1,
+          deviceId: "source-device",
+          operation: "put",
+          semanticHash: "d".repeat(64),
+          parents: [],
+          payload: {
+            deviceId: "source-device",
+            objectId: String(index + 4).repeat(64),
+            compressedBytes: 1,
+            plainBytes,
+          },
+        },
+      };
+    };
+    const stalled = projection("not-downloaded", MAX_HELPER_APPLY_WORK_BYTES, 0);
+    const later = projection("later-ready", 1024, 1);
+    const projections = [stalled, later];
+    const pendingDatabaseChanges = projections.map(({ resourceId, tip }) => ({
+      resourceId,
+      kind: tip.kind,
+      eventHash: tip.eventHash,
+      changeIndex: tip.changeIndex,
+    }));
+    const repository = {
+      state: { pendingDatabaseChanges },
+    } as unknown as SyncRepository;
+    const attemptedPages: string[][] = [];
+
+    const result = await helperMainTesting.drainBoundedApplyPages(
+      (attempted) =>
+        helperMainTesting.shutdownApplyBatch(
+          repository,
+          projections,
+          attempted,
+        ),
+      async (page) => {
+        attemptedPages.push(page.map((change) => change.resourceId));
+        if (page.some((change) => change.resourceId === stalled.resourceId)) {
+          return false;
+        }
+        repository.state.pendingDatabaseChanges =
+          repository.state.pendingDatabaseChanges.filter(
+            (pending) =>
+              !page.some((change) => change.resourceId === pending.resourceId),
+          );
+        return true;
+      },
+    );
+
+    expect(result).toBe("no-progress");
+    expect(attemptedPages).toEqual([
+      [stalled.resourceId],
+      [later.resourceId],
+    ]);
+    expect(repository.state.pendingDatabaseChanges).toEqual([
+      expect.objectContaining({ resourceId: stalled.resourceId }),
+    ]);
+  });
+
+  it("does not start another page after the closed-Cursor gate changes", async () => {
+    const queue = Array.from({ length: 300 }, (_unused, index): HelperChange => ({
+      eventHash: index.toString(16).padStart(64, "0"),
+      changeIndex: 0,
+      resourceId: `settings/default/reopen-${index}`,
+      kind: "settings",
+      operation: "delete",
+      semanticHash: "e".repeat(64),
+    }));
+    const applied: string[] = [];
+    let checks = 0;
+
+    const interrupted = expect(
+      helperMainTesting.drainBoundedApplyPages(
+        () => queue.slice(0, 256),
+        async (page) => {
+          applied.push(...page.map((change) => change.resourceId));
+          queue.splice(0, page.length);
+          return true;
+        },
+        async () => {
+          checks += 1;
+          if (checks === 2) {
+            throw new CursorReopenedError("Cursor reopened");
+          }
+        },
+      ),
+    ).rejects;
+    await interrupted.toBeInstanceOf(CursorReopenedError);
+    expect(applied).toHaveLength(256);
+    expect(queue).toHaveLength(44);
+  });
+
+  it("excludes each stalled sibling after a partially successful page", async () => {
+    const queue = Array.from({ length: 300 }, (_unused, index): HelperChange => ({
+      eventHash: index.toString(16).padStart(64, "0"),
+      changeIndex: 0,
+      resourceId: `settings/default/mixed-${index}`,
+      kind: "settings",
+      operation: "delete",
+      semanticHash: "c".repeat(64),
+    }));
+    const pages: number[] = [];
+    let first = true;
+
+    const result = await helperMainTesting.drainBoundedApplyPages(
+      (stalled) =>
+        queue
+          .filter(
+            (change) =>
+              !stalled.has(`${change.eventHash}#${change.changeIndex}`),
+          )
+          .slice(0, 256),
+      async (page) => {
+        pages.push(page.length);
+        if (first) {
+          first = false;
+          const successful = page.at(-1);
+          if (successful !== undefined) {
+            queue.splice(queue.indexOf(successful), 1);
+          }
+          return {
+            madeProgress: true,
+            stalledVersionIds: page
+              .slice(0, -1)
+              .map((change) => `${change.eventHash}#${change.changeIndex}`),
+          };
+        }
+        const applied = new Set(page.map((change) => change.resourceId));
+        for (let index = queue.length - 1; index >= 0; index -= 1) {
+          if (applied.has(queue[index]?.resourceId ?? "")) {
+            queue.splice(index, 1);
+          }
+        }
+        return { madeProgress: true, stalledVersionIds: [] };
+      },
+    );
+
+    expect(result).toBe("drained");
+    expect(pages).toEqual([256, 44]);
+    expect(queue).toHaveLength(255);
+  });
+
   it("targets only the bounded explicit apply page even beside 100k changed projections", () => {
     const change: HelperChange = {
       eventHash: "a".repeat(64),
@@ -547,7 +1023,9 @@ describe("preparing a helper batch", () => {
 
     const page = helperMainTesting.finalExportTargetPage(
       request,
-      {} as SyncRepository,
+      {
+        state: { pendingDatabaseChanges: [] },
+      } as unknown as SyncRepository,
       projections,
     );
 

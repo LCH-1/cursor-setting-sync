@@ -1891,6 +1891,114 @@ describe("manager repository-tip chat enrichment", () => {
     }
   });
 
+  it("continues a manual enrichment batch on later automatic cycles", async () => {
+    const repository = await createRepository();
+    const chats = Array.from({ length: 5 }, (_, index) => {
+      const composerId = composer(370 + index);
+      const blob = agentBlob(`manager-resume-agent-blob-${index}`);
+      const source = legacyChat(composerId, 1);
+      source.composerData = row(
+        `composerData:${composerId}`,
+        JSON.stringify({ conversationState: serializedRoot(blob.id) }),
+      );
+      return { composerId, blob, source };
+    });
+    for (const { source } of chats) {
+      await publishChat(repository, source);
+    }
+    const root = temporaryRoots.at(-1);
+    if (root === undefined) {
+      throw new Error("Missing temporary root");
+    }
+    const databasePath = join(root, "manager-resume-state.vscdb");
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec(
+        "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB)",
+      );
+      const insert = database.prepare(
+        "INSERT INTO cursorDiskKV(key, value) VALUES (?, ?)",
+      );
+      for (const { blob } of chats) {
+        insert.run(blob.row.key, Buffer.from(blob.row.valueBase64, "base64"));
+      }
+    } finally {
+      database.close();
+    }
+    const extensionStorage = join(root, "manager-resume-storage");
+    await mkdir(extensionStorage, { recursive: true });
+    const manager = new SyncManager(
+      {} as never,
+      {
+        globalDatabase: databasePath,
+        extensionStorage,
+        helperScript: join(root, "helper.js"),
+      } as unknown as CursorPaths,
+      compatibility("0.0.63", "3.15.6", "1.125.0"),
+      {
+        gitSync: false,
+        enabled: true,
+        syncChat: true,
+        syncWorkspaceStorage: false,
+        maxPayloadBytes: repository.maxPayloadBytes,
+        autoApplyFiles: false,
+        applyOnShutdown: false,
+        effectiveIgnoredWorkspaces: [],
+      } as unknown as ExtensionConfiguration,
+      {
+        log: vi.fn(),
+        setStatus: vi.fn(),
+      } as unknown as StatusController,
+      {} as ConflictController,
+    );
+    const adapter: ResourceAdapter = {
+      id: "test-chat-resume",
+      kinds: ["chat"],
+      appliesWhileRunning: false,
+      scan: async () => ({
+        snapshots: [],
+        deletions: [],
+        warnings: [],
+      }),
+      apply: async () => {
+        throw new Error("offline-only adapter must not apply while running");
+      },
+    };
+    const internals = manager as unknown as {
+      repository: SyncRepository;
+      adapters: ResourceAdapter[];
+      performSync(manual: boolean, scope: "all"): Promise<void>;
+    };
+    internals.repository = repository;
+    internals.adapters = [adapter];
+    const enrichedCount = (): number =>
+      chats.filter(
+        ({ composerId }) =>
+          onlyTip(repository, `chat/${composerId}`).metadata?.syncOrigin ===
+          "agent-kv-enrichment",
+      ).length;
+
+    try {
+      await internals.performSync(true, "all");
+      expect(enrichedCount()).toBe(2);
+
+      await internals.performSync(false, "all");
+      expect(enrichedCount()).toBe(4);
+
+      await internals.performSync(false, "all");
+      expect(enrichedCount()).toBe(5);
+      for (const { composerId } of chats) {
+        expect(onlyTip(repository, `chat/${composerId}`).metadata).toMatchObject({
+          chatSnapshotSchemaVersion: 2,
+          agentKvMissingCount: 0,
+          agentKvEnrichmentAppliesCore: true,
+        });
+      }
+    } finally {
+      await manager.shutdown();
+    }
+  });
+
   it("refuses a collector result that drops existing v2 graph data", async () => {
     const repository = await createRepository();
     const composerId = composer(31);

@@ -21,6 +21,8 @@ describe("Cursor-only release workflow", () => {
     const githubRelease = workflow.slice(workflow.indexOf("  github-release:"));
     expect(githubRelease).toContain("- publish-open-vsx");
     expect(githubRelease).not.toContain("publish-vscode-marketplace");
+    expect(githubRelease).toContain("CHANGELOG.md");
+    expect(githubRelease).not.toContain("First stable release");
   });
 
   it("keeps packaging and Open VSX publication without VS Marketplace scripts", () => {

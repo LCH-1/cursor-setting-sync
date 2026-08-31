@@ -52,6 +52,7 @@ import {
   shouldPublishSnapshot,
 } from "../sync/versionPolicy";
 import { chatContinuationApplyBlockReason } from "../sync/chatContinuationPolicy";
+import { isOfflineApplyExcludedIncomingResource } from "../sync/incomingResourcePolicy";
 import { canonicalBytes, sha256 } from "../protocol/canonical";
 import {
   StateVscdbChatAdapter,
@@ -96,8 +97,10 @@ import {
 } from "../resources/resource";
 import {
   applyGlobalDatabaseChanges,
+  ensureGlobalDatabaseApplySessionBackup,
   recoverInterruptedApplyJournals,
   restoreDatabaseBackup,
+  type GlobalDatabaseApplySession,
   type PreparedHelperChange,
 } from "./database";
 import { applyNonGlobalChanges, CursorReopenedError } from "./resourceApply";
@@ -127,12 +130,22 @@ const HELPER_STARTED_AT = new Date().toISOString();
 interface CollectedBackups {
   backupPath: string | null;
   backups: HelperBackup[];
+  applied: string[];
+  skipped: string[];
+  warnings: string[];
 }
 
 class CursorExitTimeoutError extends Error {
   constructor(detail: string) {
     super(`Timed out waiting for Cursor to exit. ${detail}`);
     this.name = "CursorExitTimeoutError";
+  }
+}
+
+class FinalizerSupersededError extends Error {
+  constructor() {
+    super("A newer Cursor session superseded this shutdown finalizer.");
+    this.name = "FinalizerSupersededError";
   }
 }
 
@@ -151,7 +164,13 @@ async function run(): Promise<void> {
   let request: HelperRequest | null = null;
   let cursorExitConfirmed = false;
   let finalizerLock: FileLock | null = null;
-  const collected: CollectedBackups = { backupPath: null, backups: [] };
+  const collected: CollectedBackups = {
+    backupPath: null,
+    backups: [],
+    applied: [],
+    skipped: [],
+    warnings: [],
+  };
   try {
     request = await readJsonFile<HelperRequest>(requestPath);
     validateRequest(request);
@@ -232,16 +251,23 @@ async function run(): Promise<void> {
     }
   } catch (error) {
     if (request !== null) {
+      await forgetEvictedBackups(collected);
+      const interrupted =
+        error instanceof CursorReopenedError ||
+        error instanceof FinalizerSupersededError;
       const result: HelperResult = {
         requestId: request.requestId,
         mode: request.mode,
         success: false,
         // Not a failure the user has to act on; see HelperResult.interrupted.
-        ...(error instanceof CursorReopenedError ? { interrupted: true } : {}),
+        ...(interrupted ? { interrupted: true } : {}),
         startedAt: HELPER_STARTED_AT,
         completedAt: new Date().toISOString(),
-        applied: [],
-        skipped: [],
+        applied: [...new Set(collected.applied)],
+        skipped: [
+          ...new Set([...collected.warnings, ...collected.skipped]),
+        ],
+        warnings: [...new Set(collected.warnings)],
         backupPath: collected.backupPath,
         ...(collected.backups.length === 0 ? {} : { backups: collected.backups }),
         error: error instanceof Error ? error.stack ?? error.message : String(error),
@@ -253,8 +279,7 @@ async function run(): Promise<void> {
       // wait finished - enumerating error classes did not, so a validation
       // error during the wait relaunched Cursor beside the one still open.
       const cursorStillRunning =
-        error instanceof CursorReopenedError ||
-        error instanceof CursorExitTimeoutError;
+        interrupted || error instanceof CursorExitTimeoutError;
       if (
         request.restart &&
         cursorExitConfirmed &&
@@ -302,6 +327,7 @@ async function executeRequest(
     request.mode === "restore-backup"
       ? false
       : await beginGitTransport(request, gitWarnings);
+  collected.warnings.push(...gitWarnings);
   const repositoryFile = await readRepositoryManifest(request.repositoryRoot);
   const repository = await SyncRepository.openWithMasterKey(
     request.repositoryRoot,
@@ -329,10 +355,16 @@ async function executeRequest(
   const pendingRestoreSources = await pendingRestoreSourceBackups(
     request.storageRoot,
   );
-  const priorBackupPaths = (): string[] => [
-    ...collected.backups.map((backup) => backup.backupPath),
-    ...pendingRestoreSources,
-  ];
+  const recoveryBackupPaths = collected.backups.map(
+    (backup) => backup.backupPath,
+  );
+  const priorBackupPaths = (): string[] =>
+    priorApplyBackupPaths(
+      collected,
+      recoveryBackupPaths,
+      pendingRestoreSources,
+      request.paths.globalDatabase,
+    );
 
   if (request.mode === "restore-backup") {
     if (request.backupToRestore === undefined) {
@@ -361,10 +393,10 @@ async function executeRequest(
     return successResult(
       request,
       [],
-      gitWarnings,
+      collected.warnings,
       request.backupToRestore,
       collected.backups,
-      gitWarnings,
+      collected.warnings,
     );
   }
 
@@ -375,7 +407,9 @@ async function executeRequest(
   // from the routine `skipped` entries so the extension host can raise a
   // standing warning for them without also flagging every deliberately
   // retained tombstone and every superseded change.
-  const warnings = [...gitWarnings, ...exported.warnings];
+  const warnings = collected.warnings;
+  warnings.push(...exported.warnings);
+  const notices = [...exported.notices];
   // The shutdown finalizer applies the queue too, when the user has left that
   // on. This is the moment the queue was always waiting for - Cursor is closed
   // because the user closed it - and it costs them nothing: no modal, no
@@ -385,6 +419,8 @@ async function executeRequest(
   const shutdownApply =
     request.mode === "final-export" &&
     request.syncOptions.applyOnShutdown !== false;
+  const drainsApplyQueue =
+    shutdownApply || request.mode === "apply-and-restart";
   if (request.mode === "final-export" && !shutdownApply) {
     await finishGitTransport(
       gitActive,
@@ -401,7 +437,15 @@ async function executeRequest(
       warnings,
     );
   }
-  await ensureExclusiveAccess();
+  const ensureDrainAccess = async (): Promise<void> => {
+    if (shutdownApply && (await isFinalizerCancelled(request))) {
+      throw new FinalizerSupersededError();
+    }
+    await ensureExclusiveAccess();
+  };
+  if (!drainsApplyQueue) {
+    await ensureDrainAccess();
+  }
 
   const reconciler = new EventReconciler();
   const checkpoint = await absorbedCheckpointManifest(repository);
@@ -410,12 +454,170 @@ async function executeRequest(
     repository.state,
     checkpoint,
   );
-  // Read from the queue for a shutdown, handed over for an explicit apply; see
-  // {@link shutdownApplyBatch} for why the finalizer cannot use a list decided
-  // at arm time.
-  const requestedChanges = shutdownApply
-    ? shutdownApplyBatch(repository, reconcileResult.projections)
-    : request.changes;
+  const applied = collected.applied;
+  const skipped = collected.skipped;
+  const globalSession: GlobalDatabaseApplySession = {
+    verifiedBackupPath: null,
+  };
+  const applyPage = async (
+    requestedChanges: HelperChange[],
+  ): Promise<BoundedApplyPageProgress> => {
+    const page = await applyVerifiedPage(
+      request,
+      repository,
+      reconcileResult.projections,
+      exported,
+      requestedChanges,
+      collected,
+      globalSession,
+      heartbeat,
+      ensureDrainAccess,
+      priorBackupPaths,
+    );
+    applied.push(...page.applied);
+    skipped.push(...page.skipped);
+    warnings.push(...page.warnings);
+    return {
+      madeProgress: page.madeProgress,
+      stalledVersionIds: page.stalledVersionIds,
+    };
+  };
+
+  if (drainsApplyQueue) {
+    const durableQueuePresent =
+      shutdownApplyCandidates(repository, reconcileResult.projections).length >
+      0;
+    let explicitFallbackUsed = false;
+    const drain = await drainBoundedApplyPages(
+      (stalledVersionIds) => {
+        if (durableQueuePresent) {
+          return shutdownApplyBatch(
+            repository,
+            reconcileResult.projections,
+            stalledVersionIds,
+          );
+        }
+        if (explicitFallbackUsed) {
+          return [];
+        }
+        explicitFallbackUsed = true;
+        return boundedHelperTargetPage(
+          request.changes.filter(
+            (change) =>
+              !stalledVersionIds.has(helperChangeVersionId(change)),
+          ),
+        );
+      },
+      applyPage,
+      ensureDrainAccess,
+      heartbeat,
+    );
+    if (
+      drain === "no-progress" ||
+      shutdownApplyCandidates(repository, reconcileResult.projections)
+        .length > 0
+    ) {
+      notices.push(
+        shutdownApply
+          ? "Automatic shutdown apply completed one bounded sweep, but some changes made no progress; they stay queued for a later automatic apply."
+          : "Offline apply completed one bounded sweep, but some changes made no progress; they stay queued for the next automatic shutdown apply or Sync & Apply.",
+      );
+    }
+  }
+  await finishGitTransport(
+    gitActive,
+    request.repositoryRoot,
+    shutdownApply
+      ? `shutdown export and apply (${repository.state.device.deviceId.slice(0, 8)})`
+      : `apply (${request.requestId.slice(0, 8)})`,
+    warnings,
+  );
+  await forgetEvictedBackups(collected);
+  return successResult(
+    request,
+    [...new Set(applied)],
+    [...new Set([...warnings, ...skipped, ...notices])],
+    collected.backupPath,
+    collected.backups,
+    [...new Set(warnings)],
+  );
+}
+
+async function drainBoundedApplyPages(
+  nextPage: (stalledVersionIds: ReadonlySet<string>) => HelperChange[],
+  applyPage: (
+    page: HelperChange[],
+  ) => Promise<boolean | BoundedApplyPageProgress>,
+  beforePage: () => Promise<void> = async () => {},
+  heartbeat: () => void = () => {},
+): Promise<"drained" | "no-progress"> {
+  const seenPages = new Set<string>();
+  const stalledVersionIds = new Set<string>();
+  let noProgress = false;
+  while (true) {
+    const page = nextPage(stalledVersionIds);
+    if (page.length === 0) {
+      return noProgress ? "no-progress" : "drained";
+    }
+    await beforePage();
+    const fingerprint = page.map(helperChangeVersionId).join("\n");
+    if (seenPages.has(fingerprint)) {
+      for (const change of page) {
+        stalledVersionIds.add(helperChangeVersionId(change));
+      }
+      noProgress = true;
+      continue;
+    }
+    seenPages.add(fingerprint);
+    const outcome = await applyPage(page);
+    const madeProgress =
+      typeof outcome === "boolean" ? outcome : outcome.madeProgress;
+    const pageStalledVersionIds =
+      typeof outcome === "boolean" ? [] : outcome.stalledVersionIds;
+    for (const versionId of pageStalledVersionIds) {
+      stalledVersionIds.add(versionId);
+    }
+    if (!madeProgress) {
+      if (pageStalledVersionIds.length === 0) {
+        // A legacy/testing callback can still report only a boolean. Exclude
+        // the whole no-progress page so a transient front item cannot starve
+        // later work.
+        for (const change of page) {
+          stalledVersionIds.add(helperChangeVersionId(change));
+        }
+      }
+      noProgress = true;
+    }
+    heartbeat();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
+interface ApplyVerifiedPageOutcome {
+  applied: string[];
+  skipped: string[];
+  warnings: string[];
+  madeProgress: boolean;
+  stalledVersionIds: string[];
+}
+
+interface BoundedApplyPageProgress {
+  madeProgress: boolean;
+  stalledVersionIds: string[];
+}
+
+async function applyVerifiedPage(
+  request: HelperRequest,
+  repository: SyncRepository,
+  projections: ResourceProjection[],
+  exported: FinalExportOutcome,
+  requestedChanges: HelperChange[],
+  collected: CollectedBackups,
+  globalSession: GlobalDatabaseApplySession,
+  heartbeat: () => void,
+  ensureExclusiveAccess: () => Promise<void>,
+  priorBackupPaths: () => string[],
+): Promise<ApplyVerifiedPageOutcome> {
   const pageVerifiedChanges = intersectVerifiedApplyPage(
     requestedChanges,
     exported.verifiedApplyVersionIds,
@@ -426,28 +628,22 @@ async function executeRequest(
       return reason === null ? [] : [[change.resourceId, reason] as const];
     }),
   );
-  for (const [resourceId, reason] of exportBlockReasons) {
-    warnings.push(`Applying ${resourceId} was deferred: ${reason}`);
-  }
+  const warnings = [...exportBlockReasons].map(
+    ([resourceId, reason]) => `Applying ${resourceId} was deferred: ${reason}`,
+  );
   const eligible = pageVerifiedChanges.filter(
     (change) =>
       !exportBlockReasons.has(change.resourceId) &&
-      isEligible(
-        change,
-        reconcileResult.projections,
-        repository.state.conflicts,
-      ),
+      isEligible(change, projections, repository.state.conflicts),
   );
-  const skipped = [
-    ...pageVerifiedChanges
+  const skipped = pageVerifiedChanges
     .filter((change) => !eligible.includes(change))
     .map((change) => {
       const exportBlock = exportBlockReasons.get(change.resourceId);
       return exportBlock === undefined
         ? `${change.resourceId}: superseded or conflicted`
         : `${change.resourceId}: ${exportBlock}`;
-    }),
-  ];
+    });
   const preparation = await prepareChanges(repository, eligible);
   skipped.push(...preparation.skipped);
   // A payload this computer cannot read is a real failure, not a routine skip:
@@ -465,19 +661,30 @@ async function executeRequest(
   // Every kind that lives in the global `state.vscdb`. Missing one here does
   // not fail loudly: the change is prepared, routed to neither applier, and
   // dropped - so it is never marked applied and sits in the queue forever,
-  // re-offered on every launch and applied by nothing. `remote-targets` was
-  // added in 0.0.48 with its write path in the database layer but not with
-  // this list, and the SSH folder history it carries never once landed on
-  // either computer.
+  // re-offered on every launch and applied by nothing.
   const globalPrepared = prepared.filter((item) =>
     GLOBAL_DATABASE_KINDS.includes(item.change.kind),
   );
-  let backupPath: string | null = null;
   const applied: string[] = [];
   const retainedLocal = new Set<string>();
   const globalRetainedHashes: Record<string, string> = {};
   const globalLocalChatCoreHashes: Record<string, string | null> = {};
   const globalFailureByResourceId: Record<string, string> = {};
+  if (pageMayMutateGlobalDatabase(prepared)) {
+    await ensureExclusiveAccess();
+    const backupPath = await ensureGlobalDatabaseApplySessionBackup(
+      request,
+      globalSession,
+      heartbeat,
+      priorBackupPaths,
+    );
+    collected.backupPath ??= backupPath;
+    rememberCollectedBackup(collected, {
+      backupPath,
+      contract: "global",
+      targetPath: request.paths.globalDatabase,
+    });
+  }
   if (globalPrepared.length > 0) {
     await ensureExclusiveAccess();
     const globalResult = await applyGlobalDatabaseChanges(
@@ -487,14 +694,8 @@ async function executeRequest(
       ensureExclusiveAccess,
       priorBackupPaths,
       repository.state.device.deviceId,
+      globalSession,
     );
-    backupPath = globalResult.backupPath;
-    collected.backupPath = backupPath;
-    collected.backups.push({
-      backupPath,
-      contract: "global",
-      targetPath: request.paths.globalDatabase,
-    });
     applied.push(...globalResult.applied);
     skipped.push(...globalResult.skipped);
     Object.assign(
@@ -520,13 +721,13 @@ async function executeRequest(
     request,
     prepared,
     ensureExclusiveAccess,
-    (backup) => collected.backups.push(backup),
+    (backup) => rememberCollectedBackup(collected, backup),
     heartbeat,
     // The pre-apply global snapshot above must survive every retention pass
-    // the non-global applies run - it is the request's only pre-apply
-    // recovery point for the global database - and so must any queued
-    // restore's source.
+    // the non-global applies run - it is the request's one recovery point for
+    // the whole drain - and so must any queued restore's source.
     priorBackupPaths,
+    () => globalSession.verifiedBackupPath,
   );
   applied.push(...nonGlobalResult.applied);
   skipped.push(...nonGlobalResult.skipped);
@@ -537,6 +738,11 @@ async function executeRequest(
   for (const resourceId of nonGlobalResult.retainedLocal) {
     retainedLocal.add(resourceId);
   }
+  const failureByResourceId = {
+    ...preparation.failureByResourceId,
+    ...globalFailureByResourceId,
+    ...nonGlobalResult.failureByResourceId,
+  };
   markAppliedProjections(
     repository,
     eligible,
@@ -544,29 +750,100 @@ async function executeRequest(
     retainedLocal,
     { ...globalRetainedHashes, ...nonGlobalResult.retainedLocalHashes },
     globalLocalChatCoreHashes,
-    {
-      ...preparation.failureByResourceId,
-      ...globalFailureByResourceId,
-      ...nonGlobalResult.failureByResourceId,
-    },
+    failureByResourceId,
   );
   await repository.saveState();
-  await finishGitTransport(
-    gitActive,
-    request.repositoryRoot,
-    shutdownApply
-      ? `shutdown export and apply (${repository.state.device.deviceId.slice(0, 8)})`
-      : `apply (${request.requestId.slice(0, 8)})`,
-    warnings,
+  const remainingReadyVersionIds = new Set(
+    shutdownApplyCandidates(repository, projections).map(helperChangeVersionId),
   );
-  return successResult(
-    request,
+  return {
     applied,
-    [...warnings, ...skipped, ...exported.notices],
-    backupPath,
-    collected.backups,
+    skipped,
     warnings,
+    madeProgress:
+      applied.length > 0 || Object.keys(failureByResourceId).length > 0,
+    stalledVersionIds: requestedChanges
+      .map(helperChangeVersionId)
+      .filter((versionId) => remainingReadyVersionIds.has(versionId)),
+  };
+}
+
+function pageMayMutateGlobalDatabase(
+  prepared: readonly PreparedHelperChange[],
+): boolean {
+  return prepared.some(
+    ({ change }) =>
+      GLOBAL_DATABASE_KINDS.includes(change.kind) ||
+      (change.kind === "extension" &&
+        change.operation === "put" &&
+        change.metadata?.profileId === "default"),
   );
+}
+
+function rememberCollectedBackup(
+  collected: CollectedBackups,
+  backup: HelperBackup,
+): void {
+  if (
+    collected.backups.some(
+      (candidate) =>
+        candidate.backupPath === backup.backupPath &&
+        candidate.contract === backup.contract &&
+        candidate.targetPath === backup.targetPath,
+    )
+  ) {
+    return;
+  }
+  collected.backups.push(backup);
+}
+
+function priorApplyBackupPaths(
+  collected: Pick<CollectedBackups, "backupPath" | "backups">,
+  recoveryBackupPaths: readonly string[],
+  pendingRestoreSources: readonly string[],
+  globalDatabasePath: string,
+): string[] {
+  return [
+    ...new Set([
+      ...recoveryBackupPaths,
+      ...pendingRestoreSources,
+      ...(collected.backupPath === null ? [] : [collected.backupPath]),
+      ...collected.backups
+        .filter(
+          (backup) =>
+            backup.contract === "item-table" &&
+            backup.targetPath !== globalDatabasePath,
+        )
+        .map((backup) => backup.backupPath),
+    ]),
+  ];
+}
+
+async function forgetEvictedBackups(
+  collected: CollectedBackups,
+): Promise<void> {
+  const existing: HelperBackup[] = [];
+  for (const backup of collected.backups) {
+    try {
+      if (await pathExists(backup.backupPath)) {
+        existing.push(backup);
+      }
+    } catch {
+      // An unreadable path is not proof retention evicted it. Keep reporting
+      // the recovery point instead of masking the helper's real result.
+      existing.push(backup);
+    }
+  }
+  collected.backups = existing;
+  if (collected.backupPath !== null) {
+    try {
+      if (!(await pathExists(collected.backupPath))) {
+        collected.backupPath = null;
+      }
+    } catch {
+      // Same rule as the structured backup list above.
+    }
+  }
 }
 
 async function beginGitTransport(
@@ -1303,15 +1580,20 @@ function finalExportTargetPage(
   projections: ResourceProjection[],
 ): HelperChange[] {
   if (request.mode === "apply-and-restart") {
-    return boundedHelperTargetPage(request.changes);
+    const durable = shutdownApplyCandidates(repository, projections);
+    return durable.length === 0
+      ? boundedHelperTargetPage(request.changes)
+      : durable;
   }
   if (
     request.mode === "final-export" &&
     request.syncOptions.applyOnShutdown !== false
   ) {
-    return boundedHelperTargetPage(
-      shutdownApplyBatch(repository, projections),
-    );
+    // The adapter drain already reads the local tree in bounded pages. Give it
+    // every READY incoming identity up front so that one exact final scan can
+    // authorize all later 256-change/32 MiB database pages. Re-running that
+    // whole scan once per apply page can keep Cursor closed for hours.
+    return shutdownApplyCandidates(repository, projections);
   }
   return [];
 }
@@ -1516,20 +1798,31 @@ async function preparedChatContinuationFailure(
  *
  * Mirrors `pendingHelperBatch` in the extension host: blocked entries are
  * skipped, entries whose tip is gone are skipped, and the batch stops at the
- * same fixed work ceiling so one shutdown cannot retain hundreds of MiB of
- * payload buffers while their appliers allocate parse/SQLite copies. Whatever
- * does not fit stays queued for the next pass.
+ * same fixed work ceiling so one page cannot retain hundreds of MiB of payload
+ * buffers while their appliers allocate parse/SQLite copies. Whatever does not
+ * fit stays queued while the same closed-Cursor helper advances to its next
+ * page.
  */
 function shutdownApplyBatch(
   repository: SyncRepository,
   projections: ResourceProjection[],
+  excludedVersionIds: ReadonlySet<string> = new Set(),
+): HelperChange[] {
+  return boundedShutdownApplyPage(
+    shutdownApplyCandidates(repository, projections, excludedVersionIds),
+  );
+}
+
+function shutdownApplyCandidates(
+  repository: SyncRepository,
+  projections: ResourceProjection[],
+  excludedVersionIds: ReadonlySet<string> = new Set(),
 ): HelperChange[] {
   const tipByVersionId = new Map<string, ResourceProjection>();
   for (const projection of projections) {
     tipByVersionId.set(projection.tip.versionId, projection);
   }
   const changes: HelperChange[] = [];
-  let totalBytes = 0;
   for (const pending of repository.state.pendingDatabaseChanges) {
     if (pending.blockedReason !== undefined) {
       continue;
@@ -1537,23 +1830,31 @@ function shutdownApplyBatch(
     const projection = tipByVersionId.get(
       `${pending.eventHash}#${pending.changeIndex}`,
     );
-    if (projection === undefined) {
+    if (
+      projection === undefined ||
+      projection.resourceId !== pending.resourceId ||
+      projection.tip.kind !== pending.kind
+    ) {
       continue;
     }
     const tip = projection.tip;
+    if (
+      isOfflineApplyExcludedIncomingResource(
+        projection.resourceId,
+        tip.kind,
+        tip.metadata,
+      )
+    ) {
+      continue;
+    }
+    if (excludedVersionIds.has(tip.versionId)) {
+      continue;
+    }
     if (chatContinuationApplyBlockReason(tip) !== undefined) {
       // A repository state written by an older extension can still contain an
       // unblocked legacy/partial chat. The shutdown helper independently
       // rebuilds its page from that durable queue, so it needs the same final
       // continuation gate as the live extension host.
-      continue;
-    }
-    const payloadBytes = tip.payload?.plainBytes ?? 0;
-    if (
-      changes.length >= 256 ||
-      (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES &&
-        totalBytes + payloadBytes > MAX_HELPER_APPLY_WORK_BYTES)
-    ) {
       continue;
     }
     const change: HelperChange = {
@@ -1570,6 +1871,25 @@ function shutdownApplyBatch(
     }
     if (tip.metadata !== undefined) {
       change.metadata = tip.metadata;
+    }
+    changes.push(change);
+  }
+  return changes;
+}
+
+function boundedShutdownApplyPage(
+  candidates: readonly HelperChange[],
+): HelperChange[] {
+  const changes: HelperChange[] = [];
+  let totalBytes = 0;
+  for (const change of candidates) {
+    const payloadBytes = change.payload?.plainBytes ?? 0;
+    if (
+      changes.length >= 256 ||
+      (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES &&
+        totalBytes + payloadBytes > MAX_HELPER_APPLY_WORK_BYTES)
+    ) {
+      continue;
     }
     changes.push(change);
     if (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES) {
@@ -1604,6 +1924,15 @@ function isEligible(
   }
 
   const tip = projection.tip;
+  if (
+    isOfflineApplyExcludedIncomingResource(
+      projection.resourceId,
+      tip.kind,
+      tip.metadata,
+    )
+  ) {
+    return false;
+  }
   if (chatContinuationApplyBlockReason(tip) !== undefined) {
     // The hand-off request is not authority. Re-bind it to the freshly
     // reconciled tip and refuse an incomplete ordinary chat even if an older
@@ -1693,12 +2022,16 @@ function validCheckpointMarkerProvenance(tip: ResourceTip): boolean {
 /** Narrow seams for authenticated helper/final-export regressions. */
 export const __testing = Object.freeze({
   boundedHelperTargetPage,
+  drainBoundedApplyPages,
   exportFinalChanges,
   finalExportTargetPage,
   intersectVerifiedApplyPage,
   finalExportApplyBlockReason,
   isEligible,
+  pageMayMutateGlobalDatabase,
+  priorApplyBackupPaths,
   rememberLearnedChatProjectionSources,
+  shutdownApplyCandidates,
   shutdownApplyBatch,
 });
 

@@ -110,5 +110,5 @@ jobs:
             gh release create "$GITHUB_REF_NAME" "release-artifact/${VSIX_NAME}" \
               --verify-tag \
               --title "Cursor Setting Sync ${GITHUB_REF_NAME}" \
-              --notes "First stable release of Cursor Setting Sync. It provides encrypted, bounded synchronization with one Manage command, automatic routine maintenance, offline-safe database application, and schema-aware chat continuation recovery. See CHANGELOG.md in the tagged source for complete details."
+              --notes "Cursor-only release of Cursor Setting Sync. See CHANGELOG.md in the tagged source for complete details."
           fi

@@ -165,6 +165,99 @@ describeBuilt("the offline helper, end to end", () => {
     expect(readComposerIds(fixture.databasePath)).not.toContain(COMPOSER);
   }, 120_000);
 
+  it("drains more than one shutdown page with one global backup", async () => {
+    const fixture = await createFixture();
+    const pending: HelperChange[] = [];
+    const snapshots = Array.from({ length: 300 }, (_unused, index) => {
+      const composerId = `00000000-0000-4000-8000-${index
+        .toString()
+        .padStart(12, "0")}`;
+      const snapshot = chatSnapshot(composerId);
+      const body = canonicalBytes(snapshot);
+      return {
+        resourceId: `chat/${composerId}`,
+        kind: "chat" as const,
+        content: body,
+        semanticHash: sha256(body),
+        metadata: {
+          composerId,
+          workspaceId: null,
+          lastUpdatedAt: snapshot.header.lastUpdatedAt,
+          bubbleCount: snapshot.bubbles.length,
+          chatSnapshotSchemaVersion: 2,
+          agentKvBlobCount: 0,
+          agentKvReferencedCount: 0,
+          agentKvMissingCount: 0,
+          chatCoreHash: portableChatCoreHash(snapshot),
+        },
+      };
+    });
+    for (let offset = 0; offset < snapshots.length; offset += 200) {
+      const published = await fixture.repository.publish(
+        snapshots.slice(offset, offset + 200),
+        [],
+      );
+      const event = (await fixture.repository.listEvents()).find(
+        (candidate) => candidate.eventHash === published.eventHash,
+      );
+      expect(event).toBeDefined();
+      if (event === undefined) {
+        throw new Error("Published drain fixture event was not found.");
+      }
+      for (const [changeIndex, change] of event.manifest.changes.entries()) {
+        pending.push({
+          eventHash: event.eventHash,
+          changeIndex,
+          sourceDeviceId: event.stored.header.deviceId,
+          resourceId: change.resourceId,
+          kind: "chat",
+          operation: "put",
+          semanticHash: change.semanticHash,
+          ...(change.payload === undefined ? {} : { payload: change.payload }),
+          ...(change.metadata === undefined ? {} : { metadata: change.metadata }),
+        });
+      }
+    }
+    fixture.repository.state.pendingDatabaseChanges = pending.map((change) => ({
+      resourceId: change.resourceId,
+      kind: change.kind,
+      eventHash: change.eventHash,
+      changeIndex: change.changeIndex,
+    }));
+    await fixture.repository.saveState();
+    fixture.request.mode = "final-export";
+    fixture.request.restart = false;
+    fixture.request.syncOptions.applyOnShutdown = true;
+
+    const result = await runHelper(fixture);
+
+    expect(result.success).toBe(true);
+    expect(result.error).toBeNull();
+    expect(new Set(result.applied)).toEqual(
+      new Set(snapshots.map((snapshot) => snapshot.resourceId)),
+    );
+    const backupFiles = await readdir(
+      join(fixture.request.storageRoot, "backups"),
+    );
+    expect(
+      backupFiles.filter(
+        (name) => name.startsWith("state-") && name.endsWith(".vscdb"),
+      ),
+    ).toHaveLength(1);
+    const reopened = await SyncRepository.open(
+      fixture.request.repositoryRoot,
+      fixture.request.storageRoot,
+      "a sufficiently long end to end passphrase",
+      fixture.request.syncOptions.maxPayloadBytes,
+      {
+        extensionVersion: fixture.request.extensionVersion,
+        cursorVersion: fixture.request.expectedCursorVersion,
+        vscodeVersion: fixture.request.expectedVscodeVersion,
+      },
+    );
+    expect(reopened.state.pendingDatabaseChanges).toEqual([]);
+  }, 120_000);
+
   it("restores a backup through the bundle the way the command does", async () => {
     // restoreDatabaseBackup is covered directly, but nothing had ever run the
     // helper in restore-backup mode - the mode Cursor Setting Sync: Restore
@@ -449,12 +542,12 @@ function readComposerIds(databasePath: string): string[] {
   }
 }
 
-function chatSnapshot() {
+function chatSnapshot(composerId = COMPOSER) {
   return {
     schemaVersion: 2 as const,
-    composerId: COMPOSER,
+    composerId,
     header: {
-      composerId: COMPOSER,
+      composerId,
       workspaceId: null,
       createdAt: 1,
       lastUpdatedAt: 2,
@@ -465,7 +558,7 @@ function chatSnapshot() {
       value: JSON.stringify({ name: "written on the other computer" }),
     },
     composerData: {
-      key: `composerData:${COMPOSER}`,
+      key: `composerData:${composerId}`,
       valueBase64: Buffer.from("{}", "utf8").toString("base64"),
       valueType: "text" as const,
     },

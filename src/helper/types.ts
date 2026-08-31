@@ -95,9 +95,13 @@ export interface HelperResult {
   mode?: HelperRequest["mode"];
   success: boolean;
   /**
-   * The run stopped because Cursor was open again, not because anything went
-   * wrong. Nothing was written, the queue is untouched, and the next shutdown
-   * applies it.
+   * The run stopped because Cursor was open again or a newer session
+   * superseded the shutdown finalizer, not because anything went wrong. The
+   * in-flight bounded page is left queued and the next shutdown safely replays
+   * it. Some idempotent writes from that page may already have committed, but
+   * `applied` lists only pages whose repository checkpoint completed. A
+   * multi-page drain may already have committed and dequeued earlier pages;
+   * those resource IDs remain present in `applied`.
    *
    * Reported apart from `success` because the two call for opposite
    * treatment. A real failure is a red status bar and a notification: the user

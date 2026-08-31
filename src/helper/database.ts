@@ -105,6 +105,52 @@ export interface DatabaseApplyResult {
   localChatCoreHashes: Record<string, string | null>;
 }
 
+/**
+ * One verified pre-drain snapshot shared by successive bounded transactions.
+ *
+ * A shutdown drain can need dozens of 32 MiB pages. Copying a multi-GiB
+ * `state.vscdb` before every page exhausts the disk, while retaining only the
+ * newest copy loses the one snapshot that can undo the drain as a whole. The
+ * first page fills this session after backup validation; later pages reuse the
+ * same protected snapshot and still write their own pending/applying/verified
+ * journal transitions around each SQLite transaction.
+ */
+export interface GlobalDatabaseApplySession {
+  verifiedBackupPath: string | null;
+}
+
+export async function ensureGlobalDatabaseApplySessionBackup(
+  request: HelperRequest,
+  session: GlobalDatabaseApplySession,
+  heartbeat: () => void = () => {},
+  priorBackups: () => readonly string[] = () => [],
+): Promise<string> {
+  if (session.verifiedBackupPath !== null) {
+    if (!(await pathExists(session.verifiedBackupPath))) {
+      throw new Error(
+        `The verified pre-drain backup disappeared: ${session.verifiedBackupPath}`,
+      );
+    }
+    return session.verifiedBackupPath;
+  }
+  const database = openDatabase(request.paths.globalDatabase, { readOnly: true });
+  try {
+    database.exec("PRAGMA busy_timeout=5000");
+    database.exec("PRAGMA query_only=ON");
+    assertGlobalSchema(database);
+    assertCheck(database, "quick_check");
+    return await createGlobalDatabaseApplySessionBackup(
+      request,
+      session,
+      database,
+      heartbeat,
+      priorBackups,
+    );
+  } finally {
+    database.close();
+  }
+}
+
 interface RestoreJournal {
   version: 1 | 2 | 3;
   requestId: string;
@@ -308,15 +354,11 @@ export async function applyGlobalDatabaseChanges(
   priorBackups: () => readonly string[] = () => [],
   /** Repository device that owns this local database. Required for repairs. */
   localDeviceId?: string,
+  /** Reuses one verified pre-drain backup across successive bounded pages. */
+  session?: GlobalDatabaseApplySession,
 ): Promise<DatabaseApplyResult> {
   const localWorkspaces = await preflightGlobalChanges(request, prepared);
   const databasePath = request.paths.globalDatabase;
-  const backupRoot = join(request.storageRoot, BACKUP_DIRECTORY);
-  await ensureDirectory(backupRoot);
-  const backupPath = join(
-    backupRoot,
-    `state-${new Date().toISOString().replaceAll(":", "-")}-${request.requestId}.vscdb`,
-  );
   const journalPath = join(request.storageRoot, `apply-${request.requestId}.json`);
   const journal: ApplyJournal = {
     version: 1,
@@ -337,25 +379,14 @@ export async function applyGlobalDatabaseChanges(
     assertGlobalSchema(database);
     assertCheck(database, "quick_check");
 
-    const backupSource = openDatabase(databasePath, { readOnly: true });
-    try {
-      backupSource.exec("PRAGMA query_only=ON");
-      await backupDatabase(backupSource, backupPath, { rate: 100 });
-    } finally {
-      backupSource.close();
-    }
-    await sealBackupFile(backupPath);
-    validateDatabaseFile(backupPath, "global");
-    await enforceBackupRetention(request.storageRoot, {
-      exemptPath: backupPath,
-      exemptPaths: priorBackups(),
-    });
-    // Retention is contractually unable to touch the exempt backup, so a
-    // second full integrity pass over a possibly multi-GiB file bought
-    // nothing; existence is the only thing left to confirm.
-    if (!(await pathExists(backupPath))) {
-      throw new Error(`The pre-apply backup disappeared during retention: ${backupPath}`);
-    }
+    const applySession = session ?? { verifiedBackupPath: null };
+    const backupPath = await createGlobalDatabaseApplySessionBackup(
+      request,
+      applySession,
+      database,
+      heartbeat,
+      priorBackups,
+    );
     journal.status = "backed-up";
     journal.backupPath = backupPath;
     await writeJsonAtomic(journalPath, journal);
@@ -817,6 +848,44 @@ async function preflightGlobalChanges(
     }
   }
   return localWorkspaces;
+}
+
+async function createGlobalDatabaseApplySessionBackup(
+  request: HelperRequest,
+  session: GlobalDatabaseApplySession,
+  source: DatabaseSync,
+  heartbeat: () => void,
+  priorBackups: () => readonly string[],
+): Promise<string> {
+  if (session.verifiedBackupPath !== null) {
+    if (!(await pathExists(session.verifiedBackupPath))) {
+      throw new Error(
+        `The verified pre-drain backup disappeared: ${session.verifiedBackupPath}`,
+      );
+    }
+    return session.verifiedBackupPath;
+  }
+  const backupRoot = join(request.storageRoot, BACKUP_DIRECTORY);
+  await ensureDirectory(backupRoot);
+  const backupPath = join(
+    backupRoot,
+    `state-${new Date().toISOString().replaceAll(":", "-")}-${request.requestId}.vscdb`,
+  );
+  heartbeat();
+  await backupDatabase(source, backupPath, { rate: 100 });
+  await sealBackupFile(backupPath);
+  heartbeat();
+  validateDatabaseFile(backupPath, "global");
+  heartbeat();
+  await enforceBackupRetention(request.storageRoot, {
+    exemptPath: backupPath,
+    exemptPaths: priorBackups(),
+  });
+  if (!(await pathExists(backupPath))) {
+    throw new Error(`The pre-apply backup disappeared during retention: ${backupPath}`);
+  }
+  session.verifiedBackupPath = backupPath;
+  return backupPath;
 }
 
 function* preparedWorkspaceIds(

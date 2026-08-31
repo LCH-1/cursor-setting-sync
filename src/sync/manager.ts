@@ -129,7 +129,6 @@ import { ProfilesAdapter } from "../resources/profiles";
 import { UiStateAdapter } from "../resources/uiState";
 import { mergeUiStateBuffers } from "../resources/uiStateMerge";
 import {
-  isPolicyExcludedUiStateKey,
   normalizeIgnoredUiStateKeys,
 } from "../resources/uiStatePolicy";
 import {
@@ -155,7 +154,6 @@ import {
 import {
   StateVscdbChatAdapter,
   isPortableChatSnapshotV2,
-  isSyncableComposerId,
   parsePortableChatSnapshot,
   portableChatCoreHash,
   type PortableAgentKvPayload,
@@ -290,6 +288,11 @@ export {
   chatContinuationApplyBlockReason,
   INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON,
 } from "./chatContinuationPolicy";
+import {
+  isOfflineApplyExcludedIncomingResource,
+  isPolicyExcludedUiStateResource,
+} from "./incomingResourcePolicy";
+export { isUnscannableIncomingResource } from "./incomingResourcePolicy";
 import { assertSafeRepositoryLocation } from "./repositoryPath";
 import {
   AUTO_MERGE_WARNING_SOURCE,
@@ -1445,7 +1448,7 @@ export class SyncManager implements vscode.Disposable {
         // Durable, because the toast below dies with the window this is about
         // to quit. Without it the queue comes back smaller than promised.
         this.status.log(
-          `Applying ${changes.length} change(s); ${batch.deferredForBatchLimit} more exceed the per-apply size limit, stay queued, and are offered again after this pass.`,
+          `Applying ${changes.length} initial change(s); ${batch.deferredForBatchLimit} additional ready change(s) will be drained automatically in successive bounded pages during this same offline run.`,
         );
       }
       // The last thing written before the window goes away, and the first
@@ -7335,19 +7338,15 @@ export class SyncManager implements vscode.Disposable {
           this.helperFailure = null;
         }
       } else if (isInterruptedResult(result)) {
-        // Cursor was open again before the offline pass could write anything.
-        // Nothing was applied and the queue is intact, so there is nothing to
-        // report and nothing to fix - it applies at the next shutdown. This
-        // became the routine outcome when 0.0.49 began applying the whole
-        // queue at shutdown instead of only exporting: the pass takes minutes,
-        // and reopening the editor inside that window is not a mistake.
+        // Cursor was open again before the bounded drain completed. Earlier
+        // pages can already be committed and dequeued; the in-flight page can
+        // also have idempotent physical writes without its queue checkpoint.
+        // The structured result preserves only fully checkpointed progress.
         //
         // The offer is re-enabled for the session, though. Without it a user
         // who always reopens quickly would get neither a successful shutdown
         // apply nor a prompt, and the queue would never drain.
-        this.status.log(
-          `Helper ${result.requestId} stopped because Cursor was reopened; nothing was applied and the queue is unchanged.`,
-        );
+        this.status.log(interruptedHelperResultLog(result));
         this.shutdownApplyInterrupted = true;
       } else {
         this.status.log(`Helper ${result.requestId} failed: ${result.error ?? "unknown"}`);
@@ -8306,6 +8305,15 @@ export function isInterruptedResult(result: {
   );
 }
 
+export function interruptedHelperResultLog(result: {
+  requestId: string;
+  applied: readonly string[];
+}): string {
+  return result.applied.length === 0
+    ? `Helper ${result.requestId} was interrupted before any page completion was recorded; the in-flight page remains queued for safe replay, and some idempotent writes may already have occurred.`
+    : `Helper ${result.requestId} was interrupted after recording ${result.applied.length} applied resource(s); completed pages remain applied, while the in-flight page and remaining queue stay queued for safe replay and may include idempotent writes already made.`;
+}
+
 /**
  * " · 167 messages" for a chat version, and nothing for anything else.
  *
@@ -9201,7 +9209,7 @@ export function queuedApplyPrompt(
     // "may need more than one pass" on every queue alike, which was noise on
     // the ones that fit and no help on the ones that did not.
     (deferredForBatchLimit > 0
-      ? ` ${deferredForBatchLimit} more are too large to carry in the same pass; they stay queued and are offered again once this one finishes.`
+      ? ` ${deferredForBatchLimit} more will be processed automatically in successive bounded pages during the same apply.`
       : "")
   );
 }
@@ -10009,82 +10017,6 @@ function validFileTime(value: unknown): value is number {
 }
 
 /**
- * True for an inbound resource this device's own scan is never going to produce.
- *
- * Leaving the queue is observational: an entry is dropped when a later scan
- * finds the local resource already carrying the incoming value. Nothing is
- * dequeued on the helper's say-so, and that is deliberate - the helper reporting
- * a write is not evidence that Cursor kept it. The price is that a resource the
- * scan does not emit can never be seen to arrive, so it stays queued for good:
- * offered at launch, handed to a helper that skips it, offered again next time.
- * Three restarts of that is what a device looked like with three of these left.
- *
- * Both kinds below are already refused on the publish side, and the missing
- * mirror of that refusal is the whole defect. A workspaceStorage directory with
- * no folder URI belongs to a window that had nothing open; it is named after the
- * millisecond that window opened, or `empty-window`, so it names a window here
- * and nothing whatsoever anywhere else. A composer whose ID is not a chat ID is
- * Cursor's own scratch row - every installation has `empty-state-draft` - and
- * `parsePortableChatSnapshot` rejects it on apply regardless.
- *
- * Measured against this repository before it was written: 8 of 1237
- * workspaceStorage resources and 1 of 513 chats, which is exactly the set that
- * would not drain and nothing else.
- */
-export function isUnscannableIncomingResource(
-  resourceId: string,
-  kind: ResourceKind,
-  metadata: ResourceTip["metadata"],
-): boolean {
-  if (kind === "workspace-storage") {
-    return typeof metadata?.workspaceUri !== "string";
-  }
-  if (kind !== "chat") {
-    return false;
-  }
-  const prefix = "chat/";
-  if (!resourceId.startsWith(prefix)) {
-    return false;
-  }
-  let composerId: string;
-  try {
-    composerId = decodeURIComponent(resourceId.slice(prefix.length));
-  } catch {
-    // Not decodable is not evidence of anything; leave it to the normal path.
-    return false;
-  }
-  return !isSyncableComposerId(composerId);
-}
-
-/**
- * True for an inbound ui-state resource this build declines to synchronize —
- * since 0.0.42, every one of them.
- *
- * Read from the resource ID rather than the tip metadata: the ID is what the
- * helper validates the metadata against, and events written by older builds are
- * the ones this has to recognize. `cursor-user-rules` is a separate kind and
- * never matches here.
- */
-function isPolicyExcludedUiStateResource(
-  resourceId: string,
-  kind: ResourceKind,
-): boolean {
-  const prefix = "ui-state/";
-  if (kind !== "ui-state" || !resourceId.startsWith(prefix)) {
-    return false;
-  }
-  let key: string;
-  try {
-    key = decodeURIComponent(resourceId.slice(prefix.length));
-  } catch {
-    // Undecodable, so the helper would reject the metadata match anyway. The
-    // kind is excluded either way; there is nothing to queue.
-    return true;
-  }
-  return isPolicyExcludedUiStateKey(key);
-}
-
-/**
  * The two reasons owned by {@link SyncManager.ensureWorkspaceMappings} rather
  * than by `resourceApplyBlockReason`.
  *
@@ -10185,8 +10117,11 @@ export function queuePending(
   const effectiveBlockedReason =
     blockedReason ?? chatContinuationApplyBlockReason(tip);
   if (
-    isPolicyExcludedUiStateResource(projection.resourceId, tip.kind) ||
-    isUnscannableIncomingResource(projection.resourceId, tip.kind, tip.metadata)
+    isOfflineApplyExcludedIncomingResource(
+      projection.resourceId,
+      tip.kind,
+      tip.metadata,
+    )
   ) {
     // Never hand the helper a change it is only going to skip. Any entry an
     // earlier run of this build already queued is dropped here too, so an
@@ -10270,18 +10205,18 @@ function prunePending(
 }
 
 /**
- * What one apply can carry, and what it leaves for the next one.
+ * What the extension-host handoff can carry, and what the helper reads itself.
  *
  * The batch limit exists so a single request cannot ask the helper to hold
  * half a gigabyte of payloads in memory at once, but a change that falls
- * outside it used to be dropped from the request without a word. The apply
- * then succeeded, the queue went down by less than the user was told, and the
- * remainder looked exactly like the queue that would not drain - which is a
- * failure this project has already chased twice for other reasons.
+ * outside it used to be dropped from the request without a word. The offline
+ * helper now reconciles the durable queue and drains successive bounded pages
+ * in the same run; the count remains useful for accurately describing that
+ * work before Cursor closes.
  */
 interface PendingHelperBatch {
   changes: HelperChange[];
-  /** Applicable now, but over the batch limit; a later pass will carry them. */
+  /** Applicable now, but outside the initial handoff page; this run drains them. */
   deferredForBatchLimit: number;
 }
 
@@ -10291,13 +10226,6 @@ export function pendingHelperBatch(repository: SyncRepository): PendingHelperBat
   let deferredForBatchLimit = 0;
   for (const pending of repository.state.pendingDatabaseChanges) {
       if (pending.blockedReason !== undefined) {
-        continue;
-      }
-      // Last gate before the helper. `queuePending` already refuses these, but
-      // a repository written by an earlier run of this build can still hold the
-      // entry, and the helper is the place where getting it wrong cost the user
-      // every other resource in the request.
-      if (isPolicyExcludedUiStateResource(pending.resourceId, pending.kind)) {
         continue;
       }
       const tip = findTip(
@@ -10316,8 +10244,14 @@ export function pendingHelperBatch(repository: SyncRepository): PendingHelperBat
         // its queued block reason.
         continue;
       }
+      // Last gate before the helper. `queuePending` already refuses these, but
+      // a repository written by an earlier build can still hold the entry.
       if (
-        isUnscannableIncomingResource(pending.resourceId, tip.kind, tip.metadata)
+        isOfflineApplyExcludedIncomingResource(
+          pending.resourceId,
+          tip.kind,
+          tip.metadata,
+        )
       ) {
         continue;
       }
@@ -10327,8 +10261,9 @@ export function pendingHelperBatch(repository: SyncRepository): PendingHelperBat
         (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES &&
           totalBytes + payloadBytes > MAX_HELPER_APPLY_WORK_BYTES)
       ) {
-        // Counted rather than silently skipped: the caller says so, and the
-        // entry stays queued for the next pass.
+        // Counted rather than silently skipped: the caller says so, while the
+        // offline helper reads it from the durable queue on a later page in
+        // this same run.
         deferredForBatchLimit += 1;
         continue;
       }

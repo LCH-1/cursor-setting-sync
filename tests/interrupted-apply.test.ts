@@ -8,6 +8,7 @@ vi.mock("vscode", () => ({
 import {
   formatDuration,
   helperRunDuration,
+  interruptedHelperResultLog,
   isInterruptedResult,
 } from "../src/sync/manager";
 
@@ -16,8 +17,8 @@ const REOPENED =
 
 describe("a shutdown pass cut short by the editor reopening", () => {
   it("is told apart from a failure the user has to act on", () => {
-    // Nothing was written and the queue is intact, so this calls for a log
-    // line, not the red status bar and notification a real failure gets.
+    // The in-flight page stays queued for idempotent replay, so this calls for
+    // a log line, not the red status bar and notification a real failure gets.
     // It became the routine outcome when 0.0.49 started applying the whole
     // queue at shutdown rather than only exporting: that pass takes minutes,
     // and reopening the editor inside that window is not a mistake. Painting
@@ -47,6 +48,22 @@ describe("a shutdown pass cut short by the editor reopening", () => {
     expect(isInterruptedResult({})).toBe(false);
     expect(isInterruptedResult({ interrupted: false, error: "disk full" })).toBe(
       false,
+    );
+  });
+
+  it("reports pages committed before Cursor reopened", () => {
+    expect(
+      interruptedHelperResultLog({
+        requestId: "request",
+        applied: ["chat/one", "chat/two"],
+      }),
+    ).toContain(
+      "was interrupted after recording 2 applied resource(s); completed pages remain applied, while the in-flight page and remaining queue stay queued for safe replay",
+    );
+    expect(
+      interruptedHelperResultLog({ requestId: "request", applied: [] }),
+    ).toContain(
+      "was interrupted before any page completion was recorded; the in-flight page remains queued for safe replay, and some idempotent writes may already have occurred",
     );
   });
 });

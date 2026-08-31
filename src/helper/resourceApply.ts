@@ -108,6 +108,8 @@ export async function applyNonGlobalChanges(
    * pre-apply recovery point while the request was still running.
    */
   priorBackups: () => readonly string[] = () => [],
+  /** Full pre-drain snapshot that already covers the default profile database. */
+  coveredGlobalDatabaseBackup: () => string | null = () => null,
 ): Promise<NonGlobalApplyResult> {
   const applied: string[] = [];
   const skipped: string[] = [];
@@ -209,6 +211,7 @@ export async function applyNonGlobalChanges(
             content,
             registerBackup,
             exemptBackupPaths,
+            ensureExclusiveAccess,
           );
         } else {
           // Plain files get the same re-check as every database branch: the
@@ -337,6 +340,7 @@ export async function applyNonGlobalChanges(
           registerBackup,
           exemptBackupPaths,
           storeWorkLimit,
+          ensureExclusiveAccess,
         );
         if (appliedHash !== change.semanticHash) {
           // The upsert-only merge retained target-only rows; remember the
@@ -370,6 +374,7 @@ export async function applyNonGlobalChanges(
     registerBackup,
     heartbeat,
     exemptBackupPaths,
+    coveredGlobalDatabaseBackup,
   );
   applied.push(...extensionResult.applied);
   skipped.push(...extensionResult.skipped);
@@ -410,6 +415,7 @@ async function mergeWorkspaceStateDatabase(
   content: Buffer,
   registerBackup: (backup: HelperBackup) => void,
   exemptBackupPaths: () => readonly string[] = () => [],
+  beforeDestructiveWrite: () => Promise<void> = async () => {},
 ): Promise<void> {
   const workspaceWorkLimit = auxiliaryResourceLimit(
     request.syncOptions.maxPayloadBytes,
@@ -451,6 +457,7 @@ async function mergeWorkspaceStateDatabase(
         });
         registerBackup({ backupPath, contract: "workspace", targetPath: target });
       },
+      beforeDestructiveWrite,
     },
   });
 }
@@ -463,6 +470,7 @@ async function applyStoreSnapshot(
   registerBackup: (backup: HelperBackup) => void,
   exemptBackupPaths: () => readonly string[] = () => [],
   maxWorkBytes = CHAT_AUXILIARY_MAX_RESOURCE_BYTES,
+  beforeDestructiveWrite: () => Promise<void> = async () => {},
 ): Promise<string> {
   await ensureDirectory(dirname(target));
   if (await pathExists(target)) {
@@ -512,6 +520,7 @@ async function applyStoreSnapshot(
     registerBackup({ backupPath, contract: "store", targetPath: target });
   }
 
+  await beforeDestructiveWrite();
   const database = openDatabase(target);
   let transactionStarted = false;
   try {
@@ -583,6 +592,7 @@ async function applyExtensionChanges(
   registerBackup: (backup: HelperBackup) => void,
   heartbeat: () => void = () => {},
   exemptBackupPaths: () => readonly string[] = () => [],
+  coveredGlobalDatabaseBackup: () => string | null = () => null,
 ): Promise<{
   applied: string[];
   skipped: string[];
@@ -716,6 +726,8 @@ async function applyExtensionChanges(
           registerBackup,
           heartbeat,
           exemptBackupPaths,
+          coveredGlobalDatabaseBackup,
+          ensureExclusiveAccess,
         );
       } catch (error) {
         if (error instanceof CursorReopenedError) {
@@ -855,6 +867,8 @@ async function updateExtensionEnablement(
   registerBackup: (backup: HelperBackup) => void,
   heartbeat: () => void = () => {},
   exemptBackupPaths: () => readonly string[] = () => [],
+  coveredGlobalDatabaseBackup: () => string | null = () => null,
+  beforeDestructiveWrite: () => Promise<void> = async () => {},
 ): Promise<void> {
   const databasePath =
     profileId === "default"
@@ -886,16 +900,29 @@ async function updateExtensionEnablement(
   }
   const backupRoot = join(request.storageRoot, "backups");
   await ensureDirectory(backupRoot);
+  const sharedGlobalBackup =
+    profileId === "default" ? coveredGlobalDatabaseBackup() : null;
+  if (
+    sharedGlobalBackup !== null &&
+    !(await pathExists(sharedGlobalBackup))
+  ) {
+    throw new Error(
+      `The verified pre-drain backup disappeared: ${sharedGlobalBackup}`,
+    );
+  }
   // Named per database and request, NOT per extension: the rollback point for
   // this request's enablement writes is the database before its FIRST such
   // write, and one 1.3 GiB copy per extension was how three default-profile
   // extensions blew the byte budget and evicted the same request's pre-apply
   // global backup - the exact data loss the budget exists to prevent.
-  const backupPath = join(
-    backupRoot,
-    `extensions-${profileId}-${request.requestId}.vscdb`,
-  );
-  const backupAlreadyTaken = await pathExists(backupPath);
+  const backupPath =
+    sharedGlobalBackup ??
+    join(
+      backupRoot,
+      `extensions-${profileId}-${request.requestId}.vscdb`,
+    );
+  const backupAlreadyTaken =
+    sharedGlobalBackup !== null || (await pathExists(backupPath));
   const database = openDatabase(databasePath);
   let transactionStarted = false;
   try {
@@ -928,6 +955,7 @@ async function updateExtensionEnablement(
       }
       registerBackup({ backupPath, contract: "item-table", targetPath: databasePath });
     }
+    await beforeDestructiveWrite();
     database.exec("BEGIN IMMEDIATE");
     transactionStarted = true;
     const raw = readDisabledExtensionState(database);

@@ -4,6 +4,14 @@ All notable changes to Cursor Setting Sync will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-31
+
+### Fixed
+
+- **One shutdown or one `Sync & Apply` now drains all ready offline work automatically.** The helper keeps the 256-change and 32 MiB safety limits per page, but advances those pages internally instead of requiring repeated commands or restarts. A stalled resource stays queued without blocking later ready resources.
+- **Large chat continuation recovery now finishes without repeated manual synchronization.** Bounded enrichment work resumes during automatic background cycles until a complete, core-applicable snapshot can be published.
+- **Every offline database write rechecks that Cursor is still closed immediately before its transaction begins.** If Cursor is reopened during a long backup, completed pages remain checkpointed and untouched pages stay queued without writing to a live database.
+
 ### Changed
 
 - **Public releases now target Cursor only.** The release workflow publishes the verified VSIX to Open VSX for Cursor and attaches it to the GitHub Release. Visual Studio Marketplace publication and the local `vsce publish` scripts were removed.

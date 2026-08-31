@@ -1,15 +1,26 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as sqlite from "node:sqlite";
 import {
   applyGlobalDatabaseChanges,
+  ensureGlobalDatabaseApplySessionBackup,
   portableToStoredProfile,
   recoverInterruptedApplyJournals,
   restoreDatabaseBackup,
+  type GlobalDatabaseApplySession,
   type PreparedHelperChange,
 } from "../src/helper/database";
+import { enforceBackupRetention } from "../src/helper/backupRetention";
 import type { HelperRequest } from "../src/helper/types";
 import { applyNonGlobalChanges } from "../src/helper/resourceApply";
 import { pathExists } from "../src/platform/files";
@@ -64,6 +75,122 @@ afterEach(async () => {
 });
 
 describeWithBackup("offline database helper", () => {
+  it("reuses one verified pre-drain backup across bounded global pages", async () => {
+    const fixture = await createFixture();
+    const session: GlobalDatabaseApplySession = {
+      verifiedBackupPath: null,
+    };
+    const change = (index: number, value: string): PreparedHelperChange => ({
+      change: {
+        eventHash: String(index).repeat(64),
+        changeIndex: 0,
+        resourceId: `cursor-user-rules/${encodeURIComponent(USER_RULES_KEY)}`,
+        kind: "cursor-user-rules",
+        operation: "put",
+        semanticHash: sha256(value),
+        metadata: { key: USER_RULES_KEY, registeredUserTarget: false },
+      },
+      content: Buffer.from(value, "utf8"),
+    });
+
+    const first = await applyGlobalDatabaseChanges(
+      fixture.request,
+      [change(1, "first")],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      session,
+    );
+    const second = await applyGlobalDatabaseChanges(
+      fixture.request,
+      [change(2, "second")],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      session,
+    );
+
+    expect(second.backupPath).toBe(first.backupPath);
+    expect(session.verifiedBackupPath).toBe(first.backupPath);
+    expect(
+      (await readdir(join(fixture.request.storageRoot, "backups"))).filter(
+        (name) => name.startsWith("state-") && name.endsWith(".vscdb"),
+      ),
+    ).toHaveLength(1);
+    expect(readItem(first.backupPath, USER_RULES_KEY)).toBeNull();
+    expect(readItem(fixture.databasePath, USER_RULES_KEY)).toBe("second");
+    const journal = JSON.parse(
+      await readFile(
+        join(
+          fixture.request.storageRoot,
+          `apply-${fixture.request.requestId}.json`,
+        ),
+        "utf8",
+      ),
+    ) as { status: string; backupPath: string | null; completedAt: string | null };
+    expect(journal.status).toBe("verified");
+    expect(journal.backupPath).toBe(first.backupPath);
+    expect(journal.completedAt).not.toBeNull();
+  });
+
+  it("takes the shared global backup before an extension-first page", async () => {
+    const fixture = await createFixture();
+    const session: GlobalDatabaseApplySession = {
+      verifiedBackupPath: null,
+    };
+    const backupPath = await ensureGlobalDatabaseApplySessionBackup(
+      fixture.request,
+      session,
+    );
+    const extensionId = "some.extension";
+    const extensionDatabase = new DatabaseSync(fixture.databasePath);
+    extensionDatabase
+      .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
+      .run(
+        "extensionsIdentifiers/disabled",
+        JSON.stringify([{ id: extensionId }]),
+      );
+    extensionDatabase.close();
+    expect(readItem(backupPath, "extensionsIdentifiers/disabled")).toBeNull();
+    expect(
+      readItem(fixture.databasePath, "extensionsIdentifiers/disabled"),
+    ).toBe(JSON.stringify([{ id: extensionId }]));
+
+    const backupRoot = join(fixture.request.storageRoot, "backups");
+    for (let index = 0; index < 3; index += 1) {
+      await writeFile(join(backupRoot, `pressure-${index}.vscdb`), `${index}`);
+    }
+    await enforceBackupRetention(fixture.request.storageRoot, {
+      maxFiles: 1,
+      maxAgeMs: Number.MAX_SAFE_INTEGER,
+      maxTotalBytes: Number.MAX_SAFE_INTEGER,
+      exemptPath: backupPath,
+    });
+    expect(await pathExists(backupPath)).toBe(true);
+
+    const globalResult = await applyGlobalDatabaseChanges(
+      fixture.request,
+      [userRulesChange("text", Buffer.from("after extension", "utf8"))],
+      undefined,
+      undefined,
+      () => [backupPath],
+      undefined,
+      session,
+    );
+    expect(globalResult.backupPath).toBe(backupPath);
+    expect(readItem(backupPath, USER_RULES_KEY)).toBeNull();
+    expect(readItem(fixture.databasePath, USER_RULES_KEY)).toBe(
+      "after extension",
+    );
+    expect(
+      (await readdir(backupRoot)).filter(
+        (name) => name.startsWith("state-") && name.endsWith(".vscdb"),
+      ),
+    ).toHaveLength(1);
+  });
+
   it("applies a chat-only batch without reading an oversized target marker", async () => {
     const fixture = await createFixture();
     const database = new DatabaseSync(fixture.databasePath);

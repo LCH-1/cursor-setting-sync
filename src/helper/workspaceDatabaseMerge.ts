@@ -175,6 +175,8 @@ export interface ApplyWorkspaceDatabaseOptions {
   hooks?: {
     /** Runs after the read-only backup is verified and before any write transaction. */
     afterBackupValidated?: () => Promise<void>;
+    /** Re-checks external write authority immediately before the transaction. */
+    beforeDestructiveWrite?: () => Promise<void>;
   };
 }
 
@@ -613,6 +615,7 @@ export async function applyWorkspaceDatabaseSnapshot(
     );
   }
 
+  await options.hooks?.beforeDestructiveWrite?.();
   const database = openDatabase(options.targetPath);
   let transactionOpen = false;
   try {

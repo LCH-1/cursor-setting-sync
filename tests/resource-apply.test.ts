@@ -7,6 +7,7 @@ import type { CursorPaths } from "../src/platform/paths";
 import type { JsonValue } from "../src/types";
 import type { PreparedHelperChange } from "../src/helper/database";
 import type { HelperBackup, HelperRequest } from "../src/helper/types";
+import { backupDatabase } from "../src/platform/sqlite";
 import {
   applyNonGlobalChanges,
   CursorReopenedError,
@@ -297,6 +298,99 @@ describeWithBackup("extension enablement over a NULL disabled list", () => {
     expect(result.backups).toHaveLength(1);
     expect(result.backups[0]?.targetPath).toBe(fixture.paths.globalDatabase);
   });
+
+  it("aborts after the enablement backup but before the write transaction when Cursor reopens", async () => {
+    const fixture = await createFixture();
+    await createProfileDatabase(fixture.paths.globalDatabase, null);
+    await stubCursorCli(fixture);
+    const collected: HelperBackup[] = [];
+    let exclusiveChecks = 0;
+
+    await expect(
+      applyNonGlobalChanges(
+        fixture.request,
+        [
+          extensionPut(
+            "extension/default/some.extension",
+            "some.extension",
+            false,
+          ),
+        ],
+        async () => {
+          exclusiveChecks += 1;
+          if (exclusiveChecks === 3) {
+            throw new CursorReopenedError(
+              "Cursor was reopened before offline changes could be applied.",
+            );
+          }
+        },
+        (backup) => collected.push(backup),
+      ),
+    ).rejects.toBeInstanceOf(CursorReopenedError);
+
+    expect(exclusiveChecks).toBe(3);
+    expect(collected).toHaveLength(1);
+    expect(collected[0]?.contract).toBe("item-table");
+    expect(
+      readItemTableType(
+        fixture.paths.globalDatabase,
+        "extensionsIdentifiers/disabled",
+      ),
+    ).toBe("null");
+  });
+
+  it("reuses a supplied full global backup instead of taking a duplicate", async () => {
+    const fixture = await createFixture();
+    await createProfileDatabase(fixture.paths.globalDatabase, null);
+    await stubCursorCli(fixture);
+    const backupRoot = join(fixture.request.storageRoot, "backups");
+    await mkdir(backupRoot, { recursive: true });
+    const sharedBackup = join(backupRoot, "state-shared.vscdb");
+    const source = new DatabaseSync(fixture.paths.globalDatabase, {
+      readOnly: true,
+    });
+    try {
+      await backupDatabase(source, sharedBackup, { rate: 100 });
+    } finally {
+      source.close();
+    }
+
+    const result = await applyNonGlobalChanges(
+      fixture.request,
+      [
+        extensionPut(
+          "extension/default/some.extension",
+          "some.extension",
+          false,
+        ),
+      ],
+      async () => {},
+      () => {},
+      () => {},
+      () => [sharedBackup],
+      () => sharedBackup,
+    );
+
+    expect(result.applied).toEqual(["extension/default/some.extension"]);
+    expect(result.backups).toEqual([]);
+    expect(
+      readItemTableValue(
+        fixture.paths.globalDatabase,
+        "extensionsIdentifiers/disabled",
+      ),
+    ).toBe(JSON.stringify([{ id: "some.extension" }]));
+    expect(
+      readItemTableType(sharedBackup, "extensionsIdentifiers/disabled"),
+    ).toBe("null");
+    await expect(
+      stat(
+        join(
+          backupRoot,
+          `extensions-default-${fixture.request.requestId}.vscdb`,
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
 });
 
 describeWithBackup("non-global resource apply with backups", () => {
@@ -371,17 +465,15 @@ describeWithBackup("non-global resource apply with backups", () => {
     expect(readItemTableValue(targetPath, "interactive.sessions")).toBe("value");
   });
 
-  it("registers earlier backups with the caller before a mid-batch abort", async () => {
+  it("aborts after the store backup but before the write transaction when Cursor reopens", async () => {
     const fixture = await createFixture();
-    const firstRelativePath = "chats/session-a/store.db";
-    const firstResourceId = `chat-store/${encodeURIComponent(firstRelativePath)}`;
-    const secondRelativePath = "chats/session-b/store.db";
-    const secondResourceId = `chat-store/${encodeURIComponent(secondRelativePath)}`;
-    const firstStorePath = join(
+    const relativePath = "chats/session-a/store.db";
+    const resourceId = `chat-store/${encodeURIComponent(relativePath)}`;
+    const storePath = join(
       fixture.paths.cursorHome,
-      ...firstRelativePath.split("/"),
+      ...relativePath.split("/"),
     );
-    await createStoreDatabase(firstStorePath, [["shared", "local"]]);
+    await createStoreDatabase(storePath, [["shared", "local"]]);
     const collected: HelperBackup[] = [];
     let exclusiveChecks = 0;
 
@@ -389,16 +481,13 @@ describeWithBackup("non-global resource apply with backups", () => {
       applyNonGlobalChanges(
         fixture.request,
         [
-          storeChange(firstResourceId, firstRelativePath, [
-            { key: "shared", value: { type: "text", value: "remote" } },
-          ]),
-          storeChange(secondResourceId, secondRelativePath, [
+          storeChange(resourceId, relativePath, [
             { key: "shared", value: { type: "text", value: "remote" } },
           ]),
         ],
         async () => {
           exclusiveChecks += 1;
-          if (exclusiveChecks > 1) {
+          if (exclusiveChecks === 2) {
             throw new CursorReopenedError(
               "Cursor was reopened before offline changes could be applied.",
             );
@@ -406,12 +495,60 @@ describeWithBackup("non-global resource apply with backups", () => {
         },
         (backup) => collected.push(backup),
       ),
-    ).rejects.toThrow("Cursor was reopened");
+    ).rejects.toBeInstanceOf(CursorReopenedError);
 
+    expect(exclusiveChecks).toBe(2);
     expect(collected).toHaveLength(1);
     expect(collected[0]?.contract).toBe("store");
-    expect(collected[0]?.targetPath).toBe(firstStorePath);
+    expect(collected[0]?.targetPath).toBe(storePath);
     await expect(stat(collected[0]?.backupPath ?? "")).resolves.toBeDefined();
+    expect(readMetaValue(storePath, "shared")).toBe("local");
+  });
+
+  it("aborts after the workspace backup but before the write transaction when Cursor reopens", async () => {
+    const fixture = await createFixture();
+    fixture.request.workspaceMappings = { "remote-a": "workspace-local" };
+    const targetPath = join(
+      fixture.paths.workspaceStorageRoot,
+      "workspace-local",
+      "state.vscdb",
+    );
+    await mkdir(join(targetPath, ".."), { recursive: true });
+    await writeFile(
+      join(
+        fixture.paths.workspaceStorageRoot,
+        "workspace-local",
+        "workspace.json",
+      ),
+      JSON.stringify({ folder: "file:///C:/projects/local" }),
+      "utf8",
+    );
+    await createWorkspaceDatabase(targetPath, "local-key", "kept");
+    const collected: HelperBackup[] = [];
+    let exclusiveChecks = 0;
+
+    await expect(
+      applyNonGlobalChanges(
+        fixture.request,
+        [await workspaceDatabaseChange(fixture, "remote-a", "notepadData")],
+        async () => {
+          exclusiveChecks += 1;
+          if (exclusiveChecks === 2) {
+            throw new CursorReopenedError(
+              "Cursor was reopened before offline changes could be applied.",
+            );
+          }
+        },
+        (backup) => collected.push(backup),
+      ),
+    ).rejects.toBeInstanceOf(CursorReopenedError);
+
+    expect(exclusiveChecks).toBe(2);
+    expect(collected).toHaveLength(1);
+    expect(collected[0]?.contract).toBe("workspace");
+    expect(collected[0]?.targetPath).toBe(targetPath);
+    expect(readItemTableValue(targetPath, "local-key")).toBe("kept");
+    expect(readItemTableValue(targetPath, "notepadData")).toBeNull();
   });
 });
 
