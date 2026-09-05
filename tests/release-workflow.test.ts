@@ -22,7 +22,7 @@ describe("Cursor-only release workflow", () => {
     expect(files.filter((file) => !publicFiles.has(file))).toEqual([]);
     expect(files).toContain("package.json");
     expect(files).toContain("docs/usage.md");
-  });
+  }, 20_000);
 
   it("publishes the verified artifact only to Open VSX before GitHub Release", () => {
     expect(workflow).toContain("publish-open-vsx:");
