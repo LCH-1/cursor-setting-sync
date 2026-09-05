@@ -312,6 +312,7 @@ import {
 import { SyncCycleQueue } from "./cycleQueue";
 import type { SyncScope } from "./cycleQueue";
 import { BackgroundCoordinator } from "./backgroundCoordinator";
+import { resolveBackupSource } from "../helper/compressedBackups";
 import { createPollPlan, type PollPlanEntry } from "./pollPlan";
 import {
   PERMANENT_EXCLUSION_REASONS,
@@ -4699,13 +4700,18 @@ export class SyncManager implements vscode.Disposable {
       const name = basename(path).toLowerCase();
       return (
         (name.startsWith("state-") || name.startsWith("pre-restore-")) &&
-        name.endsWith(".vscdb")
+        (name.endsWith(".vscdb") || name.endsWith(".vscdb.gz"))
       );
     });
-    const recorded = this.context.globalState.get<StoredHelperBackup[]>(
+    const storedBackups = this.context.globalState.get<StoredHelperBackup[]>(
       LAST_HELPER_BACKUPS_KEY,
       [],
     );
+    const recorded: StoredHelperBackup[] = [];
+    for (const backup of storedBackups) {
+      const path = await resolveBackupSource(backup.backupPath);
+      if (path !== null) recorded.push({ ...backup, backupPath: path });
+    }
     const recordedByPath = new Map(
       recorded.map((entry) => [entry.backupPath.toLowerCase(), entry]),
     );
@@ -4751,15 +4757,13 @@ export class SyncManager implements vscode.Disposable {
     }
     for (const entry of recorded) {
       if (
-        entry.contract === "global" ||
         backups.some(
           (path) => path.toLowerCase() === entry.backupPath.toLowerCase(),
         ) ||
         !(await pathExists(entry.backupPath))
       ) {
-        // Non-global backups living OUTSIDE the scanned tree (workspace and
-        // store snapshots in other directories) still come from the records;
-        // ones inside it were already listed above with their contract.
+        // Consolidated full-DB archives can retain an extensions-* filename;
+        // their recorded contract, not the prefix, determines the restore.
         continue;
       }
       items.push({

@@ -65,6 +65,7 @@ import {
 import { verifyPortableChatContinuationClosure } from "../chat/continuationClosure";
 import { buildChatTipEnrichmentCandidateIndex } from "../chat/enrichment";
 import { migrateOfflineChatTips } from "./chatMigration";
+import { maintainCompressedBackups, resolveBackupSource } from "./compressedBackups";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
 import {
@@ -103,6 +104,7 @@ import {
   ensureGlobalDatabaseApplySessionBackup,
   recoverInterruptedApplyJournals,
   restoreDatabaseBackup,
+  validateDatabaseFile,
   type GlobalDatabaseApplySession,
   type PreparedHelperChange,
 } from "./database";
@@ -246,6 +248,29 @@ async function run(): Promise<void> {
         },
         recoveryNotices,
       );
+      if (result.success) {
+        try {
+          const maintenance = await maintainCompressedBackups({
+            storageRoot: request.storageRoot,
+            paths: request.paths,
+            backups: collected.backups,
+            validate: validateDatabaseFile,
+            beforeWork: ensureCursorStillClosed,
+            heartbeat: () => lock.refresh(),
+          });
+          const retained = new Map(maintenance.backups.map(backup => [backup.backupPath, backup]));
+          for (const backup of result.backups ?? []) {
+            const path = await resolveBackupSource(backup.backupPath);
+            if (path !== null && !retained.has(path)) retained.set(path, { ...backup, backupPath: path });
+          }
+          result.backups = [...retained.values()];
+          result.backupPath = result.backupPath === null ? null : await resolveBackupSource(result.backupPath);
+          result.warnings = [...(result.warnings ?? []), ...maintenance.warnings];
+        } catch (error) {
+          result.warnings = [...(result.warnings ?? []), `Backup compression was deferred; existing recovery files were preserved: ${error instanceof Error ? error.message : String(error)}`];
+        }
+      }
+      result.completedAt = new Date().toISOString();
       await writeResult(request, result);
       if (request.restart && result.success) {
         restartCursor(request.cursorExecutable);

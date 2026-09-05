@@ -7,6 +7,7 @@ import { DatabaseSync, backup } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { SyncRepository } from "../src/protocol/repository";
 import { restoreDatabaseBackup } from "../src/helper/database";
+import { withReadableBackup } from "../src/helper/compressedBackups";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import { portableChatCoreHash } from "../src/chat/stateVscdb";
 import { pathExists, readJsonFile, writeJsonAtomic } from "../src/platform/files";
@@ -153,7 +154,7 @@ describeBuilt("the offline helper, end to end", () => {
     const backups = await readdir(join(fixture.request.storageRoot, "backups"));
     expect(backups.length).toBeGreaterThan(0);
     expect(result.backupPath).not.toBeNull();
-    expect(readComposerIds(result.backupPath ?? "")).not.toContain(COMPOSER);
+    await withReadableBackup(result.backupPath ?? "", async source => expect(readComposerIds(source)).not.toContain(COMPOSER));
 
     // And restoring it rolls the apply back, which is the whole point of taking
     // it: an apply nobody can undo is not one anybody should run.
@@ -241,7 +242,7 @@ describeBuilt("the offline helper, end to end", () => {
     );
     expect(
       backupFiles.filter(
-        (name) => name.startsWith("state-") && name.endsWith(".vscdb"),
+        (name) => name.startsWith("state-") && name.endsWith(".vscdb.gz"),
       ),
     ).toHaveLength(1);
     const reopened = await SyncRepository.open(
@@ -297,11 +298,10 @@ describeBuilt("the offline helper, end to end", () => {
     expect(readComposerIds(fixture.databasePath)).toEqual(before);
     const preRestore = (
       await readdir(join(fixture.request.storageRoot, "backups"))
-    ).filter((name) => name.startsWith("pre-restore-") && name.endsWith(".vscdb"));
+    ).filter((name) => name.startsWith("pre-restore-") && name.endsWith(".vscdb.gz"));
     expect(preRestore).toHaveLength(1);
-    expect(
-      readComposerIds(join(fixture.request.storageRoot, "backups", preRestore[0] ?? "")),
-    ).toContain(COMPOSER);
+    await withReadableBackup(join(fixture.request.storageRoot, "backups", preRestore[0] ?? ""),
+      async source => expect(readComposerIds(source)).toContain(COMPOSER));
   }, 120_000);
 
   it("consumes its request file and reports rather than vanishing", async () => {

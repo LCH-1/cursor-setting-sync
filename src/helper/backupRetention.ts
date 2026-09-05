@@ -351,6 +351,10 @@ async function scanBackupDirectory(
 
     const entries = await readdir(directory, { withFileTypes: true });
     for (const entry of entries) {
+      // Archive retention is per database; extraction scratch must survive
+      // the pre-restore backup created while it is in use.
+      if (/\.(vscdb|db)\.gz(?:\.json)?$/.test(entry.name) ||
+        entry.name.startsWith(".restore-") || entry.name.endsWith(".partial")) continue;
       const child = resolve(directory, entry.name);
       if (!isPathInside(backupRoot, child, false)) {
         throw new Error(`Backup entry escapes the exact backup root: ${child}`);

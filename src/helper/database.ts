@@ -17,6 +17,7 @@ import {
 import type { ApplyJournal, JsonValue } from "../types";
 import type { HelperChange, HelperRequest } from "./types";
 import { enforceBackupRetention } from "./backupRetention";
+import { resolveBackupSource, withReadableBackup } from "./compressedBackups";
 import {
   ensureDirectory,
   assertSafeIdentifier,
@@ -472,6 +473,20 @@ export async function restoreDatabaseBackup(
    */
   beforeDestructiveWrite: () => Promise<void> = async () => {},
 ): Promise<string> {
+  return withReadableBackup(backupPath, source => restoreReadableDatabaseBackup(
+    databasePath, source, storageRoot, requestId, contract, beforeDestructiveWrite, backupPath,
+  ));
+}
+
+async function restoreReadableDatabaseBackup(
+  databasePath: string,
+  backupPath: string,
+  storageRoot: string,
+  requestId: string,
+  contract: DatabaseContract,
+  beforeDestructiveWrite: () => Promise<void>,
+  originalBackupPath: string,
+): Promise<string> {
   if (!(await pathExists(backupPath))) {
     throw new Error(`Backup does not exist: ${backupPath}`);
   }
@@ -488,7 +503,7 @@ export async function restoreDatabaseBackup(
     requestId,
     status: "preparing",
     databasePath,
-    backupPath,
+    backupPath: originalBackupPath,
     startedAt: new Date().toISOString(),
     completedAt: null,
     error: null,
@@ -583,6 +598,17 @@ async function restoreKnownTablesWithQueries(
    * transaction itself.
    */
   beforeDestructiveWrite: () => Promise<void> = async () => {},
+): Promise<void> {
+  return withReadableBackup(backupPath, source => restoreReadableKnownTables(
+    databasePath, source, contract, beforeDestructiveWrite,
+  ));
+}
+
+async function restoreReadableKnownTables(
+  databasePath: string,
+  backupPath: string,
+  contract: DatabaseContract,
+  beforeDestructiveWrite: () => Promise<void>,
 ): Promise<void> {
   const tables = restoreTablesForContract(contract);
   const database = openDatabase(databasePath);
@@ -691,7 +717,7 @@ function checkpointBestEffort(database: DatabaseSync): void {
   }
 }
 
-function validateDatabaseFile(
+export function validateDatabaseFile(
   path: string,
   contract: DatabaseContract = "integrity",
 ): void {
@@ -717,7 +743,7 @@ async function recoverRestoreJournal(
   notice: (message: string) => void = () => {},
 ): Promise<void> {
   const contract = journal.contract ?? "global";
-  if (!(await pathExists(journal.backupPath))) {
+  if (await resolveBackupSource(journal.backupPath) === null) {
     validateDatabaseFile(journal.databasePath, contract);
     journal.status = "failed";
     journal.error = "Interrupted restore source is missing; the live database was left untouched.";
@@ -736,7 +762,7 @@ async function recoverRestoreJournal(
     notice(journal.error);
   } else {
     try {
-      validateDatabaseFile(journal.backupPath, contract);
+      await withReadableBackup(journal.backupPath, async source => validateDatabaseFile(source, contract));
     } catch (error) {
       // A source that stopped validating - damaged since the interruption, or
       // written for a schema Cursor has since changed - is a permanent fact
