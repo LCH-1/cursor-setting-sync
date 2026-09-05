@@ -32,6 +32,10 @@ import type { CursorPaths } from "../src/platform/paths";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import { EventReconciler } from "../src/protocol/reconciler";
 import { SyncRepository } from "../src/protocol/repository";
+import { applyGlobalDatabaseChanges } from "../src/helper/database";
+import { migrateOfflineChatTips } from "../src/helper/chatMigration";
+import { enrichCurrentChatTipsFromLiveDatabase } from "../src/chat/enrichment";
+import { MAX_HELPER_APPLY_WORK_BYTES } from "../src/constants";
 import type {
   PortableChatSnapshot,
   PortableChatSnapshotV2,
@@ -51,6 +55,144 @@ afterEach(async () => {
 });
 
 describe("the helper's bounded final chat export", () => {
+  it("exports and restores one chat above the interactive page limit without dropping its core", async () => {
+    const source = await createFixture(64 * 1024 * 1024);
+    const id = composerId(991);
+    insertLiveChat(source.database, id, "large offline chat", 2, 25 * 1024 * 1024);
+    source.database.close();
+    const exported = await helperMainTesting.exportFinalChanges(source.request, source.repository);
+    expect(exported.incompleteKinds).not.toContain("chat");
+    const tip = source.repository.state.tips[`chat/${id}`]![0]!;
+    expect(tip.payload!.plainBytes).toBeGreaterThan(MAX_HELPER_APPLY_WORK_BYTES);
+    expect(tip.metadata).toMatchObject({ chatSnapshotSchemaVersion: 2, agentKvMissingCount: 0 });
+    const change = helperChange(tip, `chat/${id}`);
+    const prepared = await prepareChanges(source.repository, [change]);
+    expect(prepared.prepared).toHaveLength(1);
+    expect(prepared.skipped).toEqual([]);
+    const target = await createFixture(64 * 1024 * 1024);
+    target.database.close();
+    const result = await applyGlobalDatabaseChanges(target.request, prepared.prepared);
+    expect(result.applied).toEqual([`chat/${id}`]);
+    const restored = new DatabaseSync(target.request.paths.globalDatabase, { readOnly: true });
+    try {
+      expect(restored.prepare("SELECT count(*) AS n FROM composerHeaders WHERE composerId=?").get(id)?.n).toBe(1);
+      const value = restored.prepare("SELECT value FROM cursorDiskKV WHERE key=?").get(`bubbleId:${id}:bubble-${id}`)?.value;
+      expect((JSON.parse(String(value)) as { text: string }).text).toHaveLength(25 * 1024 * 1024);
+      expect(restored.prepare("PRAGMA quick_check").get()?.quick_check).toBe("ok");
+    } finally {
+      restored.close();
+    }
+  }, 60_000);
+
+  it("migrates an interactive-deferred legacy chat and verifies its new target in the same shutdown", async () => {
+    const fixture = await createFixture(64 * 1024 * 1024);
+    const id = composerId(992);
+    const blob = Buffer.alloc(14 * 1024 * 1024, 0x61);
+    const blobId = sha256(blob);
+    const serializedState = `~${Buffer.concat([Buffer.from([0x0a, 0x20]), Buffer.from(blobId, "hex")]).toString("base64")}`;
+    fixture.database.prepare("INSERT INTO cursorDiskKV(key,value) VALUES (?,?)").run(`agentKv:blob:${blobId}`, blob);
+    fixture.database.close();
+    const source = portableChat(id, "legacy large source", 2, "x".repeat(13 * 1024 * 1024));
+    source.composerData.valueBase64 = Buffer.from(JSON.stringify({ conversationState: serializedState })).toString("base64");
+    const content = canonicalBytes(source);
+    await fixture.repository.publish([{
+      resourceId: `chat/${id}`, kind: "chat", content, semanticHash: sha256(content), parents: [],
+      metadata: { chatSnapshotSchemaVersion: 1, bubbleCount: 1 },
+    }], []);
+    new EventReconciler().reconcile(await fixture.repository.listEvents(), fixture.repository.state, null);
+    const interactive = await enrichCurrentChatTipsFromLiveDatabase(fixture.repository, fixture.request.paths.globalDatabase, {
+      cursor: { afterResourceId: null }, maxPayloadBytes: fixture.request.syncOptions.maxPayloadBytes,
+    });
+    expect(interactive.published).toBe(0);
+    const before = vi.fn(async () => {});
+    const migrated = await migrateOfflineChatTips(fixture.repository, fixture.request, before, () => {});
+    expect(migrated).toEqual({ published: 1, warnings: [] });
+    expect(before).toHaveBeenCalledOnce();
+    const tip = fixture.repository.state.tips[`chat/${id}`]![0]!;
+    expect(tip.payload!.plainBytes).toBeGreaterThan(MAX_HELPER_APPLY_WORK_BYTES);
+    expect(tip.metadata).toMatchObject({ chatSnapshotSchemaVersion: 2, agentKvMissingCount: 0, agentKvEnrichmentAppliesCore: true });
+    expect(fixture.repository.state.pendingDatabaseChanges).toEqual([expect.objectContaining({ resourceId: `chat/${id}` })]);
+    const verified = await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository, () => {}, true);
+    expect(verified.verifiedApplyVersionIds).toContain(tip.versionId);
+    const preparation = await prepareChanges(fixture.repository, [helperChange(tip, `chat/${id}`)]);
+    expect(preparation.skipped).toEqual([]);
+    const applied = await applyGlobalDatabaseChanges(fixture.request, preparation.prepared);
+    expect(applied.applied).toEqual([`chat/${id}`]);
+    const reread = new DatabaseSync(fixture.request.paths.globalDatabase, { readOnly: true });
+    try {
+      expect(reread.prepare("SELECT count(*) AS n FROM composerHeaders WHERE composerId=?").get(id)?.n).toBe(1);
+      const storedBlob = reread.prepare("SELECT value FROM cursorDiskKV WHERE key=?").get(`agentKv:blob:${blobId}`)?.value;
+      expect(sha256(Buffer.from(storedBlob as Uint8Array))).toBe(blobId);
+    } finally { reread.close(); }
+    expect((await migrateOfflineChatTips(fixture.repository, fixture.request, before, () => {})).published).toBe(0);
+  }, 60_000);
+
+  it("does not migrate newer producer data or continue after the closed-Cursor check fails", async () => {
+    const fixture = await createFixture();
+    fixture.database.close();
+    const id = composerId(993);
+    const content = canonicalBytes(portableChat(id, "version gate", 1, "retained source"));
+    await fixture.repository.publish([{
+      resourceId: `chat/${id}`, kind: "chat", content, semanticHash: sha256(content), parents: [],
+      metadata: { chatSnapshotSchemaVersion: 1 },
+    }], []);
+    new EventReconciler().reconcile(await fixture.repository.listEvents(), fixture.repository.state, null);
+    const head = fixture.repository.state.ownStreamHead;
+    const before = vi.fn(async () => {});
+    const older = { ...fixture.request, extensionVersion: "0.0.62" };
+    expect(await migrateOfflineChatTips(fixture.repository, older, before, () => {})).toEqual({ published: 0, warnings: [] });
+    expect(before).not.toHaveBeenCalled();
+    await expect(migrateOfflineChatTips(fixture.repository, fixture.request, async () => {
+      throw new Error("Cursor reopened");
+    }, () => {})).rejects.toThrow("Cursor reopened");
+    expect(fixture.repository.state.ownStreamHead).toEqual(head);
+    expect(fixture.repository.state.pendingDatabaseChanges).toEqual([]);
+  });
+
+  it("recaptures an own legacy body edit even when its header and row count are unchanged", async () => {
+    const fixture = await createFixture();
+    const id = composerId(994);
+    insertLiveChat(fixture.database, id, "unchanged header", 2, 10);
+    const source = portableChat(id, "unchanged header", 2, "x".repeat(10));
+    const content = canonicalBytes(source);
+    await fixture.repository.publish([{
+      resourceId: `chat/${id}`, kind: "chat", content, semanticHash: sha256(content), parents: [],
+      metadata: { chatSnapshotSchemaVersion: 1, chatCoreHash: portableChatCoreHash(source), bubbleCount: 1, lastUpdatedAt: 2 },
+    }], []);
+    new EventReconciler().reconcile(await fixture.repository.listEvents(), fixture.repository.state, null);
+    const original = fixture.repository.state.tips[`chat/${id}`]![0]!;
+    fixture.repository.state.projections[`chat/${id}`] = {
+      resourceId: `chat/${id}`, kind: "chat", versionId: original.versionId,
+      semanticHash: original.semanticHash, sourceTimestamp: 2, sourceBubbleCount: 1,
+      sourceChatCoreHash: portableChatCoreHash(source),
+    };
+    fixture.database.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run(JSON.stringify({ text: "edited body" }), `bubbleId:${id}:bubble-${id}`);
+    fixture.database.close();
+    await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository);
+    const updated = fixture.repository.state.tips[`chat/${id}`]![0]!;
+    expect(updated.versionId).not.toBe(original.versionId);
+    expect(updated.metadata?.chatCoreHash).not.toBe(original.metadata?.chatCoreHash);
+    expect(fixture.repository.state.conflicts.filter((conflict) => conflict.resolvedAt === undefined)).toEqual([]);
+  });
+
+  it("checks the last same-count body edit of a recent complete chat at shutdown", async () => {
+    const fixture = await createFixture();
+    const id = composerId(995);
+    insertLiveChat(fixture.database, id, "recent complete chat", 2, 10);
+    fixture.database.close();
+    await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository);
+    const original = fixture.repository.state.tips[`chat/${id}`]![0]!;
+    expect(original.metadata?.chatSnapshotSchemaVersion).toBe(2);
+    const edit = new DatabaseSync(fixture.request.paths.globalDatabase);
+    edit.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run(JSON.stringify({ text: "final body" }), `bubbleId:${id}:bubble-${id}`);
+    edit.close();
+    await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository);
+    const updated = fixture.repository.state.tips[`chat/${id}`]![0]!;
+    expect(updated.versionId).not.toBe(original.versionId);
+    expect(updated.metadata?.lastUpdatedAt).toBe(original.metadata?.lastUpdatedAt);
+    expect(updated.metadata?.bubbleCount).toBe(original.metadata?.bubbleCount);
+  });
+
   it("publishes a same-mtime local Cursor-file edit before a queued peer tip can overwrite it", async () => {
     const fixture = await createFixture();
     const relativePath = "rules/same.md";
@@ -1032,7 +1174,7 @@ interface Fixture {
   request: HelperRequest;
 }
 
-async function createFixture(): Promise<Fixture> {
+async function createFixture(maxPayloadBytes = MAX_PAYLOAD_BYTES): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "cursor-final-export-drain-"));
   roots.push(root);
   const databasePath = join(root, "state.vscdb");
@@ -1071,7 +1213,7 @@ async function createFixture(): Promise<Fixture> {
     repositoryRoot,
     storageRoot,
     PASSPHRASE,
-    MAX_PAYLOAD_BYTES,
+    maxPayloadBytes,
     {
       extensionVersion: "0.0.63",
       cursorVersion: "3.11.19",
@@ -1135,7 +1277,7 @@ async function createFixture(): Promise<Fixture> {
         applyOnShutdown: true,
         syncChat: true,
         syncWorkspaceStorage: false,
-        maxPayloadBytes: MAX_PAYLOAD_BYTES,
+        maxPayloadBytes,
         gitSync: false,
       },
     },

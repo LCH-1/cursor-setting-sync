@@ -233,6 +233,8 @@ export const MAX_EVENT_CHANGES = 10_000;
 export const MAX_APPLY_BATCH_BYTES = 512 * 1024 * 1024;
 /** Fixed in-process payload envelope for one offline helper apply page. */
 export const MAX_HELPER_APPLY_WORK_BYTES = 32 * 1024 * 1024;
+/** Large chats run alone in the offline helper, never in an interactive batch. */
+export const MAX_HELPER_SINGLE_CHAT_BYTES = 128 * 1024 * 1024;
 /** Fixed extension-host envelope for one appliesWhileRunning payload. */
 export const MAX_RUNNING_APPLY_PAYLOAD_BYTES = 32 * 1024 * 1024;
 /** Fixed extension-host envelope for the payload copied into a prune marker. */

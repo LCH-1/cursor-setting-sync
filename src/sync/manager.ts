@@ -23,6 +23,7 @@ import {
   EVENT_EXTENSION,
   LOCK_SKIP_REMINDER_MS,
   MAX_HELPER_APPLY_WORK_BYTES,
+  MAX_HELPER_SINGLE_CHAT_BYTES,
   MAX_RUNNING_APPLY_PAYLOAD_BYTES,
   QUIT_START_GRACE_MS,
   REPOSITORY_FILE,
@@ -10753,8 +10754,12 @@ export function pendingHelperBatch(repository: SyncRepository): PendingHelperBat
         continue;
       }
       const payloadBytes = tip.payload?.plainBytes ?? 0;
+      const largeSingleChat = tip.kind === "chat" &&
+        payloadBytes > MAX_HELPER_APPLY_WORK_BYTES && payloadBytes <= MAX_HELPER_SINGLE_CHAT_BYTES;
       if (
         changes.length >= 256 ||
+        totalBytes > MAX_HELPER_APPLY_WORK_BYTES ||
+        (largeSingleChat && changes.length > 0) ||
         (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES &&
           totalBytes + payloadBytes > MAX_HELPER_APPLY_WORK_BYTES)
       ) {
@@ -10783,7 +10788,7 @@ export function pendingHelperBatch(repository: SyncRepository): PendingHelperBat
       // A single authenticated oversized object is deliberately included so
       // the helper can turn it into a visible per-resource blocked failure
       // without reading the payload. Aggregate overflow alone is deferred.
-      if (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES) {
+      if (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES || largeSingleChat) {
         totalBytes += payloadBytes;
       }
   }

@@ -2,7 +2,7 @@
 # added back. A stray scratch file dropped in the root - an editor "Untitled",
 # a screenshot, a note - used to match no pattern here and shipped inside the
 # VSIX. An allowlist cannot miss the next one.
-*
+**
 !package.json
 !README.md
 !README.ko.md
@@ -10,6 +10,12 @@
 !LICENSE
 !THIRD_PARTY_NOTICES.md
 !icon.png
+!dist/extension.js
+!dist/helper.js
+!docs/usage.md
+!docs/security.md
+!docs/protocol.md
+!docs/compatibility.md
 
 .gitignore
 .github/**

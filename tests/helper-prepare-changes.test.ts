@@ -30,7 +30,7 @@ import type { HelperChange, HelperRequest } from "../src/helper/types";
 import type { PreparedHelperChange } from "../src/helper/database";
 import { CursorReopenedError } from "../src/helper/resourceApply";
 import type { ResourceProjection } from "../src/protocol/reconciler";
-import { MAX_HELPER_APPLY_WORK_BYTES } from "../src/constants";
+import { MAX_HELPER_APPLY_WORK_BYTES, MAX_HELPER_SINGLE_CHAT_BYTES } from "../src/constants";
 
 const PASSPHRASE = "a sufficiently long test passphrase";
 const PRODUCER: EventProducer = {
@@ -40,6 +40,20 @@ const PRODUCER: EventProducer = {
 };
 
 describe("preparing a helper batch", () => {
+  it("admits one large chat alone without raising the ordinary resource page ceiling", () => {
+    const small: HelperChange = {
+      resourceId: "chat/11111111-1111-4111-8111-111111111111", kind: "chat", operation: "put",
+      eventHash: "a".repeat(64), changeIndex: 0, semanticHash: "b".repeat(64),
+      payload: { deviceId: "source-device", objectId: "c".repeat(64), plainBytes: 1024, compressedBytes: 100 },
+    };
+    const big = { ...small, resourceId: "chat/22222222-2222-4222-8222-222222222222", payload: { ...small.payload!, plainBytes: MAX_HELPER_APPLY_WORK_BYTES + 1 } };
+    const tooBig = { ...big, payload: { ...big.payload, plainBytes: MAX_HELPER_SINGLE_CHAT_BYTES + 1 } };
+    expect(helperMainTesting.boundedHelperTargetPage([big, small])).toEqual([big]);
+    expect(helperMainTesting.boundedHelperTargetPage([small, big])).toEqual([small]);
+    expect(helperMainTesting.boundedHelperTargetPage([tooBig, small])).toEqual([small]);
+    expect(helperMainTesting.boundedHelperTargetPage([{ ...big, kind: "profile" }, small])).toEqual([small]);
+  });
+
   it("grandfathers only ordinary legacy checkpoint markers", () => {
     const parentVersionId = `${"1".repeat(64)}#0`;
     const markerDeviceId = "legacy-marker-device";

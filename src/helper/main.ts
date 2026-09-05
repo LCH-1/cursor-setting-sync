@@ -15,6 +15,7 @@ import {
   APPLY_FAILURE_BLOCK_PREFIX,
   HELPER_REQUEST_VERSION,
   MAX_HELPER_APPLY_WORK_BYTES,
+  MAX_HELPER_SINGLE_CHAT_BYTES,
   RESTART_TO_APPLY_TITLE,
 } from "../constants";
 import { GLOBAL_DATABASE_KINDS } from "../types";
@@ -62,6 +63,8 @@ import {
   type PortableChatSnapshot,
 } from "../chat/stateVscdb";
 import { verifyPortableChatContinuationClosure } from "../chat/continuationClosure";
+import { buildChatTipEnrichmentCandidateIndex } from "../chat/enrichment";
+import { migrateOfflineChatTips } from "./chatMigration";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
 import {
@@ -113,6 +116,7 @@ import {
 const execFileAsync = promisify(execFile);
 const MAX_FINAL_EXPORT_CHAT_SCAN_PASSES = 32;
 const MAX_FINAL_EXPORT_PROFILE_SCAN_PASSES = 256;
+const FINAL_EXPORT_RECENT_LOCAL_CHATS = 8;
 
 function finalExportPassLimit(adapter: ResourceAdapter): number {
   return adapter.id === "settings" || adapter.id === "extensions"
@@ -400,7 +404,23 @@ async function executeRequest(
     );
   }
 
-  const exported = await exportFinalChanges(request, repository, heartbeat);
+  let exported = await exportFinalChanges(request, repository, heartbeat);
+  if (request.syncOptions.syncChat) {
+    const migration = await migrateOfflineChatTips(repository, request, ensureExclusiveAccess, heartbeat);
+    exported.warnings.push(...migration.warnings);
+    if (migration.published > 0) {
+      // Re-verify only chat targets created by migration; workspace backups and
+      // other adapters already drained once and must not restart for each page.
+      const chats = await exportFinalChanges(request, repository, heartbeat, true);
+      exported = {
+        warnings: [...exported.warnings, ...chats.warnings],
+        notices: [...exported.notices, ...chats.notices],
+        protectedLocalResourceIds: [...new Set([...exported.protectedLocalResourceIds, ...chats.protectedLocalResourceIds])],
+        incompleteKinds: [...new Set([...exported.incompleteKinds, ...chats.incompleteKinds])],
+        verifiedApplyVersionIds: [...new Set([...exported.verifiedApplyVersionIds, ...chats.verifiedApplyVersionIds])],
+      };
+    }
+  }
   // Everything that means a resource did NOT reach the repository: a git
   // transport failure, an adapter that threw during the shutdown scan, or a
   // snapshot dropped for exceeding the payload limit. These are reported apart
@@ -902,6 +922,7 @@ async function exportFinalChanges(
   request: HelperRequest,
   repository: SyncRepository,
   heartbeat: () => void = () => {},
+  chatOnly = false,
 ): Promise<FinalExportOutcome> {
   const reconciler = new EventReconciler();
   const checkpoint = await absorbedCheckpointManifest(repository);
@@ -914,7 +935,7 @@ async function exportFinalChanges(
     request,
     repository,
     preResult.projections,
-  );
+  ).filter((change) => !chatOnly || change.kind === "chat");
   const conflictedResources = new Set(
     repository.state.conflicts
       .filter((conflict) => conflict.resolvedAt === undefined)
@@ -930,6 +951,20 @@ async function exportFinalChanges(
       (change) => chatTipMayReplaceLocalCore(change),
     )
     .map((change) => change.resourceId);
+  for (const candidate of buildChatTipEnrichmentCandidateIndex(repository.state.tips)) {
+    if (candidate.tip.deviceId === repository.state.device.deviceId) {
+      forceCoreVerificationResourceIds.push(candidate.resourceId);
+    }
+  }
+  // Cursor can finish a message without moving header time/count. Check a
+  // small recent local set at shutdown instead of waiting for the long idle audit.
+  const recentLocalChats = preResult.projections
+    .filter(({ resourceId, tip }) => tip.kind === "chat" && tip.operation === "put" &&
+      tip.deviceId === repository.state.device.deviceId &&
+      repository.state.projections[resourceId]?.kind === "chat")
+    .sort((left, right) => Number(right.tip.metadata?.lastUpdatedAt ?? 0) - Number(left.tip.metadata?.lastUpdatedAt ?? 0))
+    .slice(0, FINAL_EXPORT_RECENT_LOCAL_CHATS);
+  forceCoreVerificationResourceIds.push(...recentLocalChats.map(({ resourceId }) => resourceId));
   // A queued incoming tip may overwrite a local edit whose mtime was restored
   // by a copy/sync tool. Timestamp and persisted file identity shortcuts are
   // disabled for these exact targets during the pre-apply export.
@@ -989,6 +1024,7 @@ async function exportFinalChanges(
   let stateChatAdapter: StateVscdbChatAdapter | null = null;
   if (request.syncOptions.syncChat) {
     stateChatAdapter = new StateVscdbChatAdapter(request.paths, {
+      offline: true,
       // A fresh shutdown helper must verify changed headers and message counts,
       // but it must not start the extension host's periodic equal-count sweep
       // from zero on every launch. That full sweep is stateful polling work.
@@ -1022,6 +1058,9 @@ async function exportFinalChanges(
   const incompleteKinds = new Set<ResourceKind>();
   const publishedEventHashes = new Set<string>();
   for (const adapter of adapters) {
+    if (chatOnly && adapter !== stateChatAdapter) {
+      continue;
+    }
     adapter.setMaxPayloadBytes?.(request.syncOptions.maxPayloadBytes);
     const drainsBounded = typeof adapter.scanStatus === "function";
     let scanKnown = drainsBounded
@@ -1614,9 +1653,17 @@ function boundedHelperTargetPage(
         !Number.isSafeInteger(declaredBytes) ||
         declaredBytes === undefined ||
         declaredBytes < 0 ||
-        declaredBytes > MAX_HELPER_APPLY_WORK_BYTES ||
-        totalBytes + declaredBytes > MAX_HELPER_APPLY_WORK_BYTES
+        declaredBytes > helperPayloadLimit(change.kind)
       ) {
+        continue;
+      }
+      if (declaredBytes > MAX_HELPER_APPLY_WORK_BYTES) {
+        if (selected.length === 0) {
+          return [change];
+        }
+        continue;
+      }
+      if (totalBytes + declaredBytes > MAX_HELPER_APPLY_WORK_BYTES) {
         continue;
       }
       totalBytes += declaredBytes;
@@ -1624,6 +1671,10 @@ function boundedHelperTargetPage(
     selected.push(change);
   }
   return selected;
+}
+
+function helperPayloadLimit(kind: ResourceKind): number {
+  return kind === "chat" ? MAX_HELPER_SINGLE_CHAT_BYTES : MAX_HELPER_APPLY_WORK_BYTES;
 }
 
 export async function prepareChanges(
@@ -1654,14 +1705,16 @@ export async function prepareChanges(
       if (
         !Number.isSafeInteger(declaredBytes) ||
         declaredBytes < 0 ||
-        declaredBytes > batchLimit
+        declaredBytes > helperPayloadLimit(change.kind)
       ) {
-        const message = `the authenticated payload size ${declaredBytes} exceeds the fixed ${batchLimit} byte helper work limit`;
+        const message = `the authenticated payload size ${declaredBytes} exceeds the fixed ${helperPayloadLimit(change.kind)} byte helper work limit`;
         skipped.push(`${change.resourceId}: ${message}`);
         failureByResourceId[change.resourceId] = message;
         continue;
       }
-      if (preparedCount >= 256 || totalBytes + declaredBytes > batchLimit) {
+      if (preparedCount >= 256 || (declaredBytes > batchLimit
+        ? preparedCount > 0
+        : totalBytes + declaredBytes > batchLimit)) {
         skipped.push(
           `${change.resourceId}: deferred to a later bounded helper apply page; it stays queued`,
         );
@@ -1711,7 +1764,7 @@ export async function prepareChanges(
       });
       preparedCount += 1;
     } else {
-      if (preparedCount >= 256) {
+      if (preparedCount >= 256 || totalBytes > batchLimit) {
         skipped.push(
           `${change.resourceId}: deferred to a later bounded helper apply page; it stays queued`,
         );
@@ -1777,7 +1830,7 @@ async function preparedChatContinuationFailure(
   const closure = await verifyPortableChatContinuationClosure(snapshot, {
     limits: {
       maxNodes: 4_096,
-      maxBytes: MAX_HELPER_APPLY_WORK_BYTES,
+      maxBytes: MAX_HELPER_SINGLE_CHAT_BYTES,
       maxDepth: 256,
       maxProtobufDepth: 64,
     },
@@ -1884,6 +1937,12 @@ function boundedShutdownApplyPage(
   let totalBytes = 0;
   for (const change of candidates) {
     const payloadBytes = change.payload?.plainBytes ?? 0;
+    if (change.kind === "chat" && payloadBytes > MAX_HELPER_APPLY_WORK_BYTES && payloadBytes <= MAX_HELPER_SINGLE_CHAT_BYTES) {
+      if (changes.length === 0) {
+        return [change];
+      }
+      continue;
+    }
     if (
       changes.length >= 256 ||
       (payloadBytes <= MAX_HELPER_APPLY_WORK_BYTES &&

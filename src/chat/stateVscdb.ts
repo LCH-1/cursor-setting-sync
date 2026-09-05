@@ -1,6 +1,7 @@
 import type { DatabaseSync } from "../platform/sqlite";
 import { openDatabase } from "../platform/sqlite";
 import { createHash } from "node:crypto";
+import { MAX_HELPER_SINGLE_CHAT_BYTES } from "../constants";
 import { open } from "node:fs/promises";
 import type {
   LocalProjection,
@@ -305,6 +306,8 @@ export type PortableChatSnapshot =
   | PortableChatSnapshotV2;
 
 export interface StateVscdbChatAdapterOptions {
+  /** Only the closed-Cursor helper may materialize one larger chat at a time. */
+  offline?: boolean;
   /** Narrow performance-test seam; production leaves this undefined. */
   onBubbleCountProbe?: () => void;
   /** Narrow idle-fast-path test seam; production leaves this undefined. */
@@ -388,17 +391,18 @@ export function portableChatConversationStates(
 export function scanPortableChatConversationStates(
   snapshot: PortableChatSnapshot,
 ): PortableChatConversationStateScan {
-  const states: string[] = [];
-  const budget = createJsonStructureBudget();
-  if (!appendPortableConversationState(snapshot.composerData, budget, states)) {
+  // Each parsed row is discarded before the next. Sharing its allocation
+  // budget across all messages made ordinary long histories permanently v1.
+  const states = new Set<string>();
+  if (!appendPortableConversationState(snapshot.composerData, createJsonStructureBudget(), states)) {
     return { status: "structure-limit" };
   }
   for (const row of snapshot.bubbles) {
-    if (!appendPortableConversationState(row, budget, states)) {
+    if (!appendPortableConversationState(row, createJsonStructureBudget(), states)) {
       return { status: "structure-limit" };
     }
   }
-  return { status: "complete", states };
+  return { status: "complete", states: [...states] };
 }
 
 /**
@@ -429,7 +433,7 @@ export function portableChatCoreHash(snapshot: PortableChatSnapshot): string {
 function appendPortableConversationState(
   row: PortableKvRow,
   budget: JsonStructureBudget,
-  states: string[],
+  states: Set<string>,
 ): boolean {
   if (row.valueType === "null") {
     return true;
@@ -444,7 +448,7 @@ function appendPortableConversationState(
   }
   const state = conversationStateFromJsonText(text);
   if (state !== null) {
-    states.push(state);
+    states.add(state);
   }
   return true;
 }
@@ -1227,7 +1231,9 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         const maxPayloadBytes = this.maxPayloadBytes;
         const headerMaterializationLimit = Math.min(
           maxPayloadBytes ?? MAX_UNCONFIGURED_HEADER_MATERIALIZE_BYTES,
-          MAX_CHAT_INTERACTIVE_CAPTURE_BYTES,
+          this.options.offline === true
+            ? MAX_HELPER_SINGLE_CHAT_BYTES
+            : MAX_CHAT_INTERACTIVE_CAPTURE_BYTES,
         );
         if (
           maxPayloadBytes !== null &&
@@ -1250,6 +1256,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
                   warning: interactiveChatCaptureWarning(
                     resourceId,
                     byteLength,
+                    headerMaterializationLimit,
                   ),
                 }
               : {}),
@@ -1469,6 +1476,9 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
             this.options.onChatCoreHashYield,
             this.options.onChatCoreValueChunkRead,
             this.options.onChatCoreMetadataRow,
+            this.options.offline === true
+              ? MAX_HELPER_SINGLE_CHAT_BYTES
+              : MAX_CHAT_INTERACTIVE_CAPTURE_BYTES,
           );
           // Deep verification can materialize several megabytes of SQLite
           // text and canonical JSON for one conversation. Yield between those
@@ -1570,6 +1580,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
                     warning: interactiveChatCaptureWarning(
                       resourceId,
                       captured.byteLength,
+                      maxPayloadBytes,
                     ),
                   }
                 : {}),
@@ -2480,6 +2491,7 @@ async function captureChat(
   onCoreHashYield?: () => void,
   onCoreValueChunkRead?: () => void,
   onCoreMetadataRow?: () => void,
+  captureWorkLimit = MAX_CHAT_INTERACTIVE_CAPTURE_BYTES,
 ): Promise<ChatCapture> {
   database.exec("BEGIN");
   try {
@@ -2580,13 +2592,13 @@ async function captureChat(
         metadataSummary,
         liveBubbleCount ?? 0,
       );
-      if (rawCoreLowerBound > MAX_CHAT_INTERACTIVE_CAPTURE_BYTES) {
+      if (rawCoreLowerBound > captureWorkLimit) {
         const oversized = opaqueOversizedChatCore(
           header,
           composerDataMetadata,
           liveBubbleCount ?? 0,
           rawCoreLowerBound,
-          interactiveChatCaptureWarning(resourceId, rawCoreLowerBound),
+          interactiveChatCaptureWarning(resourceId, rawCoreLowerBound, captureWorkLimit),
         );
         resolveInitialGraphPriority(agentKvBudget, resourceId);
         database.exec("COMMIT");
@@ -3066,23 +3078,22 @@ function collectRawConversationStates(
   composerData: RawKvRow,
   bubbles: readonly RawKvRow[],
 ): PortableChatConversationStateScan {
-  const states: string[] = [];
-  const budget = createJsonStructureBudget();
-  if (!appendRawConversationState(composerData, budget, states)) {
+  const states = new Set<string>();
+  if (!appendRawConversationState(composerData, createJsonStructureBudget(), states)) {
     return { status: "structure-limit" };
   }
   for (const row of bubbles) {
-    if (!appendRawConversationState(row, budget, states)) {
+    if (!appendRawConversationState(row, createJsonStructureBudget(), states)) {
       return { status: "structure-limit" };
     }
   }
-  return { status: "complete", states };
+  return { status: "complete", states: [...states] };
 }
 
 function appendRawConversationState(
   row: RawKvRow,
   budget: JsonStructureBudget,
-  states: string[],
+  states: Set<string>,
 ): boolean {
   let text: string;
   if (row.valueType === "text" && typeof row.value === "string") {
@@ -3108,7 +3119,7 @@ function appendRawConversationState(
   }
   const state = conversationStateFromJsonText(text);
   if (state !== null) {
-    states.push(state);
+    states.add(state);
   }
   return true;
 }
@@ -3135,7 +3146,7 @@ async function captureAgentKvPayload(
     return {
       kind: "fallback",
       notice:
-        "Kept one chat on schema v1 because its decoded conversation JSON exceeds the fixed structural parser safety limit; its core conversation remains synchronized.",
+        "Kept one chat on schema v1 because one decoded conversation row exceeds the fixed structural parser safety limit; repository history is retained, but other PCs cannot apply it until continuation is complete.",
     };
   }
   const states = stateScan.states;
@@ -3188,7 +3199,7 @@ async function captureAgentKvPayload(
   if (walked.limitReasons.length > 0) {
     return {
       kind: "fallback",
-      notice: `Kept one chat on schema v1 because its agentKv reachability exceeded the ${walked.limitReasons.join(", ")} safety limit; its core conversation remains synchronized.`,
+      notice: `Kept one chat on schema v1 because its agentKv reachability exceeded the ${walked.limitReasons.join(", ")} safety limit; repository history is retained, but other PCs cannot apply it until continuation is complete.`,
     };
   }
   if (
@@ -3197,7 +3208,7 @@ async function captureAgentKvPayload(
     return {
       kind: "fallback",
       notice:
-        "Kept one chat on schema v1 because its conversationState format is not safely readable; its core conversation remains synchronized.",
+        "Kept one chat on schema v1 because its conversationState format is not safely readable; repository history is retained, but other PCs cannot apply it until continuation is complete.",
     };
   }
   const blobs: PortableKvRow[] = walked.blobs.map((blob) => {
@@ -4059,15 +4070,19 @@ function bodylessChatsWarning(composerIds: readonly string[]): string {
 function interactiveChatCaptureWarning(
   resourceId: string,
   byteLength: number,
+  workLimit = MAX_CHAT_INTERACTIVE_CAPTURE_BYTES,
 ): string {
   const measuredMiB = (byteLength / 1024 / 1024).toFixed(1);
-  const limitMiB = MAX_CHAT_INTERACTIVE_CAPTURE_BYTES / 1024 / 1024;
+  const limitMiB = workLimit / 1024 / 1024;
+  const offline = workLimit > MAX_CHAT_INTERACTIVE_CAPTURE_BYTES;
   return (
     `${resourceId} is at least ${measuredMiB} MiB and exceeds the fixed ` +
-    `${limitMiB} MiB live chat-capture safety budget, so it was not ` +
+    `${limitMiB} MiB ${offline ? "offline" : "live"} chat-capture safety budget, so it was not ` +
     "materialized or published automatically. Other resources still sync. " +
-    "Use the bounded Repair/Restore workflow for this unusually large chat, " +
-    'or disable "cursorSettingSync.syncChat" if it should remain local.'
+    (offline
+      ? "This chat remains local; it cannot be captured within the offline safety limit."
+      : `The shutdown helper automatically retries one chat at a time up to ${MAX_HELPER_SINGLE_CHAT_BYTES / 1024 / 1024} MiB, ` +
+        "subject to the configured payload and continuation safety limits.")
   );
 }
 
@@ -4079,9 +4094,8 @@ function interactiveChatRowWorkWarning(
     `${resourceId} has more than ${MAX_CHAT_CORE_METADATA_ROWS.toLocaleString("en-US")} ` +
     `conversation rows (at least ${observedRows.toLocaleString("en-US")} observed) ` +
     "and exceeds the fixed live chat-capture work budget, so its values were " +
-    "not read or published automatically. Other resources still sync. Use the " +
-    "bounded Repair/Restore workflow for this unusually large chat, or disable " +
-    '"cursorSettingSync.syncChat" if it should remain local.'
+    "not read or published automatically. Other resources still sync. " +
+    "This chat remains local; the shutdown helper enforces the same row limit."
   );
 }
 

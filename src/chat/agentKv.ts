@@ -758,6 +758,8 @@ const conversationStateFields: { [fieldNumber: number]: SchemaFieldRule } = {
   34: lengthField(),
   35: lengthField(),
   36: lengthField(),
+  // Cursor 3.18: message_count_at_last_compaction is a uint32, not a blob edge.
+  37: varintField(),
 };
 
 const selectedContextFields = opaqueLengthFields([
@@ -869,6 +871,9 @@ const AGENT_KV_SCHEMAS: Readonly<Record<AgentKvSchemaName, AgentKvSchema>> = {
       22: lengthField(),
       23: lengthField(),
       24: varintField(),
+      // Cursor 3.18 adds uint64 started_at_ms / completed_at_ms timestamps.
+      25: varintField(),
+      26: varintField(),
     },
   },
   "selected-context": { fields: selectedContextFields },

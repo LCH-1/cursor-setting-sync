@@ -515,6 +515,73 @@ describe("agentKv conversation graph", () => {
     }
   });
 
+  it("retains the full graph with Cursor 3.18 compaction and user-message timestamps", async () => {
+    const leaf = opaqueFixture("retained conversation context");
+    const priorState = bytesField(1, Buffer.from(leaf.id, "hex"));
+    const priorStateId = sha256(priorState);
+    const user = Buffer.concat([
+      bytesField(10, Buffer.from(priorStateId, "hex")),
+      varint(25n * 8n),
+      varint(1788500000000n),
+      varint(26n * 8n),
+      varint(1788500237755n),
+    ]);
+    const userId = sha256(user);
+    const turn = bytesField(1, bytesField(1, Buffer.from(userId, "hex")));
+    const turnId = sha256(turn);
+    const serializedState = state(Buffer.concat([
+      bytesField(8, Buffer.from(turnId, "hex")),
+      varint(37n * 8n),
+      varint(967n),
+    ]));
+    const materialized = [
+      leaf,
+      { id: priorStateId, bytes: priorState },
+      { id: userId, bytes: user },
+      { id: turnId, bytes: turn },
+    ];
+    const lookup = vi.fn(lookupFrom(new Map(
+      materialized.map(({ id, bytes }) => [
+        key(id), { status: "found", key: key(id), bytes },
+      ]),
+    )));
+
+    const result = await walkAgentKvReachability(serializedState, lookup);
+
+    expect(result.complete).toBe(true);
+    expect(result.limitReasons).toEqual([]);
+    expect(result.blobs.map(({ id }) => id).sort()).toEqual(
+      materialized.map(({ id }) => id).sort(),
+    );
+    expect(lookup).toHaveBeenCalledTimes(materialized.length);
+  });
+
+  it.each([37, 38])("refuses non-scalar or unknown conversation field %i", (field) => {
+    const result = extractAgentKvRootIds(state(bytesField(field, Buffer.alloc(32))));
+
+    expect(result.complete).toBe(false);
+    expect(result.limitReasons).toEqual(["schema"]);
+    expect(result.roots).toEqual([]);
+  });
+
+  it.each([25, 26, 27])("refuses non-scalar or unknown user-message field %i", async (field) => {
+    const user = bytesField(field, Buffer.alloc(32));
+    const userId = sha256(user);
+    const turn = bytesField(1, bytesField(1, Buffer.from(userId, "hex")));
+    const turnId = sha256(turn);
+    const result = await walkAgentKvReachability(
+      state(bytesField(8, Buffer.from(turnId, "hex"))),
+      lookupFrom(new Map([
+        [key(turnId), { status: "found", key: key(turnId), bytes: turn }],
+        [key(userId), { status: "found", key: key(userId), bytes: user }],
+      ])),
+    );
+
+    expect(result.complete).toBe(false);
+    expect(result.limitReasons).toEqual(["schema"]);
+    expect(result.visitedNodes).toBe(2);
+  });
+
   it("fails closed on an unknown conversation schema field without fabricating an ID", () => {
     const arbitrary32 = Buffer.alloc(32, 0x7a);
 

@@ -71,6 +71,26 @@ afterEach(async () => {
 });
 
 describe("manager repository-tip chat enrichment", () => {
+  it("enriches many small decoded rows without exhausting a cross-row JSON allocation budget", async () => {
+    const repository = await createRepository();
+    const source = legacyChat(composer(365), 4_000);
+    const minified = JSON.stringify({ values: Array(20).fill(0) });
+    source.bubbles = source.bubbles.map((bubble) => row(bubble.key, minified));
+    await publishChat(repository, source);
+    const result = await enrichCurrentChatTips(repository, {
+      cursor: initialCursor(),
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv: async () => ({ agentKv: payload([], [], []) }),
+    });
+    expect(result).toMatchObject({ attempted: 1, published: 1, warnings: [] });
+    await reconcile(repository);
+    expect(onlyTip(repository, `chat/${source.composerId}`).metadata).toMatchObject({
+      chatSnapshotSchemaVersion: 2,
+      agentKvMissingCount: 0,
+      agentKvEnrichmentAppliesCore: true,
+    });
+  });
+
   it("does not replace an automatic repair recipe with blob-only enrichment", async () => {
     const repository = await createRepository();
     const composerId = composer(99);
@@ -1390,10 +1410,10 @@ describe("manager repository-tip chat enrichment", () => {
       },
     ],
     [
-      "aggregate many-small decoded rows",
+      "one overly wide decoded row",
       () => {
-        const source = legacyChat(composer(365), 4_000);
-        const minified = `[${Array.from({ length: 20 }, () => "0").join(",")}]`;
+        const source = legacyChat(composer(365), 1);
+        const minified = `[${Array.from({ length: 65_536 }, () => "0").join(",")}]`;
         source.bubbles = source.bubbles.map((bubble) =>
           row(bubble.key, minified)
         );

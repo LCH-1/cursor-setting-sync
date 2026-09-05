@@ -348,7 +348,7 @@ describe("a conversation that grows after its header stops changing", () => {
       parsePortableChatSnapshot(result.snapshots[0]!.content).schemaVersion,
     ).toBe(1);
     expect(result.notices?.join(" ")).toContain(
-      "decoded conversation JSON exceeds",
+      "decoded conversation row exceeds",
     );
     expect(result.warnings).toEqual([]);
   });

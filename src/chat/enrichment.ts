@@ -1,4 +1,5 @@
 import { stat } from "node:fs/promises";
+import { MAX_HELPER_SINGLE_CHAT_BYTES } from "../constants";
 import type { SyncRepository } from "../protocol/repository";
 import { canonicalBytes, sha256 } from "../protocol/canonical";
 import {
@@ -114,6 +115,8 @@ export type CollectChatTipAgentKv = (
 ) => Promise<ChatTipAgentKvCollection | null>;
 
 export interface ChatTipEnrichmentOptions {
+  /** The offline worker releases each large source/output pair before continuing. */
+  offline?: boolean;
   cursor: ChatTipEnrichmentCursor;
   maxPayloadBytes: number;
   collectAgentKv: CollectChatTipAgentKv;
@@ -200,6 +203,7 @@ export async function enrichCurrentChatTips(
   const warnings: string[] = [];
   const plans: PlannedEnrichment[] = [];
   let retainedPlanBytes = 0;
+  const workLimit = enrichmentWorkLimit(options);
 
   for (const candidate of candidates) {
     if (options.tipAllowed?.(candidate.tip) === false) {
@@ -208,7 +212,7 @@ export async function enrichCurrentChatTips(
     rememberEnrichmentAttempt(candidate, options);
     const declaredSourceBytes = candidate.tip.payload?.plainBytes;
     const availableWorkBytes =
-      CHAT_TIP_ENRICHMENT_MAX_WORK_BYTES - retainedPlanBytes;
+      workLimit - retainedPlanBytes;
     if (
       declaredSourceBytes === undefined ||
       declaredSourceBytes >= Math.ceil(availableWorkBytes / 2)
@@ -216,7 +220,7 @@ export async function enrichCurrentChatTips(
       const permanentlyTooLarge =
         declaredSourceBytes === undefined ||
         declaredSourceBytes >=
-          Math.ceil(CHAT_TIP_ENRICHMENT_MAX_WORK_BYTES / 2);
+          Math.ceil(workLimit / 2);
       if (permanentlyTooLarge) {
         rememberPolicyStableEnrichmentAttempt(candidate, options);
       } else {
@@ -225,7 +229,7 @@ export async function enrichCurrentChatTips(
         forgetEnrichmentAttempt(candidate, options);
       }
       warnings.push(
-        `Deferred agent blob enrichment for ${candidate.resourceId}: its authenticated source and rebuilt payload cannot fit the fixed ${CHAT_TIP_ENRICHMENT_MAX_WORK_BYTES}-byte interactive work budget. The visible chat remains synchronized, but continuation enrichment needs a smaller source snapshot or a future bounded offline migration.`,
+        `Deferred agent blob enrichment for ${candidate.resourceId}: its authenticated source and rebuilt payload cannot fit the fixed ${workLimit}-byte ${options.offline === true ? "offline" : "interactive"} work budget. Repository history is retained; continuation requires a complete snapshot. Large chats are retried automatically by the shutdown helper.`,
       );
       continue;
     }
@@ -551,7 +555,7 @@ async function planChatTipEnrichment(
   }
 
   if (isSamePayloadCoreMigration(candidate.tip, source)) {
-    const closure = await verifyEnrichmentContinuationClosure(source);
+    const closure = await verifyEnrichmentContinuationClosure(source, options);
     if (closure.status === "complete") {
       return plannedEnrichment(
         candidate,
@@ -666,7 +670,7 @@ async function planChatTipEnrichment(
       throw new Error("enrichment changed the repository chat core");
     }
     enriched = parsed;
-    const closure = await verifyEnrichmentContinuationClosure(enriched);
+    const closure = await verifyEnrichmentContinuationClosure(enriched, options);
     if (closure.status === "invalid" || closure.status === "unknown") {
       throw new Error(
         `enriched continuation closure is ${closure.status}: ${closure.reason}`,
@@ -770,6 +774,7 @@ function sameStrings(
 
 async function verifyEnrichmentContinuationClosure(
   snapshot: PortableChatSnapshotV2,
+  options: ChatTipEnrichmentOptions,
 ) {
   return verifyPortableChatContinuationClosure(snapshot, {
     limits: {
@@ -778,7 +783,7 @@ async function verifyEnrichmentContinuationClosure(
         DEFAULT_AGENT_KV_WALK_LIMITS.maxNodes,
       ),
       maxBytes: Math.min(
-        CHAT_TIP_ENRICHMENT_MAX_WORK_BYTES,
+        options.offline === true ? MAX_HELPER_SINGLE_CHAT_BYTES : CHAT_TIP_ENRICHMENT_MAX_WORK_BYTES,
         DEFAULT_AGENT_KV_WALK_LIMITS.maxBytes,
       ),
       maxDepth: DEFAULT_AGENT_KV_WALK_LIMITS.maxDepth,
@@ -911,14 +916,20 @@ function enrichmentAttemptKey(
   candidate: ChatTipEnrichmentCandidate,
   options: ChatTipEnrichmentOptions,
 ): string {
-  return `${candidate.tip.versionId}\n${options.databaseGeneration ?? ""}\n${options.maxPayloadBytes}\n${CHAT_TIP_ENRICHMENT_MAX_WORK_BYTES}`;
+  return `${candidate.tip.versionId}\n${options.databaseGeneration ?? ""}\n${options.maxPayloadBytes}\n${enrichmentWorkLimit(options)}`;
 }
 
 function enrichmentPolicyAttemptKey(
   candidate: ChatTipEnrichmentCandidate,
   options: ChatTipEnrichmentOptions,
 ): string {
-  return `tip-policy\n${candidate.tip.versionId}\n${options.maxPayloadBytes}\n${CHAT_TIP_ENRICHMENT_MAX_WORK_BYTES}`;
+  return `tip-policy\n${candidate.tip.versionId}\n${options.maxPayloadBytes}\n${enrichmentWorkLimit(options)}`;
+}
+
+function enrichmentWorkLimit(options: ChatTipEnrichmentOptions): number {
+  return options.offline === true
+    ? 2 * MAX_HELPER_SINGLE_CHAT_BYTES
+    : CHAT_TIP_ENRICHMENT_MAX_WORK_BYTES;
 }
 
 function emptyLegacyAgentKvPayload(
