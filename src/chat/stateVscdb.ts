@@ -1051,11 +1051,6 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
             (settlement === undefined &&
               (this.forcedCoreVerificationResourceIds.has(resourceId) ||
                 projection?.requiresAgentKvRecapture === true));
-          const sourceTimestamp =
-            settlement?.sourceTimestamp ??
-            (projection?.kind === "chat"
-              ? projection.sourceTimestamp
-              : undefined);
           const sourceBubbleCount =
             settlement?.sourceBubbleCount ??
             (projection?.kind === "chat"
@@ -1064,9 +1059,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           const sourceHeaderMatches =
             settlement !== undefined
               ? settlement.sourceTimestamp === listedTimestamp
-              : listedTimestamp !== null &&
-                projection?.kind === "chat" &&
-                sourceTimestamp === listedTimestamp;
+              : projectionTimestampMatches(projection, listedTimestamp);
           if (
             priorityBodyRead ||
             !sourceHeaderMatches ||
@@ -1387,10 +1380,6 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           // form; only the expensive body read is suppressed.
           this.observeProjectionFingerprint(resourceId, projection);
         }
-        // Only a timestamp that is a real number carries change information, and
-        // the projection has to already be a chat for the comparison to mean
-        // anything. Anything else falls through to the transactional capture,
-        // which is where the authoritative comparison still lives.
         if (
           deepVerificationIds.has(resourceId) &&
           !deepVerificationRequired
@@ -1409,9 +1398,6 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           deepVerificationRequired ||
           projectionChangedSinceObserved ||
           headerChangedSinceProjection;
-        const sourceTimestamp =
-          settlement?.sourceTimestamp ??
-          (projection?.kind === "chat" ? projection.sourceTimestamp : undefined);
         const sourceBubbleCount =
           settlement?.sourceBubbleCount ??
           (projection?.kind === "chat"
@@ -1421,9 +1407,8 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           settlement !== undefined
             ? settlement.sourceHeaderFingerprint === headerFingerprint &&
               settlement.sourceTimestamp === listedTimestamp
-            : listedTimestamp !== null &&
-              projection?.kind === "chat" &&
-              sourceTimestamp === listedTimestamp &&
+            : projection?.kind === "chat" &&
+              projectionTimestampMatches(projection, listedTimestamp) &&
               projection.sourceHeaderFingerprint === headerFingerprint;
         // Cursor usually advances lastUpdatedAt with a header edit, but not for
         // every column in every release. A changed row fingerprint must
@@ -3738,6 +3723,21 @@ function portableRow(row: RawKvRow): PortableKvRow {
       row.valueType,
     )}.`,
   );
+}
+
+function projectionTimestampMatches(
+  projection: LocalProjection | undefined,
+  listedTimestamp: number | null,
+): boolean {
+  if (projection?.kind !== "chat") {
+    return false;
+  }
+  // Timestamp absence is stable only after a full core capture; legacy
+  // projections without that baseline must still take the body-read path.
+  return listedTimestamp === null
+    ? projection.sourceTimestamp === undefined &&
+        /^[0-9a-f]{64}$/.test(projection.sourceChatCoreHash ?? "")
+    : projection.sourceTimestamp === listedTimestamp;
 }
 
 /** A SQLite value usable as a change timestamp, or null if it is not one. */

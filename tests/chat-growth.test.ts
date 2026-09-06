@@ -29,11 +29,17 @@ import type { LocalProjection, ResourceSnapshot, ResourceTip } from "../src/type
 
 const { DatabaseSync } = sqlite;
 const temporaryRoots: string[] = [];
+const temporaryDatabases: InstanceType<typeof DatabaseSync>[] = [];
 const COMPOSER = "00000000-0000-4000-8000-00000000000a";
 /** Cursor stamps this once, near the start, and then leaves it alone. */
 const FROZEN_TIMESTAMP = 1785492730565;
 
 afterEach(async () => {
+  for (const database of temporaryDatabases.splice(0)) {
+    if (database.isOpen) {
+      database.close();
+    }
+  }
   await Promise.all(
     temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -2496,6 +2502,152 @@ describe("a conversation that grows after its header stops changing", () => {
     database.close();
   });
 
+  it("keeps NULL timestamp chats cheap across unrelated WAL commits", async () => {
+    const { paths, database } = await createGlobalDatabase();
+    database.exec("PRAGMA journal_mode=WAL");
+    insertHeader(database, COMPOSER, null);
+    insertKv(database, `composerData:${COMPOSER}`, "{}");
+    const bodies = vi.fn();
+    const countProbes = vi.fn();
+    const adapter = new StateVscdbChatAdapter(paths, {
+      periodicDeepVerification: false,
+      onChatBodyCapture: bodies,
+      onBubbleCountProbe: countProbes,
+    });
+    const known = await settleKnownChat(adapter);
+    bodies.mockClear();
+    countProbes.mockClear();
+    for (let pass = 0; pass < 4; pass += 1) {
+      insertKv(database, "unrelated:heartbeat", String(pass));
+      expect((await adapter.scan(known)).snapshots).toHaveLength(0);
+    }
+    expect(countProbes).toHaveBeenCalled();
+    expect(bodies).not.toHaveBeenCalled();
+    database.close();
+  });
+
+  it("settles 247 NULL timestamp chats without repeating budget-fallback captures", async () => {
+    const { paths, database } = await createGlobalDatabase();
+    database.exec("PRAGMA journal_mode=WAL");
+    for (let index = 0; index < 247; index += 1) {
+      const id = composerIdFor(index + 0x400);
+      insertHeader(database, id, null);
+      insertKv(database, `composerData:${id}`, "{}");
+    }
+    const bodies = vi.fn();
+    const adapter = new StateVscdbChatAdapter(paths, {
+      periodicDeepVerification: false,
+      onChatBodyCapture: bodies,
+    });
+    const known: Record<string, LocalProjection> = {};
+    for (let pass = 0; pass < 20; pass += 1) {
+      const result = await adapter.scan(known);
+      for (const snapshot of result.snapshots) {
+        Object.assign(known, projectionFromSnapshot(snapshot));
+      }
+      if (Object.keys(known).length === 247 && adapter.scanStatus().complete) {
+        break;
+      }
+    }
+    expect(Object.keys(known)).toHaveLength(247);
+    await adapter.scan(known);
+    bodies.mockClear();
+    for (let pass = 0; pass < 10; pass += 1) {
+      insertKv(database, "unrelated:heartbeat", String(pass));
+      const result = await adapter.scan(known);
+      expect(result.snapshots).toHaveLength(0);
+      expect(result.notices?.join(" ") ?? "").not.toContain("graph-work budget");
+    }
+    expect(bodies).not.toHaveBeenCalled();
+    database.close();
+  });
+
+  it("detects bubble growth and header edits under a NULL timestamp", async () => {
+    const { paths, database } = await createGlobalDatabase();
+    insertHeader(database, COMPOSER, null);
+    insertKv(database, `composerData:${COMPOSER}`, "{}");
+    const adapter = new StateVscdbChatAdapter(paths, { periodicDeepVerification: false });
+    let known = await settleKnownChat(adapter);
+    insertKv(database, `bubbleId:${COMPOSER}:b0`, '{"text":"new message"}');
+    const growth = await adapter.scan(known);
+    expect(growth.snapshots).toHaveLength(1);
+    expect(growth.snapshots[0]?.metadata?.bubbleCount).toBe(1);
+    known = projectionFromSnapshot(growth.snapshots[0]!);
+    await adapter.scan(known);
+    database.prepare("UPDATE composerHeaders SET value = ? WHERE composerId = ?")
+      .run('{"name":"changed title"}', COMPOSER);
+    const edited = await adapter.scan(known);
+    expect(edited.snapshots).toHaveLength(1);
+    expect(edited.snapshots[0]?.semanticHash).not.toBe(growth.snapshots[0]?.semanticHash);
+    database.close();
+  });
+
+  it("audits equal-count edits and honors forced verification under a NULL timestamp", async () => {
+    const { paths, database } = await createGlobalDatabase();
+    insertHeader(database, COMPOSER, null);
+    insertKv(database, `composerData:${COMPOSER}`, "{}");
+    insertKv(database, `bubbleId:${COMPOSER}:b0`, '{"text":"old"}');
+    let now = 1_000;
+    const bodies = vi.fn();
+    const adapter = new StateVscdbChatAdapter(paths, { now: () => now, onChatBodyCapture: bodies });
+    let known = await settleKnownChat(adapter);
+    database.prepare("UPDATE cursorDiskKV SET value = ? WHERE key = ?")
+      .run('{"text":"same-count edit"}', `bubbleId:${COMPOSER}:b0`);
+    bodies.mockClear();
+    expect((await adapter.scan(known)).snapshots).toEqual([]);
+    expect(bodies).not.toHaveBeenCalled();
+    now += CHAT_DEEP_VERIFICATION_INTERVAL_MS;
+    const edited = await adapter.scan(known);
+    expect(edited.snapshots).toHaveLength(1);
+    known = projectionFromSnapshot(edited.snapshots[0]!);
+    database.prepare("UPDATE cursorDiskKV SET value = ? WHERE key = ?")
+      .run('{"text":"forced edit"}', `bubbleId:${COMPOSER}:b0`);
+    const forced = await new StateVscdbChatAdapter(paths, {
+      periodicDeepVerification: false,
+      forceCoreVerificationResourceIds: [`chat/${COMPOSER}`],
+    }).scan(known);
+    expect(forced.snapshots).toHaveLength(1);
+    expect(forced.snapshots[0]?.semanticHash).not.toBe(known[`chat/${COMPOSER}`]?.semanticHash);
+    database.close();
+  });
+
+  it.each([undefined, "", "invalid-hash"])("does not trust a NULL timestamp projection with core baseline %s", async (coreHash) => {
+    const { paths, database } = await createGlobalDatabase();
+    insertHeader(database, COMPOSER, null);
+    insertKv(database, `composerData:${COMPOSER}`, "{}");
+    const known = await settleKnownChat(new StateVscdbChatAdapter(paths));
+    if (coreHash === undefined) {
+      delete known[`chat/${COMPOSER}`]!.sourceChatCoreHash;
+    } else {
+      known[`chat/${COMPOSER}`]!.sourceChatCoreHash = coreHash;
+    }
+    const bodies = vi.fn();
+    await new StateVscdbChatAdapter(paths, {
+      periodicDeepVerification: false,
+      onChatBodyCapture: bodies,
+    }).scan(known);
+    expect(bodies).toHaveBeenCalledTimes(1);
+    database.close();
+  });
+
+  it("recaptures numeric to NULL timestamp transitions and back", async () => {
+    const { paths, database } = await createGlobalDatabase();
+    insertHeader(database, COMPOSER, FROZEN_TIMESTAMP);
+    insertKv(database, `composerData:${COMPOSER}`, "{}");
+    const adapter = new StateVscdbChatAdapter(paths, { periodicDeepVerification: false });
+    let known = await settleKnownChat(adapter);
+    for (const timestamp of [null, FROZEN_TIMESTAMP + 1]) {
+      database.prepare("UPDATE composerHeaders SET lastUpdatedAt = ? WHERE composerId = ?")
+        .run(timestamp, COMPOSER);
+      const changed = await adapter.scan(known);
+      expect(changed.snapshots).toHaveLength(1);
+      expect(changed.snapshots[0]?.metadata?.lastUpdatedAt).toBe(timestamp);
+      known = projectionFromSnapshot(changed.snapshots[0]!);
+      expect((await adapter.scan(known)).snapshots).toHaveLength(0);
+    }
+    database.close();
+  });
+
   it("re-emits a late-sweep snapshot until the known projection acknowledges it", async () => {
     const { paths, database } = await createGlobalDatabase();
     database.exec("PRAGMA journal_mode=WAL");
@@ -2649,7 +2801,9 @@ function projectionFromSnapshot(
       kind: "chat",
       semanticHash: snapshot.semanticHash,
       versionId: null,
-      sourceTimestamp: snapshot.metadata?.lastUpdatedAt as number,
+      ...(typeof snapshot.metadata?.lastUpdatedAt === "number"
+        ? { sourceTimestamp: snapshot.metadata.lastUpdatedAt }
+        : {}),
       sourceBubbleCount: snapshot.metadata?.bubbleCount as number,
       ...(typeof snapshot.metadata?.chatCoreHash === "string"
         ? { sourceChatCoreHash: snapshot.metadata.chatCoreHash }
@@ -2726,6 +2880,7 @@ async function createGlobalDatabase(): Promise<{
   temporaryRoots.push(root);
   const globalDatabase = join(root, "state.vscdb");
   const database = new DatabaseSync(globalDatabase);
+  temporaryDatabases.push(database);
   database.exec(
     "CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
   );
