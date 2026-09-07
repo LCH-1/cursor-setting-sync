@@ -23,6 +23,7 @@ import { SyncRepository } from "../src/protocol/repository";
 import type {
   EventProducer,
   ResourceSnapshot,
+  ResourceTip,
   SyncConflict,
 } from "../src/types";
 
@@ -489,6 +490,20 @@ describe("mergeChatSnapshotBuffers", () => {
     expect(fromBase.schemaVersion).toBe(1);
   });
 
+  it.each([null, 500])("keeps enrichment when an identical legacy core is republished at %s", (lastUpdatedAt) => {
+    const options = { bubbles: ["b1"], lastUpdatedAt };
+    const legacy = chat(options);
+    const enriched = chatV2(options, [Buffer.from("preserved-blob")], []);
+    for (const base of [null, legacy]) {
+      for (const ordered of [[legacy, enriched], [enriched, legacy]] as const) {
+        const outcome = mergeChatSnapshotBuffers(base, ordered);
+        expect(outcome.status).toBe("merged");
+        expect(outcome.content).toEqual(enriched);
+        expect(outcome.semanticHash).toBe(sha256(enriched));
+      }
+    }
+  });
+
   it("keeps a v1 winner eligible for enrichment instead of falsely completing an inherited partial graph", () => {
     const missingChildId = sha256("omitted inherited child");
     const inheritedRoot = bytesField(4, Buffer.from(missingChildId, "hex"));
@@ -874,6 +889,161 @@ describe("base-free chat conflicts", () => {
       expect(tips[0]?.metadata?.syncOrigin).toBe("auto-merge");
       const resolved = await repository.readVersion(tips[0]?.versionId ?? "");
       expect(bubbleKeys(resolved.content ?? undefined)).toHaveLength(2);
+    });
+  });
+
+  it.each(["base-free", "three-way"] as const)(
+    "resolves duplicate enriched tips beside a stale capture (%s)",
+    async (mode) => {
+      await withRepository(async (repository) => {
+        const resourceId = `chat/${COMPOSER}`;
+        const options = { bubbles: ["b1"], lastUpdatedAt: null };
+        const legacy = chat(options);
+        const enriched = chatV2(options, [Buffer.from("preserved-blob")], []);
+        let parents: string[] = [];
+        if (mode === "three-way") {
+          const base = await repository.publish(
+            [{ ...chatSnapshot(resourceId, legacy), parents: [] }], [],
+          );
+          parents = [`${base.eventHash}#0`];
+        }
+        for (const content of [enriched, enriched, legacy]) {
+          const snapshot = chatSnapshot(resourceId, content);
+          await repository.publish(
+            [{
+              ...snapshot,
+              parents,
+              metadata: {
+                ...snapshot.metadata,
+                ...(content === enriched ? {
+                  syncOrigin: "agent-kv-enrichment",
+                  chatSnapshotSchemaVersion: 2,
+                  agentKvMissingCount: 0,
+                } : {}),
+              },
+            }], [],
+          );
+        }
+        const conflicts = await reconcileConflicts(repository);
+        const allTipIds = conflicts[0]!.tipVersionIds;
+        expect(allTipIds).toHaveLength(3);
+        const reads = vi.spyOn(repository, "tryReadVersion");
+
+        expect(await autoMergeConflicts(repository, conflicts)).toBe(true);
+        expect(await reconcileConflicts(repository)).toEqual([]);
+        const tip = repository.state.tips[resourceId]![0]!;
+        expect([...tip.parents].sort()).toEqual([...allTipIds].sort());
+        expect(tip.semanticHash).toBe(sha256(enriched));
+        expect(tip.metadata).toMatchObject({
+          chatSnapshotSchemaVersion: 2,
+          agentKvMissingCount: 0,
+        });
+        const duplicateReads = reads.mock.calls.filter(([version]) =>
+          allTipIds.includes(version),
+        );
+        expect(duplicateReads.length).toBeLessThanOrEqual(2);
+      });
+    },
+  );
+
+  it.each([true, false])("preserves the exact enrichment apply contract when only that side changed (appliesCore=%s)", async (appliesCore) => {
+    await withRepository(async (repository) => {
+      const resourceId = `chat/${COMPOSER}`;
+      const options = { bubbles: ["b1"], lastUpdatedAt: 500 };
+      const legacy = chat(options);
+      const enriched = chatV2(options, [Buffer.from("retained-blob")],
+        appliesCore ? [] : [sha256("missing-blob")]);
+      const base = await repository.publish([
+        { ...chatSnapshot(resourceId, legacy), parents: [] },
+      ], []);
+      const baseVersion = `${base.eventHash}#0`;
+      const metadata = {
+        syncOrigin: "agent-kv-enrichment",
+        chatSnapshotSchemaVersion: 2,
+        agentKvEnrichmentAppliesCore: appliesCore,
+        agentKvMissingCount: appliesCore ? 0 : 1,
+        enrichedFromVersionId: baseVersion,
+        enrichedFromSemanticHash: sha256(legacy),
+        originalProducer: { ...PRODUCER },
+      };
+      await repository.publish([
+        { ...chatSnapshot(resourceId, enriched), metadata, parents: [baseVersion] },
+      ], []);
+      await repository.publish([
+        { ...chatSnapshot(resourceId, legacy), parents: [baseVersion] },
+      ], []);
+      const conflicts = await reconcileConflicts(repository);
+      const reads = vi.spyOn(repository, "tryReadVersion");
+      expect(await autoMergeConflicts(repository, conflicts)).toBe(true);
+      expect(reads).toHaveBeenCalledOnce();
+      expect(await reconcileConflicts(repository)).toEqual([]);
+      const tip = repository.state.tips[resourceId]![0]!;
+      expect(tip.metadata).toEqual(metadata);
+      expect((await repository.readVersion(tip.versionId)).content).toEqual(enriched);
+    });
+  });
+
+  it("refuses an oversized enrichment survivor before decrypting it", async () => {
+    await withRepository(async (repository) => {
+      const resourceId = `chat/${COMPOSER}`;
+      const options = { bubbles: ["b1"], lastUpdatedAt: 500 };
+      const legacy = chat(options);
+      const base = await repository.publish([
+        { ...chatSnapshot(resourceId, legacy), parents: [] },
+      ], []);
+      const parents = [`${base.eventHash}#0`];
+      await repository.publish([{
+        ...chatSnapshot(resourceId, chatV2(options, [Buffer.from("blob")], [])),
+        parents,
+        metadata: { syncOrigin: "agent-kv-enrichment", agentKvEnrichmentAppliesCore: false },
+      }], []);
+      await repository.publish([{ ...chatSnapshot(resourceId, legacy), parents }], []);
+      const conflicts = await reconcileConflicts(repository);
+      const survivor = repository.state.tips[resourceId]!.find((tip) =>
+        tip.metadata?.syncOrigin === "agent-kv-enrichment")!;
+      survivor.payload!.plainBytes = 32 * 1024 * 1024 + 1;
+      const reads = vi.spyOn(repository, "tryReadVersion");
+      const publish = vi.spyOn(repository, "publish");
+      const warnings: string[] = [];
+      expect(await autoMergeConflicts(repository, conflicts, () => true,
+        (warning) => warnings.push(warning))).toBe(false);
+      expect(reads).not.toHaveBeenCalled();
+      expect(publish).not.toHaveBeenCalled();
+      expect(warnings).toHaveLength(1);
+      expect(conflicts[0]?.resolvedAt).toBeUndefined();
+    });
+  });
+
+  it("preserves three distinct chat branches for manual resolution", async () => {
+    await withRepository(async (repository) => {
+      const resourceId = `chat/${COMPOSER}`;
+      for (const bubble of ["one", "two", "three"]) {
+        await repository.publish([
+          { ...chatSnapshot(resourceId, chat({ bubbles: [bubble], lastUpdatedAt: 1 })), parents: [] },
+        ], []);
+      }
+      const conflicts = await reconcileConflicts(repository);
+      const reads = vi.spyOn(repository, "tryReadVersion");
+      expect(await autoMergeConflicts(repository, conflicts)).toBe(false);
+      expect(reads).not.toHaveBeenCalled();
+      expect(conflicts[0]?.resolvedAt).toBeUndefined();
+      expect(repository.state.tips[resourceId]).toHaveLength(3);
+    });
+  });
+
+  it("checks compatibility of every duplicate before merging chat tips", async () => {
+    await withRepository(async (repository) => {
+      const resourceId = `chat/${COMPOSER}`;
+      const first = chat({ bubbles: ["b1"], lastUpdatedAt: 1 });
+      const second = chat({ bubbles: ["b2"], lastUpdatedAt: 2 });
+      for (const content of [first, second, second]) {
+        await repository.publish([{ ...chatSnapshot(resourceId, content), parents: [] }], []);
+      }
+      const conflicts = await reconcileConflicts(repository);
+      const canMerge = vi.fn((tips: ResourceTip[]) => tips.length < 3);
+      expect(await autoMergeConflicts(repository, conflicts, canMerge)).toBe(false);
+      expect(canMerge.mock.calls[0]?.[0]).toHaveLength(3);
+      expect(conflicts[0]?.resolvedAt).toBeUndefined();
     });
   });
 

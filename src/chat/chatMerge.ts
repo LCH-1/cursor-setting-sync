@@ -14,6 +14,7 @@ import type {
 import {
   isPortableChatSnapshotV2,
   parsePortableChatSnapshot,
+  portableChatCoreHash,
   scanPortableChatConversationStates,
 } from "./stateVscdb";
 import { extractAgentKvRootIds } from "./agentKv";
@@ -38,6 +39,16 @@ const CHAT_AUTO_MERGE_MAX_JSON_STRUCTURAL_TOKENS = 65_536;
 const CHAT_AUTO_MERGE_MAX_JSON_NESTING_DEPTH = 256;
 /** Fixed punctuation/headroom for the conservative pre-Map output estimate. */
 const CHAT_AUTO_MERGE_CANONICAL_OVERHEAD_BYTES = 4 * 1024;
+
+export const CHAT_OFFLINE_MERGE_MAX_WORK_BYTES = 256 * 1024 * 1024;
+const CHAT_OFFLINE_MERGE_MAX_OUTPUT_BYTES = 128 * 1024 * 1024;
+
+interface ChatMergeLimits {
+  maxWorkBytes: number;
+  maxOutputBytes: number;
+  maxBubbleRowWork: number;
+  maxStructuralTokens: number;
+}
 
 class ChatMergeWorkBudgetError extends Error {}
 
@@ -99,12 +110,45 @@ export function mergeChatSnapshotBuffers(
   ordered: readonly [Buffer, Buffer],
   maxWorkBytes = CHAT_AUTO_MERGE_MAX_WORK_BYTES,
 ): ChatMergeResult {
-  const [first, second] = ordered;
   const workBudget = normalizedChatMergeWorkBudget(maxWorkBytes);
+  if (workBudget === null) {
+    return workBudgetConflict();
+  }
+  return mergeChatBuffers(base, ordered, {
+    maxWorkBytes: workBudget,
+    maxOutputBytes: workBudget,
+    maxBubbleRowWork: CHAT_AUTO_MERGE_MAX_BUBBLE_ROW_WORK,
+    maxStructuralTokens: CHAT_AUTO_MERGE_MAX_JSON_STRUCTURAL_TOKENS,
+  });
+}
+
+/** Only the standalone helper may use this larger, single-conflict envelope. */
+export function mergeOfflineChatSnapshotBuffers(
+  base: Buffer | null,
+  ordered: readonly [Buffer, Buffer],
+): ChatMergeResult {
+  if ([base, ...ordered].some((content) =>
+    content !== null && content.byteLength > CHAT_OFFLINE_MERGE_MAX_OUTPUT_BYTES)) {
+    return workBudgetConflict();
+  }
+  return mergeChatBuffers(base, ordered, {
+    maxWorkBytes: CHAT_OFFLINE_MERGE_MAX_WORK_BYTES,
+    maxOutputBytes: CHAT_OFFLINE_MERGE_MAX_OUTPUT_BYTES,
+    maxBubbleRowWork: 3 * CHAT_AUTO_MERGE_MAX_BUBBLE_ROW_WORK,
+    maxStructuralTokens: 1_048_576,
+  });
+}
+
+function mergeChatBuffers(
+  base: Buffer | null,
+  ordered: readonly [Buffer, Buffer],
+  limits: ChatMergeLimits,
+): ChatMergeResult {
+  const [first, second] = ordered;
+  const workBudget = limits.maxWorkBytes;
   if (
-    workBudget === null ||
     !buffersFitMergeBudget(base, first, second, workBudget) ||
-    !buffersFitChatJsonStructureBudget(base, first, second)
+    !buffersFitChatJsonStructureBudget(base, first, second, limits.maxStructuralTokens)
   ) {
     return workBudgetConflict();
   }
@@ -161,6 +205,7 @@ export function mergeChatSnapshotBuffers(
       firstSnapshot,
       secondSnapshot,
       workBudget,
+      limits.maxStructuralTokens,
     );
     if (equalTimestampWinner === null) {
       return { status: "conflict" };
@@ -186,6 +231,7 @@ export function mergeChatSnapshotBuffers(
       winner,
       emitsV2,
       workBudget,
+      limits.maxBubbleRowWork,
     )
   ) {
     return workBudgetConflict();
@@ -239,7 +285,7 @@ export function mergeChatSnapshotBuffers(
     // Exact non-allocating size check after deduplication. The conservative
     // gate above bounded the Map/Set work; this one proves canonicalBytes will
     // not allocate a result beyond the same interactive cap.
-    if (portableChatCanonicalByteLength(merged) > workBudget) {
+    if (portableChatCanonicalByteLength(merged) > limits.maxOutputBytes) {
       return workBudgetConflict();
     }
     // `StateVscdbChatAdapter.scan` publishes `canonicalBytes(snapshot)` and
@@ -458,16 +504,25 @@ function electEqualTimestampCore(
   first: PortableChatSnapshot,
   second: PortableChatSnapshot,
   workBudget: number,
+  maxStructuralTokens: number,
 ): 0 | 1 | null {
   // Identical shape/state makes either side safe. Keep replicated tip order so
   // machine-local header fields still converge deterministically.
   if (sameRow(first.composerData, second.composerData)) {
+    // A later export of the identical v1 core is not an edit to continuation
+    // data. Keep the v2 envelope or both PCs can downgrade and enrich forever.
+    if (
+      first.schemaVersion !== second.schemaVersion &&
+      portableChatCoreHash(first) === portableChatCoreHash(second)
+    ) {
+      return isPortableChatSnapshotV2(first) ? 0 : 1;
+    }
     return 0;
   }
 
   const budget: EqualTimestampElectionBudget = {
     structure: createJsonStructureBudget({
-      maxStructuralTokens: CHAT_AUTO_MERGE_MAX_JSON_STRUCTURAL_TOKENS,
+      maxStructuralTokens,
       maxNestingDepth: CHAT_AUTO_MERGE_MAX_JSON_NESTING_DEPTH,
     }),
     remainingDecodedBytes: workBudget,
@@ -750,8 +805,9 @@ function buffersFitChatJsonStructureBudget(
   base: Buffer | null,
   first: Buffer,
   second: Buffer,
+  maxStructuralTokens: number,
 ): boolean {
-  let remaining = CHAT_AUTO_MERGE_MAX_JSON_STRUCTURAL_TOKENS;
+  let remaining = maxStructuralTokens;
   for (const content of [base, first, second]) {
     if (content === null) {
       continue;
@@ -815,13 +871,16 @@ function chatMergeStructureFitsBudget(
   winner: PortableChatSnapshot,
   emitsV2: boolean,
   budget: number,
+  maxBubbleRowWork: number,
 ): boolean {
   const snapshots = base === null ? [first, second] : [base, first, second];
   const bubbleOccurrences = snapshots.reduce(
     (count, snapshot) => count + snapshot.bubbles.length,
     0,
   );
-  if (bubbleOccurrences > CHAT_AUTO_MERGE_MAX_BUBBLE_ROW_WORK) {
+  if (bubbleOccurrences > maxBubbleRowWork || snapshots.some(
+    (snapshot) => snapshot.bubbles.length > CHAT_AUTO_MERGE_MAX_BUBBLE_ROW_WORK,
+  )) {
     return false;
   }
 

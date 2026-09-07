@@ -10860,10 +10860,16 @@ export async function autoMergeConflicts(
       if (conflict.resolvedAt !== undefined) {
         continue;
       }
-      const tips = repository.state.tips[conflict.resourceId] ?? [];
-      if (tips.length < 2 || !canMerge(tips)) {
+      const currentTips = repository.state.tips[conflict.resourceId] ?? [];
+      if (currentTips.length < 2 || !canMerge(currentTips)) {
         continue;
       }
+      // Concurrent deterministic merges can leave duplicate tips beside a
+      // stale capture. Merge the distinct chat payloads, while publication
+      // still acknowledges every current tip as a parent.
+      const tips = conflict.kind === "chat"
+        ? distinctChatMergeTips(currentTips)
+        : currentTips;
       if (
         conflict.kind === "ui-state" &&
         (tips.length > 2 ||
@@ -10887,7 +10893,10 @@ export async function autoMergeConflicts(
         }
         continue;
       }
-      if (tips.length !== 2 || conflict.tipVersionIds.length !== 2) {
+      if (
+        tips.length !== 2 ||
+        (conflict.kind !== "chat" && conflict.tipVersionIds.length !== 2)
+      ) {
         continue;
       }
       if (conflict.baseVersionId === null) {
@@ -11091,13 +11100,6 @@ export async function autoMergeConflicts(
               contentOf(olderTip),
             ], autoMergeWorkBudget)
           : undefined;
-      if (chatOutcome?.workBudgetExceeded === true) {
-        warnAutoMergeWorkDeferred(
-          conflict.resourceId,
-          autoMergeWorkBudget,
-          onWarning,
-        );
-      }
       // chat is its own branch rather than a `??` in front of the chain, so it
       // can never reach the diff3 fallback: a line-based merge of two chat
       // snapshots can produce syntactically valid JSON that describes a
@@ -11253,6 +11255,17 @@ export async function autoMergeConflicts(
     }
   }
   return mergedAny;
+}
+
+function distinctChatMergeTips(tips: readonly ResourceTip[]): ResourceTip[] {
+  const distinct = new Map<string, ResourceTip>();
+  for (const tip of [...tips].sort(compareTips)) {
+    const key = `${tip.kind}:${tip.operation}:${tip.semanticHash}`;
+    if (!distinct.has(key)) {
+      distinct.set(key, tip);
+    }
+  }
+  return [...distinct.values()];
 }
 
 /**
@@ -11875,7 +11888,11 @@ async function resolveTrivialConflict(
             semanticHash: survivor.semanticHash,
             metadata: {
               ...(survivor.metadata ?? {}),
-              syncOrigin: "auto-merge",
+              // A base reassertion adds no content. Carry an enrichment
+              // survivor unchanged, including its blob-only apply contract.
+              syncOrigin: isDirectChatEnrichment(survivor)
+                ? "agent-kv-enrichment"
+                : "auto-merge",
             },
           },
         ],
@@ -11929,9 +11946,15 @@ function isProtectedTrivialConflictSurvivor(survivor: ResourceTip): boolean {
   return (
     survivor.metadata?.syncOrigin === "checkpoint-marker" ||
     survivorOrigin === "automatic-chat-repair" ||
-    survivorOrigin === "agent-kv-enrichment" ||
+    (survivorOrigin === "agent-kv-enrichment" &&
+      !isDirectChatEnrichment(survivor)) ||
     survivorOrigin === "version-restore"
   );
+}
+
+function isDirectChatEnrichment(tip: ResourceTip): boolean {
+  return tip.kind === "chat" && tip.operation === "put" &&
+    tip.metadata?.syncOrigin === "agent-kv-enrichment";
 }
 
 function declaredAutoMergeWorkFits(

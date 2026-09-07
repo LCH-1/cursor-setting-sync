@@ -34,6 +34,8 @@ import { EventReconciler } from "../src/protocol/reconciler";
 import { SyncRepository } from "../src/protocol/repository";
 import { applyGlobalDatabaseChanges } from "../src/helper/database";
 import { migrateOfflineChatTips } from "../src/helper/chatMigration";
+import { mergeOfflineChatConflicts } from "../src/helper/chatConflictMerge";
+import { mergeChatSnapshotBuffers } from "../src/chat/chatMerge";
 import { enrichCurrentChatTipsFromLiveDatabase } from "../src/chat/enrichment";
 import { MAX_HELPER_APPLY_WORK_BYTES } from "../src/constants";
 import type {
@@ -55,6 +57,144 @@ afterEach(async () => {
 });
 
 describe("the helper's bounded final chat export", () => {
+  it("closes large duplicate forks with the exact complete enrichment contract and applies it once", async () => {
+    const fixture = await createFixture(64 * 1024 * 1024);
+    fixture.database.close();
+    const id = composerId(994);
+    const resourceId = `chat/${id}`;
+    const source = portableChat(id, "large identical core", 2, "x".repeat(13 * 1024 * 1024));
+    const legacy = canonicalBytes(source);
+    const complete = canonicalBytes({ ...source, schemaVersion: 2,
+      agentKv: { blobs: [], referencedIds: [], missingIds: [] } });
+    const publish = async (content: Buffer, parents: string[], metadata = {}) => fixture.repository.publish([{
+      resourceId, kind: "chat", content, semanticHash: sha256(content), parents, metadata,
+    }], []);
+    await publish(legacy, []);
+    new EventReconciler().reconcile(await fixture.repository.listEvents(), fixture.repository.state, null);
+    const base = fixture.repository.state.tips[resourceId]![0]!;
+    const metadata = {
+      syncOrigin: "agent-kv-enrichment", agentKvEnrichmentAppliesCore: true,
+      enrichedFromVersionId: base.versionId,
+      originalProducer: base.producer!, chatCoreHash: portableChatCoreHash(source),
+      chatSnapshotSchemaVersion: 2, agentKvBlobCount: 0, agentKvReferencedCount: 0, agentKvMissingCount: 0,
+    };
+    await publish(complete, [base.versionId], metadata);
+    await publish(legacy, [base.versionId]);
+    await publish(complete, [base.versionId], metadata);
+    const before = new EventReconciler().reconcile(await fixture.repository.listEvents(), fixture.repository.state, null);
+    expect(before.conflicts).toHaveLength(1);
+    const parents = fixture.repository.state.tips[resourceId]!.map(tip => tip.versionId).sort();
+    expect(mergeChatSnapshotBuffers(legacy, [legacy, complete]).workBudgetExceeded).toBe(true);
+    const guard = vi.fn(async () => {});
+    expect(await mergeOfflineChatConflicts(fixture.repository, fixture.request, guard, () => {}))
+      .toEqual({ published: 1, warnings: [] });
+    expect(guard).toHaveBeenCalledTimes(2);
+    const tip = fixture.repository.state.tips[resourceId]![0]!;
+    expect(tip.parents).toEqual(parents);
+    expect(tip.metadata).toEqual(metadata);
+    expect((await fixture.repository.readVersion(tip.versionId)).content?.equals(complete)).toBe(true);
+    expect(fixture.repository.state.pendingDatabaseChanges).toEqual([
+      expect.objectContaining({ resourceId, eventHash: tip.eventHash }),
+    ]);
+    const verified = await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository, () => {}, true);
+    expect(verified.verifiedApplyVersionIds).toContain(tip.versionId);
+    const prepared = await prepareChanges(fixture.repository, [helperChange(tip, resourceId)]);
+    expect(prepared.skipped).toEqual([]);
+    const applied = await applyGlobalDatabaseChanges(fixture.request, prepared.prepared);
+    expect(applied.applied).toEqual([resourceId]);
+    const db = new DatabaseSync(fixture.request.paths.globalDatabase, { readOnly: true });
+    try {
+      const row = db.prepare("SELECT value FROM cursorDiskKV WHERE key=?").get(source.bubbles[0]!.key)!;
+      expect(Buffer.from(String(row.value)).toString("base64")).toBe(source.bubbles[0]!.valueBase64);
+      expect(db.prepare("PRAGMA quick_check").get()?.quick_check).toBe("ok");
+    } finally { db.close(); }
+    expect((await mergeOfflineChatConflicts(fixture.repository, fixture.request, guard, () => {})).published).toBe(0);
+  }, 60_000);
+
+  it("leaves ambiguous, novel-union and protected-recipe forks intact", async () => {
+    for (const mode of ["ambiguous", "novel-union", "protected"] as const) {
+      const fixture = await createFixture();
+      fixture.database.close();
+      const id = composerId(995);
+      const first = portableChat(id, "first", 2, "retained");
+      const second = portableChat(id, "second", 2, "retained");
+      if (mode === "ambiguous") {
+        second.composerData.valueBase64 = Buffer.from(JSON.stringify({
+          fullConversationHeadersOnly: [{ bubbleId: `bubble-${id}` }], conversationState: "changed",
+        })).toString("base64");
+      } else if (mode === "novel-union") {
+        second.bubbles = [{ ...second.bubbles[0]!, key: `bubbleId:${id}:another` }];
+      }
+      for (const snapshot of [first, second]) {
+        const content = canonicalBytes(snapshot);
+        await fixture.repository.publish([{ resourceId: `chat/${id}`, kind: "chat", content,
+          semanticHash: sha256(content), parents: [],
+          ...(mode === "protected" ? { metadata: { syncOrigin: "version-restore" } } : {}),
+        }], []);
+      }
+      const head = fixture.repository.state.ownStreamHead;
+      expect((await mergeOfflineChatConflicts(fixture.repository, fixture.request, async () => {}, () => {})).published).toBe(0);
+      expect(fixture.repository.state.ownStreamHead).toEqual(head);
+      expect(fixture.repository.state.tips[`chat/${id}`]).toHaveLength(2);
+    }
+  });
+
+  it("preflights payload bytes and producer versions and aborts if Cursor reopens before publication", async () => {
+    const fixture = await createFixture();
+    fixture.database.close();
+    const id = composerId(996);
+    for (const title of ["first", "second"]) {
+      const content = canonicalBytes(portableChat(id, title, 2, "retained"));
+      await fixture.repository.publish([{ resourceId: `chat/${id}`, kind: "chat", content,
+        semanticHash: sha256(content), parents: [],
+      }], []);
+    }
+    const read = vi.spyOn(fixture.repository, "readVersion");
+    expect((await mergeOfflineChatConflicts(fixture.repository,
+      { ...fixture.request, extensionVersion: "0.0.1" }, async () => {}, () => {})).published).toBe(0);
+    expect(read).not.toHaveBeenCalled();
+    const originalMetadata = fixture.repository.readVersionMetadata.bind(fixture.repository);
+    const metadata = vi.spyOn(fixture.repository, "readVersionMetadata").mockImplementation(async (version) => {
+      const value = await originalMetadata(version);
+      value.change = { ...value.change, payload: { ...value.change.payload!, plainBytes: 129 * 1024 * 1024 } };
+      return value;
+    });
+    expect((await mergeOfflineChatConflicts(fixture.repository, fixture.request, async () => {}, () => {})).published).toBe(0);
+    expect(read).not.toHaveBeenCalled();
+    metadata.mockRestore();
+    const publish = vi.spyOn(fixture.repository, "publish");
+    const guard = vi.fn().mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error("Cursor reopened"));
+    await expect(mergeOfflineChatConflicts(fixture.repository, fixture.request, guard, () => {})).rejects.toThrow("Cursor reopened");
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it("refuses aggregate input overflow before decrypting any payload", async () => {
+    const fixture = await createFixture(128 * 1024 * 1024);
+    fixture.database.close();
+    const id = composerId(997);
+    const publish = async (title: string, parents: string[]) => {
+      const content = canonicalBytes(portableChat(id, title, 2, "retained"));
+      await fixture.repository.publish([{ resourceId: `chat/${id}`, kind: "chat", content,
+        semanticHash: sha256(content), parents,
+      }], []);
+    };
+    await publish("base", []);
+    new EventReconciler().reconcile(await fixture.repository.listEvents(), fixture.repository.state, null);
+    const base = fixture.repository.state.tips[`chat/${id}`]![0]!.versionId;
+    await publish("first", [base]);
+    await publish("second", [base]);
+    const original = fixture.repository.readVersionMetadata.bind(fixture.repository);
+    vi.spyOn(fixture.repository, "readVersionMetadata").mockImplementation(async version => {
+      const value = await original(version);
+      return { ...value, change: { ...value.change,
+        payload: { ...value.change.payload!, plainBytes: 100 * 1024 * 1024 },
+      } };
+    });
+    const read = vi.spyOn(fixture.repository, "readVersion");
+    expect((await mergeOfflineChatConflicts(fixture.repository, fixture.request, async () => {}, () => {})).published).toBe(0);
+    expect(read).not.toHaveBeenCalled();
+  });
+
   it("exports and restores one chat above the interactive page limit without dropping its core", async () => {
     const source = await createFixture(64 * 1024 * 1024);
     const id = composerId(991);

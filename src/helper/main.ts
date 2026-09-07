@@ -65,6 +65,7 @@ import {
 import { verifyPortableChatContinuationClosure } from "../chat/continuationClosure";
 import { buildChatTipEnrichmentCandidateIndex } from "../chat/enrichment";
 import { migrateOfflineChatTips } from "./chatMigration";
+import { mergeOfflineChatConflicts } from "./chatConflictMerge";
 import { maintainCompressedBackups, resolveBackupSource } from "./compressedBackups";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
@@ -431,9 +432,11 @@ async function executeRequest(
 
   let exported = await exportFinalChanges(request, repository, heartbeat);
   if (request.syncOptions.syncChat) {
+    const merged = await mergeOfflineChatConflicts(repository, request, ensureExclusiveAccess, heartbeat);
+    exported.warnings.push(...merged.warnings);
     const migration = await migrateOfflineChatTips(repository, request, ensureExclusiveAccess, heartbeat);
     exported.warnings.push(...migration.warnings);
-    if (migration.published > 0) {
+    if (merged.published > 0 || migration.published > 0) {
       // Re-verify only chat targets created by migration; workspace backups and
       // other adapters already drained once and must not restart for each page.
       const chats = await exportFinalChanges(request, repository, heartbeat, true);
