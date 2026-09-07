@@ -71,6 +71,30 @@ afterEach(async () => {
 });
 
 describe("manager repository-tip chat enrichment", () => {
+  it("never upgrades a missing0 snapshot with missing visible rows into a core-applying enrichment", async () => {
+    const repository = await createRepository();
+    const source = {
+      ...legacyChat(composer(366), 0),
+      schemaVersion: 2 as const,
+      agentKv: payload([], [], []),
+    };
+    source.composerData = row(`composerData:${source.composerId}`, JSON.stringify({
+      fullConversationHeadersOnly: Array.from({ length: 39 }, (_, index) => ({ bubbleId: `message-${index}` })),
+    }));
+    const original = await publishChat(repository, source, {
+      syncOrigin: "auto-merge", chatSnapshotSchemaVersion: 2, agentKvMissingCount: 0,
+    });
+    const collectAgentKv = vi.fn(async () => ({ agentKv: payload([], [], []) }));
+    const result = await enrichCurrentChatTips(repository, {
+      cursor: initialCursor(), maxPayloadBytes: repository.maxPayloadBytes, collectAgentKv,
+    });
+    expect(result.published).toBe(0);
+    expect(collectAgentKv).not.toHaveBeenCalled();
+    expect(result.warnings.join("\n")).toContain("missing visible conversation rows");
+    await reconcile(repository);
+    expect(onlyTip(repository, `chat/${source.composerId}`).versionId).toBe(original.versionId);
+  });
+
   it("enriches many small decoded rows without exhausting a cross-row JSON allocation budget", async () => {
     const repository = await createRepository();
     const source = legacyChat(composer(365), 4_000);
@@ -2313,9 +2337,9 @@ function legacyChat(
       checkpointAt: null,
       value: "repository core",
     },
-    composerData: row(`composerData:${composerId}`, "composer-data"),
+    composerData: row(`composerData:${composerId}`, "{}"),
     bubbles: Array.from({ length: bubbleCount }, (_, index) =>
-      row(`bubbleId:${composerId}:bubble-${index}`, `bubble-${index}`),
+      row(`bubbleId:${composerId}:bubble-${index}`, JSON.stringify({ text: `bubble-${index}` })),
     ),
   };
 }

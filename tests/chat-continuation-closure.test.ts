@@ -11,6 +11,24 @@ import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 const COMPOSER = "11111111-1111-4111-8111-111111111111";
 
 describe("portable v2 continuation closure", () => {
+  it.each([
+    { name: "null", headers: null },
+    { name: "string", headers: "active" },
+    { name: "object", headers: { bubbleId: "active" } },
+    { name: "null entry", headers: [null] },
+    { name: "missing ID", headers: [{}] },
+    { name: "non-string ID", headers: [{ bubbleId: 42 }] },
+    { name: "empty ID", headers: [{ bubbleId: "" }] },
+    { name: "duplicate ID", headers: [{ bubbleId: "active" }, { bubbleId: "active" }] },
+  ])("does not treat an explicitly invalid $name visible header list as a legacy core", async ({ headers }) => {
+    const snapshot = portableV2("", []);
+    snapshot.composerData.valueBase64 = Buffer.from(JSON.stringify({ fullConversationHeadersOnly: headers })).toString("base64");
+    snapshot.bubbles = [{ key: `bubbleId:${COMPOSER}:active`, valueType: "text", valueBase64: Buffer.from("{}").toString("base64") }];
+
+    await expect(verifyPortableChatContinuationClosure(snapshot)).resolves.toMatchObject({
+      status: "unknown", reason: "conversation-state-unreadable" });
+  });
+
   it("verifies a complete multi-level graph from the elected core", async () => {
     const leaf = assistantStep("continuation leaf");
     const leafId = sha256(leaf);
@@ -120,6 +138,50 @@ describe("portable v2 continuation closure", () => {
         limits: { maxNodes: 1 },
       }),
     ).resolves.toMatchObject({ status: "unknown", reason: "walk-limit" });
+  });
+
+  it.each([
+    ["malformed JSON", Buffer.from("{malformed}")],
+    ["invalid UTF-8", Buffer.from([0xff])],
+    ["scalar JSON", Buffer.from("42")],
+    ["non-string state", Buffer.from('{"conversationState":42}')],
+  ])("does not call %s an empty complete graph", async (_name, bytes) => {
+    const snapshot = portableV2("~", []);
+    snapshot.composerData.valueBase64 = bytes.toString("base64");
+    await expect(verifyPortableChatContinuationClosure(snapshot)).resolves.toMatchObject({
+      status: "unknown", reason: "conversation-state-unreadable",
+    });
+  });
+
+  it("cannot prove completeness when a retained bubble state is unreadable", async () => {
+    const snapshot = portableV2("~", []);
+    snapshot.bubbles.push({
+      key: `bubbleId:${COMPOSER}:broken`,
+      valueType: "text",
+      valueBase64: Buffer.from("{malformed}").toString("base64"),
+    });
+    await expect(verifyPortableChatContinuationClosure(snapshot)).resolves.toMatchObject({
+      status: "unknown", reason: "conversation-state-unreadable",
+    });
+  });
+
+  it("retains an inactive branch without treating its missing graph as active", async () => {
+    const missingId = sha256("inactive branch unavailable root");
+    const snapshot = portableV2("~", []);
+    snapshot.composerData.valueBase64 = Buffer.from(JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "active" }],
+    })).toString("base64");
+    snapshot.bubbles = [
+      { key: `bubbleId:${COMPOSER}:active`, valueType: "text", valueBase64: Buffer.from("{}").toString("base64") },
+      { key: `bubbleId:${COMPOSER}:inactive`, valueType: "text", valueBase64: Buffer.from(JSON.stringify({ conversationState: stateFor(missingId) })).toString("base64") },
+    ];
+    await expect(verifyPortableChatContinuationClosure(snapshot)).resolves.toMatchObject({
+      status: "complete", activeReachableCount: 0,
+    });
+    snapshot.bubbles = snapshot.bubbles.filter((row) => row.key.endsWith(":inactive"));
+    await expect(verifyPortableChatContinuationClosure(snapshot)).resolves.toMatchObject({
+      status: "unknown", reason: "conversation-state-unreadable",
+    });
   });
 });
 

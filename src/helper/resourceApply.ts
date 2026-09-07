@@ -653,8 +653,8 @@ async function applyExtensionChanges(
         applied.push(change.resourceId);
         continue;
       }
-      const profileArgs =
-        profileId === "default" ? [] : ["--profile", profileName];
+      const profileArgs = ["--user-data-dir", dirname(request.paths.userDataRoot),
+        ...(profileId === "default" ? [] : ["--profile", profileName])];
       const cli = await cursorCliPath();
       if (cli === null) {
         skipped.push(

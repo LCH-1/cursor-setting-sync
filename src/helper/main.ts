@@ -1,7 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { readFile, readdir, rm, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { inspectSqliteCapabilities, openDatabase } from "../platform/sqlite";
 import {
   cursorExitTimeoutDetail,
@@ -157,7 +157,9 @@ class FinalizerSupersededError extends Error {
 }
 
 
-void run();
+if (require.main === module) {
+  void run();
+}
 
 async function run(): Promise<void> {
   const requestPath = process.argv[2];
@@ -274,7 +276,7 @@ async function run(): Promise<void> {
       result.completedAt = new Date().toISOString();
       await writeResult(request, result);
       if (request.restart && result.success) {
-        restartCursor(request.cursorExecutable);
+        restartCursor(request);
       }
     } finally {
       await lock.release();
@@ -316,7 +318,7 @@ async function run(): Promise<void> {
         !cursorStillRunning &&
         (await databaseIsHealthy(request.paths.globalDatabase))
       ) {
-        restartCursor(request.cursorExecutable);
+        restartCursor(request);
       }
     } else {
       process.stderr.write(
@@ -969,6 +971,13 @@ async function exportFinalChanges(
       .filter((conflict) => conflict.resolvedAt === undefined)
       .map((conflict) => conflict.resourceId),
   );
+  const unverifiableLocalResources = await repairUnpublishedConflictObservations(
+    repository,
+    new Set([
+      ...conflictedResources,
+      ...targetChanges.filter((change) => change.kind === "chat").map((change) => change.resourceId),
+    ]),
+  );
   const protectedSyntheticResources = new Set(
     targetChanges
       .filter((change) => isSyntheticChange(change))
@@ -979,6 +988,9 @@ async function exportFinalChanges(
       (change) => chatTipMayReplaceLocalCore(change),
     )
     .map((change) => change.resourceId);
+  forceCoreVerificationResourceIds.push(...repository.state.conflicts
+    .filter((conflict) => conflict.kind === "chat" && conflict.resolvedAt === undefined)
+    .map((conflict) => conflict.resourceId));
   for (const candidate of buildChatTipEnrichmentCandidateIndex(repository.state.tips)) {
     if (candidate.tip.deviceId === repository.state.device.deviceId) {
       forceCoreVerificationResourceIds.push(candidate.resourceId);
@@ -1076,13 +1088,15 @@ async function exportFinalChanges(
   try {
   const snapshots: ResourceSnapshot[] = [];
   const deletions: ResourceDeletion[] = [];
-  const warnings: string[] = [];
+  const warnings: string[] = [...unverifiableLocalResources].map((resourceId) =>
+    `${resourceId}: prior local observation could not be authenticated; incoming chat apply was deferred to preserve local messages.`,
+  );
   // Deliberate exclusions, kept out of `warnings` so a device that has merely
   // been configured does not sit permanently at "Partial - some resources were
   // not saved to the repository". They are re-derived on every run and none of
   // them is a failure.
   const notices: string[] = [];
-  const protectedLocalResourceIds = new Set<string>();
+  const protectedLocalResourceIds = new Set(unverifiableLocalResources);
   const incompleteKinds = new Set<ResourceKind>();
   const publishedEventHashes = new Set<string>();
   for (const adapter of adapters) {
@@ -1357,6 +1371,42 @@ function helperChangeVersionId(change: HelperChange): string {
   return `${change.eventHash}#${change.changeIndex}`;
 }
 
+async function repairUnpublishedConflictObservations(
+  repository: SyncRepository,
+  resources: ReadonlySet<string>,
+): Promise<Set<string>> {
+  const unverifiable = new Set<string>();
+  for (const resourceId of resources) {
+    const projection = repository.state.projections[resourceId];
+    if (projection?.kind !== "chat" ||
+      (repository.state.tips[resourceId] ?? []).some((tip) =>
+        tip.operation === "put" && tip.semanticHash === projection.semanticHash)) {
+      continue;
+    }
+    if (projection.versionId === null) {
+      delete repository.state.projections[resourceId];
+      continue;
+    }
+    const authenticated = await repository.readVersionMetadata(projection.versionId).catch(() => null);
+    if (authenticated === null || authenticated.change.resourceId !== resourceId ||
+      authenticated.change.kind !== "chat" || authenticated.change.operation !== "put") {
+      unverifiable.add(resourceId);
+      continue;
+    }
+    if (authenticated.change.semanticHash === projection.semanticHash) {
+      continue;
+    }
+    // Older helpers persisted a suppressed conflict scan with its old version
+    // ID. That observation cannot authorize overwriting the unpublished edit.
+    projection.semanticHash = authenticated.change.semanticHash;
+    delete projection.sourceTimestamp;
+    delete projection.sourceBubbleCount;
+    delete projection.sourceChatCoreHash;
+    delete projection.sourceHeaderFingerprint;
+  }
+  return unverifiable;
+}
+
 function intersectVerifiedApplyPage(
   changes: readonly HelperChange[],
   verifiedVersionIds: readonly string[],
@@ -1376,7 +1426,7 @@ function prepareFinalExportScanChanges(
 ): { snapshots: ResourceSnapshot[]; deletions: ResourceDeletion[] } {
   const snapshots = result.snapshots
     .filter((snapshot) => {
-      if (conflictedResources.has(snapshot.resourceId)) {
+      if (conflictedResources.has(snapshot.resourceId) && snapshot.kind !== "chat") {
         return false;
       }
       const projection = known[snapshot.resourceId];
@@ -1402,10 +1452,7 @@ function prepareFinalExportScanChanges(
     })
     .map((snapshot) => ({
       ...snapshot,
-      parents: parentsForLocalChange(
-        repository.state.projections[snapshot.resourceId],
-        repository.state.tips[snapshot.resourceId] ?? [],
-      ),
+      parents: finalExportSnapshotParents(snapshot, repository, conflictedResources),
     }));
   const deletions = result.deletions
     .filter(
@@ -1439,6 +1486,27 @@ function prepareFinalExportScanChanges(
       ),
     }));
   return { snapshots, deletions };
+}
+
+function finalExportSnapshotParents(
+  snapshot: ResourceSnapshot,
+  repository: SyncRepository,
+  conflictedResources: ReadonlySet<string>,
+): string[] {
+  const tips = repository.state.tips[snapshot.resourceId] ?? [];
+  const parents = new Set(parentsForLocalChange(
+    repository.state.projections[snapshot.resourceId], tips,
+  ));
+  if (snapshot.kind === "chat" && conflictedResources.has(snapshot.resourceId)) {
+    // Final shutdown edits must advance only this device's branch before a
+    // merge sees it; consuming the peer tips here would resolve unseen edits.
+    for (const tip of tips) {
+      if (tip.deviceId === repository.state.device.deviceId && tip.semanticHash !== snapshot.semanticHash) {
+        parents.add(tip.versionId);
+      }
+    }
+  }
+  return [...parents].sort();
 }
 
 function localProjectionOverlay(
@@ -2118,6 +2186,7 @@ export const __testing = Object.freeze({
   pageMayMutateGlobalDatabase,
   priorApplyBackupPaths,
   rememberLearnedChatProjectionSources,
+  restartCursor,
   shutdownApplyCandidates,
   shutdownApplyBatch,
 });
@@ -2618,10 +2687,14 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function restartCursor(cursorExecutable: string): void {
+function restartCursor(request: HelperRequest): void {
   const environment = { ...process.env };
   delete environment.ELECTRON_RUN_AS_NODE;
-  const launch = cursorLaunchCommand(cursorExecutable);
+  const launch = cursorLaunchCommand(
+    request.cursorExecutable,
+    process.platform,
+    dirname(request.paths.userDataRoot),
+  );
   const child = spawn(launch.command, launch.args, {
     detached: true,
     stdio: "ignore",

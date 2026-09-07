@@ -46,6 +46,67 @@ afterEach(async () => {
 });
 
 describe("a conversation that grows after its header stops changing", () => {
+  it.each([
+    { name: "null", headers: null },
+    { name: "string", headers: "active" },
+    { name: "object", headers: { bubbleId: "active" } },
+    { name: "null entry", headers: [null] },
+    { name: "missing ID", headers: [{}] },
+    { name: "non-string ID", headers: [{ bubbleId: 42 }] },
+    { name: "empty ID", headers: [{ bubbleId: "" }] },
+    { name: "duplicate ID", headers: [{ bubbleId: "active" }, { bubbleId: "active" }] },
+  ])("preserves raw core bytes on v1 when the visible header list contains $name", async ({ headers }) => {
+    const { paths, database } = await createGlobalDatabase();
+    const composerData = JSON.stringify({ fullConversationHeadersOnly: headers });
+    insertHeader(database, COMPOSER, FROZEN_TIMESTAMP);
+    insertKv(database, `composerData:${COMPOSER}`, composerData);
+    insertKv(database, `bubbleId:${COMPOSER}:active`, "{}");
+    database.close();
+
+    const result = await new StateVscdbChatAdapter(paths).scan({});
+    const snapshot = parsePortableChatSnapshot(result.snapshots[0]!.content);
+
+    expect(snapshot.schemaVersion).toBe(1);
+    expect(snapshot.composerData.valueBase64).toBe(Buffer.from(composerData).toString("base64"));
+    expect(snapshot.bubbles).toHaveLength(1);
+    expect(result.snapshots[0]?.metadata).not.toHaveProperty("agentKvMissingCount");
+  });
+
+  it.each(["malformed", "missing-visible"])("does not label %s active rows as a complete empty graph", async (scenario) => {
+    const { paths, database } = await createGlobalDatabase();
+    insertHeader(database, COMPOSER, FROZEN_TIMESTAMP);
+    insertKv(database, `composerData:${COMPOSER}`, scenario === "malformed"
+      ? "{malformed}"
+      : JSON.stringify({ fullConversationHeadersOnly: [{ bubbleId: "missing" }] }));
+    insertKv(database, `bubbleId:${COMPOSER}:retained`, "{}");
+    database.close();
+    const result = await new StateVscdbChatAdapter(paths).scan({});
+    const snapshot = parsePortableChatSnapshot(result.snapshots[0]!.content);
+    expect(snapshot.schemaVersion).toBe(1);
+    expect(snapshot.bubbles).toHaveLength(1);
+  });
+
+  it("keeps inactive branch rows while capturing only the visible continuation graph", async () => {
+    const { paths, database } = await createGlobalDatabase();
+    insertHeader(database, COMPOSER, FROZEN_TIMESTAMP);
+    insertKv(database, `composerData:${COMPOSER}`, JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: "active" }],
+    }));
+    insertKv(database, `bubbleId:${COMPOSER}:active`, "{}");
+    insertKv(database, `bubbleId:${COMPOSER}:inactive`, JSON.stringify({
+      conversationState: state(bytesField(1, Buffer.from(sha256("missing inactive root"), "hex"))),
+    }));
+    database.close();
+    const result = await new StateVscdbChatAdapter(paths).scan({});
+    const snapshot = parsePortableChatSnapshot(result.snapshots[0]!.content);
+    expect(snapshot.bubbles).toHaveLength(2);
+    expect(snapshot.schemaVersion).toBe(2);
+    if (snapshot.schemaVersion !== 2) {
+      throw new Error("expected v2 chat capture");
+    }
+    expect(snapshot.agentKv).toEqual({ blobs: [], referencedIds: [], missingIds: [] });
+  });
+
   it("republishes when messages are added under an unchanged timestamp", async () => {
     // The bug this pins, measured on the real pair: Cursor writes
     // composerHeaders.lastUpdatedAt once near the start of a conversation and

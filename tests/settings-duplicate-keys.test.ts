@@ -93,4 +93,48 @@ describe("settings apply with duplicated top-level keys", () => {
     expect(parsed["editor.fontSize"]).toBeUndefined();
     expect(parsed["editor.tabSize"]).toBe(2);
   });
+
+  it.each(["put", "delete"] as const)(
+    "%s succeeds when the final allowed pass resolves the last duplicate",
+    async (operation) => {
+      const source = `{\n${Array.from(
+        { length: 9 },
+        () => '  "editor.fontSize": 14',
+      ).join(",\n")}\n}\n`;
+      const { adapter, settingsPath } = await fixture(source);
+
+      await adapter.apply(
+        operation === "put"
+          ? putInput("editor.fontSize", 16)
+          : deleteInput("editor.fontSize"),
+      );
+
+      const parsed = parseJsonc(
+        await readFile(settingsPath, "utf8"),
+        settingsPath,
+      ) as Record<string, unknown>;
+      expect(parsed["editor.fontSize"]).toBe(
+        operation === "put" ? 16 : undefined,
+      );
+    },
+  );
+
+  it.each(["put", "delete"] as const)(
+    "%s preserves the original file when duplicates exceed the work limit",
+    async (operation) => {
+      const source = `{\n${Array.from(
+        { length: 12 },
+        () => '  "editor.fontSize": 14',
+      ).join(",\n")}\n}\n`;
+      const { adapter, settingsPath } = await fixture(source);
+
+      await expect(adapter.apply(
+        operation === "put"
+          ? putInput("editor.fontSize", 16)
+          : deleteInput("editor.fontSize"),
+      )).rejects.toThrow(/duplicate settings keys remain/);
+
+      expect(await readFile(settingsPath, "utf8")).toBe(source);
+    },
+  );
 });

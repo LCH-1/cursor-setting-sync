@@ -546,7 +546,15 @@ export class SettingsAdapter implements ResourceAdapter {
       }
       assertSettingsApplyOutput(updated, target, applyLimit);
     }
-    parseJsoncObject(updated, target);
+    const applied = parseJsoncObject(updated, target);
+    const landed = isDeletion(input)
+      ? applied[key] === undefined
+      : JSON.stringify(applied[key]) === JSON.stringify(value);
+    if (!landed) {
+      throw new Error(
+        `Unable to apply ${input.resourceId}: duplicate settings keys remain after the bounded normalization pass.`,
+      );
+    }
     const output = Buffer.from(updated, "utf8");
     if (output.byteLength > applyLimit) {
       throw new Error(

@@ -1,15 +1,12 @@
-import { CHAT_OFFLINE_MERGE_MAX_WORK_BYTES, mergeOfflineChatSnapshotBuffers } from "../chat/chatMerge";
-import { MAX_HELPER_SINGLE_CHAT_BYTES } from "../constants";
-import { sha256 } from "../protocol/canonical";
-import { compareTips, EventReconciler } from "../protocol/reconciler";
+import { prepareChatConflictResolution } from "../chat/conflictResolution";
+import { EventReconciler } from "../protocol/reconciler";
 import type { SyncRepository } from "../protocol/repository";
 import { chatContinuationApplyBlockReason } from "../sync/chatContinuationPolicy";
 import { absorbedCheckpointManifest } from "../sync/versionPolicy";
-import type { ResourceSnapshot, ResourceTip, SyncConflict } from "../types";
 import { helperAcceptsChatProducer } from "./chatMigration";
 import type { HelperRequest } from "./types";
 
-/** Prove that one existing payload contains the merge, preserving its apply contract. */
+/** Publish the same merge/latest policy after the final local export is safe. */
 export async function mergeOfflineChatConflicts(
   repository: SyncRepository,
   request: HelperRequest,
@@ -28,7 +25,11 @@ export async function mergeOfflineChatConflicts(
       continue;
     }
     await ensureExclusiveAccess();
-    const snapshot = await prepareMerge(repository, request, conflict).catch((error: unknown) => {
+    const snapshot = await prepareChatConflictResolution(repository, conflict, {
+      offline: true,
+      tipsAllowed: (tips) => tips.every((tip) => helperAcceptsChatProducer(tip, request)),
+      onWarning: (message) => warnings.push(message),
+    }).catch((error: unknown) => {
       warnings.push(`Offline chat merge for ${conflict.resourceId} was deferred: ${error instanceof Error ? error.message : String(error)}`);
       return null;
     });
@@ -66,76 +67,4 @@ export async function mergeOfflineChatConflicts(
     await repository.writeAck();
   }
   return { published: publishedIds.size, warnings };
-}
-
-async function prepareMerge(
-  repository: SyncRepository,
-  request: HelperRequest,
-  conflict: SyncConflict,
-): Promise<ResourceSnapshot | null> {
-  const currentTips = [...(repository.state.tips[conflict.resourceId] ?? [])].sort(compareTips);
-  if (currentTips.length < 2 || currentTips.some((tip) =>
-    tip.kind !== "chat" || tip.operation !== "put" ||
-    !helperAcceptsChatProducer(tip, request) || !supportsExactMerge(tip))) {
-    return null;
-  }
-  const distinct = new Map<string, ResourceTip>();
-  for (const tip of currentTips) {
-    if (!distinct.has(tip.semanticHash)) {
-      distinct.set(tip.semanticHash, tip);
-    }
-  }
-  const tips = [...distinct.values()];
-  if (tips.length !== 2) {
-    return null;
-  }
-  const versions = [tips[0]!.versionId, tips[1]!.versionId,
-    ...(conflict.baseVersionId === null ? [] : [conflict.baseVersionId])];
-  let remaining = CHAT_OFFLINE_MERGE_MAX_WORK_BYTES;
-  for (const version of versions) {
-    const { change } = await repository.readVersionMetadata(version);
-    const bytes = change.payload?.plainBytes;
-    if (change.resourceId !== conflict.resourceId || change.kind !== "chat" ||
-      change.operation !== "put" || bytes === undefined ||
-      !Number.isSafeInteger(bytes) || bytes <= 0 ||
-      bytes > Math.min(repository.maxPayloadBytes, MAX_HELPER_SINGLE_CHAT_BYTES, remaining)) {
-      return null;
-    }
-    remaining -= bytes;
-  }
-  const contents: Buffer[] = [];
-  for (const version of versions) {
-    const { content, change } = await repository.readVersion(version);
-    if (content === null || sha256(content) !== change.semanticHash) {
-      return null;
-    }
-    contents.push(content);
-  }
-  const merged = mergeOfflineChatSnapshotBuffers(contents[2] ?? null, [contents[0]!, contents[1]!]);
-  if (merged.content === undefined || merged.content.byteLength > repository.maxPayloadBytes) {
-    return null;
-  }
-  const survivorIndex = contents.slice(0, 2).findIndex((content) => content.equals(merged.content!));
-  if (survivorIndex === -1) {
-    // A novel union needs a new apply recipe. This path only republishes a
-    // proven complete existing version, including blob-only enrichment rules.
-    return null;
-  }
-  const survivor = tips[survivorIndex]!;
-  return {
-    resourceId: conflict.resourceId, kind: "chat", content: merged.content,
-    semanticHash: survivor.semanticHash,
-    parents: currentTips.map((tip) => tip.versionId).sort(),
-    metadata: {
-      ...survivor.metadata,
-      syncOrigin: survivor.metadata?.syncOrigin === "agent-kv-enrichment"
-        ? "agent-kv-enrichment" : "auto-merge",
-    },
-  };
-}
-
-function supportsExactMerge(tip: ResourceTip): boolean {
-  const origin = tip.metadata?.syncOrigin;
-  return origin === undefined || origin === "auto-merge" ||
-    origin === "conflict-resolution" || origin === "agent-kv-enrichment";
 }

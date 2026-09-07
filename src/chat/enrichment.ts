@@ -537,9 +537,12 @@ async function planChatTipEnrichment(
       throw new Error("tip composer ID does not match its resource ID");
     }
     sourceCoreHash = portableChatCoreHash(source);
-    const stateScan = scanPortableChatConversationStates(source);
+    const stateScan = scanPortableChatConversationStates(source, true);
     if (stateScan.status === "structure-limit") {
       throw new Error(enrichmentJsonStructureLimit("decoded row"));
+    }
+    if (stateScan.status === "unreadable") {
+      throw new Error("the source chat has unreadable or missing visible conversation rows");
     }
     sourceConversationStates = stateScan.states;
   } catch (error) {

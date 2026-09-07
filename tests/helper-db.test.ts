@@ -75,6 +75,36 @@ afterEach(async () => {
 });
 
 describeWithBackup("offline database helper", () => {
+  it("preserves the local core when a missing0 backup declares messages absent from its payload", async () => {
+    const fixture = await createFixture();
+    const composerId = "15151515-1515-4515-8515-151515151515";
+    const local = repairSnapshot(composerId,
+      JSON.stringify({ fullConversationHeadersOnly: [{ bubbleId: "local" }] }),
+      "local title", [{ id: "local", value: { text: "retained local message" } }]);
+    await applyGlobalDatabaseChanges(fixture.request, [ordinaryChatChange(local)]);
+    const broken: PortableChatSnapshotV2 = {
+      ...local,
+      schemaVersion: 2,
+      header: { ...local.header, value: "broken remote title" },
+      composerData: { ...local.composerData, valueBase64: Buffer.from(JSON.stringify({
+        fullConversationHeadersOnly: Array.from({ length: 39 }, (_, index) => ({ bubbleId: `remote-${index}` })),
+      })).toString("base64") },
+      bubbles: [],
+      agentKv: { blobs: [], referencedIds: [], missingIds: [] },
+    };
+    const result = await applyGlobalDatabaseChanges(fixture.request, [ordinaryChatChange(broken, "c")]);
+    expect(result.applied).toEqual([]);
+    expect(result.failureByResourceId[`chat/${composerId}`]).toContain("visible messages are missing");
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      expect(readKv(database, `composerData:${composerId}`)).toBe(Buffer.from(local.composerData.valueBase64, "base64").toString());
+      expect(readKv(database, `bubbleId:${composerId}:local`)).toBe(JSON.stringify({ text: "retained local message" }));
+      expect(database.prepare("SELECT value FROM composerHeaders WHERE composerId = ?").get(composerId)?.value).toBe("local title");
+    } finally {
+      database.close();
+    }
+  });
+
   it("reuses one verified pre-drain backup across bounded global pages", async () => {
     const fixture = await createFixture();
     const session: GlobalDatabaseApplySession = {

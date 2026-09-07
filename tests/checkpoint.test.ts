@@ -30,6 +30,76 @@ import type {
 } from "../src/types";
 
 describe("repository checkpoints", () => {
+  it("returns authenticated version ordering without reading its payload", async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "cursor-setting-sync-version-order-"));
+    try {
+      const repository = await createRepository(temporaryRoot);
+      const publication = await repository.publish(
+        [
+          snapshot("settings/default/z", "16"),
+          snapshot("settings/default/a", "14"),
+        ],
+        [],
+      );
+      const event = (await repository.listEvents())[0]!;
+      const readObject = vi.spyOn(repository, "readObject");
+      const versionId = `${publication.eventHash}#1`;
+
+      const metadata = await repository.readVersionMetadata(versionId);
+
+      expect(metadata.change.resourceId).toBe("settings/default/z");
+      expect(metadata.producer).toEqual(producer);
+      expect(metadata.ordering).toEqual({
+        versionId,
+        eventHash: publication.eventHash,
+        lamport: event.manifest.lamport,
+        deviceId: repository.state.device.deviceId,
+        createdAt: event.manifest.createdAt,
+      });
+      expect(readObject).not.toHaveBeenCalled();
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves original ordering after pruning without using checkpoint time", async () => {
+    const temporaryRoot = await mkdtemp(join(tmpdir(), "cursor-setting-sync-folded-order-"));
+    try {
+      const repository = await createRepository(temporaryRoot);
+      const publication = await repository.publish(
+        [snapshot("settings/default/editor.fontSize", "16")],
+        [],
+      );
+      const versionId = `${publication.eventHash}#0`;
+      const original = await repository.readVersionMetadata(versionId);
+      await adoptTips(repository);
+      await repository.createCheckpoint(true);
+      const pruning = await repository.pruneWithGates({
+        reconciledWithoutWarnings: true,
+        overrideAgeGate: true,
+      });
+      expect(pruning.status).toBe("pruned");
+      expect(pruning.eventsDeleted).toBe(1);
+      const readObject = vi.spyOn(repository, "readObject");
+
+      const folded = await repository.readVersionMetadata(versionId);
+
+      expect(folded.ordering).toEqual({
+        versionId,
+        eventHash: publication.eventHash,
+        lamport: original.ordering!.lamport,
+        deviceId: original.ordering!.deviceId,
+      });
+      expect(folded.ordering).not.toHaveProperty("createdAt");
+      expect(folded.ordering!.lamport).toBeLessThan(repository.state.checkpoint!.lamport);
+      expect(folded.change).toEqual(original.change);
+      expect(folded.producer).toEqual(original.producer);
+      expect(readObject).not.toHaveBeenCalled();
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   it("collects selected resource histories with one event traversal", async () => {
     const temporaryRoot = await mkdtemp(join(tmpdir(), "cursor-setting-sync-history-"));
     try {

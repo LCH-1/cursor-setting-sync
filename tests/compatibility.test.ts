@@ -339,6 +339,35 @@ describe("platform-specific Cursor process handling", () => {
     });
   });
 
+  it("reopens the same custom user data directory on Windows and Linux", () => {
+    expect(cursorLaunchCommand(
+      "C:\\Apps\\Cursor.exe", "win32", "C:\\isolated cursor data",
+    )).toEqual({
+      command: "C:\\Apps\\Cursor.exe",
+      args: ["--user-data-dir", "C:\\isolated cursor data"],
+    });
+    expect(cursorLaunchCommand(
+      "/opt/Cursor.AppImage", "linux", "/home/u/isolated cursor data",
+    )).toEqual({
+      command: "/opt/Cursor.AppImage",
+      args: ["--user-data-dir", "/home/u/isolated cursor data"],
+    });
+  });
+
+  it("passes custom user data arguments through the macOS application launcher", () => {
+    expect(cursorLaunchCommand(
+      "/Applications/Cursor.app/Contents/MacOS/Cursor",
+      "darwin",
+      "/Users/u/isolated cursor data",
+    )).toEqual({
+      command: "open",
+      args: [
+        "-a", "/Applications/Cursor.app", "--args",
+        "--user-data-dir", "/Users/u/isolated cursor data",
+      ],
+    });
+  });
+
   it("records the AppImage as the restart target on Linux", () => {
     expect(
       cursorExecutableForRestart(

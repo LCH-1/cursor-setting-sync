@@ -22,6 +22,64 @@ const producer = {
 const PEER_CHAT = "chat/00000000-0000-4000-8000-000000000001";
 
 describe("the checkpoint marker re-asserts a tip this device may never have applied", () => {
+  it("preserves chat resolution ordering through repeated checkpoint pruning", async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "cursor-setting-sync-resolution-marker-"),
+    );
+    try {
+      const repository = await createRepository(temporaryRoot);
+      const content = Buffer.from("preserved chat core", "utf8");
+      const snapshot = {
+        resourceId: PEER_CHAT,
+        kind: "chat" as const,
+        content,
+        semanticHash: sha256(content),
+      };
+      const original = await repository.publish([snapshot], []);
+      const originalVersionId = `${original.eventHash}#0`;
+      const originalOrdering = (await repository.readVersionMetadata(
+        originalVersionId,
+      )).ordering!;
+      const chatResolutionOrigin = { ...originalOrdering };
+      const chatResolutionCoreHash = sha256(content);
+      await repository.publish([
+        {
+          ...snapshot,
+          parents: [originalVersionId],
+          metadata: {
+            syncOrigin: "auto-merge",
+            chatResolutionOrigin,
+            chatResolutionCoreHash,
+          },
+        },
+      ], []);
+
+      for (let pass = 0; pass < 2; pass += 1) {
+        await reconcileRepository(repository);
+        await repository.createCheckpoint(true);
+        const pruning = await repository.pruneWithGates({
+          reconciledWithoutWarnings: true,
+          overrideAgeGate: true,
+        });
+        expect(pruning.status).toBe("pruned");
+        const marker = await repository.readVersionMetadata(
+          `${pruning.markerEventHash}#0`,
+        );
+
+        expect(marker.change.metadata).toMatchObject({
+          syncOrigin: "checkpoint-marker",
+          checkpointedSyncOrigin: "auto-merge",
+          chatResolutionOrigin,
+          chatResolutionCoreHash,
+        });
+        expect(marker.ordering!.lamport).toBeGreaterThan(originalOrdering.lamport);
+        expect(await repository.tryReadVersionMetadata(originalVersionId)).toBeNull();
+      }
+    } finally {
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
   it("upgrades an ordinary v0.0.59 marker to explicit provenance", async () => {
     const temporaryRoot = await mkdtemp(
       join(tmpdir(), "cursor-setting-sync-legacy-marker-"),

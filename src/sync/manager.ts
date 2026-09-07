@@ -170,6 +170,7 @@ import {
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
 import { chatHeaderTitle, chatSnapshotTitle } from "../chat/title";
+import { prepareChatConflictResolution } from "../chat/conflictResolution";
 import {
   buildChatTipEnrichmentCandidateIndex,
   enrichCurrentChatTipsFromLiveDatabase,
@@ -2117,6 +2118,25 @@ export class SyncManager implements vscode.Disposable {
 
   async resolveConflicts(): Promise<void> {
     const repository = this.requireRepository();
+    const refreshConflictGraph = async (): Promise<boolean> => {
+      const checkpoint = await absorbedCheckpointManifest(repository);
+      const reconciledState = structuredClone(repository.state);
+      const result = new EventReconciler().reconcile(
+        await repository.listReconciliationEvents(checkpoint),
+        reconciledState,
+        checkpoint,
+      );
+      if (result.warnings.length > 0) {
+        this.status.log(`Conflict resolution blocked by repository stream warning: ${result.warnings[0]}`);
+        void vscode.window.showWarningMessage(
+          `Conflicts cannot be resolved while the repository event stream is incomplete. Synchronize again after the shared folder settles. ${result.warnings[0]}`,
+        );
+        return false;
+      }
+      Object.assign(repository.state, reconciledState);
+      this.reconciliationCache = null;
+      return true;
+    };
     // Wrapped in progress because this is the one command reached by CLICKING a
     // warning in the status bar, and the lock it needs is routinely held by this
     // window's own poll for a good part of a minute. Taking it bare meant the
@@ -2134,6 +2154,9 @@ export class SyncManager implements vscode.Disposable {
     try {
       await this.openGitWindow(repository);
       await repository.refreshState({ forceAudit: true });
+      if (!(await refreshConflictGraph())) {
+        return;
+      }
     } finally {
       await refreshLock.release();
     }
@@ -2156,6 +2179,7 @@ export class SyncManager implements vscode.Disposable {
       resolved: 0,
       deferred: [...collected.deferred],
     };
+    let alreadyResolved = 0;
     if (collected.selections.length > 0) {
       // The answers are already in hand, so this waits for a busy poll instead
       // of failing. Losing a set of decisions to a routine 30-second cycle -
@@ -2180,10 +2204,34 @@ export class SyncManager implements vscode.Disposable {
       try {
         await repository.ensureInitialized();
         const gitActive = await this.openGitWindow(repository);
-        await repository.refreshState();
+        await repository.refreshState({ forceAudit: true });
+        if (!(await refreshConflictGraph())) {
+          return;
+        }
+        const activeConflicts = new Map(repository.state.conflicts
+          .filter(conflict => conflict.resolvedAt === undefined)
+          .map(conflict => [conflict.resourceId, conflict]));
+        const pendingSelections = collected.selections.filter(selection => {
+          if (!activeConflicts.has(selection.resourceId) &&
+            (repository.state.tips[selection.resourceId]?.length ?? 0) > 0) {
+            alreadyResolved += 1;
+            this.status.log(`Conflict already resolved during selection: ${selection.resourceId}`);
+            return false;
+          }
+          return true;
+        }).map(selection => {
+          const current = activeConflicts.get(selection.resourceId);
+          const currentTipIds = (repository.state.tips[selection.resourceId] ?? [])
+            .map(tip => tip.versionId).sort();
+          const selectedTipIds = [...selection.tipVersionIds].sort();
+          return current !== undefined && currentTipIds.length === selectedTipIds.length &&
+            currentTipIds.every((versionId, index) => versionId === selectedTipIds[index])
+            ? { ...selection, conflictId: current.conflictId }
+            : selection;
+        });
         const applied = await this.conflicts.applySelections(
           repository,
-          collected.selections,
+          pendingSelections,
         );
         resolution.resolved = applied.resolved;
         resolution.deferred.push(...applied.deferred);
@@ -2221,7 +2269,12 @@ export class SyncManager implements vscode.Disposable {
         `${resolution.deferred.length} conflict(s) are deferred. ${resolution.deferred[0]}`,
       );
     }
-    if (resolution.resolved > 0) {
+    if (alreadyResolved > 0) {
+      void vscode.window.showInformationMessage(
+        `${alreadyResolved} conflict(s) were already resolved while the selection was open. Their current versions were kept.`,
+      );
+    }
+    if (resolution.resolved > 0 || alreadyResolved > 0) {
       await this.syncNow(true);
     } else if (resolution.deferred.length === 0) {
       void vscode.window.showInformationMessage(
@@ -10862,6 +10915,16 @@ export async function autoMergeConflicts(
       }
       const currentTips = repository.state.tips[conflict.resourceId] ?? [];
       if (currentTips.length < 2 || !canMerge(currentTips)) {
+        continue;
+      }
+      if (conflict.kind === "chat" && currentTips.every(tip => tip.operation === "put")) {
+        const snapshot = await prepareChatConflictResolution(repository, conflict, {
+          offline: false, tipsAllowed: canMerge, onWarning,
+        });
+        if (snapshot !== null && await publishAutoMerge(repository, conflict, [snapshot], [], onWarning)) {
+          conflict.resolvedAt = new Date().toISOString();
+          mergedAny = true;
+        }
         continue;
       }
       // Concurrent deterministic merges can leave duplicate tips beside a

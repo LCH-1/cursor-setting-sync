@@ -14,7 +14,6 @@ import type {
 import {
   isPortableChatSnapshotV2,
   parsePortableChatSnapshot,
-  portableChatCoreHash,
   scanPortableChatConversationStates,
 } from "./stateVscdb";
 import { extractAgentKvRootIds } from "./agentKv";
@@ -74,11 +73,10 @@ class ChatMergeWorkBudgetError extends Error {}
  *  - **The header and `composerData` come from one side whole.** They describe
  *    the conversation's shape — its title, ordering and checkpoint — and half of
  *    one plus half of the other describes no conversation at all. The side that
- *    wins is normally the one with the greater `header.lastUpdatedAt`. Cursor
- *    can leave that timestamp frozen while a conversation grows, though, so an
- *    equal timestamp is resolved only by a provable one-sided base change or a
- *    complete strict extension of the visible message sequence. Ambiguous
- *    equal-timestamp shapes remain a manual conflict. Orphaned bubbles that the
+ *    wins must have identical state, a provable one-sided base change, or a
+ *    complete strict extension of the visible message sequence. Wall clocks
+ *    can differ and Cursor can leave timestamps frozen while a chat grows.
+ *    Ambiguous shapes remain conflicts. Orphaned bubbles that the
  *    winning `composerData` does not reference are inert rows, so merely
  *    unioning them cannot recover from choosing the stale shape.
  *
@@ -139,6 +137,60 @@ export function mergeOfflineChatSnapshotBuffers(
   });
 }
 
+/** Adds only previously validated immutable blobs; callers must verify closure. */
+export function buildChatContinuationCandidate(
+  latest: PortableChatSnapshot,
+  sources: readonly PortableChatSnapshot[],
+  maxOutputBytes = CHAT_OFFLINE_MERGE_MAX_OUTPUT_BYTES,
+): Buffer | null {
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0 ||
+    sources.length > 16 || !hasExactMergeSafeSnapshotShape(latest) ||
+    !isPortableChatCoreUsable(latest, maxOutputBytes) ||
+    sources.some((source) => source.composerId !== latest.composerId)) {
+    return null;
+  }
+  const snapshots = [latest, ...sources];
+  let blobOccurrences = 0;
+  for (const snapshot of snapshots) {
+    if (isPortableChatSnapshotV2(snapshot)) {
+      blobOccurrences += snapshot.agentKv.blobs.length;
+      if (blobOccurrences > 17 * CHAT_CORE_AGENT_KV_MAX_NODES ||
+        snapshot.agentKv.blobs.some((row) => !hasExactPortableRowShape(row))) {
+        return null;
+      }
+    }
+  }
+  const stateScan = scanPortableChatConversationStates(latest, true);
+  if (stateScan.status !== "complete") {
+    return null;
+  }
+  const roots = extractBoundedChatCoreAgentKvRootsFromStates(stateScan.states);
+  if (roots === null) {
+    return null;
+  }
+  const core: PortableChatSnapshotV1 = {
+    schemaVersion: 1,
+    composerId: latest.composerId,
+    header: latest.header,
+    composerData: latest.composerData,
+    bubbles: latest.bubbles,
+  };
+  try {
+    const candidate: PortableChatSnapshotV2 = {
+      ...core,
+      schemaVersion: 2,
+      agentKv: mergeAgentKvSnapshots(snapshots, core, roots),
+    };
+    if (portableChatCanonicalByteLength(candidate) >
+      Math.min(maxOutputBytes, CHAT_OFFLINE_MERGE_MAX_OUTPUT_BYTES)) {
+      return null;
+    }
+    return canonicalBytes(candidate);
+  } catch {
+    return null;
+  }
+}
+
 function mergeChatBuffers(
   base: Buffer | null,
   ordered: readonly [Buffer, Buffer],
@@ -184,33 +236,17 @@ function mergeChatBuffers(
     // manual resolution instead.
     return { status: "conflict" };
   }
-  // A real timestamp difference keeps the established behavior. On equality,
-  // tip order is not evidence of conversation recency: Cursor commonly stamps
-  // the header near the start and streams later messages without updating it.
-  // Elect only from bounded, structural evidence in the two cores (and their
-  // readable base), otherwise leave both original tips available for manual
-  // resolution instead of making one side's unioned bubbles inert.
-  const timestampComparison = compareLastUpdatedAt(
+  // A wall-clock timestamp cannot prove that one branch contains the other's
+  // messages. Choosing its shape would hide the losing branch's unioned rows.
+  const winnerIndex = electCompatibleCore(
+    baseSnapshot,
     firstSnapshot,
     secondSnapshot,
+    workBudget,
+    limits.maxStructuralTokens,
   );
-  let winnerIndex: 0 | 1;
-  if (timestampComparison > 0) {
-    winnerIndex = 0;
-  } else if (timestampComparison < 0) {
-    winnerIndex = 1;
-  } else {
-    const equalTimestampWinner = electEqualTimestampCore(
-      baseSnapshot,
-      firstSnapshot,
-      secondSnapshot,
-      workBudget,
-      limits.maxStructuralTokens,
-    );
-    if (equalTimestampWinner === null) {
-      return { status: "conflict" };
-    }
-    winnerIndex = equalTimestampWinner;
+  if (winnerIndex === null) {
+    return { status: "conflict" };
   }
   const winner = winnerIndex === 0 ? firstSnapshot : secondSnapshot;
   // A v1 elected core has no verified declaration of its active continuation
@@ -347,10 +383,18 @@ function mergeAgentKvPayload(
   winner: PortableChatSnapshot,
   coreRoots: readonly string[],
 ): PortableAgentKvPayload {
+  return mergeAgentKvSnapshots([base, first, second], winner, coreRoots);
+}
+
+function mergeAgentKvSnapshots(
+  snapshots: readonly (PortableChatSnapshot | null)[],
+  winner: PortableChatSnapshot,
+  coreRoots: readonly string[],
+): PortableAgentKvPayload {
   const referenced = new Set<string>();
   const blobs = new Map<string, PortableKvRow>();
   let decodedBlobBytes = 0;
-  for (const snapshot of [base, first, second]) {
+  for (const snapshot of snapshots) {
     if (snapshot === null || !isPortableChatSnapshotV2(snapshot)) {
       continue;
     }
@@ -499,7 +543,7 @@ type MergeJsonInspection =
  * later, not which frozen-timestamp conversation is more complete. The caller
  * keeps the fork manual unless one of these bounded proofs succeeds.
  */
-function electEqualTimestampCore(
+function electCompatibleCore(
   base: PortableChatSnapshot | null,
   first: PortableChatSnapshot,
   second: PortableChatSnapshot,
@@ -513,11 +557,11 @@ function electEqualTimestampCore(
     // data. Keep the v2 envelope or both PCs can downgrade and enrich forever.
     if (
       first.schemaVersion !== second.schemaVersion &&
-      portableChatCoreHash(first) === portableChatCoreHash(second)
+      sameChatContentExceptDeviceHeader(first, second)
     ) {
       return isPortableChatSnapshotV2(first) ? 0 : 1;
     }
-    return 0;
+    return compareLastUpdatedAt(first, second) < 0 ? 1 : 0;
   }
 
   const budget: EqualTimestampElectionBudget = {
@@ -584,6 +628,22 @@ function electEqualTimestampCore(
   return null;
 }
 
+function sameChatContentExceptDeviceHeader(
+  first: PortableChatSnapshot,
+  second: PortableChatSnapshot,
+): boolean {
+  const sharedHeaderKeys = [
+    "composerId", "createdAt", "lastUpdatedAt", "isArchived", "isSubagent",
+    "checkpointAt", "value",
+  ] as const;
+  return sharedHeaderKeys.every((key) => first.header[key] === second.header[key]) &&
+    first.bubbles.length === second.bubbles.length &&
+    first.bubbles.every((row, index) => {
+      const other = second.bubbles[index];
+      return other !== undefined && row.key === other.key && sameRow(row, other);
+    });
+}
+
 /** Cursor's ordered visible conversation shape, or null when not provable. */
 function visibleBubbleKeys(
   snapshot: PortableChatSnapshot,
@@ -636,14 +696,35 @@ function visibleBubblesAreCompleteAndUsable(
   const bubbles = indexBubbles(snapshot.bubbles);
   for (const key of references) {
     const row = bubbles.get(key);
-    if (
-      row === undefined ||
-      inspectMergeJsonRow(row, budget).status !== "usable"
-    ) {
+    if (row === undefined || !isUsableJsonObject(inspectMergeJsonRow(row, budget))) {
       return false;
     }
   }
   return true;
+}
+
+/** Validates an exact fallback without changing its core or exposing messages. */
+export function isPortableChatCoreUsable(
+  snapshot: PortableChatSnapshot,
+  maxWorkBytes = CHAT_OFFLINE_MERGE_MAX_OUTPUT_BYTES,
+): boolean {
+  if (!Number.isSafeInteger(maxWorkBytes) || maxWorkBytes <= 0) {
+    return false;
+  }
+  const budget: EqualTimestampElectionBudget = {
+    structure: createJsonStructureBudget({
+      maxStructuralTokens: 1_048_576,
+      maxNestingDepth: CHAT_AUTO_MERGE_MAX_JSON_NESTING_DEPTH,
+    }),
+    remainingDecodedBytes: Math.min(maxWorkBytes, CHAT_OFFLINE_MERGE_MAX_OUTPUT_BYTES),
+  };
+  const references = visibleBubbleKeys(snapshot, budget);
+  return references !== null && visibleBubblesAreCompleteAndUsable(snapshot, references, budget);
+}
+
+function isUsableJsonObject(inspected: MergeJsonInspection): boolean {
+  return inspected.status === "usable" && inspected.value !== null &&
+    typeof inspected.value === "object" && !Array.isArray(inspected.value);
 }
 
 function inspectMergeJsonRow(

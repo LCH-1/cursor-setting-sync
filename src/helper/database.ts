@@ -11,6 +11,7 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   BACKUP_DIRECTORY,
   CURSOR_USER_RULES_KEY,
+  MAX_HELPER_SINGLE_CHAT_BYTES,
   TARGET_STORAGE_MARKER,
   USER_STORAGE_TARGET,
 } from "../constants";
@@ -29,6 +30,7 @@ import {
 import {
   bubbleKeyRange,
   isPortableChatSnapshotV2,
+  MAX_CHAT_CORE_METADATA_ROWS,
   parsePortableChatSnapshot,
   portableChatCoreHash,
   type PortableAgentKvPayload,
@@ -100,8 +102,8 @@ export interface DatabaseApplyResult {
   /** What the next scan of those resources will hash to. */
   retainedLocalHashes: Record<string, string>;
   /**
-   * Blob-only enrichment core shortcut: the verified source-equal hash, or
-   * null when the preserved local core is partial or divergent.
+   * Verified physical core after latest selection or source-equal enrichment;
+   * null when no bounded exact observation can be remembered.
    */
   localChatCoreHashes: Record<string, string | null>;
 }
@@ -1268,6 +1270,10 @@ function applyPreparedChange(
       }
       throw error;
     }
+    const sourceAudit = auditChatReferences(snapshot);
+    if (sourceAudit.status === "known" && sourceAudit.unavailableBubbleKeys.length > 0) {
+      return { status: "failed", reason: "Chat core apply is blocked because its visible messages are missing or unreadable." };
+    }
     const sourceWorkspaceId = snapshot.header.workspaceId;
     if (sourceWorkspaceId === null) {
       // A workspace-less composer round-trips as workspace-less; there is
@@ -1278,7 +1284,8 @@ function applyPreparedChange(
         null,
         request.syncOptions.maxPayloadBytes,
       );
-      return chatAppliedOutcome(change.semanticHash, writtenHash);
+      return chatAppliedOutcome(change.semanticHash, writtenHash,
+        resolvedChatLocalCoreHash(database, snapshot, null, change.metadata, request.syncOptions.maxPayloadBytes));
     }
     const sourceWorkspaceUri = metadataStringOrNull(
       change.metadata,
@@ -1305,7 +1312,8 @@ function applyPreparedChange(
         sourceWorkspaceId,
         request.syncOptions.maxPayloadBytes,
       );
-      return chatAppliedOutcome(change.semanticHash, writtenHash);
+      return chatAppliedOutcome(change.semanticHash, writtenHash,
+        resolvedChatLocalCoreHash(database, snapshot, sourceWorkspaceId, change.metadata, request.syncOptions.maxPayloadBytes));
     }
     const writtenHash = upsertChat(
       database,
@@ -1313,7 +1321,8 @@ function applyPreparedChange(
       targetWorkspaceId,
       request.syncOptions.maxPayloadBytes,
     );
-    return chatAppliedOutcome(change.semanticHash, writtenHash);
+    return chatAppliedOutcome(change.semanticHash, writtenHash,
+      resolvedChatLocalCoreHash(database, snapshot, targetWorkspaceId, change.metadata, request.syncOptions.maxPayloadBytes));
   }
 
   if (
@@ -1474,11 +1483,91 @@ function applyPreparedChange(
 function chatAppliedOutcome(
   publishedHash: string,
   writtenHash: string,
+  localChatCoreHash?: string | null,
 ): ChangeOutcome {
   return {
     status: "applied",
     ...(writtenHash === publishedHash ? {} : { retainedLocalHash: writtenHash }),
+    ...(localChatCoreHash === undefined ? {} : { localChatCoreHash }),
   };
+}
+
+function resolvedChatLocalCoreHash(
+  database: DatabaseSync,
+  snapshot: PortableChatSnapshot,
+  workspaceId: string | null,
+  metadata: Record<string, JsonValue> | undefined,
+  maxBytes: number,
+): string | null | undefined {
+  if (metadata?.chatResolutionStrategy !== "latest" && metadata?.chatResolutionStrategy !== "merged") {
+    return undefined;
+  }
+  // Conflict resolution preserves inactive local branches. Remember the exact
+  // physical core so those retained rows cannot masquerade as a fresh edit.
+  const hash = createHash("sha256");
+  const rowMetadata = database.prepare(
+    "SELECT key, typeof(value) AS valueType, length(CAST(value AS BLOB)) AS valueBytes " +
+      "FROM cursorDiskKV WHERE key >= ? AND key < ? ORDER BY key LIMIT ?",
+  );
+  const valueChunk = database.prepare(
+    "SELECT substr(CAST(value AS BLOB), ?, ?) AS value FROM cursorDiskKV WHERE key = ?",
+  );
+  let remainingBytes = Math.min(maxBytes, MAX_HELPER_SINGLE_CHAT_BYTES);
+  const hashRow = (row: Record<string, SqliteStorageValue>): boolean => {
+    if (typeof row.key !== "string" ||
+      (row.valueType !== "text" && row.valueType !== "blob" && row.valueType !== "null")) {
+      return false;
+    }
+    const bytes = row.valueType === "null" ? 0 : row.valueBytes;
+    if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 0 || bytes > remainingBytes) {
+      return false;
+    }
+    remainingBytes -= bytes;
+    hash.update('{"key":');
+    hash.update(canonicalJson(row.key));
+    hash.update(',"valueBase64":"');
+    const chunkBytes = 48 * 1024;
+    for (let offset = 0; offset < bytes; offset += chunkBytes) {
+      const length = Math.min(chunkBytes, bytes - offset);
+      const chunk = valueChunk.get(offset + 1, length, row.key)?.value;
+      if (!(chunk instanceof Uint8Array) || chunk.byteLength !== length) {
+        return false;
+      }
+      hash.update(Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).toString("base64"));
+    }
+    hash.update('","valueType":');
+    hash.update(canonicalJson(row.valueType));
+    hash.update("}");
+    return true;
+  };
+  hash.update('{"bubbles":[');
+  let count = 0;
+  for (const row of rowMetadata.iterate(...bubbleKeyRange(snapshot.composerId), MAX_CHAT_CORE_METADATA_ROWS + 1)) {
+    count += 1;
+    if (count > MAX_CHAT_CORE_METADATA_ROWS) {
+      return null;
+    }
+    if (count > 1) {
+      hash.update(",");
+    }
+    if (!hashRow(row)) {
+      return null;
+    }
+  }
+  hash.update('],"composerData":');
+  const composer = database.prepare(
+    "SELECT key, typeof(value) AS valueType, length(CAST(value AS BLOB)) AS valueBytes " +
+      "FROM cursorDiskKV WHERE key = ?",
+  ).get(snapshot.composerData.key);
+  if (composer === undefined || !hashRow(composer)) {
+    return null;
+  }
+  hash.update(',"composerId":');
+  hash.update(canonicalJson(snapshot.composerId));
+  hash.update(',"header":');
+  updatePortableComposerHeaderHash(hash, { ...snapshot.header, workspaceId });
+  hash.update(',"schemaVersion":1}');
+  return hash.digest("hex");
 }
 
 function updatePortableAgentKvHash(

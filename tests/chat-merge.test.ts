@@ -10,7 +10,7 @@ vi.mock("vscode", () => ({
 
 import { EventReconciler, compareTips } from "../src/protocol/reconciler";
 import { autoMergeConflicts } from "../src/sync/manager";
-import { mergeChatSnapshotBuffers } from "../src/chat/chatMerge";
+import { buildChatContinuationCandidate, isPortableChatCoreUsable, mergeChatSnapshotBuffers } from "../src/chat/chatMerge";
 import { verifyPortableChatContinuationClosure } from "../src/chat/continuationClosure";
 import {
   parsePortableChatSnapshot,
@@ -36,6 +36,52 @@ const PRODUCER: EventProducer = {
 
 const COMPOSER = "026e7136-6ca9-4847-9328-6fc5a697c651";
 
+describe("retaining the latest core with historical continuation blobs", () => {
+  it("completes the latest graph without importing an older branch or composer state", async () => {
+    const leaf = conversationStepBytes("latest continuation leaf");
+    const leafId = sha256(leaf);
+    const root = conversationTurnBytes([leafId]);
+    const rootId = sha256(root);
+    const latest = parsePortableChatSnapshot(visibleChat({
+      visibleBubbles: ["base", "latest"], lastUpdatedAt: 100, title: "latest title",
+      conversationState: serializedTurnRootState([rootId]),
+    }));
+    const oldCore = visibleChat({ visibleBubbles: ["base", "old-branch"], lastUpdatedAt: 900 });
+    const sources = [
+      parsePortableChatSnapshot(chatV2FromCore(oldCore, [root], [leafId])),
+      parsePortableChatSnapshot(chatV2FromCore(oldCore, [leaf])),
+    ];
+    const content = buildChatContinuationCandidate(latest, sources);
+    expect(content).not.toBeNull();
+    const candidate = parsePortableChatSnapshot(content!);
+    expect(portableChatCoreHash(candidate)).toBe(portableChatCoreHash(latest));
+    expect(candidate.bubbles).toEqual(latest.bubbles);
+    expect(candidate.header).toEqual(latest.header);
+    expect(candidate.composerData).toEqual(latest.composerData);
+    if (candidate.schemaVersion !== 2) {
+      throw new Error("expected v2 continuation candidate");
+    }
+    await expect(verifyPortableChatContinuationClosure(candidate)).resolves.toMatchObject({ status: "complete" });
+    expect(buildChatContinuationCandidate(latest, [...sources].reverse())).toEqual(content);
+    expect(buildChatContinuationCandidate(latest, sources, 1)).toBeNull();
+  });
+
+  it("leaves an unavailable latest root missing for the caller to reject", async () => {
+    const rootId = sha256("unavailable latest root");
+    const latest = parsePortableChatSnapshot(visibleChat({
+      visibleBubbles: ["latest"], lastUpdatedAt: 100,
+      conversationState: serializedRootState([rootId]),
+    }));
+    const content = buildChatContinuationCandidate(latest, []);
+    const candidate = parsePortableChatSnapshot(content!);
+    if (candidate.schemaVersion !== 2) {
+      throw new Error("expected v2 continuation candidate");
+    }
+    expect(portableChatCoreHash(candidate)).toBe(portableChatCoreHash(latest));
+    await expect(verifyPortableChatContinuationClosure(candidate)).resolves.toMatchObject({ status: "incomplete" });
+  });
+});
+
 describe("mergeChatSnapshotBuffers", () => {
   it("keeps every bubble either side captured", () => {
     // The live case: one device holds 4 bubbles the other has not seen yet.
@@ -55,8 +101,8 @@ describe("mergeChatSnapshotBuffers", () => {
   });
 
   it("adopts the header of the newer capture, not of the first argument", () => {
-    const older = chat({ bubbles: ["b1"], lastUpdatedAt: 100, title: "old" });
-    const newer = chat({ bubbles: ["b1"], lastUpdatedAt: 900, title: "new" });
+    const older = visibleChat({ visibleBubbles: ["b1"], lastUpdatedAt: 100, title: "old" });
+    const newer = visibleChat({ visibleBubbles: ["b1"], lastUpdatedAt: 900, title: "new" });
 
     // The newer side is passed second, so a merge that just took `ordered[0]`
     // would silently adopt the stale title.
@@ -130,6 +176,48 @@ describe("mergeChatSnapshotBuffers", () => {
       expect(visibleBubbleIds(outcome.content)).toEqual(["b1", "b2", "b3"]);
       expect(header(outcome.content).value).toBe("complete");
     }
+  });
+
+  it.each([[100, 200], [200, 100], [null, 200]] as const)(
+    "does not hide either visible branch when their timestamps are %s and %s",
+    (leftAt, rightAt) => {
+      const left = visibleChat({ visibleBubbles: ["base", "left"], lastUpdatedAt: leftAt });
+      const right = visibleChat({ visibleBubbles: ["base", "right"], lastUpdatedAt: rightAt });
+      for (const ordered of [[left, right], [right, left]] as const) {
+        expect(mergeChatSnapshotBuffers(null, ordered).status).toBe("conflict");
+      }
+    },
+  );
+
+  it("keeps a complete append when the shorter capture has a larger wall clock", () => {
+    const shorter = visibleChat({ visibleBubbles: ["base"], lastUpdatedAt: 900 });
+    const longer = visibleChat({ visibleBubbles: ["base", "new"], lastUpdatedAt: 100 });
+    for (const ordered of [[shorter, longer], [longer, shorter]] as const) {
+      const outcome = mergeChatSnapshotBuffers(null, ordered);
+      expect(outcome.status).toBe("merged");
+      expect(visibleBubbleIds(outcome.content)).toEqual(["base", "new"]);
+    }
+  });
+
+  it("declines a malformed higher-timestamp shape instead of electing it", () => {
+    const safe = visibleChat({ visibleBubbles: ["base"], lastUpdatedAt: 100 });
+    const malformed = visibleChat({
+      visibleBubbles: ["base", "new"], lastUpdatedAt: 900,
+      composerDataText: "{malformed",
+    });
+    expect(mergeChatSnapshotBuffers(null, [safe, malformed]).status).toBe("conflict");
+  });
+
+  it("requires usable visible rows before an exact version can be selected", () => {
+    const complete = visibleChat({ visibleBubbles: ["base", "new"], lastUpdatedAt: 100 });
+    const missing = visibleChat({
+      visibleBubbles: ["base", "new"], storedBubbles: ["base"], lastUpdatedAt: 900,
+    });
+    const scalar = withBubbleValue(complete, "new", "42");
+    expect(isPortableChatCoreUsable(parsePortableChatSnapshot(complete))).toBe(true);
+    expect(isPortableChatCoreUsable(parsePortableChatSnapshot(missing))).toBe(false);
+    expect(isPortableChatCoreUsable(parsePortableChatSnapshot(scalar))).toBe(false);
+    expect(isPortableChatCoreUsable(parsePortableChatSnapshot(complete), 1)).toBe(false);
   });
 
   it("elects the only complete composerData change from a readable base", () => {
@@ -504,6 +592,27 @@ describe("mergeChatSnapshotBuffers", () => {
     }
   });
 
+  it("keeps v2 when only device-local header mapping differs", () => {
+    const legacy = visibleChat({ visibleBubbles: ["b1"], lastUpdatedAt: 500 });
+    const enriched = chatV2FromCore(legacy, [Buffer.from("retained auxiliary blob")]);
+    const remapped = parsePortableChatSnapshot(legacy);
+    remapped.header.recency = 99;
+    remapped.header.workspaceId = "other-device-workspace";
+    for (const ordered of [[canonicalBytes(remapped), enriched], [enriched, canonicalBytes(remapped)]] as const) {
+      expect(mergeChatSnapshotBuffers(null, ordered).content).toEqual(enriched);
+    }
+  });
+
+  it("does not erase an authored title change just to retain an older v2 envelope", () => {
+    const before = visibleChat({ visibleBubbles: ["b1"], lastUpdatedAt: 500, title: "old" });
+    const enriched = chatV2FromCore(before, []);
+    const renamed = parsePortableChatSnapshot(before);
+    renamed.header.value = "new title";
+    const outcome = mergeChatSnapshotBuffers(null, [canonicalBytes(renamed), enriched]);
+    expect(outcome.status).toBe("merged");
+    expect(header(outcome.content).value).toBe("new title");
+  });
+
   it("keeps a v1 winner eligible for enrichment instead of falsely completing an inherited partial graph", () => {
     const missingChildId = sha256("omitted inherited child");
     const inheritedRoot = bytesField(4, Buffer.from(missingChildId, "hex"));
@@ -692,17 +801,17 @@ describe("mergeChatSnapshotBuffers", () => {
     const olderBlob = Buffer.from("older complete root", "utf8");
     const olderRoot = sha256(olderBlob);
     const newerRoot = sha256("newer core root without a local blob");
-    const newer = chat({
-      bubbles: ["new"],
+    const newer = visibleChat({
+      visibleBubbles: ["old", "new"],
       lastUpdatedAt: 20,
       conversationState: serializedRootState([newerRoot]),
     });
-    const older = chatV2(
-      {
-        bubbles: ["old"],
+    const older = chatV2FromCore(
+      visibleChat({
+        visibleBubbles: ["old"],
         lastUpdatedAt: 10,
         conversationState: serializedRootState([olderRoot]),
-      },
+      }),
       [olderBlob],
     );
 
@@ -749,7 +858,7 @@ describe("mergeChatSnapshotBuffers", () => {
       ),
     ],
   ])(
-    "keeps an unsafe v1 winner enrichable but declines v2 winner roots that are %s",
+    "declines unproven v1 shapes and v2 roots that are %s",
     (_case, state) => {
     const olderBlob = Buffer.from("retained complete root", "utf8");
     const older = chatV2(
@@ -763,11 +872,7 @@ describe("mergeChatSnapshotBuffers", () => {
     });
 
     const v1Outcome = mergeChatSnapshotBuffers(null, [unsafeWinner, older]);
-    expect(v1Outcome.status).toBe("merged");
-    expect(
-      parsePortableChatSnapshot(v1Outcome.content ?? Buffer.alloc(0))
-        .schemaVersion,
-    ).toBe(1);
+    expect(v1Outcome.status).toBe("conflict");
     const unsafeV2 = chatV2(
       {
         bubbles: ["same"],
@@ -818,8 +923,8 @@ describe("base-free chat conflicts", () => {
       expect(reads).not.toHaveBeenCalled();
       expect(publishes).not.toHaveBeenCalled();
       expect(conflicts[0]?.resolvedAt).toBeUndefined();
-      expect(warnings.join("\n")).toContain("interactive merge budget");
-      expect(warnings.join("\n")).toContain("Resolve Conflicts");
+      expect(warnings.join("\n")).toContain("interactive merge work limit");
+      expect(warnings.join("\n")).toContain("offline helper");
 
       reads.mockRestore();
       publishes.mockRestore();
@@ -916,7 +1021,7 @@ describe("base-free chat conflicts", () => {
               metadata: {
                 ...snapshot.metadata,
                 ...(content === enriched ? {
-                  syncOrigin: "agent-kv-enrichment",
+                  ...(mode === "three-way" ? { syncOrigin: "agent-kv-enrichment" } : {}),
                   chatSnapshotSchemaVersion: 2,
                   agentKvMissingCount: 0,
                 } : {}),
@@ -975,10 +1080,10 @@ describe("base-free chat conflicts", () => {
       const conflicts = await reconcileConflicts(repository);
       const reads = vi.spyOn(repository, "tryReadVersion");
       expect(await autoMergeConflicts(repository, conflicts)).toBe(true);
-      expect(reads).toHaveBeenCalledOnce();
+      expect(reads.mock.calls.length).toBeLessThanOrEqual(3);
       expect(await reconcileConflicts(repository)).toEqual([]);
       const tip = repository.state.tips[resourceId]![0]!;
-      expect(tip.metadata).toEqual(metadata);
+      expect(tip.metadata).toMatchObject(metadata);
       expect((await repository.readVersion(tip.versionId)).content).toEqual(enriched);
     });
   });
@@ -1014,20 +1119,20 @@ describe("base-free chat conflicts", () => {
     });
   });
 
-  it("preserves three distinct chat branches for manual resolution", async () => {
+  it("retains the latest exact version when three chat branches diverge", async () => {
     await withRepository(async (repository) => {
       const resourceId = `chat/${COMPOSER}`;
       for (const bubble of ["one", "two", "three"]) {
         await repository.publish([
-          { ...chatSnapshot(resourceId, chat({ bubbles: [bubble], lastUpdatedAt: 1 })), parents: [] },
+          { ...chatSnapshot(resourceId, visibleChat({ visibleBubbles: [bubble], lastUpdatedAt: 1 })), parents: [] },
         ], []);
       }
       const conflicts = await reconcileConflicts(repository);
-      const reads = vi.spyOn(repository, "tryReadVersion");
-      expect(await autoMergeConflicts(repository, conflicts)).toBe(false);
-      expect(reads).not.toHaveBeenCalled();
-      expect(conflicts[0]?.resolvedAt).toBeUndefined();
-      expect(repository.state.tips[resourceId]).toHaveLength(3);
+      expect(await autoMergeConflicts(repository, conflicts)).toBe(true);
+      await reconcileConflicts(repository);
+      const tip = repository.state.tips[resourceId]![0]!;
+      expect(tip.metadata?.chatResolutionStrategy).toBe("latest");
+      expect(visibleBubbleIds((await repository.readVersion(tip.versionId)).content ?? undefined)).toEqual(["three"]);
     });
   });
 
@@ -1047,14 +1152,14 @@ describe("base-free chat conflicts", () => {
     });
   });
 
-  it("resolves a real divergence by union rather than by discarding a side", async () => {
+  it("retains the latest exact visible branch when a real divergence cannot merge safely", async () => {
     await withRepository(async (repository) => {
       const resourceId = `chat/${COMPOSER}`;
       await publishFork(
         repository,
         resourceId,
-        chat({ bubbles: ["b1", "b2", "b3"], lastUpdatedAt: 10 }),
-        chat({ bubbles: ["b1", "b4"], lastUpdatedAt: 20 }),
+        visibleChat({ visibleBubbles: ["b1", "b2", "b3"], lastUpdatedAt: 10 }),
+        visibleChat({ visibleBubbles: ["b1", "b4"], lastUpdatedAt: 20 }),
       );
       const conflicts = await reconcileConflicts(repository);
 
@@ -1063,27 +1168,27 @@ describe("base-free chat conflicts", () => {
 
       const tips = repository.state.tips[resourceId] ?? [];
       const resolved = await repository.readVersion(tips[0]?.versionId ?? "");
-      // Nothing was thrown away, and the count that travels with the tip
-      // describes the union rather than the winning side.
-      expect(bubbleKeys(resolved.content ?? undefined)).toHaveLength(4);
-      expect(tips[0]?.metadata?.bubbleCount).toBe(4);
+      expect(visibleBubbleIds(resolved.content ?? undefined)).toEqual(["b1", "b4"]);
+      expect(bubbleKeys(resolved.content ?? undefined)).toHaveLength(2);
+      expect(tips[0]?.metadata?.chatResolutionStrategy).toBe("latest");
+      expect(tips[0]?.metadata?.bubbleCount).toBe(2);
       expect(header(resolved.content ?? undefined).lastUpdatedAt).toBe(20);
     });
   });
 
   it.each(["base-free", "three-way"] as const)(
-    "does not publish an ambiguous %s same-key row disagreement",
+    "does not publish an unreadable %s same-key row disagreement",
     async (mode) => {
       await withRepository(async (repository) => {
         const resourceId = `chat/${COMPOSER}`;
         const baseContent = chat({ bubbles: ["b1"], lastUpdatedAt: 1 });
         const left = withBubbleValue(
-          chat({ bubbles: ["b1", "left"], lastUpdatedAt: 3 }),
+          visibleChat({ visibleBubbles: ["b1", "left"], lastUpdatedAt: 3 }),
           "b1",
           "left content",
         );
         const right = withBubbleValue(
-          chat({ bubbles: ["b1", "right"], lastUpdatedAt: 2 }),
+          visibleChat({ visibleBubbles: ["b1", "right"], lastUpdatedAt: 2 }),
           "b1",
           "right content",
         );
@@ -1115,7 +1220,7 @@ describe("base-free chat conflicts", () => {
     },
   );
 
-  it("recomputes v2 format metadata from the merged payload", async () => {
+  it.each([false, true])("recomputes complete v2 metadata with inactive missing declarations=%s", async (partial) => {
     await withRepository(async (repository) => {
       const resourceId = `chat/${COMPOSER}`;
       const firstBlob = Buffer.from("first merged blob", "utf8");
@@ -1130,7 +1235,7 @@ describe("base-free chat conflicts", () => {
         chatV2(
           { bubbles: ["b2"], lastUpdatedAt: 20 },
           [secondBlob],
-          [unresolved],
+          partial ? [unresolved] : [],
         ),
       ];
       for (const [index, content] of sides.entries()) {
@@ -1139,8 +1244,7 @@ describe("base-free chat conflicts", () => {
             {
               ...chatSnapshot(resourceId, content),
               parents: [],
-              // Deliberately stale winner metadata: the merged event must not
-              // claim this v2 graph is complete merely because one input did.
+              // Input metadata cannot establish the resulting graph's completeness.
               metadata: {
                 composerId: COMPOSER,
                 chatSnapshotSchemaVersion: index === 0 ? 2 : 1,
@@ -1171,12 +1275,22 @@ describe("base-free chat conflicts", () => {
       expect(tip?.metadata).toMatchObject({
         chatSnapshotSchemaVersion: 2,
         agentKvBlobCount: 2,
-        agentKvReferencedCount: 3,
-        agentKvMissingCount: 1,
-        bubbleCount: 2,
+        agentKvReferencedCount: 2,
+        agentKvMissingCount: 0,
+        bubbleCount: partial ? 1 : 2,
         chatCoreHash: portableChatCoreHash(parsed),
+        chatResolutionStrategy: partial ? "latest" : "merged",
       });
-      expect(parsed.agentKv.missingIds).toEqual([unresolved]);
+      expect(parsed.agentKv.missingIds).toEqual([]);
+      expect(parsed.agentKv.referencedIds).toEqual([sha256(firstBlob), sha256(secondBlob)].sort());
+      await expect(verifyPortableChatContinuationClosure(parsed)).resolves.toMatchObject({ status: "complete" });
+      if (partial) {
+        const latest = parsePortableChatSnapshot(sides[1]!);
+        expect(portableChatCoreHash(parsed)).toBe(portableChatCoreHash(latest));
+        expect(parsed.header).toEqual(latest.header);
+        expect(parsed.composerData).toEqual(latest.composerData);
+        expect(parsed.bubbles).toEqual(latest.bubbles);
+      }
     });
   });
 
@@ -1199,8 +1313,8 @@ describe("base-free chat conflicts", () => {
       // Both sides descend from the base, so this fork has a real merge base
       // and takes the three-way path rather than the base-free one.
       for (const side of [
-        chat({ bubbles: ["b1", "b3"], lastUpdatedAt: 30 }),
-        chat({ bubbles: ["b1", "b4"], lastUpdatedAt: 20 }),
+        chatV2({ bubbles: ["b1", "b3"], lastUpdatedAt: 30 }, []),
+        chatV2({ bubbles: ["b1", "b4"], lastUpdatedAt: 20 }, []),
       ]) {
         await repository.publish(
           [{ ...chatSnapshot(resourceId, side), parents: [baseVersion] }],
@@ -1229,7 +1343,7 @@ describe("base-free chat conflicts", () => {
     });
   });
 
-  it("keeps a non-exact three-way base manual instead of dropping its pruned bubble", async () => {
+  it("retains the latest exact tip and preserves an unsupported base in history", async () => {
     await withRepository(async (repository) => {
       const resourceId = `chat/${COMPOSER}`;
       const exactBase = parsePortableChatSnapshot(
@@ -1256,10 +1370,15 @@ describe("base-free chat conflicts", () => {
       const conflicts = await reconcileConflicts(repository);
       const publishes = vi.spyOn(repository, "publish");
 
-      expect(await autoMergeConflicts(repository, conflicts)).toBe(false);
-      expect(publishes).not.toHaveBeenCalled();
-      expect(conflicts[0]?.resolvedAt).toBeUndefined();
-      expect(repository.state.tips[resourceId]).toHaveLength(2);
+      expect(await autoMergeConflicts(repository, conflicts)).toBe(true);
+      expect(publishes).toHaveBeenCalledOnce();
+      await reconcileConflicts(repository);
+      const tip = repository.state.tips[resourceId]![0]!;
+      expect(tip.metadata?.chatResolutionStrategy).toBe("latest");
+      expect(bubbleKeys((await repository.readVersion(tip.versionId)).content ?? undefined)).toEqual([
+        bubbleKey("b1"), bubbleKey("right"),
+      ]);
+      expect((await repository.readVersion(baseVersion)).content).toEqual(baseContent);
 
       publishes.mockRestore();
     });
@@ -1309,7 +1428,7 @@ describe("base-free chat conflicts", () => {
       expect(reads).not.toHaveBeenCalled();
       expect(publishes).not.toHaveBeenCalled();
       expect(conflicts[0]?.resolvedAt).toBeUndefined();
-      expect(warnings.join("\n")).toContain("interactive merge budget");
+      expect(warnings.join("\n")).toContain("interactive merge work limit");
 
       reads.mockRestore();
       metadataReads.mockRestore();
@@ -1317,7 +1436,7 @@ describe("base-free chat conflicts", () => {
     });
   });
 
-  it("keeps an over-count disjoint bubble union manual without publishing", async () => {
+  it("retains the latest exact version when a disjoint bubble union exceeds its row budget", async () => {
     await withRepository(async (repository) => {
       const resourceId = `chat/${COMPOSER}`;
       const leftIds = Array.from(
@@ -1345,12 +1464,12 @@ describe("base-free chat conflicts", () => {
           () => true,
           (warning) => warnings.push(warning),
         ),
-      ).toBe(false);
-      expect(publishes).not.toHaveBeenCalled();
-      expect(conflicts[0]?.resolvedAt).toBeUndefined();
-      expect(repository.state.tips[resourceId]).toHaveLength(2);
-      expect(warnings.join("\n")).toContain("interactive merge budget");
-      expect(warnings.join("\n")).toContain("Resolve Conflicts");
+      ).toBe(true);
+      expect(publishes).toHaveBeenCalledOnce();
+      await reconcileConflicts(repository);
+      const tip = repository.state.tips[resourceId]![0]!;
+      expect(tip.metadata?.chatResolutionStrategy).toBe("latest");
+      expect(bubbleKeys((await repository.readVersion(tip.versionId)).content ?? undefined)).toHaveLength(rightIds.length);
 
       publishes.mockRestore();
     }, 8 * 1024 * 1024);
@@ -1395,7 +1514,7 @@ describe("base-free chat conflicts", () => {
           {
             ...chatSnapshot(
               resourceId,
-              chat({ bubbles: ["b1", "b2"], lastUpdatedAt: 400, recency: 1 }),
+              chatV2({ bubbles: ["b1", "b2"], lastUpdatedAt: 400, recency: 1 }, []),
             ),
             parents: [],
           },
@@ -1418,7 +1537,7 @@ describe("base-free chat conflicts", () => {
           {
             ...chatSnapshot(
               resourceId,
-              chat({ bubbles: ["b2", "b3"], lastUpdatedAt: 400, recency: 8 }),
+              chatV2({ bubbles: ["b2", "b3"], lastUpdatedAt: 400, recency: 8 }, []),
             ),
             parents: [],
           },
@@ -1470,12 +1589,13 @@ function chat(options: {
     },
     composerData: row(
       `composerData:${composerId}`,
-      options.conversationState === undefined
-        ? options.title ?? "body"
-        : JSON.stringify({ conversationState: options.conversationState }),
+      JSON.stringify({
+        fullConversationHeadersOnly: [],
+        ...(options.conversationState === undefined ? {} : { conversationState: options.conversationState }),
+      }),
     ),
     bubbles: options.bubbles.map((id) =>
-      row(`bubbleId:${composerId}:${id}`, id),
+      row(`bubbleId:${composerId}:${id}`, JSON.stringify({ text: id })),
     ),
   };
   return canonicalBytes(snapshot);

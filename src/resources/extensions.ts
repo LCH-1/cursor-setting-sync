@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { stat } from "node:fs/promises";
 import { openDatabase, sqliteStorageText } from "../platform/sqlite";
 import { existsSync } from "node:fs";
@@ -558,7 +558,7 @@ export class ExtensionsAdapter implements ResourceAdapter {
   private async listInstalledExtensions(
     profileName: string | null,
   ): Promise<Array<{ id: string; version: string }>> {
-    const args = ["--list-extensions", "--show-versions"];
+    const args = ["--list-extensions", "--show-versions", "--user-data-dir", dirname(this.paths.userDataRoot)];
     if (profileName !== null) {
       args.push("--profile", profileName);
     }

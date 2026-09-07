@@ -82,7 +82,7 @@ import type {
   ResourceSnapshot,
   ResourceTip,
 } from "../src/types";
-import type { ConflictController } from "../src/ui/conflicts";
+import { ConflictController, type ConflictSelection } from "../src/ui/conflicts";
 import type { StatusController } from "../src/ui/status";
 import { shouldPublishSnapshot } from "../src/sync/versionPolicy";
 
@@ -113,6 +113,132 @@ afterEach(async () => {
       }),
     ),
   );
+});
+
+describe("conflict command graph refresh", () => {
+  it("shows peer conflicts that arrived after the last persisted reconciliation", async () => {
+    const fixture = await createConflictCommandFixture();
+    await fixture.repository.publish([{ ...settingsSnapshot("14"), parents: [] }], []);
+    await reconcileAndPersist(fixture.repository);
+    await fixture.peer.publish([{ ...settingsSnapshot("16"), parents: [] }], []);
+    const collectSelections = vi.fn(async (repository: SyncRepository) => {
+      expect(repository.state.tips[fixture.resourceId]).toHaveLength(2);
+      expect(repository.state.conflicts.filter(item => item.resolvedAt === undefined)).toHaveLength(1);
+      return { selections: [], deferred: [] };
+    });
+    fixture.controller.collectSelections = collectSelections;
+
+    try {
+      await fixture.manager.resolveConflicts();
+      expect(collectSelections).toHaveBeenCalledOnce();
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
+
+  it("does not publish a selection after a peer changes one of its tips", async () => {
+    const fixture = await createConflictCommandFixture();
+    await fixture.repository.publish([{ ...settingsSnapshot("14"), parents: [] }], []);
+    const peerInitial = await fixture.peer.publish([{ ...settingsSnapshot("16"), parents: [] }], []);
+    await reconcileAndPersist(fixture.repository);
+    fixture.controller.collectSelections = vi.fn(async (repository: SyncRepository) => {
+      const selection = selectedConflict(repository, fixture.resourceId);
+      await fixture.peer.publish([{ ...settingsSnapshot("18"), parents: [`${peerInitial.eventHash}#0`] }], []);
+      return { selections: [selection], deferred: [] };
+    });
+    const publish = vi.spyOn(fixture.repository, "publish");
+
+    try {
+      await fixture.manager.resolveConflicts();
+      expect(publish).not.toHaveBeenCalled();
+      expect(fixture.log.mock.calls.some(([message]) => message.includes("conflict changed"))).toBe(true);
+      expect(fixture.repository.state.tips[fixture.resourceId]).toHaveLength(2);
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
+
+  it("keeps a decision when another window only recreates the local conflict identifier", async () => {
+    const fixture = await createConflictCommandFixture();
+    await fixture.repository.publish([{ ...settingsSnapshot("14"), parents: [] }], []);
+    await fixture.peer.publish([{ ...settingsSnapshot("16"), parents: [] }], []);
+    await reconcileAndPersist(fixture.repository);
+    fixture.controller.collectSelections = vi.fn(async (repository: SyncRepository) => {
+      const selection = selectedConflict(repository, fixture.resourceId);
+      const current = repository.state.conflicts.find(item => item.conflictId === selection.conflictId)!;
+      current.conflictId = "recreated-by-another-window";
+      await repository.saveState();
+      return { selections: [selection], deferred: [] };
+    });
+    const publish = vi.spyOn(fixture.repository, "publish");
+
+    try {
+      await fixture.manager.resolveConflicts();
+      expect(publish).toHaveBeenCalledOnce();
+      expect(fixture.log.mock.calls.some(([message]) => message.includes("Conflict deferred"))).toBe(false);
+      expect(fixture.repository.state.tips[fixture.resourceId]).toHaveLength(1);
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
+
+  it("distinguishes already converged choices from conflicts that still need a decision", async () => {
+    const fixture = await createConflictCommandFixture();
+    await fixture.repository.publish([{ ...settingsSnapshot("14"), parents: [] }], []);
+    await fixture.peer.publish([{ ...settingsSnapshot("16"), parents: [] }], []);
+    await reconcileAndPersist(fixture.repository);
+    fixture.controller.collectSelections = vi.fn(async (repository: SyncRepository) => {
+      const selection = selectedConflict(repository, fixture.resourceId);
+      await fixture.peer.publish([{ ...settingsSnapshot("16"), parents: selection.tipVersionIds }], []);
+      return { selections: [selection], deferred: [] };
+    });
+    const publish = vi.spyOn(fixture.repository, "publish");
+    const applySelections = vi.spyOn(fixture.controller, "applySelections");
+
+    try {
+      await fixture.manager.resolveConflicts();
+      expect(publish).not.toHaveBeenCalled();
+      expect(applySelections.mock.calls.every(([, choices]) => choices.length === 0)).toBe(true);
+      expect(fixture.log.mock.calls.some(([message]) => message.includes("already resolved"))).toBe(true);
+      expect(fixture.log.mock.calls.some(([message]) => message.includes("Conflict deferred"))).toBe(false);
+      expect(fixture.repository.state.tips[fixture.resourceId]).toHaveLength(1);
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
+
+  it.each(["collect", "apply"])("retains the last verified graph when a peer stream is incomplete before %s", async (phase) => {
+    const fixture = await createConflictCommandFixture();
+    await fixture.repository.publish([{ ...settingsSnapshot("14"), parents: [] }], []);
+    const peerInitial = await fixture.peer.publish([{ ...settingsSnapshot("16"), parents: [] }], []);
+    await reconcileAndPersist(fixture.repository);
+    const oldTips = structuredClone(fixture.repository.state.tips);
+    const createGap = async () => {
+      const middle = await fixture.peer.publish([{ ...settingsSnapshot("18"), parents: [`${peerInitial.eventHash}#0`] }], []);
+      await fixture.peer.publish([{ ...settingsSnapshot("20"), parents: [`${middle.eventHash}#0`] }], []);
+      await rm(middle.eventPath!);
+    };
+    const collectSelections = vi.fn(async (repository: SyncRepository) => {
+      const selection = selectedConflict(repository, fixture.resourceId);
+      await createGap();
+      return { selections: [selection], deferred: [] };
+    });
+    fixture.controller.collectSelections = collectSelections;
+    const publish = vi.spyOn(fixture.repository, "publish");
+    if (phase === "collect") {
+      await createGap();
+    }
+
+    try {
+      await fixture.manager.resolveConflicts();
+      expect(collectSelections).toHaveBeenCalledTimes(phase === "collect" ? 0 : 1);
+      expect(publish).not.toHaveBeenCalled();
+      expect(fixture.repository.state.tips).toEqual(oldTips);
+      expect(fixture.log.mock.calls.some(([message]) => message.includes("repository stream warning"))).toBe(true);
+    } finally {
+      fixture.manager.dispose();
+    }
+  });
 });
 
 describe("pending helper request work envelope", () => {
@@ -3014,6 +3140,44 @@ function helperTip(
       metadata: { profileId: "default", key: resourceId.split("/").at(-1) ?? "" },
     },
   };
+}
+
+async function createConflictCommandFixture() {
+  const root = await mkdtemp(join(tmpdir(), "cursor-conflict-command-"));
+  temporaryRoots.push(root);
+  const storage = join(root, "manager");
+  await mkdir(storage, { recursive: true });
+  const producer = { extensionVersion: "0.0.61", cursorVersion: "3.15.6", vscodeVersion: "1.125.0" };
+  const passphrase = "a sufficiently long test passphrase";
+  const repository = await SyncRepository.create(join(root, "repository"), join(root, "local"), passphrase, 1024 * 1024, producer);
+  const peer = await SyncRepository.open(repository.root, join(root, "peer"), passphrase, 1024 * 1024, producer);
+  const log = vi.fn<(message: string) => void>();
+  const manager = createManager({
+    paths: { extensionStorage: storage, helperScript: join(root, "helper.js") } as CursorPaths,
+    status: { log, setStatus: vi.fn() } as unknown as StatusController,
+  });
+  const controller = new ConflictController();
+  const internals = manager as unknown as {
+    repository: SyncRepository;
+    conflicts: ConflictController;
+    openGitWindow(repository: SyncRepository): Promise<boolean>;
+    resourceApplyBlockReason(tip: ResourceTip): string | null;
+    applySyntheticProjectionsBeforeScan(): Promise<void>;
+  };
+  internals.repository = repository;
+  internals.conflicts = controller;
+  internals.openGitWindow = vi.fn(async () => false);
+  internals.resourceApplyBlockReason = () => null;
+  internals.applySyntheticProjectionsBeforeScan = vi.fn(async () => undefined);
+  vi.spyOn(manager, "syncNow").mockResolvedValue();
+  return { manager, repository, peer, controller, log, resourceId: settingsSnapshot("14").resourceId };
+}
+
+function selectedConflict(repository: SyncRepository, resourceId: string): ConflictSelection {
+  const conflict = repository.state.conflicts.find(item => item.resourceId === resourceId && item.resolvedAt === undefined)!;
+  const tips = repository.state.tips[resourceId]!;
+  return { conflictId: conflict.conflictId, resourceId, tipVersionIds: tips.map(tip => tip.versionId).sort(),
+    tip: tips[0]!, live: null };
 }
 
 async function reconcileAndPersist(repository: SyncRepository): Promise<void> {

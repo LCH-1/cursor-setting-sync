@@ -170,46 +170,54 @@ describe("large payloads through the repository", () => {
 });
 
 describe("autoMergeConflicts error containment", () => {
-  it("degrades one failing conflict to manual instead of ending the cycle", async () => {
+  it("retains an unreadable latest conflict and continues resolving the next chat", async () => {
     await withRepository(async (repository) => {
       const resourceId = `chat/${COMPOSER}`;
-      for (const side of ["a", "b"] as const) {
-        const content = smallChat(side);
-        await repository.publish(
-          [
-            {
-              resourceId,
-              kind: "chat",
-              content,
-              semanticHash: sha256(content),
-              metadata: { composerId: COMPOSER, workspaceId: null },
-              parents: [],
-            },
-          ],
-          [],
-        );
+      const otherComposer = "036e7136-6ca9-4847-9328-6fc5a697c651";
+      const otherResourceId = `chat/${otherComposer}`;
+      for (const composerId of [COMPOSER, otherComposer]) {
+        for (const side of ["a", "b"] as const) {
+          const content = smallChat(side, composerId);
+          await repository.publish(
+            [{ resourceId: `chat/${composerId}`, kind: "chat", content,
+              semanticHash: sha256(content), metadata: { composerId, workspaceId: null }, parents: [] }],
+            [],
+          );
+        }
       }
       const conflicts = await reconcileConflicts(repository);
+      const unreadable = conflicts.find(conflict => conflict.resourceId === resourceId)!;
+      const healthy = conflicts.find(conflict => conflict.resourceId === otherResourceId)!;
+      const brokenObjects = new Set(await Promise.all(repository.state.tips[resourceId]!.map(async tip =>
+        (await repository.tryReadVersionMetadata(tip.versionId))!.change.payload!.objectId)));
       const warnings: string[] = [];
       // Any unanticipated failure inside the merge - the 0.0.6 RangeError was
       // one - must not escape. `readObject` is where that one surfaced.
-      vi.spyOn(repository, "readObject").mockRejectedValue(
-        new RangeError("Maximum call stack size exceeded"),
-      );
+      const read = repository.readObject.bind(repository);
+      vi.spyOn(repository, "readObject").mockImplementation(async reference => {
+        if (brokenObjects.has(reference.objectId)) {
+          throw new RangeError("Maximum call stack size exceeded");
+        }
+        return read(reference);
+      });
 
       const merged = await autoMergeConflicts(
         repository,
-        conflicts,
+        [unreadable, healthy],
         () => true,
         (warning) => warnings.push(warning),
       );
 
-      expect(merged).toBe(false);
-      expect(conflicts[0]?.resolvedAt).toBeUndefined();
+      expect(merged).toBe(true);
+      expect(unreadable.resolvedAt).toBeUndefined();
+      expect(healthy.resolvedAt).toBeDefined();
+      await reconcileConflicts(repository);
+      expect(repository.state.tips[resourceId]).toHaveLength(2);
+      expect(repository.state.tips[otherResourceId]).toHaveLength(1);
       expect(warnings).toHaveLength(1);
       expect(warnings[0]).toContain(resourceId);
-      expect(warnings[0]).toContain("Maximum call stack size exceeded");
-      expect(warnings[0]).toContain("Resolve Conflicts");
+      expect(warnings[0]).toContain("could not validate its latest version");
+      expect(warnings[0]).toContain("original forks remain available");
       vi.restoreAllMocks();
     });
   });
@@ -274,12 +282,12 @@ describe("oversized adapter settlement warnings", () => {
   });
 });
 
-function chatSnapshot(bubbles: Array<[string, string]>, lastUpdatedAt: number): Buffer {
+function chatSnapshot(bubbles: Array<[string, string]>, lastUpdatedAt: number, composerId = COMPOSER): Buffer {
   return canonicalBytes({
-    schemaVersion: 1,
-    composerId: COMPOSER,
+    schemaVersion: 2,
+    composerId,
     header: {
-      composerId: COMPOSER,
+      composerId,
       workspaceId: null,
       createdAt: 1,
       lastUpdatedAt,
@@ -290,15 +298,18 @@ function chatSnapshot(bubbles: Array<[string, string]>, lastUpdatedAt: number): 
       value: "conversation",
     },
     composerData: {
-      key: `composerData:${COMPOSER}`,
-      valueBase64: Buffer.from("body", "utf8").toString("base64"),
+      key: `composerData:${composerId}`,
+      valueBase64: Buffer.from(JSON.stringify({
+        fullConversationHeadersOnly: bubbles.map(([bubbleId]) => ({ bubbleId })),
+      }), "utf8").toString("base64"),
       valueType: "text",
     },
     bubbles: bubbles.map(([id, body]) => ({
-      key: `bubbleId:${COMPOSER}:${id}`,
-      valueBase64: Buffer.from(body, "utf8").toString("base64"),
+      key: `bubbleId:${composerId}:${id}`,
+      valueBase64: Buffer.from(JSON.stringify({ text: body }), "utf8").toString("base64"),
       valueType: "text",
     })),
+    agentKv: { blobs: [], referencedIds: [], missingIds: [] },
   });
 }
 
@@ -307,14 +318,15 @@ function bigChat(side: string, extraBubble: string, body: string): Buffer {
   return chatSnapshot(
     [
       ["b1", body],
+      ...(side === "b" ? [["b2", `a-${body}`] as [string, string]] : []),
       [extraBubble, `${side}-${body}`],
     ],
     side === "a" ? 200 : 100,
   );
 }
 
-function smallChat(side: string): Buffer {
-  return chatSnapshot([["b1", side]], side === "a" ? 200 : 100);
+function smallChat(side: string, composerId = COMPOSER): Buffer {
+  return chatSnapshot([["b1", side]], side === "a" ? 200 : 100, composerId);
 }
 
 async function reconcileConflicts(

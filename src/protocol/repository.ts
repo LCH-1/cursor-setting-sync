@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { readdir, rm, stat } from "node:fs/promises";
 import type { Dirent } from "node:fs";
+import { parsePortableChatSnapshot, portableChatCoreHash } from "../chat/stateVscdb";
 import {
   CHECKPOINT_ENVELOPE_VERSION,
   CHECKPOINT_EXTENSION,
@@ -161,9 +162,18 @@ export interface PublishResult {
   changeCount: number;
 }
 
+export interface ResourceVersionOrdering {
+  versionId: string;
+  eventHash: string;
+  lamport: number;
+  deviceId: string;
+  createdAt?: string;
+}
+
 export interface ResourceVersionMetadata {
   change: ResourceChange;
   producer?: EventProducer;
+  ordering?: ResourceVersionOrdering;
 }
 
 export interface ResourceVersionData extends ResourceVersionMetadata {
@@ -1155,7 +1165,16 @@ export class SyncRepository {
     if (event === undefined || change === undefined) {
       return this.readCheckpointVersionMetadata(versionId);
     }
-    const data: ResourceVersionMetadata = { change };
+    const data: ResourceVersionMetadata = {
+      change,
+      ordering: {
+        versionId,
+        eventHash: event.eventHash,
+        lamport: event.manifest.lamport,
+        deviceId: event.stored.header.deviceId,
+        createdAt: event.manifest.createdAt,
+      },
+    };
     if (event.manifest.producer !== undefined) {
       data.producer = event.manifest.producer;
     }
@@ -1389,7 +1408,15 @@ export class SyncRepository {
     if (folded.metadata !== undefined) {
       change.metadata = folded.metadata;
     }
-    const data: ResourceVersionMetadata = { change };
+    const data: ResourceVersionMetadata = {
+      change,
+      ordering: {
+        versionId: folded.versionId,
+        eventHash: folded.versionId.slice(0, folded.versionId.lastIndexOf("#")),
+        lamport: folded.lamport,
+        deviceId: folded.deviceId,
+      },
+    };
     if (folded.producer !== undefined) {
       data.producer = folded.producer;
     }
@@ -2880,7 +2907,7 @@ export class SyncRepository {
               kind: active.kind,
               content,
               semanticHash: active.semanticHash,
-              metadata: checkpointMarkerMetadata(active),
+              metadata: checkpointMarkerMetadata(active, content, resourceId),
               parents: [active.versionId],
             },
           ],
@@ -3274,9 +3301,38 @@ function chooseCheckpointTip(tips: ResourceTip[]): ResourceTip | undefined {
 
 function checkpointMarkerMetadata(
   active: ResourceTip,
+  content?: Buffer,
+  resourceId?: string,
 ): Record<string, JsonValue> {
   const metadata = active.metadata;
   const directOrigin = metadata?.syncOrigin;
+  let capturedOrdering: Record<string, JsonValue> = {};
+  if (active.kind === "chat" && active.operation === "put" && directOrigin === undefined &&
+    metadata?.chatResolutionOrigin === undefined) {
+    let coreHash = metadata?.chatCoreHash;
+    if ((typeof coreHash !== "string" || !/^[a-f0-9]{64}$/.test(coreHash)) && content !== undefined) {
+      try {
+        const snapshot = parsePortableChatSnapshot(content);
+        if (`chat/${snapshot.composerId}` === resourceId) {
+          coreHash = portableChatCoreHash(snapshot);
+        }
+      } catch {
+        // An unreadable legacy payload cannot establish capture provenance.
+      }
+    }
+    if (typeof coreHash === "string" && /^[a-f0-9]{64}$/.test(coreHash)) {
+      capturedOrdering = {
+        chatResolutionCoreHash: coreHash,
+        chatResolutionOrigin: {
+          versionId: active.versionId,
+          eventHash: active.eventHash,
+          lamport: active.lamport,
+          deviceId: active.deviceId,
+          ...(active.createdAt === undefined ? {} : { createdAt: active.createdAt }),
+        },
+      };
+    }
+  }
   const legacyKind = classifyLegacyCheckpointMarker(metadata);
   const passThroughOrigin =
     directOrigin === "checkpoint-marker"
@@ -3301,6 +3357,7 @@ function checkpointMarkerMetadata(
   const checkpointedProducer = checkpointedEffectiveProducer(active);
   return {
     ...(metadata ?? {}),
+    ...capturedOrdering,
     ...(typeof passThroughOrigin === "string"
       ? { checkpointedSyncOrigin: passThroughOrigin }
       : {}),

@@ -259,7 +259,11 @@ const MACOS_BUNDLE_BINARY_SEGMENT = ".app/Contents/MacOS/";
 export function cursorLaunchCommand(
   cursorExecutable: string,
   platform: NodeJS.Platform = process.platform,
+  userDataDirectory?: string,
 ): { command: string; args: string[] } {
+  const args = userDataDirectory === undefined
+    ? []
+    : ["--user-data-dir", userDataDirectory];
   if (
     platform === "darwin" &&
     cursorExecutable.includes(MACOS_BUNDLE_BINARY_SEGMENT)
@@ -269,10 +273,14 @@ export function cursorLaunchCommand(
     const bundleEnd = cursorExecutable.indexOf(".app/") + ".app".length;
     return {
       command: "open",
-      args: ["-a", cursorExecutable.slice(0, bundleEnd)],
+      args: [
+        "-a",
+        cursorExecutable.slice(0, bundleEnd),
+        ...(args.length === 0 ? [] : ["--args", ...args]),
+      ],
     };
   }
-  return { command: cursorExecutable, args: [] };
+  return { command: cursorExecutable, args };
 }
 
 export function cursorExecutableForRestart(

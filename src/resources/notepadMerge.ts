@@ -200,7 +200,11 @@ function electEntry(
   if (
     typeof preferredText === "string" &&
     typeof otherText === "string" &&
-    preferredText !== otherText
+    preferredText !== otherText &&
+    sameEntry(
+      { ...preferred, text: null },
+      { ...other, text: null },
+    )
   ) {
     if (preferredText.includes(otherText)) {
       return preferred;

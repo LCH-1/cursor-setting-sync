@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type * as vscode from "vscode";
 
 export interface CursorPaths {
@@ -65,8 +65,8 @@ export function resolveCursorPaths(
   appRoot: string,
   environment: PlatformEnvironment = {},
 ): CursorPaths {
-  const userDataRoot = resolveUserDataRoot(environment);
-  const globalStorageRoot = join(userDataRoot, "globalStorage");
+  const globalStorageRoot = dirname(context.globalStorageUri.fsPath);
+  const userDataRoot = dirname(globalStorageRoot);
   const cursorHome = join(environment.home ?? homedir(), ".cursor");
 
   return {

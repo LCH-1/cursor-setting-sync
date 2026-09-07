@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import * as sqlite from "node:sqlite";
 import type { CursorPaths } from "../src/platform/paths";
 import type { JsonValue } from "../src/types";
@@ -19,6 +19,7 @@ import {
   serializeWorkspaceDatabaseSnapshot,
 } from "../src/helper/workspaceDatabaseMerge";
 import { workspaceStorageResourceId } from "../src/resources/workspaceStorage";
+import { createExtensionIgnoreMatcher, ExtensionsAdapter } from "../src/resources/extensions";
 
 const temporaryRoots: string[] = [];
 const { DatabaseSync } = sqlite;
@@ -137,6 +138,56 @@ describe("non-global resource apply", () => {
     expect(result.applied).toEqual([storeResourceId]);
     expect(result.retainedLocal).toEqual([]);
     expect(result.retainedLocalHashes).toEqual({});
+  });
+
+  it.each([false, true])("keeps extension listing, installation, verification and removal in the active data directory (named profile %s)", async (namedProfile) => {
+    const fixture = await createFixture();
+    fixture.request.cursorExecutable = process.execPath;
+    const cliRoot = join(fixture.paths.appRoot, "out");
+    await mkdir(cliRoot, { recursive: true });
+    await writeFile(join(cliRoot, "cli.js"), [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const args = process.argv.slice(2);",
+      "fs.appendFileSync(path.join(__dirname, 'calls.jsonl'), JSON.stringify(args) + '\\n');",
+      "if (args.includes('--list-extensions')) process.stdout.write('some.extension@1.2.3\\n');",
+    ].join("\n"), "utf8");
+    const profileId = namedProfile ? "custom-profile" : "default";
+    const profileName = namedProfile ? "Custom Profile" : "Default";
+    await createProfileDatabase(namedProfile
+      ? join(fixture.paths.profilesRoot, profileId, "globalStorage", "state.vscdb")
+      : fixture.paths.globalDatabase, "[]");
+    const adapter = new ExtensionsAdapter(fixture.paths, createExtensionIgnoreMatcher([]));
+    const listing = adapter as unknown as {
+      listInstalledExtensions(profile: string | null): Promise<Array<{ id: string; version: string }>>;
+    };
+    expect(await listing.listInstalledExtensions(namedProfile ? profileName : null))
+      .toEqual([{ id: "some.extension", version: "1.2.3" }]);
+    const resourceId = `extension/${profileId}/some.extension`;
+    const install = extensionPut(resourceId, "some.extension");
+    const uninstall = extensionDelete(resourceId, "some.extension");
+    for (const item of [install, uninstall]) {
+      item.change.metadata = { ...item.change.metadata, profileId, profileName };
+    }
+
+    const installed = await applyNonGlobalChanges(fixture.request, [install]);
+    const removed = await applyNonGlobalChanges(fixture.request, [uninstall]);
+
+    expect(installed.applied).toEqual([resourceId]);
+    expect(removed.applied).toEqual([resourceId]);
+    const calls = (await readFile(join(cliRoot, "calls.jsonl"), "utf8")).trim().split("\n")
+      .map(line => JSON.parse(line) as string[]);
+    expect(calls).toHaveLength(4);
+    expect(calls.filter(args => args.includes("--list-extensions"))).toHaveLength(2);
+    expect(calls.some(args => args.includes("--install-extension"))).toBe(true);
+    expect(calls.some(args => args.includes("--uninstall-extension"))).toBe(true);
+    for (const args of calls) {
+      expect(args[args.indexOf("--user-data-dir") + 1]).toBe(dirname(fixture.paths.userDataRoot));
+      expect(args.includes("--profile")).toBe(namedProfile);
+      if (namedProfile) {
+        expect(args[args.indexOf("--profile") + 1]).toBe(profileName);
+      }
+    }
   });
 
   it("treats uninstalling an absent extension as applied and isolates other CLI failures", async () => {

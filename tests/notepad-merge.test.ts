@@ -93,6 +93,38 @@ describe("notepads.json merge", () => {
     expect(unionNotepadBuffers(first, second).status).toBe("conflict");
   });
 
+  it("does not discard a concurrent rename when the other text is longer", () => {
+    const base = notepads([note("1", "todo", "buy milk")]);
+    const appended = notepads([note("1", "todo", "buy milk\nbuy bread")]);
+    const renamed = notepads([note("1", "backlog", "buy milk")]);
+
+    for (const [preferred, other] of [
+      [appended, renamed],
+      [renamed, appended],
+    ] as const) {
+      expect(mergeNotepadBuffers(base, preferred, other).status).toBe("conflict");
+      expect(unionNotepadBuffers(preferred, other).status).toBe("conflict");
+    }
+  });
+
+  it("does not discard other fields when text containment elects an entry", () => {
+    const payload = (text: string, revision: number): Buffer => Buffer.from(
+      JSON.stringify([{ id: "1", name: "todo", text, futureField: { revision } }]),
+      "utf8",
+    );
+    const base = payload("buy milk", 1);
+    const appended = payload("buy milk\nbuy bread", 1);
+    const editedMetadata = payload("buy milk", 2);
+
+    for (const [preferred, other] of [
+      [appended, editedMetadata],
+      [editedMetadata, appended],
+    ] as const) {
+      expect(mergeNotepadBuffers(base, preferred, other).status).toBe("conflict");
+      expect(unionNotepadBuffers(preferred, other).status).toBe("conflict");
+    }
+  });
+
   it("still settles a notepad both computers hold identically", () => {
     const same = notepads([note("1", "todo", "same")]);
     expect(parsed(unionNotepadBuffers(same, same))).toHaveLength(1);
@@ -215,6 +247,25 @@ describe("notepads.json merge", () => {
 });
 
 describe("notepads.json auto-merge", () => {
+  it("keeps both fork versions when text containment cannot preserve a rename", async () => {
+    await withRepository(async (repository) => {
+      const conflicts = await forkResource(
+        repository,
+        notepads([note("1", "todo", "buy milk")]),
+        notepads([note("1", "todo", "buy milk\nbuy bread")]),
+        notepads([note("1", "backlog", "buy milk")]),
+      );
+      const versions = [...conflicts[0]!.tipVersionIds].sort();
+
+      expect(await autoMergeConflicts(repository, conflicts)).toBe(false);
+      const retained = await reconcileConflicts(repository);
+
+      expect(retained).toHaveLength(1);
+      expect([...retained[0]!.tipVersionIds].sort()).toEqual(versions);
+      expect(await repository.listEvents()).toHaveLength(3);
+    });
+  });
+
   it("unions a base-free fork instead of asking once per shared workspace", async () => {
     await withRepository(async (repository) => {
       const conflicts = await forkBaseFree(

@@ -398,6 +398,19 @@ describe("preparing a helper batch", () => {
     });
   });
 
+  it.each([6, 39, 49, 116, 167])("rejects a missing0 backup whose %i visible messages have no captured rows", async (visibleCount) => {
+    await withRepository(async (repository) => {
+      const snapshot = portableChat("10000000-0000-4000-8000-000000000004");
+      snapshot.composerData.valueBase64 = Buffer.from(JSON.stringify({
+        fullConversationHeadersOnly: Array.from({ length: visibleCount }, (_, index) => ({ bubbleId: `message-${index}` })),
+      })).toString("base64");
+      const tip = await publishPortableChat(repository, snapshot);
+      const result = await prepareChanges(repository, [helperChange(tip)]);
+      expect(result.prepared).toEqual([]);
+      expect(result.failureByResourceId[tip.resourceId]).toContain("unknown/conversation-state-unreadable");
+    });
+  });
+
   it("keeps a payload that has not arrived yet queued without calling it a failure", async () => {
     // The opposite case, and the reason the two are told apart: a shared
     // folder that delivers the event before the object. That heals on its own,

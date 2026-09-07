@@ -364,6 +364,10 @@ export type PortableChatConversationStateScan =
   | { status: "complete"; states: string[] }
   | { status: "structure-limit" };
 
+export type StrictPortableChatConversationStateScan =
+  | PortableChatConversationStateScan
+  | { status: "unreadable" };
+
 export class ChatJsonStructureLimitError extends Error {}
 
 /**
@@ -390,19 +394,81 @@ export function portableChatConversationStates(
  */
 export function scanPortableChatConversationStates(
   snapshot: PortableChatSnapshot,
-): PortableChatConversationStateScan {
+): PortableChatConversationStateScan;
+export function scanPortableChatConversationStates(
+  snapshot: PortableChatSnapshot,
+  strict: true,
+): StrictPortableChatConversationStateScan;
+export function scanPortableChatConversationStates(
+  snapshot: PortableChatSnapshot,
+  strict = false,
+): StrictPortableChatConversationStateScan {
   // Each parsed row is discarded before the next. Sharing its allocation
   // budget across all messages made ordinary long histories permanently v1.
   const states = new Set<string>();
-  if (!appendPortableConversationState(snapshot.composerData, createJsonStructureBudget(), states)) {
-    return { status: "structure-limit" };
+  const composerStatus = appendPortableConversationState(
+    snapshot.composerData, createJsonStructureBudget(), states, strict,
+  );
+  if (composerStatus !== "complete") {
+    return { status: composerStatus };
   }
+  const inspectedVisible = visibleConversationBubbleIds(
+    Buffer.from(snapshot.composerData.valueBase64, "base64").toString("utf8"),
+  );
+  if (strict && inspectedVisible === "unreadable") {
+    return { status: "unreadable" };
+  }
+  const visible = inspectedVisible === "unreadable" ? null : inspectedVisible;
+  const remaining = strict && visible !== null ? new Set(visible) : null;
+  const prefix = `bubbleId:${snapshot.composerId}:`;
   for (const row of snapshot.bubbles) {
-    if (!appendPortableConversationState(row, createJsonStructureBudget(), states)) {
-      return { status: "structure-limit" };
+    const bubbleId = row.key.slice(prefix.length);
+    if (visible !== null && !visible.has(bubbleId)) {
+      continue;
+    }
+    remaining?.delete(bubbleId);
+    const status = appendPortableConversationState(
+      row, createJsonStructureBudget(), states, strict,
+    );
+    if (status !== "complete") {
+      return { status };
     }
   }
+  if (remaining !== null && remaining.size > 0) {
+    return { status: "unreadable" };
+  }
   return { status: "complete", states: [...states] };
+}
+
+function visibleConversationBubbleIds(text: string): Set<string> | null | "unreadable" {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    return "unreadable";
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "unreadable";
+  }
+  if (!Object.hasOwn(parsed, "fullConversationHeadersOnly")) {
+    return null;
+  }
+  const headers = (parsed as Record<string, unknown>)["fullConversationHeadersOnly"];
+  if (!Array.isArray(headers)) {
+    return "unreadable";
+  }
+  const ids = new Set<string>();
+  for (const header of headers) {
+    if (header === null || typeof header !== "object" || Array.isArray(header)) {
+      return "unreadable";
+    }
+    const id = (header as Record<string, unknown>)["bubbleId"];
+    if (typeof id !== "string" || id.length === 0 || ids.has(id)) {
+      return "unreadable";
+    }
+    ids.add(id);
+  }
+  return ids;
 }
 
 /**
@@ -434,23 +500,50 @@ function appendPortableConversationState(
   row: PortableKvRow,
   budget: JsonStructureBudget,
   states: Set<string>,
-): boolean {
+  strict: boolean,
+): "complete" | "structure-limit" | "unreadable" {
   if (row.valueType === "null") {
-    return true;
+    return strict ? "unreadable" : "complete";
   }
   const bytes = Buffer.from(row.valueBase64, "base64");
   if (!budget.consume(bytes)) {
-    return false;
+    return "structure-limit";
   }
   const text = bytes.toString("utf8");
   if (!Buffer.from(text, "utf8").equals(bytes)) {
-    return true;
+    return strict ? "unreadable" : "complete";
+  }
+  if (strict) {
+    return appendStrictConversationState(text, states);
   }
   const state = conversationStateFromJsonText(text);
   if (state !== null) {
     states.add(state);
   }
-  return true;
+  return "complete";
+}
+
+function appendStrictConversationState(
+  text: string,
+  states: Set<string>,
+): "complete" | "unreadable" {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    return "unreadable";
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "unreadable";
+  }
+  const state = (parsed as Record<string, unknown>)["conversationState"];
+  if (state !== undefined && state !== null) {
+    if (typeof state !== "string") {
+      return "unreadable";
+    }
+    states.add(state);
+  }
+  return "complete";
 }
 
 function conversationStateFromJsonText(text: string): string | null {
@@ -3062,15 +3155,38 @@ function analyzeChatCore(
 function collectRawConversationStates(
   composerData: RawKvRow,
   bubbles: readonly RawKvRow[],
-): PortableChatConversationStateScan {
+): StrictPortableChatConversationStateScan {
   const states = new Set<string>();
-  if (!appendRawConversationState(composerData, createJsonStructureBudget(), states)) {
-    return { status: "structure-limit" };
+  const composerStatus = appendRawConversationState(composerData, createJsonStructureBudget(), states);
+  if (composerStatus !== "complete") {
+    return { status: composerStatus };
   }
+  const composerText = typeof composerData.value === "string"
+    ? composerData.value
+    : composerData.value instanceof Uint8Array
+      ? Buffer.from(composerData.value).toString("utf8") : "";
+  const visible = visibleConversationBubbleIds(composerText);
+  if (visible === "unreadable") {
+    return { status: "unreadable" };
+  }
+  const composerKey = typeof composerData.key === "string" ? composerData.key : "";
+  const prefix = `bubbleId:${composerKey.slice("composerData:".length)}:`;
+  const remaining = visible !== null ? new Set(visible) : null;
   for (const row of bubbles) {
-    if (!appendRawConversationState(row, createJsonStructureBudget(), states)) {
-      return { status: "structure-limit" };
+    if (visible !== null && typeof row.key === "string" &&
+      !visible.has(row.key.slice(prefix.length))) {
+      continue;
     }
+    if (typeof row.key === "string") {
+      remaining?.delete(row.key.slice(prefix.length));
+    }
+    const status = appendRawConversationState(row, createJsonStructureBudget(), states);
+    if (status !== "complete") {
+      return { status };
+    }
+  }
+  if (remaining !== null && remaining.size > 0) {
+    return { status: "unreadable" };
   }
   return { status: "complete", states: [...states] };
 }
@@ -3079,11 +3195,11 @@ function appendRawConversationState(
   row: RawKvRow,
   budget: JsonStructureBudget,
   states: Set<string>,
-): boolean {
+): "complete" | "structure-limit" | "unreadable" {
   let text: string;
   if (row.valueType === "text" && typeof row.value === "string") {
     if (!budget.consume(row.value)) {
-      return false;
+      return "structure-limit";
     }
     text = row.value;
   } else if (row.valueType === "blob" && row.value instanceof Uint8Array) {
@@ -3093,20 +3209,16 @@ function appendRawConversationState(
       row.value.byteLength,
     );
     if (!budget.consume(bytes)) {
-      return false;
+      return "structure-limit";
     }
     text = bytes.toString("utf8");
     if (!Buffer.from(text, "utf8").equals(row.value)) {
-      return true;
+      return "unreadable";
     }
   } else {
-    return true;
+    return "unreadable";
   }
-  const state = conversationStateFromJsonText(text);
-  if (state !== null) {
-    states.add(state);
-  }
-  return true;
+  return appendStrictConversationState(text, states);
 }
 
 type AgentKvCapture =
@@ -3115,7 +3227,7 @@ type AgentKvCapture =
 
 async function captureAgentKvPayload(
   statement: ChatStatement,
-  stateScan: PortableChatConversationStateScan | null,
+  stateScan: StrictPortableChatConversationStateScan | null,
   budget: AgentKvScanBudget,
   recaptureRequested = false,
   maxGraphBytes = MAX_AGENT_KV_BYTES_PER_CHAT,
@@ -3132,6 +3244,12 @@ async function captureAgentKvPayload(
       kind: "fallback",
       notice:
         "Kept one chat on schema v1 because one decoded conversation row exceeds the fixed structural parser safety limit; repository history is retained, but other PCs cannot apply it until continuation is complete.",
+    };
+  }
+  if (stateScan.status === "unreadable") {
+    return {
+      kind: "fallback",
+      notice: "Kept one chat on schema v1 because its active conversation rows are unreadable or missing; continuation completeness cannot be verified.",
     };
   }
   const states = stateScan.states;

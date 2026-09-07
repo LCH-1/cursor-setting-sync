@@ -69,11 +69,17 @@ export async function verifyPortableChatContinuationClosure(
   snapshot: PortableChatSnapshotV2,
   options?: AgentKvWalkOptions,
 ): Promise<PortableChatContinuationClosureResult> {
-  const stateScan = scanPortableChatConversationStates(snapshot);
+  const stateScan = scanPortableChatConversationStates(snapshot, true);
   if (stateScan.status === "structure-limit") {
     return closureResult(snapshot, null, {
       status: "unknown",
       reason: "conversation-json-structure-limit",
+    });
+  }
+  if (stateScan.status === "unreadable") {
+    return closureResult(snapshot, null, {
+      status: "unknown",
+      reason: "conversation-state-unreadable",
     });
   }
 
