@@ -10,7 +10,7 @@ import {
   effectiveVersionProducer,
   isSyntheticTip,
 } from "../src/sync/versionPolicy";
-import { sha256 } from "../src/protocol/canonical";
+import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import type { ResourceKind, ResourceTip } from "../src/types";
 
 const producer = {
@@ -28,7 +28,12 @@ describe("the checkpoint marker re-asserts a tip this device may never have appl
     );
     try {
       const repository = await createRepository(temporaryRoot);
-      const content = Buffer.from("preserved chat core", "utf8");
+      const composerId = PEER_CHAT.slice("chat/".length);
+      const content = canonicalBytes({ schemaVersion: 1, composerId,
+        header: { composerId, workspaceId: null, createdAt: 1, lastUpdatedAt: 2,
+          isArchived: 0, isSubagent: 0, recency: 0, checkpointAt: null, value: "{}" },
+        composerData: { key: `composerData:${composerId}`, valueType: "text",
+          valueBase64: Buffer.from('{"fullConversationHeadersOnly":[]}').toString("base64") }, bubbles: [] });
       const snapshot = {
         resourceId: PEER_CHAT,
         kind: "chat" as const,

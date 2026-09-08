@@ -276,6 +276,41 @@ function orderingOfTip(tip: ResourceTip): ResourceVersionOrdering {
     ...(tip.createdAt === undefined ? {} : { createdAt: tip.createdAt }) };
 }
 
+export async function readOriginalChatOrdering(
+  resourceId: string,
+  tip: ResourceTip,
+  read: (version: string) => Promise<ResourceVersionMetadata | null>,
+): Promise<ResourceVersionOrdering | null> {
+  const metadata = new Map<string, ResourceVersionMetadata | null>();
+  const boundedRead = async (version: string): Promise<ResourceVersionMetadata | null> => {
+    if (!metadata.has(version)) {
+      if (metadata.size >= MAX_ORIGIN_VERSIONS) {
+        return null;
+      }
+      metadata.set(version, await read(version));
+    }
+    return metadata.get(version) ?? null;
+  };
+  const data = await boundedRead(tip.versionId);
+  if (data === null || data.change.resourceId !== resourceId || data.change.kind !== "chat" ||
+    data.change.operation !== "put" || data.change.semanticHash !== tip.semanticHash) {
+    return null;
+  }
+  return originalOrdering(data, orderingOfTip(tip), resourceId, boundedRead, new Set(), new Map());
+}
+
+export function hasIndependentChatOrdering(tip: ResourceTip, coreHash: string): boolean {
+  const stored = parseOrdering(tip.metadata?.chatResolutionOrigin);
+  if (stored !== null) {
+    return stored.lamport <= tip.lamport && tip.metadata?.chatResolutionCoreHash === coreHash;
+  }
+  if (tip.metadata?.chatResolutionOrigin !== undefined || tip.metadata?.syncOrigin === "checkpoint-marker") {
+    return false;
+  }
+  const origin = effectiveSyncOrigin(tip.metadata);
+  return origin !== "agent-kv-enrichment" && origin !== "auto-merge";
+}
+
 function compareOrdering(left: ResourceVersionOrdering, right: ResourceVersionOrdering): number {
   return right.lamport - left.lamport || compareCodeUnits(right.deviceId, left.deviceId) ||
     compareCodeUnits(right.eventHash, left.eventHash) || compareCodeUnits(right.versionId, left.versionId);

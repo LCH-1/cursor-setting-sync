@@ -6,6 +6,12 @@ import { readdir, rm, stat } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { parsePortableChatSnapshot, portableChatCoreHash } from "../chat/stateVscdb";
 import {
+  CHAT_CHECKPOINT_MAX_WORK_BYTES,
+  createChatCheckpointWorkBudget,
+  inspectChatCheckpointSafety,
+  type ChatCheckpointCoreInspection,
+} from "../chat/checkpointSafety";
+import {
   CHECKPOINT_ENVELOPE_VERSION,
   CHECKPOINT_EXTENSION,
   CHECKPOINTED_EVENT_PROTOCOL_VERSION,
@@ -259,6 +265,8 @@ function replaceLocalState(
 }
 
 export class SyncRepository {
+  private readonly chatCheckpointCoreInspections = new Map<string, ChatCheckpointCoreInspection>();
+  private chatCheckpointInspectionCursor: string | null = null;
   private readonly eventKey: Buffer;
   private readonly objectKey: Buffer;
   private readonly objectIdKey: Buffer;
@@ -910,6 +918,7 @@ export class SyncRepository {
   private async scanEvents(
     afterStreams: Record<string, StreamCursor> | null,
     forceAudit = false,
+    includeRetired = false,
   ): Promise<DecryptedEvent[]> {
     const devicesRoot = join(this.root, "devices");
     if (!(await pathExists(devicesRoot))) {
@@ -925,11 +934,11 @@ export class SyncRepository {
       ) {
         continue;
       }
-      const retiredCursor = this.state.retiredDevices.includes(deviceEntry.name)
+      const retiredCursor = !includeRetired && this.state.retiredDevices.includes(deviceEntry.name)
         ? this.state.streams[deviceEntry.name]
         : undefined;
       if (
-        this.state.retiredDevices.includes(deviceEntry.name) &&
+        !includeRetired && this.state.retiredDevices.includes(deviceEntry.name) &&
         retiredCursor === undefined
       ) {
         continue;
@@ -993,7 +1002,7 @@ export class SyncRepository {
           const info = await statResilient(eventPath);
           const cached = this.decodedEvents.get(cacheKey);
           if (
-            cached !== undefined &&
+            !forceAudit && cached !== undefined &&
             cached.size === info.size &&
             cached.mtimeMs === info.mtimeMs
           ) {
@@ -1776,10 +1785,19 @@ export class SyncRepository {
     await this.assertNoUnknownResourceKinds("create a checkpoint");
     const lamport = this.state.lamport + 1;
     const resources: CheckpointResource[] = [];
-    for (const resourceId of Object.keys(this.state.tips).sort()) {
-      const active = chooseCheckpointTip(this.state.tips[resourceId] ?? []);
+    const chatBudget = createChatCheckpointWorkBudget();
+    const previousResources = new Map((await this.loadAbsorbedCheckpointManifest())?.resources.map(resource =>
+      [resource.versionId, resource] as const) ?? []);
+    const resourceIds = rotateCheckpointInspections(Object.keys(this.state.tips).map(resourceId => ({ resourceId })),
+      this.chatCheckpointInspectionCursor);
+    for (const { resourceId } of resourceIds) {
+      let active = chooseCheckpointTip(this.state.tips[resourceId] ?? []);
       if (active === undefined) {
         continue;
+      }
+      const previous = previousResources.get(active.versionId);
+      if (previous?.resourceId === resourceId && previous.semanticHash === active.semanticHash && previous.metadata !== undefined) {
+        active = { ...active, metadata: previous.metadata };
       }
       const resource: CheckpointResource = {
         resourceId,
@@ -1793,14 +1811,21 @@ export class SyncRepository {
       if (active.payload !== undefined) {
         resource.payload = active.payload;
       }
-      if (active.metadata !== undefined) {
-        resource.metadata = active.metadata;
+      const remainingBytes = chatBudget.remainingBytes;
+      const chatSafety = await inspectChatCheckpointSafety(this, resourceId, active,
+        chatBudget, this.chatCheckpointCoreInspections, true);
+      if (chatBudget.remainingBytes < remainingBytes) {
+        this.chatCheckpointInspectionCursor = resourceId;
+      }
+      if (chatSafety.metadata !== undefined) {
+        resource.metadata = chatSafety.metadata;
       }
       if (active.producer !== undefined) {
         resource.producer = active.producer;
       }
       resources.push(resource);
     }
+    resources.sort((left, right) => compareCodeUnits(left.resourceId, right.resourceId));
     const manifest: CheckpointManifest = {
       checkpointVersion: 1,
       createdAt: new Date().toISOString(),
@@ -1990,10 +2015,80 @@ export class SyncRepository {
         [],
       );
     }
+    const warnings: string[] = [];
+    const protectedChats = new Set<string>();
+    const preservationReasons = new Map<string, number>();
+    const chatBudget = createChatCheckpointWorkBudget();
+    const checkedVersions = new Set<string>();
+    const inspectionCandidates: Array<{ resourceId: string; tip: ResourceTip }> =
+      manifest.resources.map(resource => ({ resourceId: resource.resourceId, tip: checkpointResourceTip(resource) }));
+    for (const [resourceId, tips] of Object.entries(this.state.tips)) {
+      if (new Set(tips.map(tip => `${tip.operation}:${tip.semanticHash}`)).size > 1 &&
+        tips.some(tip => tip.kind === "chat")) {
+        protectedChats.add(resourceId);
+        preservationReasons.set("unresolved-conflict", (preservationReasons.get("unresolved-conflict") ?? 0) + 1);
+      }
+      inspectionCandidates.push(...tips.map(tip => ({ resourceId, tip })));
+    }
+    for (const { resourceId, tip } of rotateCheckpointInspections(inspectionCandidates, this.chatCheckpointInspectionCursor)) {
+      if (checkedVersions.has(tip.versionId)) {
+        continue;
+      }
+      checkedVersions.add(tip.versionId);
+      const remainingBytes = chatBudget.remainingBytes;
+      const safety = await inspectChatCheckpointSafety(this, resourceId, tip,
+        chatBudget, this.chatCheckpointCoreInspections, false);
+      if (chatBudget.remainingBytes < remainingBytes) {
+        this.chatCheckpointInspectionCursor = resourceId;
+      }
+      if (safety.preserveHistory) {
+        protectedChats.add(resourceId);
+        const reason = safety.reason ?? "unreadable-core";
+        preservationReasons.set(reason, (preservationReasons.get(reason) ?? 0) + 1);
+      }
+    }
+    const protectedEvents = new Set<string>();
+    const protectedCheckpoints = new Set<string>();
+    const authenticatedEvents = new Set<string>();
+    const inspectedCheckpoints = new Set<string>();
+    if (protectedChats.size > 0) {
+      try {
+        for (const event of await this.scanEvents(null, true, true)) {
+          authenticatedEvents.add(`${event.stored.header.deviceId}/${event.eventHash}`);
+          if (event.manifest.changes.some(change => protectedChats.has(change.resourceId))) {
+            protectedEvents.add(event.eventHash);
+          }
+        }
+        let checkpointReadBudget = CHAT_CHECKPOINT_MAX_WORK_BYTES;
+        if (await pathExists(this.sharedCheckpointsRoot)) {
+          for (const file of await readdir(this.sharedCheckpointsRoot)) {
+            const match = CHECKPOINT_FILE_PATTERN.exec(file);
+            if (match === null || compareCheckpointIdentity({ lamport: Number(match[1]), hash: match[2]! }, checkpoint) >= 0) {
+              continue;
+            }
+            const filePath = join(this.sharedCheckpointsRoot, file);
+            const size = (await stat(filePath)).size;
+            if (size > checkpointReadBudget) {
+              protectedCheckpoints.add(file);
+              preservationReasons.set("checkpoint-work-limit", (preservationReasons.get("checkpoint-work-limit") ?? 0) + 1);
+              continue;
+            }
+            checkpointReadBudget -= size;
+            const prior = await this.readCheckpointFile(filePath, match[2]!, Number(match[1]));
+            inspectedCheckpoints.add(file);
+            if (prior.manifest.resources.some(resource => protectedChats.has(resource.resourceId))) {
+              protectedCheckpoints.add(file);
+            }
+          }
+        }
+      } catch (error) {
+        return abortedPrune(`Chat recovery history could not be authenticated before pruning: ${error instanceof Error ? error.message : String(error)}`, []);
+      }
+      warnings.push(`Preserved shared recovery history for ${protectedChats.size} chat(s): ${[...preservationReasons].map(([reason, count]) => `${reason}=${count}`).join(", ")}. Chat payload verification is bounded to ${CHAT_CHECKPOINT_MAX_WORK_BYTES / (1024 * 1024)} MiB per operation; complete independent chats can still be pruned.`);
+    }
     // The marker content is materialized before any deletion so that a tip
     // blob that has not propagated yet aborts the prune cleanly instead of
     // failing after the irreversible deletions already happened.
-    const warnings: string[] = [];
     const markerPreparation = await this.prepareCheckpointMarker();
     const marker = markerPreparation.marker;
     if (marker === null) {
@@ -2027,6 +2122,10 @@ export class SyncRepository {
         if (match === null || Number(match[1]) > cursor.lastSequence) {
           continue;
         }
+        if (protectedEvents.has(match[2]!) ||
+          (protectedChats.size > 0 && !authenticatedEvents.has(`${deviceId}/${match[2]!}`))) {
+          continue;
+        }
         const removedBytes = await removeFileReclaiming(join(eventRoot, file));
         if (removedBytes !== null) {
           eventsDeleted += 1;
@@ -2050,6 +2149,10 @@ export class SyncRepository {
           hash: match[2] ?? "",
         };
         if (compareCheckpointIdentity(identity, checkpoint) >= 0) {
+          continue;
+        }
+        if (protectedCheckpoints.has(file) ||
+          (protectedChats.size > 0 && !inspectedCheckpoints.has(file))) {
           continue;
         }
         const removedBytes = await removeFileReclaiming(
@@ -2105,7 +2208,7 @@ export class SyncRepository {
       );
     }
     const referenced = new Set<string>();
-    for (const event of await this.listEvents()) {
+    for (const event of await this.scanEvents(null, true, true)) {
       for (const change of event.manifest.changes) {
         if (change.payload !== undefined) {
           referenced.add(`${change.payload.deviceId}/${change.payload.objectId}`);
@@ -2115,6 +2218,21 @@ export class SyncRepository {
     const manifest = await this.loadAbsorbedCheckpointManifest();
     if (manifest !== null) {
       for (const resource of manifest.resources) {
+        if (resource.payload !== undefined) {
+          referenced.add(
+            `${resource.payload.deviceId}/${resource.payload.objectId}`,
+          );
+        }
+      }
+    }
+    // Peers may still be using a shared predecessor while a newer checkpoint propagates.
+    for (const candidate of await this.sharedCheckpointCandidates()) {
+      const checkpoint = await this.readCheckpointFile(
+        candidate.path,
+        candidate.hash,
+        candidate.lamport,
+      );
+      for (const resource of checkpoint.manifest.resources) {
         if (resource.payload !== undefined) {
           referenced.add(
             `${resource.payload.deviceId}/${resource.payload.objectId}`,
@@ -3297,6 +3415,18 @@ function chooseCheckpointTip(tips: ResourceTip[]): ResourceTip | undefined {
   const updates = tips.filter((tip) => tip.operation === "put");
   const candidates = updates.length > 0 ? updates : tips;
   return [...candidates].sort(compareCheckpointTips)[0];
+}
+
+function rotateCheckpointInspections<T extends { resourceId: string }>(candidates: T[], cursor: string | null): T[] {
+  const ordered = [...candidates].sort((left, right) => compareCodeUnits(left.resourceId, right.resourceId));
+  const next = cursor === null ? 0 : ordered.findIndex(candidate => compareCodeUnits(candidate.resourceId, cursor) > 0);
+  return next <= 0 ? ordered : [...ordered.slice(next), ...ordered.slice(0, next)];
+}
+
+function checkpointResourceTip(resource: CheckpointResource): ResourceTip {
+  const separator = resource.versionId.lastIndexOf("#");
+  return { ...resource, eventHash: resource.versionId.slice(0, separator),
+    changeIndex: Number(resource.versionId.slice(separator + 1)), parents: [] };
 }
 
 function checkpointMarkerMetadata(

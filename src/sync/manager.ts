@@ -5042,7 +5042,13 @@ export class SyncManager implements vscode.Disposable {
           "Resolve all synchronization conflicts before creating a checkpoint.",
         );
       }
+      if (pendingDatabaseChangesBlockMaintenance(repository.state.pendingDatabaseChanges)) {
+        throw new Error(
+          "Apply or resolve pending database changes before checkpointing; their history is still needed to verify unapplied local versions.",
+        );
+      }
       let created: CheckpointCreateResult | null = null;
+      let compaction: CheckpointCommandOutcome["compaction"] = null;
       const checkpointAtStart = repository.state.checkpoint;
       const checkpointWasBehind =
         checkpointAtStart !== undefined &&
@@ -5069,7 +5075,7 @@ export class SyncManager implements vscode.Disposable {
         );
       }
       if (created === null && repository.state.checkpoint === undefined) {
-        return { created: null, prune: null, gitSquash: null };
+        return { created: null, prune: null, compaction: null, gitSquash: null };
       }
       report("Pruning superseded history...");
       const prune = await repository.pruneWithGates({
@@ -5097,7 +5103,7 @@ export class SyncManager implements vscode.Disposable {
             error instanceof Error ? error.message : String(error);
         }
         if (compactionBlocked === null) {
-          await repository.compactOwnOrphans(true);
+          compaction = await repository.compactOwnOrphans(true);
         } else {
           prune.warnings.push(
             `Object compaction was skipped: ${compactionBlocked}`,
@@ -5130,7 +5136,7 @@ export class SyncManager implements vscode.Disposable {
           }
         }
       }
-      return { created, prune, gitSquash };
+      return { created, prune, compaction, gitSquash };
     } finally {
       await lock.release();
     }
@@ -8357,12 +8363,21 @@ function describeCheckpointOutcome(outcome: CheckpointCommandOutcome): string {
     parts.push("nothing to prune");
   } else if (outcome.prune.status === "pruned") {
     parts.push(
-      `pruned ${outcome.prune.eventsDeleted} event file(s) and reclaimed ${formatBytes(outcome.prune.reclaimedBytes)}`,
+      `pruned ${outcome.prune.eventsDeleted} event file(s) and ${outcome.prune.checkpointFilesDeleted} checkpoint file(s) (${formatBytes(outcome.prune.reclaimedBytes)})`,
     );
   } else {
     parts.push(`pruning skipped (${outcome.prune.reason ?? "unknown reason"})`);
   }
-  return `${parts.join("; ")}.`;
+  if (outcome.compaction !== null) {
+    parts.push(`compacted ${outcome.compaction.removedFiles} object file(s) (${formatBytes(outcome.compaction.reclaimedBytes)})`);
+  }
+  if (outcome.prune?.status === "pruned" || outcome.compaction !== null) {
+    const reclaimedBytes = (outcome.prune?.reclaimedBytes ?? 0) + (outcome.compaction?.reclaimedBytes ?? 0);
+    parts.push(`reclaimed ${formatBytes(reclaimedBytes)} in total`);
+  }
+  const warnings = [...new Set((outcome.prune?.warnings ?? [])
+    .map(warning => warning.replace(/\s+/g, " ").trim()).filter(Boolean))];
+  return `${parts.join("; ")}.${warnings.length > 0 ? ` Warnings: ${warnings.join(" ")}` : ""}`;
 }
 
 function unresolvedConflicts(repository: SyncRepository): SyncConflict[] {
@@ -9940,6 +9955,7 @@ interface SyntheticApplyResult {
 interface CheckpointCommandOutcome {
   created: CheckpointCreateResult | null;
   prune: PruneResult | null;
+  compaction: { removedFiles: number; reclaimedBytes: number } | null;
   gitSquash: SquashHistoryResult | null;
 }
 
