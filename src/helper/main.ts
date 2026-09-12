@@ -434,24 +434,7 @@ async function executeRequest(
   }
 
   let exported = await exportFinalChanges(request, repository, heartbeat);
-  if (request.syncOptions.syncChat) {
-    const merged = await mergeOfflineChatConflicts(repository, request, ensureExclusiveAccess, heartbeat);
-    exported.warnings.push(...merged.warnings);
-    const migration = await migrateOfflineChatTips(repository, request, ensureExclusiveAccess, heartbeat);
-    exported.warnings.push(...migration.warnings);
-    if (merged.published > 0 || migration.published > 0) {
-      // Re-verify only chat targets created by migration; workspace backups and
-      // other adapters already drained once and must not restart for each page.
-      const chats = await exportFinalChanges(request, repository, heartbeat, true);
-      exported = {
-        warnings: [...exported.warnings, ...chats.warnings],
-        notices: [...exported.notices, ...chats.notices],
-        protectedLocalResourceIds: [...new Set([...exported.protectedLocalResourceIds, ...chats.protectedLocalResourceIds])],
-        incompleteKinds: [...new Set([...exported.incompleteKinds, ...chats.incompleteKinds])],
-        verifiedApplyVersionIds: [...new Set([...exported.verifiedApplyVersionIds, ...chats.verifiedApplyVersionIds])],
-      };
-    }
-  }
+  exported = await settleOfflineChatChanges(request, repository, exported, ensureExclusiveAccess, heartbeat);
   // Everything that means a resource did NOT reach the repository: a git
   // transport failure, an adapter that threw during the shutdown scan, or a
   // snapshot dropped for exceeding the payload limit. These are reported apart
@@ -655,6 +638,52 @@ interface ApplyVerifiedPageOutcome {
 interface BoundedApplyPageProgress {
   madeProgress: boolean;
   stalledVersionIds: string[];
+}
+
+async function settleOfflineChatChanges(
+  request: HelperRequest,
+  repository: SyncRepository,
+  exported: FinalExportOutcome,
+  ensureExclusiveAccess: () => Promise<void>,
+  heartbeat: () => void,
+): Promise<FinalExportOutcome> {
+  if (!request.syncOptions.syncChat) {
+    return exported;
+  }
+  for (let round = 0; round < 2; round += 1) {
+    await ensureExclusiveAccess();
+    heartbeat();
+    const merged = await mergeOfflineChatConflicts(repository, request, ensureExclusiveAccess, heartbeat);
+    exported.warnings.push(...merged.warnings);
+    const migration = await migrateOfflineChatTips(repository, request, ensureExclusiveAccess, heartbeat);
+    exported.warnings.push(...migration.warnings);
+    if (merged.published === 0 && migration.published === 0) {
+      return exported;
+    }
+    await ensureExclusiveAccess();
+    heartbeat();
+    // A partial peer tip only becomes an apply target after migration. Its
+    // first forced local scan can reveal an edit that needs the second round.
+    const chats = await exportFinalChanges(request, repository, heartbeat, true);
+    exported = {
+      warnings: [...exported.warnings, ...chats.warnings],
+      notices: [...exported.notices, ...chats.notices],
+      protectedLocalResourceIds: [...new Set([...exported.protectedLocalResourceIds, ...chats.protectedLocalResourceIds])],
+      incompleteKinds: [...new Set([...exported.incompleteKinds, ...chats.incompleteKinds])],
+      verifiedApplyVersionIds: [...new Set([...exported.verifiedApplyVersionIds, ...chats.verifiedApplyVersionIds])],
+    };
+  }
+  const checkpoint = await absorbedCheckpointManifest(repository);
+  const reconciled = new EventReconciler().reconcile(
+    await repository.listReconciliationEvents(checkpoint), repository.state, checkpoint,
+  );
+  const verified = new Set(exported.verifiedApplyVersionIds);
+  if (reconciled.conflicts.some(conflict => conflict.kind === "chat") ||
+    shutdownApplyCandidates(repository, reconciled.projections).some(change =>
+      change.kind === "chat" && !verified.has(helperChangeVersionId(change)))) {
+    exported.notices.push("Some chat updates still need merge or final verification. They remain queued for the next shutdown apply.");
+  }
+  return exported;
 }
 
 async function applyVerifiedPage(
@@ -2258,6 +2287,7 @@ export const __testing = Object.freeze({
   restartCursor,
   shutdownApplyCandidates,
   shutdownApplyBatch,
+  settleOfflineChatChanges,
 });
 
 export function markAppliedProjections(

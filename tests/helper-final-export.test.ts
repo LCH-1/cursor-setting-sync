@@ -60,6 +60,131 @@ afterEach(async () => {
 });
 
 describe("the helper's bounded final chat export", () => {
+  it.each(["settled", "protected", "incomplete", "round-limit"] as const)("settles a local edit first discovered after partial remote continuation becomes ready in the same shutdown (%s)", async (mode) => {
+    const fixture = await createFixture();
+    const id = composerId(706);
+    const resourceId = `chat/${id}`;
+    const blob = Buffer.from("immutable continuation available on this PC");
+    const blobId = sha256(blob);
+    const conversationState = `~${Buffer.concat([Buffer.from([0x0a, 0x20]), Buffer.from(blobId, "hex")]).toString("base64")}`;
+    insertLiveChat(fixture.database, id, "shared base", 1, 8);
+    fixture.database.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run(JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: `bubble-${id}` }], conversationState,
+    }), `composerData:${id}`);
+    fixture.database.prepare("INSERT INTO cursorDiskKV VALUES (?,?)").run(`agentKv:blob:${blobId}`, blob);
+    fixture.database.close();
+    await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository, () => {}, true);
+    const base = fixture.repository.state.tips[resourceId]![0]!;
+    const source = parsePortableChatSnapshot((await fixture.repository.readVersion(base.versionId)).content!);
+    const partial: PortableChatSnapshotV2 = { ...source, schemaVersion: 2,
+      bubbles: [{ ...source.bubbles[0]!, valueBase64: Buffer.from(JSON.stringify({ text: "older remote branch" })).toString("base64") }],
+      agentKv: { blobs: [], referencedIds: [blobId], missingIds: [blobId] } };
+    const content = canonicalBytes(partial);
+    const peer = await SyncRepository.open(fixture.request.repositoryRoot, join(fixture.request.storageRoot, "peer"), PASSPHRASE, MAX_PAYLOAD_BYTES, base.producer!);
+    const remote = await peer.publish([{ resourceId, kind: "chat", content, semanticHash: sha256(content), parents: [base.versionId],
+      metadata: { chatSnapshotSchemaVersion: 2, chatCoreHash: portableChatCoreHash(partial), lastUpdatedAt: 1, bubbleCount: 1,
+        agentKvBlobCount: 0, agentKvReferencedCount: 1, agentKvMissingCount: 1 } }], []);
+    fixture.repository.state.pendingDatabaseChanges = [{ resourceId, kind: "chat", eventHash: remote.eventHash!, changeIndex: 0,
+      blockedReason: "Continuation is incomplete" }];
+    await fixture.repository.saveState();
+    const local = new DatabaseSync(fixture.request.paths.globalDatabase);
+    local.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run(JSON.stringify({ text: "latest local edit with unchanged timestamp" }), `bubbleId:${id}:bubble-${id}`);
+    local.close();
+    fixture.repository.invalidateSharedGraphObservation();
+    const originalHead = fixture.repository.state.ownStreamHead;
+    const first = await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository, () => {}, true);
+    expect(fixture.repository.state.ownStreamHead).toBe(originalHead);
+    expect(first.verifiedApplyVersionIds).toEqual([]);
+    if (mode === "protected") {
+      first.protectedLocalResourceIds.push(resourceId);
+    } else if (mode === "incomplete") {
+      first.incompleteKinds.push("chat");
+    }
+    const guard = vi.fn(async () => {});
+    let injected = false;
+    // The forwarding call below preserves each real adapter's receiver.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const originalScan = StateVscdbChatAdapter.prototype.scan;
+    const scan = mode === "round-limit" ? vi.spyOn(StateVscdbChatAdapter.prototype, "scan").mockImplementation(async function (this: StateVscdbChatAdapter, known) {
+      const tips = fixture.repository.state.tips[resourceId] ?? [];
+      if (!injected && tips.length === 1 && tips[0]!.metadata?.chatResolutionStrategy !== undefined) {
+        injected = true;
+        const database = new DatabaseSync(fixture.request.paths.globalDatabase);
+        try {
+          database.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run(JSON.stringify({ text: "another local edit during the final verification" }), `bubbleId:${id}:bubble-${id}`);
+        } finally { database.close(); }
+      }
+      return originalScan.call(this, known);
+    }) : null;
+    let outcome;
+    try {
+      outcome = await helperMainTesting.settleOfflineChatChanges(fixture.request, fixture.repository, first, guard, () => {});
+    } finally { scan?.mockRestore(); }
+    const reconciled = new EventReconciler().reconcile(await fixture.repository.listEvents(), fixture.repository.state, null);
+    if (mode === "round-limit") {
+      expect(injected).toBe(true);
+      expect(reconciled.conflicts).toHaveLength(1);
+      expect(outcome.notices).toContain("Some chat updates still need merge or final verification. They remain queued for the next shutdown apply.");
+      const tips = fixture.repository.state.tips[resourceId]!;
+      expect(tips).toHaveLength(2);
+      const latest = tips.find(tip => tip.metadata?.chatResolutionStrategy === undefined)!;
+      expect(outcome.verifiedApplyVersionIds).not.toContain(latest.versionId);
+      const verified = helperMainTesting.intersectVerifiedApplyPage(tips.map(tip => helperChange(tip, resourceId)), outcome.verifiedApplyVersionIds);
+      expect(verified.every(change => !helperMainTesting.isEligible(change, reconciled.projections, fixture.repository.state.conflicts))).toBe(true);
+      expect(fixture.repository.state.pendingDatabaseChanges).toHaveLength(1);
+      const snapshot = parsePortableChatSnapshot((await fixture.repository.readVersion(latest.versionId)).content!);
+      expect(Buffer.from(snapshot.bubbles[0]!.valueBase64, "base64").toString()).toBe(JSON.stringify({ text: "another local edit during the final verification" }));
+      return;
+    }
+    expect(reconciled.conflicts).toEqual([]);
+    const final = fixture.repository.state.tips[resourceId]![0]!;
+    expect(outcome.verifiedApplyVersionIds).toContain(final.versionId);
+    if (mode === "protected" || mode === "incomplete") {
+      expect(helperMainTesting.finalExportApplyBlockReason(helperChange(final, resourceId), outcome))
+        .toContain(mode === "protected" ? "exact final local resource" : "final local scan");
+      expect(fixture.repository.state.pendingDatabaseChanges).toHaveLength(1);
+      expect(fixture.repository.state.projections[resourceId]!.versionId).not.toBe(final.versionId);
+      return;
+    }
+    expect(helperMainTesting.finalExportApplyBlockReason(helperChange(final, resourceId), outcome)).toBeNull();
+    const snapshot = parsePortableChatSnapshot((await fixture.repository.readVersion(final.versionId)).content!);
+    expect(snapshot.schemaVersion).toBe(2);
+    expect(Buffer.from(snapshot.bubbles[0]!.valueBase64, "base64").toString()).toBe(JSON.stringify({ text: "latest local edit with unchanged timestamp" }));
+    const prepared = await prepareChanges(fixture.repository, [helperChange(final, resourceId)]);
+    const applied = await applyGlobalDatabaseChanges(fixture.request, prepared.prepared);
+    expect(applied.applied).toEqual([resourceId]);
+    markAppliedProjections(fixture.repository, [helperChange(final, resourceId)], applied.applied, new Set(applied.retainedLocal), applied.retainedLocalHashes, applied.localChatCoreHashes);
+    await fixture.repository.saveState();
+    const count = (await fixture.repository.listEvents()).length;
+    const next = await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository, () => {}, true);
+    await helperMainTesting.settleOfflineChatChanges(fixture.request, fixture.repository, next, guard, () => {});
+    expect((await fixture.repository.listEvents()).length).toBe(count);
+    expect(fixture.repository.state.pendingDatabaseChanges).toEqual([]);
+    const database = new DatabaseSync(fixture.request.paths.globalDatabase, { readOnly: true });
+    try {
+      expect(database.prepare("SELECT value FROM cursorDiskKV WHERE key=?").get(`bubbleId:${id}:bubble-${id}`)?.value)
+        .toBe(JSON.stringify({ text: "latest local edit with unchanged timestamp" }));
+    } finally { database.close(); }
+    expect(guard).toHaveBeenCalled();
+  });
+
+  it.each([false, true])("does not rescan or publish when chat settlement has no work (disabled: %s)", async (disabled) => {
+    const fixture = await createFixture();
+    fixture.database.close();
+    const first = await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository, () => {}, true);
+    fixture.request.syncOptions.syncChat = !disabled;
+    const head = fixture.repository.state.ownStreamHead;
+    const guard = vi.fn(async () => {});
+    const scan = vi.spyOn(StateVscdbChatAdapter.prototype, "scan");
+    try {
+      const outcome = await helperMainTesting.settleOfflineChatChanges(fixture.request, fixture.repository, first, guard, () => {});
+      expect(outcome).toBe(first);
+      expect(scan).not.toHaveBeenCalled();
+      expect(guard).toHaveBeenCalledTimes(disabled ? 0 : 1);
+      expect(fixture.repository.state.ownStreamHead).toBe(head);
+    } finally { scan.mockRestore(); }
+  });
+
   it.each(["final-export", "apply-and-restart"] as const)("never verifies disabled chat adapters through %s targets or its explicit fallback", async (mode) => {
     const fixture = await createFixture();
     fixture.database.close();
