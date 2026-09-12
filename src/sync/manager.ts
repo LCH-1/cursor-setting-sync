@@ -277,6 +277,8 @@ import {
   effectiveSyncOrigin,
   effectiveTipProducer,
   effectiveVersionProducer,
+  acknowledgeObservedLocalChats,
+  acknowledgePublishedLocalChats,
   filterPublishableChanges,
   formatBytes,
   isSyntheticTip,
@@ -5510,6 +5512,7 @@ export class SyncManager implements vscode.Disposable {
       const localSnapshots = new Map(
         scan.snapshots.map((snapshot) => [snapshot.resourceId, snapshot]),
       );
+      const unverifiableLocalChats = await acknowledgeObservedLocalChats(repository, scan.snapshots);
       const conflictedResources = new Set(
         repository.state.conflicts
           .filter((conflict) => conflict.resolvedAt === undefined)
@@ -5544,7 +5547,8 @@ export class SyncManager implements vscode.Disposable {
       for (const snapshot of scan.snapshots) {
         if (
           published.has(snapshot.resourceId) ||
-          protectedSyntheticResources.has(snapshot.resourceId)
+          protectedSyntheticResources.has(snapshot.resourceId) ||
+          unverifiableLocalChats.has(snapshot.resourceId)
         ) {
           continue;
         }
@@ -5640,6 +5644,7 @@ export class SyncManager implements vscode.Disposable {
           repository,
           publishable.snapshots,
           publishable.deletions,
+          { acknowledgeLocalChats: true },
         );
       } catch (error) {
         publishError = error instanceof Error ? error : new Error(String(error));
@@ -5762,6 +5767,9 @@ export class SyncManager implements vscode.Disposable {
           [...new Set([...preResult.warnings, ...result.warnings])],
         ],
         [AUTO_MERGE_WARNING_SOURCE, mergeWarnings],
+        ["chat-observation-ack", [...unverifiableLocalChats].map(resourceId =>
+          `${resourceId}: the matching local chat observation could not be authenticated; incoming chat apply was deferred.`,
+        )],
         ...publishWarningObservation(
           scan.warningsBySource.keys(),
           publishable.warningsBySource,
@@ -5787,9 +5795,14 @@ export class SyncManager implements vscode.Disposable {
         this.status.log(formatWarningLine(entry));
       }
       const pendingPruned = prunePending(repository, result.projections);
+      for (const projection of result.projections) {
+        if (unverifiableLocalChats.has(projection.resourceId)) {
+          queuePending(repository, projection, "The matching local chat observation could not be authenticated; synchronize again before applying it.");
+        }
+      }
       const appliedProjectionStateChanged = await this.applyProjections(
         repository,
-        result.projections,
+        result.projections.filter(projection => !unverifiableLocalChats.has(projection.resourceId)),
         localSnapshots,
         manual,
         scan.deferredAdapterIds,
@@ -6476,18 +6489,17 @@ export class SyncManager implements vscode.Disposable {
             continue;
           }
           try {
-            await repository.publish(
-              [
-                {
-                  ...snapshot,
-                  parents: parentsForLocalChange(
-                    known,
-                    repository.state.tips[snapshot.resourceId] ?? [],
-                  ),
-                },
-              ],
-              [],
-            );
+            const localSnapshot: ResourceSnapshot = {
+              ...snapshot,
+              parents: parentsForLocalChange(
+                known,
+                repository.state.tips[snapshot.resourceId] ?? [],
+              ),
+            };
+            const published = await repository.publish([localSnapshot], []);
+            if (published.eventHash !== null) {
+              await acknowledgePublishedLocalChats(repository, published.eventHash, [localSnapshot]);
+            }
             block(
               snapshot.resourceId,
               `A local edit to ${snapshot.resourceId} was captured before the queued database write. Synchronize again and resolve the resulting conversation conflict before retrying Cursor Setting Sync: Manage → Sync & Apply Now.`,

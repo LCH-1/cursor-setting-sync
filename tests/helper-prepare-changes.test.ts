@@ -1046,6 +1046,7 @@ describe("preparing a helper batch", () => {
     const request = {
       mode: "apply-and-restart",
       changes: [change],
+      syncOptions: { syncChat: false },
     } as HelperRequest;
 
     const page = helperMainTesting.finalExportTargetPage(

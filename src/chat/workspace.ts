@@ -455,9 +455,6 @@ export function resolveTargetWorkspace(
   explicitMappings: Record<string, string>,
   platform: NodeJS.Platform = process.platform,
 ): string | null {
-  if (localWorkspaces.some((workspace) => workspace.id === sourceWorkspaceId)) {
-    return sourceWorkspaceId;
-  }
   const explicit = Object.hasOwn(explicitMappings, sourceWorkspaceId)
     ? explicitMappings[sourceWorkspaceId]
     : undefined;
@@ -466,6 +463,9 @@ export function resolveTargetWorkspace(
     localWorkspaces.some((workspace) => workspace.id === explicit)
   ) {
     return explicit;
+  }
+  if (localWorkspaces.some((workspace) => workspace.id === sourceWorkspaceId)) {
+    return sourceWorkspaceId;
   }
   if (sourceWorkspaceUri === null) {
     return null;

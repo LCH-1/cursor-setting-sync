@@ -44,6 +44,7 @@ import { EventReconciler, parentsForLocalChange } from "../protocol/reconciler";
 import type { ResourceProjection } from "../protocol/reconciler";
 import {
   absorbedCheckpointManifest,
+  acknowledgeObservedLocalChats,
   effectiveSourceDeviceId,
   effectiveSyncOrigin,
   effectiveTipProducer,
@@ -961,6 +962,9 @@ async function exportFinalChanges(
     repository.state,
     checkpoint,
   );
+  if (request.syncOptions.syncChat) {
+    refreshShutdownChatPending(repository, preResult.projections);
+  }
   const targetChanges = finalExportTargetPage(
     request,
     repository,
@@ -976,6 +980,10 @@ async function exportFinalChanges(
     new Set([
       ...conflictedResources,
       ...targetChanges.filter((change) => change.kind === "chat").map((change) => change.resourceId),
+      ...preResult.projections.filter(({ resourceId, tip }) =>
+        tip.kind === "chat" && tip.semanticHash === repository.state.projections[resourceId]?.semanticHash &&
+        tip.versionId !== repository.state.projections[resourceId]?.versionId,
+      ).map(({ resourceId }) => resourceId),
     ]),
   );
   const protectedSyntheticResources = new Set(
@@ -1131,6 +1139,11 @@ async function exportFinalChanges(
       }
       warnings.push(...result.warnings);
       notices.push(...(result.notices ?? []));
+      const unverifiableObservations = await acknowledgeObservedLocalChats(repository, result.snapshots);
+      for (const resourceId of unverifiableObservations) {
+        protectedLocalResourceIds.add(resourceId);
+        warnings.push(`${resourceId}: the matching local chat observation could not be authenticated; incoming chat apply was deferred.`);
+      }
       const prepared = prepareFinalExportScanChanges(
         result,
         scanKnown,
@@ -1190,6 +1203,7 @@ async function exportFinalChanges(
         repository,
         publishable.snapshots,
         publishable.deletions,
+        { acknowledgeLocalChats: true },
       )) {
         publishedEventHashes.add(eventHash);
       }
@@ -1213,7 +1227,7 @@ async function exportFinalChanges(
           snapshot,
           scanKnown[snapshot.resourceId],
         );
-        if (progressAware) {
+        if (progressAware && !unverifiableObservations.has(snapshot.resourceId)) {
           repository.state.projections[snapshot.resourceId] = provisional;
         } else {
           nextPageKnown[snapshot.resourceId] = provisional;
@@ -1302,6 +1316,7 @@ async function exportFinalChanges(
     repository,
     publishable.snapshots,
     publishable.deletions,
+    { acknowledgeLocalChats: true },
   )) {
     publishedEventHashes.add(eventHash);
   }
@@ -1350,15 +1365,28 @@ async function exportFinalChanges(
       };
     }
   }
-  await repository.saveState();
-  await repository.writeAck();
-  return {
+  const outcome: FinalExportOutcome = {
     warnings: [...new Set(warnings)],
     notices: [...new Set(notices)],
     protectedLocalResourceIds: [...protectedLocalResourceIds].sort(),
     incompleteKinds: [...incompleteKinds].sort(),
     verifiedApplyVersionIds: targetChanges.map(helperChangeVersionId),
   };
+  const verified = new Map(targetChanges.map(change => [helperChangeVersionId(change), change]));
+  for (const pending of repository.state.pendingDatabaseChanges) {
+    if (!isTransientFinalChatScanBlock(pending)) {
+      continue;
+    }
+    const change = verified.get(`${pending.eventHash}#${pending.changeIndex}`);
+    if (change !== undefined && change.resourceId === pending.resourceId &&
+      finalExportApplyBlockReason(change, outcome) === null &&
+      isEligible(change, result.projections, repository.state.conflicts)) {
+      delete pending.blockedReason;
+    }
+  }
+  await repository.saveState();
+  await repository.writeAck();
+  return outcome;
   } finally {
     // A bounded scan normally finishes by closing its last directory. Error,
     // no-progress, and pass-limit exits do not, so the one-shot helper must
@@ -1378,9 +1406,7 @@ async function repairUnpublishedConflictObservations(
   const unverifiable = new Set<string>();
   for (const resourceId of resources) {
     const projection = repository.state.projections[resourceId];
-    if (projection?.kind !== "chat" ||
-      (repository.state.tips[resourceId] ?? []).some((tip) =>
-        tip.operation === "put" && tip.semanticHash === projection.semanticHash)) {
+    if (projection?.kind !== "chat") {
       continue;
     }
     if (projection.versionId === null) {
@@ -1714,11 +1740,14 @@ function finalExportTargetPage(
   repository: SyncRepository,
   projections: ResourceProjection[],
 ): HelperChange[] {
+  const enabled = (changes: HelperChange[]): HelperChange[] => request.syncOptions.syncChat
+    ? changes
+    : changes.filter(change => !["chat", "chat-transcript", "chat-store"].includes(change.kind));
   if (request.mode === "apply-and-restart") {
-    const durable = shutdownApplyCandidates(repository, projections);
-    return durable.length === 0
+    const durable = shutdownApplyCandidates(repository, projections, new Set(), true);
+    return enabled(durable.length === 0
       ? boundedHelperTargetPage(request.changes)
-      : durable;
+      : durable);
   }
   if (
     request.mode === "final-export" &&
@@ -1728,7 +1757,7 @@ function finalExportTargetPage(
     // every READY incoming identity up front so that one exact final scan can
     // authorize all later 256-change/32 MiB database pages. Re-running that
     // whole scan once per apply page can keep Cursor closed for hours.
-    return shutdownApplyCandidates(repository, projections);
+    return enabled(shutdownApplyCandidates(repository, projections, new Set(), true));
   }
   return [];
 }
@@ -1966,6 +1995,7 @@ function shutdownApplyCandidates(
   repository: SyncRepository,
   projections: ResourceProjection[],
   excludedVersionIds: ReadonlySet<string> = new Set(),
+  includeTransientFinalScanBlocks = false,
 ): HelperChange[] {
   const tipByVersionId = new Map<string, ResourceProjection>();
   for (const projection of projections) {
@@ -1973,7 +2003,8 @@ function shutdownApplyCandidates(
   }
   const changes: HelperChange[] = [];
   for (const pending of repository.state.pendingDatabaseChanges) {
-    if (pending.blockedReason !== undefined) {
+    if (pending.blockedReason !== undefined &&
+      !(includeTransientFinalScanBlocks && isTransientFinalChatScanBlock(pending))) {
       continue;
     }
     const projection = tipByVersionId.get(
@@ -2024,6 +2055,44 @@ function shutdownApplyCandidates(
     changes.push(change);
   }
   return changes;
+}
+
+function refreshShutdownChatPending(
+  repository: SyncRepository,
+  projections: readonly ResourceProjection[],
+): void {
+  const current = new Map<string, ResourceProjection>();
+  const ambiguous = new Set(repository.state.conflicts
+    .filter(conflict => conflict.resolvedAt === undefined).map(conflict => conflict.resourceId));
+  for (const projection of projections) {
+    if (current.has(projection.resourceId)) {
+      ambiguous.add(projection.resourceId);
+    }
+    current.set(projection.resourceId, projection);
+  }
+  for (const pending of repository.state.pendingDatabaseChanges) {
+    if (pending.kind !== "chat" || ambiguous.has(pending.resourceId)) {
+      continue;
+    }
+    const tip = current.get(pending.resourceId)?.tip;
+    if (tip?.kind === "chat") {
+      // This only rebinds an existing queue entry. The current tip must still
+      // pass final local verification and ordinary prepare/apply checks.
+      pending.eventHash = tip.eventHash;
+      pending.changeIndex = tip.changeIndex;
+    }
+  }
+}
+
+function isTransientFinalChatScanBlock(
+  pending: { kind: ResourceKind; resourceId: string; blockedReason?: string },
+): boolean {
+  if (pending.kind !== "chat") {
+    return false;
+  }
+  const reason = `${APPLY_FAILURE_BLOCK_PREFIX}: The final local verification for ${pending.resourceId} did not finish within the bounded scan. Retry after the current synchronization completes.`;
+  return pending.blockedReason === reason ||
+    pending.blockedReason === `${reason} Run "${RESTART_TO_APPLY_TITLE}" to try it again.`;
 }
 
 function boundedShutdownApplyPage(

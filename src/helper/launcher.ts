@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -16,6 +16,7 @@ import { pathExists, writeFileAtomic, writeJsonAtomic } from "../platform/files"
 import { acquireFileLock } from "../platform/lock";
 import type { DatabaseContract } from "./database";
 import type { HelperChange, HelperRequest } from "./types";
+import { prepareHelperRuntime } from "./runtime";
 
 export type HelperSyncOptions = HelperRequest["syncOptions"];
 
@@ -57,6 +58,7 @@ export class HelperLauncher {
     private readonly compatibility: CompatibilityReport,
     /** Test seam: how long a finalizer replacement waits for the old holder. */
     private readonly replaceWaitMs = 30_000,
+    private readonly spawnProcess: (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess = spawn,
   ) {
     this.cancelFinalizersPath = join(paths.extensionStorage, "cancel-finalizers");
   }
@@ -284,46 +286,69 @@ export class HelperLauncher {
     if (!(await pathExists(this.paths.helperScript))) {
       throw new Error(`Helper script is missing: ${this.paths.helperScript}`);
     }
-    const requestPath = join(
-      this.paths.extensionStorage,
-      `helper-request-${request.requestId}.json`,
-    );
-    await writeJsonAtomic(requestPath, request);
-    const environment = {
-      ...process.env,
-      ELECTRON_RUN_AS_NODE: "1",
-    };
-    // stderr was discarded, so a helper that died before it could write a
-    // result - a missing module, a bad runtime, anything at import time -
-    // left nothing behind but an unconsumed request file and a queue that
-    // never shrank. It goes to a file next to the request instead, which
-    // `consumeHelperResults` reports and removes.
-    const errorLog = await open(`${requestPath}.stderr.log`, "a");
-    const child = spawn(process.execPath, [this.paths.helperScript, requestPath], {
-      detached: true,
-      windowsHide: true,
-      stdio: ["pipe", "ignore", errorLog.fd],
-      env: environment,
-    });
-    void errorLog.close();
-    await new Promise<void>((resolve, reject) => {
-      const stdin = child.stdin;
-      if (stdin === null) {
-        reject(new Error("Unable to open the helper key pipe."));
-        return;
-      }
-      const onError = (error: Error): void => {
-        stdin.off("error", onError);
-        reject(error);
+    const runtime = await prepareHelperRuntime(this.paths.extensionStorage);
+    let startedChild: ChildProcess | null = null;
+    let fullyArmed = false;
+    try {
+      const requestPath = join(
+        this.paths.extensionStorage,
+        `helper-request-${request.requestId}.json`,
+      );
+      await writeJsonAtomic(requestPath, request);
+      const environment = {
+        ...process.env,
+        ELECTRON_RUN_AS_NODE: "1",
       };
-      stdin.once("error", onError);
-      stdin.end(`${masterKey.toString("base64")}\n`, () => {
-        stdin.off("error", onError);
-        resolve();
+      // stderr was discarded, so a helper that died before it could write a
+      // result - a missing module, a bad runtime, anything at import time -
+      // left nothing behind but an unconsumed request file and a queue that
+      // never shrank. It goes to a file next to the request instead, which
+      // `consumeHelperResults` reports and removes.
+      const errorLog = await open(`${requestPath}.stderr.log`, "a");
+      let child: ChildProcess;
+      try {
+        child = this.spawnProcess(runtime.executablePath, [this.paths.helperScript, requestPath], {
+          detached: true,
+          windowsHide: true,
+          stdio: ["pipe", "ignore", errorLog.fd],
+          env: environment,
+        });
+        startedChild = child;
+        await new Promise<void>((resolve, reject) => {
+          child.once("spawn", resolve);
+          child.once("error", reject);
+        });
+      } finally {
+        await errorLog.close();
+      }
+      await runtime.attach(child);
+      await new Promise<void>((resolve, reject) => {
+        const stdin = child.stdin;
+        if (stdin === null) {
+          reject(new Error("Unable to open the helper key pipe."));
+          return;
+        }
+        const onError = (error: Error): void => {
+          stdin.off("error", onError);
+          reject(error);
+        };
+        stdin.once("error", onError);
+        stdin.end(`${masterKey.toString("base64")}\n`, () => {
+          stdin.off("error", onError);
+          resolve();
+        });
       });
-    });
-    child.unref();
-    return child;
+      child.unref();
+      fullyArmed = true;
+      return child;
+    } finally {
+      if (!fullyArmed && startedChild !== null) {
+        startedChild.stdin?.destroy();
+        try { startedChild.kill(); } catch { /* The child may already have exited. */ }
+        startedChild.unref();
+      }
+      await runtime.release();
+    }
   }
 
   private async waitForFinalizersToExit(

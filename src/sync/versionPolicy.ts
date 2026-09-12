@@ -4,6 +4,7 @@ import type {
   JsonValue,
   LocalProjection,
   ResourceDeletion,
+  ResourceChange,
   ResourceSnapshot,
   ResourceTip,
 } from "../types";
@@ -12,6 +13,10 @@ import { classifyLegacyCheckpointMarker } from "../protocol/checkpointMarker";
 import { MAX_EVENT_CHANGES } from "../constants";
 import { PUBLISH_WARNING_SOURCE } from "./warningLog";
 import { assertSafeIdentifier } from "../platform/files";
+import { createHash } from "node:crypto";
+import { parsePortableChatSnapshot, portableChatCoreHash } from "../chat/stateVscdb";
+import { updatePortableComposerHeaderHash } from "../chat/headerCanonical";
+import { sha256 } from "../protocol/canonical";
 
 export function shouldPublishSnapshot(
   projection: LocalProjection | undefined,
@@ -330,6 +335,7 @@ export async function publishInBatches(
   repository: SyncRepository,
   snapshots: readonly ResourceSnapshot[],
   deletions: readonly ResourceDeletion[],
+  options: { acknowledgeLocalChats?: boolean } = {},
 ): Promise<Set<string>> {
   const published = new Set<string>();
   const record = (eventHash: string | null): void => {
@@ -373,9 +379,142 @@ export async function publishInBatches(
       batchDeletions.push(item);
       deletionIndex += 1;
     }
-    record((await repository.publish(batchSnapshots, batchDeletions)).eventHash);
+    const result = await repository.publish(batchSnapshots, batchDeletions);
+    record(result.eventHash);
+    if (options.acknowledgeLocalChats && result.eventHash !== null) {
+      await acknowledgePublishedLocalChats(repository, result.eventHash, batchSnapshots);
+    }
   } while (snapshotIndex < snapshots.length || deletionIndex < deletions.length);
   return published;
+}
+
+export async function acknowledgePublishedLocalChats(
+  repository: SyncRepository,
+  eventHash: string,
+  snapshots: readonly ResourceSnapshot[],
+): Promise<void> {
+  const localChats = snapshots.filter(isLocalChatObservation);
+  if (localChats.length === 0) {
+    return;
+  }
+  const event = (await repository.listEvents()).find(candidate => candidate.eventHash === eventHash);
+  if (event === undefined || event.stored.header.deviceId !== repository.state.device.deviceId) {
+    throw new Error("The local chat publication could not be authenticated for acknowledgement.");
+  }
+  const versions = new Map(event.manifest.changes.map((change, index) => [change.resourceId, { change, index }]));
+  for (const snapshot of localChats) {
+    const committed = versions.get(snapshot.resourceId);
+    if (committed === undefined) {
+      throw new Error("The acknowledged local chat does not match its published payload.");
+    }
+    // Publishing a local branch is already an acknowledgement of these exact
+    // bytes, even while a peer branch conflicts or enrichment replaces its tip.
+    repository.state.projections[snapshot.resourceId] = authenticatedLocalChatProjection(
+      snapshot, committed.change, `${eventHash}#${committed.index}`,
+    );
+  }
+  await repository.saveState();
+}
+
+export async function acknowledgeObservedLocalChats(
+  repository: SyncRepository,
+  snapshots: readonly ResourceSnapshot[],
+): Promise<Set<string>> {
+  const unverifiable = new Set<string>();
+  let changed = false;
+  for (const snapshot of snapshots.filter(candidate =>
+    isLocalChatObservation(candidate) && candidate.metadata?.syncOrigin !== "agent-kv-recapture")) {
+    const tips = repository.state.tips[snapshot.resourceId] ?? [];
+    const matching = tips.filter(tip =>
+      tip.kind === "chat" && tip.operation === "put" && tip.semanticHash === snapshot.semanticHash,
+    );
+    let acknowledged = false;
+    let failed = false;
+    for (const tip of matching) {
+      try {
+        const authenticated = await repository.readVersionMetadata(tip.versionId);
+        repository.state.projections[snapshot.resourceId] = authenticatedLocalChatProjection(
+          snapshot, authenticated.change, tip.versionId,
+        );
+        acknowledged = true;
+        changed = true;
+        break;
+      } catch {
+        failed = true;
+        // A stale/tampered tip cache cannot acknowledge bytes that were never
+        // committed. Another identical, authenticated tip can still do so.
+      }
+    }
+    if (!acknowledged && matching.length === 0) {
+      for (const tip of tips.filter(candidate => candidate.metadata?.syncOrigin === "agent-kv-enrichment")) {
+        try {
+          const enriched = await repository.readVersionMetadata(tip.versionId);
+          const sourceVersionId = enriched.change.metadata?.enrichedFromVersionId;
+          if (enriched.change.resourceId !== snapshot.resourceId || enriched.change.kind !== "chat" ||
+            enriched.change.operation !== "put" || enriched.change.semanticHash !== tip.semanticHash ||
+            enriched.change.metadata?.syncOrigin !== "agent-kv-enrichment" || typeof sourceVersionId !== "string") {
+            failed = true;
+            continue;
+          }
+          const source = await repository.readVersionMetadata(sourceVersionId);
+          if (source.change.semanticHash !== snapshot.semanticHash) {
+            continue;
+          }
+          // The richer tip remains pending. Only the source whose committed
+          // bytes were independently observed on this disk is acknowledged.
+          repository.state.projections[snapshot.resourceId] = authenticatedLocalChatProjection(
+            snapshot, source.change, sourceVersionId,
+          );
+          acknowledged = true;
+          changed = true;
+          break;
+        } catch {
+          failed = true;
+        }
+      }
+    }
+    if (!acknowledged && failed) {
+      unverifiable.add(snapshot.resourceId);
+    }
+  }
+  if (changed) {
+    await repository.saveState();
+  }
+  return unverifiable;
+}
+
+function isLocalChatObservation(snapshot: ResourceSnapshot): boolean {
+  return snapshot.kind === "chat" &&
+    (snapshot.metadata?.syncOrigin === undefined || snapshot.metadata.syncOrigin === "agent-kv-recapture");
+}
+
+function authenticatedLocalChatProjection(
+  snapshot: ResourceSnapshot,
+  committed: ResourceChange,
+  versionId: string,
+): LocalProjection {
+  if (committed.resourceId !== snapshot.resourceId || committed.kind !== "chat" || committed.operation !== "put" ||
+    committed.semanticHash !== snapshot.semanticHash || committed.payload === undefined ||
+    committed.payload.plainBytes !== snapshot.content.byteLength || sha256(snapshot.content) !== snapshot.semanticHash) {
+    throw new Error("The acknowledged local chat does not match its authenticated payload.");
+  }
+  const core = parsePortableChatSnapshot(snapshot.content);
+  if (`chat/${core.composerId}` !== snapshot.resourceId) {
+    throw new Error("The acknowledged local chat does not match its authenticated resource.");
+  }
+  const headerHash = createHash("sha256");
+  updatePortableComposerHeaderHash(headerHash, core.header);
+  return {
+    resourceId: snapshot.resourceId,
+    kind: "chat",
+    semanticHash: snapshot.semanticHash,
+    versionId,
+    payloadObjectId: committed.payload.objectId,
+    ...(core.header.lastUpdatedAt === null ? {} : { sourceTimestamp: core.header.lastUpdatedAt }),
+    sourceBubbleCount: core.bubbles.length,
+    sourceChatCoreHash: portableChatCoreHash(core),
+    sourceHeaderFingerprint: headerHash.digest("hex"),
+  };
 }
 
 /**

@@ -62,6 +62,33 @@ describe("the two spellings of one SSH host", () => {
     expect(resolved).toBe("3948bfec65c8d5c6c74717f13defe2a1");
   });
 
+  it("honors an explicit alias-to-descriptor mapping when both workspace directories remain", () => {
+    const sourceId = "d99145b491294fe5c2001d0f2d208970";
+    const targetId = "07072b7cfcdb3269799c0dce8ef3e033";
+    const workspaces = [
+      { id: sourceId, uri: ALIAS_URI, basename: "backend" },
+      { id: targetId, uri: DESCRIPTOR_URI, basename: "backend" },
+    ];
+    expect(normalizeWorkspaceUri(ALIAS_URI)).toBe(normalizeWorkspaceUri(DESCRIPTOR_URI));
+    expect(resolveTargetWorkspace(sourceId, ALIAS_URI, workspaces, {
+      [sourceId]: targetId,
+    })).toBe(targetId);
+    expect(resolveTargetWorkspace(sourceId, ALIAS_URI, workspaces, {})).toBe(sourceId);
+  });
+
+  it.each(["", "missing-local-target"])("falls back to the existing source for an unavailable explicit target: %s", (targetId) => {
+    expect(resolveTargetWorkspace("source", ALIAS_URI, [
+      { id: "source", uri: ALIAS_URI, basename: "backend" },
+      { id: "local-descriptor", uri: DESCRIPTOR_URI, basename: "backend" },
+    ], { source: targetId })).toBe("source");
+  });
+
+  it("retains normalized URI fallback when neither the explicit target nor source ID exists", () => {
+    expect(resolveTargetWorkspace("source", ALIAS_URI, [
+      { id: "local-descriptor", uri: DESCRIPTOR_URI, basename: "backend" },
+    ], { source: "missing-local-target" })).toBe("local-descriptor");
+  });
+
   it("keeps different servers apart", () => {
     // {"hostName":"geekdive_local"} — the other real host, one character off.
     const other =

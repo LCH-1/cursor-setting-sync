@@ -2201,9 +2201,19 @@ describe("suppressed local snapshot metadata", () => {
   });
 
   it("persists a verified chat's timestamp and bubble count without republishing it", async () => {
-    const content = Buffer.from('{"schemaVersion":1}', "utf8");
+    const composerId = "00000000-0000-4000-8000-000000000037";
+    const bubbleIds = Array.from({ length: 37 }, (_, index) => `bubble-${index}`);
+    const content = Buffer.from(JSON.stringify({
+      schemaVersion: 1, composerId,
+      header: { composerId, workspaceId: null, createdAt: T0 - 1, lastUpdatedAt: T0,
+        isArchived: 0, isSubagent: 0, recency: 0, checkpointAt: null, value: null },
+      composerData: { key: `composerData:${composerId}`, valueType: "text",
+        valueBase64: Buffer.from(JSON.stringify({ fullConversationHeadersOnly: bubbleIds.map(bubbleId => ({ bubbleId })) })).toString("base64") },
+      bubbles: bubbleIds.map(bubbleId => ({ key: `bubbleId:${composerId}:${bubbleId}`, valueType: "text",
+        valueBase64: Buffer.from(JSON.stringify({ text: bubbleId })).toString("base64") })),
+    }), "utf8");
     const snapshot = {
-      resourceId: "chat/legacy-projection",
+      resourceId: `chat/${composerId}`,
       kind: "chat" as const,
       content,
       semanticHash: sha256(content),

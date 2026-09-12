@@ -8,6 +8,7 @@ import {
 import { mkdir, readdir, rename, rm, stat } from "node:fs/promises";
 import { basename, dirname, join, posix, win32 } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { parseTree, type ParseError } from "jsonc-parser";
 import {
   BACKUP_DIRECTORY,
   CURSOR_USER_RULES_KEY,
@@ -1565,7 +1566,17 @@ function resolvedChatLocalCoreHash(
   hash.update(',"composerId":');
   hash.update(canonicalJson(snapshot.composerId));
   hash.update(',"header":');
-  updatePortableComposerHeaderHash(hash, { ...snapshot.header, workspaceId });
+  const headerValue = database.prepare(
+    "SELECT value FROM composerHeaders WHERE composerId = ?",
+  ).get(snapshot.composerId)?.value;
+  if (typeof headerValue !== "string" && headerValue !== null) {
+    return null;
+  }
+  updatePortableComposerHeaderHash(hash, {
+    ...snapshot.header,
+    value: headerValue,
+    workspaceId,
+  });
   hash.update(',"schemaVersion":1}');
   return hash.digest("hex");
 }
@@ -2007,6 +2018,35 @@ function upsertChat(
   workspaceId: string | null,
   maxAgentKvBytes: number,
 ): string {
+  const header = snapshot.header;
+  let headerValue = header.value;
+  let composerData = snapshot.composerData;
+  if (
+    workspaceId !== null &&
+    header.workspaceId !== null &&
+    workspaceId !== header.workspaceId
+  ) {
+    if (headerValue !== null) {
+      headerValue = remapChatWorkspaceIdentifier(
+        headerValue, header.workspaceId, workspaceId,
+      );
+    }
+    if (composerData.valueType !== "null") {
+      const bytes = Buffer.from(composerData.valueBase64, "base64");
+      const text = bytes.toString("utf8");
+      if (Buffer.from(text, "utf8").equals(bytes)) {
+        const mapped = remapChatWorkspaceIdentifier(
+          text, header.workspaceId, workspaceId,
+        );
+        if (mapped !== text) {
+          composerData = {
+            ...composerData,
+            valueBase64: Buffer.from(mapped, "utf8").toString("base64"),
+          };
+        }
+      }
+    }
+  }
   // Hash the normalized rows while they are written. This mirrors what the
   // next live scanner will observe without re-reading the database or building
   // a second whole-chat canonical buffer.
@@ -2043,11 +2083,11 @@ function upsertChat(
     updatePortableRowHash(hash, bubble, write.valueType);
   }
   hash.update('],"composerData":');
-  const composerDataWrite = portableKvWrite(snapshot.composerData);
-  insertKv.run(snapshot.composerData.key, composerDataWrite.value);
+  const composerDataWrite = portableKvWrite(composerData);
+  insertKv.run(composerData.key, composerDataWrite.value);
   updatePortableRowHash(
     hash,
-    snapshot.composerData,
+    composerData,
     composerDataWrite.valueType,
   );
   // Bubbles present here and absent from the snapshot are LEFT ALONE.
@@ -2067,7 +2107,6 @@ function upsertChat(
   // `fullConversationHeadersOnly` decides what the conversation contains, so a
   // row it does not reference is inert - the same reason the conflict merge
   // unions bubbles instead of choosing between them.
-  const header = snapshot.header;
   database
     .prepare(
       `INSERT INTO composerHeaders(
@@ -2093,7 +2132,7 @@ function upsertChat(
       header.isSubagent,
       header.recency,
       header.checkpointAt,
-      header.value,
+      headerValue,
     );
 
   hash.update(',"composerId":');
@@ -2109,13 +2148,57 @@ function upsertChat(
     isSubagent: header.isSubagent,
     lastUpdatedAt: header.lastUpdatedAt,
     recency: header.recency,
-    value: header.value,
+    value: headerValue,
     workspaceId,
   });
   hash.update(',"schemaVersion":');
   hash.update(String(snapshot.schemaVersion));
   hash.update("}");
   return hash.digest("hex");
+}
+
+function remapChatWorkspaceIdentifier(
+  text: string,
+  sourceWorkspaceId: string,
+  targetWorkspaceId: string,
+): string {
+  // Cursor filters the JSON identifier after its SQL workspace filter and
+  // recreates future headers from composerData. Change only the known ID token.
+  try {
+    assertBoundedJsoncStructure(text, "Chat workspace identifier");
+    const errors: ParseError[] = [];
+    const root = parseTree(text, errors, {
+      disallowComments: true,
+      allowTrailingComma: false,
+    });
+    if (errors.length > 0 || root?.type !== "object") {
+      return text;
+    }
+    const workspaceProperties = root.children?.filter(
+      (property) => property.children?.[0]?.value === "workspaceIdentifier",
+    );
+    if (workspaceProperties?.length !== 1) {
+      return text;
+    }
+    const workspace = workspaceProperties[0]?.children?.[1];
+    if (workspace?.type !== "object") {
+      return text;
+    }
+    const idProperties = workspace.children?.filter(
+      (property) => property.children?.[0]?.value === "id",
+    );
+    if (idProperties?.length !== 1) {
+      return text;
+    }
+    const id = idProperties[0]?.children?.[1];
+    if (id?.type !== "string" || id.value !== sourceWorkspaceId) {
+      return text;
+    }
+    return text.slice(0, id.offset) + JSON.stringify(targetWorkspaceId) +
+      text.slice(id.offset + id.length);
+  } catch {
+    return text;
+  }
 }
 
 function portableRowsInDatabaseOrder(

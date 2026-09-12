@@ -2904,6 +2904,90 @@ describeWithBackup("offline database helper", () => {
     );
   });
 
+  it.each([1, 2] as const)("keeps remapped v%s chats visible through Cursor's SQL and JSON workspace filters", async (schemaVersion) => {
+    const fixture = await createFixture();
+    const composerId = "45454545-4545-4545-8545-454545454545";
+    const targetId = "local-remote-workspace";
+    const targetUri = "vscode-remote://ssh-remote+target/home/project/backend";
+    const targetRoot = join(fixture.request.paths.workspaceStorageRoot, targetId);
+    const sourceRoot = join(fixture.request.paths.workspaceStorageRoot, "workspace");
+    await mkdir(targetRoot, { recursive: true });
+    await mkdir(sourceRoot, { recursive: true });
+    await writeFile(join(targetRoot, "workspace.json"), JSON.stringify({ folder: targetUri }));
+    await writeFile(join(sourceRoot, "workspace.json"), JSON.stringify({ folder: targetUri }));
+    fixture.request.workspaceMappings.workspace = targetId;
+    const base = agentKvSnapshot(composerId, [JSON.stringify({ bubbleId: "b0", text: "visible message" })], []);
+    const headerText = `{"composerId":"${composerId}","name":"remote chat", "workspaceIdentifier":{"id":"workspace","futureField":9007199254740993},"lastUpdatedAt":2}`;
+    const composerText = `{"composerId":"${composerId}", "workspaceIdentifier":{"id":"workspace","futureField":9007199254740993},"fullConversationHeadersOnly":[{"bubbleId":"b0"}],"untouched":{"id":"workspace"}}`;
+    const core: PortableChatSnapshot = {
+      schemaVersion: 1,
+      composerId,
+      header: { ...base.header, value: headerText },
+      composerData: { ...base.composerData, valueType: schemaVersion === 1 ? "blob" : "text", valueBase64: Buffer.from(composerText).toString("base64") },
+      bubbles: base.bubbles,
+    };
+    const snapshot: PortableChatSnapshot = schemaVersion === 1
+      ? core : { ...core, schemaVersion: 2, agentKv: base.agentKv };
+    const incoming = ordinaryChatChange(snapshot);
+    incoming.change.metadata = { chatResolutionStrategy: "latest" };
+    const originalBytes = Buffer.from(incoming.content!);
+    const result = await applyGlobalDatabaseChanges(fixture.request, [incoming]);
+    const expected: PortableChatSnapshot = {
+      ...snapshot,
+      header: { ...snapshot.header, workspaceId: targetId, value: headerText.replace('"id":"workspace"', `"id":"${targetId}"`) },
+      composerData: { ...snapshot.composerData, valueBase64: Buffer.from(composerText.replace('"id":"workspace"', `"id":"${targetId}"`)).toString("base64") },
+    };
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      const queried = database.prepare("SELECT value FROM composerHeaders WHERE workspaceId = ? ORDER BY recency DESC").all(targetId);
+      const visible = queried.map((row) => JSON.parse(String(row.value)) as { composerId: string; workspaceIdentifier: { id: string } })
+        .filter((header) => header.workspaceIdentifier?.id === targetId);
+      expect(visible.map((header) => header.composerId)).toEqual([composerId]);
+      const local = readPortableChatSnapshot(database, composerId);
+      expect(local).not.toBeNull();
+      expect(local!.header).toEqual(expected.header);
+      expect(local!.composerData).toEqual(expected.composerData);
+      expect(local!.bubbles).toEqual(snapshot.bubbles);
+      const nextHeader = JSON.parse(Buffer.from(local!.composerData.valueBase64, "base64").toString()) as { workspaceIdentifier: { id: string } };
+      expect(nextHeader.workspaceIdentifier.id).toBe(targetId);
+      expect(result.localChatCoreHashes[`chat/${composerId}`]).toBe(portableChatCoreHash(local!));
+    } finally {
+      database.close();
+    }
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(result.retainedLocalHashes[`chat/${composerId}`]).toBe(sha256(canonicalBytes(expected)));
+    expect(incoming.content).toEqual(originalBytes);
+    expect(snapshot.header.value).toBe(headerText);
+    expect(Buffer.from(snapshot.composerData.valueBase64, "base64").toString()).toBe(composerText);
+  });
+
+  it.each([
+    '"workspaceIdentifier":null',
+    '"workspaceIdentifier":{"id":42}',
+    '"workspaceIdentifier":{"id":"workspace","id":"future"}',
+    '"workspaceIdentifier":{"id":"workspace"},"workspaceIdentifier":{"id":"future"}',
+  ])("preserves unrecognized workspace identifier JSON: %s", async (identifier) => {
+    const fixture = await createFixture();
+    const composerId = "46464646-4646-4646-8646-464646464646";
+    const targetId = "mapped-unknown-workspace";
+    const targetRoot = join(fixture.request.paths.workspaceStorageRoot, targetId);
+    await mkdir(targetRoot, { recursive: true });
+    await writeFile(join(targetRoot, "workspace.json"), JSON.stringify({ folder: "file:///C:/mapped-unknown" }));
+    fixture.request.workspaceMappings.workspace = targetId;
+    const text = `{${identifier},"fullConversationHeadersOnly":[]}`;
+    const snapshot = repairSnapshot(composerId, text, text, []);
+    const result = await applyGlobalDatabaseChanges(fixture.request, [ordinaryChatChange(snapshot)]);
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
+    try {
+      const local = readPortableChatSnapshot(database, composerId);
+      expect(local!.header.value).toBe(text);
+      expect(local!.composerData.valueBase64).toBe(snapshot.composerData.valueBase64);
+    } finally {
+      database.close();
+    }
+  });
+
   it(
     "does not materialize many source-missing local blobs beside a near-limit core",
     async () => {
