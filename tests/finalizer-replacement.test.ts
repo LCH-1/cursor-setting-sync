@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,9 +20,17 @@ import type { CursorPaths } from "../src/platform/paths";
 import type { HelperSyncOptions } from "../src/helper/launcher";
 
 const temporaryRoots: string[] = [];
+const children: ChildProcess[] = [];
 
 afterEach(async () => {
   vi.useRealTimers();
+  await Promise.all(children.splice(0).map(async (child) => {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      child.kill();
+      await exited;
+    }
+  }));
   await Promise.all(
     temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -40,13 +48,14 @@ const syncOptions: HelperSyncOptions = {
 
 async function createLauncher(
   replaceWaitMs = 30_000,
+  helperSource?: string,
 ): Promise<{ launcher: HelperLauncher; root: string }> {
   const root = await mkdtemp(join(tmpdir(), "cursor-finalizer-replace-"));
   temporaryRoots.push(root);
   const helperScript = join(root, "helper-stub.cjs");
   await writeFile(
     helperScript,
-    "process.stdin.on('data', () => {});\nprocess.stdin.on('end', () => process.exit(0));\n",
+    helperSource ?? "process.stdin.on('data', () => {});\nprocess.stdin.on('end', () => process.exit(0));\n",
     "utf8",
   );
   const paths = { extensionStorage: root, helperScript } as unknown as CursorPaths;
@@ -56,7 +65,11 @@ async function createLauncher(
     extensionVersion: "0.0.32",
   } as unknown as CompatibilityReport;
   return {
-    launcher: new HelperLauncher(paths, compatibility, replaceWaitMs),
+    launcher: new HelperLauncher(paths, compatibility, replaceWaitMs, (command, args, options) => {
+      const child = spawn(command, args, options);
+      children.push(child);
+      return child;
+    }),
     root,
   };
 }
@@ -92,6 +105,41 @@ async function deadPid(): Promise<number> {
 }
 
 describe("replacing the shutdown finalizer", () => {
+  it.each([false, true])("lets an owned booting finalizer clean up before replacement (empty lock: %s)", async (emptyLock) => {
+    const { launcher, root } = await createLauncher(3_000, `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const requestPath = process.argv[2];
+      const root = path.dirname(requestPath);
+      const lock = path.join(root, "shutdown-finalizer.lock");
+      process.stdin.resume();
+      process.stdin.on("end", () => {
+        if (${emptyLock}) fs.writeFileSync(lock, "");
+        fs.writeFileSync(path.join(root, "booting"), "");
+        const timer = setInterval(() => {
+          if (!fs.existsSync(path.join(root, "cancel-finalizers"))) return;
+          clearInterval(timer);
+          setTimeout(() => {
+            fs.rmSync(lock, { force: true });
+            fs.writeFileSync(path.join(root, "completed"), "cancelled");
+            fs.rmSync(requestPath);
+          }, 350);
+        }, 20);
+      });
+    `);
+    await launcher.startFinalizer("C:/nonexistent-repository", Buffer.alloc(32, 1), {}, syncOptions);
+    await vi.waitFor(async () => expect(await readdir(root)).toContain("booting"));
+    const original = children.at(-1)!;
+
+    const outcome = await launcher.restartFinalizer("C:/nonexistent-repository", Buffer.alloc(32, 1), {}, syncOptions);
+
+    expect(original.exitCode).toBe(0);
+    expect(await readFile(join(root, "completed"), "utf8")).toBe("cancelled");
+    expect(outcome).toBe("armed");
+    expect(await requestFiles(root)).toHaveLength(1);
+    launcher.dispose();
+  });
+
   it("adopts a finalizer another window installed after this window's cancel", async () => {
     const { launcher, root } = await createLauncher();
     // createdAt in the near future is unambiguously later than the cancel
@@ -108,6 +156,38 @@ describe("replacing the shutdown finalizer", () => {
     expect(outcome).toBe("adopted");
     // Adoption spawns nothing: the other window's finalizer is the finalizer.
     expect(await requestFiles(root)).toEqual([]);
+    launcher.dispose();
+  });
+
+  it("leaves an owned export alive when cooperative cancellation must wait for its write to finish", async () => {
+    const { launcher, root } = await createLauncher(300, `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const root = path.dirname(process.argv[2]);
+      const lock = path.join(root, "shutdown-finalizer.lock");
+      process.stdin.resume();
+      process.stdin.on("end", () => {
+        fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, token: "export", createdAt: new Date().toISOString() }));
+        const timer = setInterval(() => {
+          if (!fs.existsSync(path.join(root, "finish-export"))) return;
+          clearInterval(timer);
+          fs.writeFileSync(path.join(root, "completed"), "exported");
+          fs.rmSync(lock);
+        }, 20);
+      });
+    `);
+    await launcher.startFinalizer("C:/nonexistent-repository", Buffer.alloc(32, 1), {}, syncOptions);
+    await vi.waitFor(async () => expect(await readdir(root)).toContain("shutdown-finalizer.lock"));
+    const original = children.at(-1)!;
+
+    expect(await launcher.restartFinalizer("C:/nonexistent-repository", Buffer.alloc(32, 1), {}, syncOptions)).toBe("stalled");
+    expect(original.exitCode).toBeNull();
+    expect(original.signalCode).toBeNull();
+    expect(original.killed).toBe(false);
+    expect(await requestFiles(root)).toHaveLength(1);
+    await writeFile(join(root, "finish-export"), "");
+    await vi.waitFor(() => expect(original.exitCode).toBe(0));
+    expect(await readFile(join(root, "completed"), "utf8")).toBe("exported");
     launcher.dispose();
   });
 

@@ -132,8 +132,6 @@ export class HelperLauncher {
       this.cancelFinalizersPath,
       Buffer.from(stamp, "utf8"),
     );
-    this.finalizer?.kill();
-    this.finalizer = null;
     return Date.parse(stamp);
   }
 
@@ -364,6 +362,15 @@ export class HelperLauncher {
     let candidate: { pid: number; createdAt: number; seenAt: number } | null =
       null;
     while (Date.now() - startedAt < this.replaceWaitMs) {
+      // A booting child may not have written its lock yet. Keep its cancel
+      // marker until it exits so replacement cannot erase the handoff early.
+      if (this.finalizer !== null) {
+        if (this.finalizer.exitCode === null && this.finalizer.signalCode === null) {
+          await delay(100);
+          continue;
+        }
+        this.finalizer = null;
+      }
       const lock = await acquireFileLock(lockPath);
       if (lock !== null) {
         await lock.release();
