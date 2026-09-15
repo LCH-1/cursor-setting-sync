@@ -176,6 +176,26 @@ describe("per-adapter scan partitioning", () => {
     );
   });
 
+  it("keeps only individually verified deletions when snapshot retention defers a scan", async () => {
+    const scoped = adapter("extensions", ["extension"], async () => ({
+      snapshots: [{ resourceId: "extension/default/publisher.large", kind: "extension", content: Buffer.alloc(20), semanticHash: "p" }],
+      deletions: ["verified", "unverified"].map((id) => ({
+        resourceId: `extension/default/publisher.${id}`, kind: "extension", semanticHash: id,
+      })),
+      warnings: [],
+    }));
+    scoped.scanStatus = () => ({
+      complete: false,
+      deferredResourceIds: ["extension-profile/work"],
+      verifiedDeletionResourceIds: ["extension/default/publisher.verified"],
+    });
+    const result = await scanAdapters([scoped], KNOWN, "all", NO_KINDS, undefined, { maxRetainedBytes: 10 });
+    expect(result.snapshots).toEqual([]);
+    expect(result.deletions.map((item) => item.resourceId)).toEqual(["extension/default/publisher.verified"]);
+    expect(result.adapterIndexes.get("extensions")?.deletions.size).toBe(1);
+    expect(result.deferredAdapterIds.has("extensions")).toBe(true);
+  });
+
   it("drops tombstones from incomplete or manager-deferred adapter scans", async () => {
     let complete = false;
     const incomplete = adapter("incomplete", ["settings"], async () => ({

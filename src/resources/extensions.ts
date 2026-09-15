@@ -7,6 +7,7 @@ import { existsSync } from "node:fs";
 import type {
   JsonValue,
   LocalProjection,
+  ResourceDeletion,
   ResourceScanResult,
   ResourceSnapshot,
 } from "../types";
@@ -175,6 +176,7 @@ export class ExtensionsAdapter implements ResourceAdapter {
 
   async scan(known: Record<string, LocalProjection>): Promise<ResourceScanResult> {
     const snapshots: ResourceSnapshot[] = [];
+    const deletions: ResourceDeletion[] = [];
     const warnings: string[] = [];
     const deferred = new Set<string>();
     const now = (this.options.now ?? Date.now)();
@@ -227,10 +229,7 @@ export class ExtensionsAdapter implements ResourceAdapter {
       GENERAL_MAX_RETAINED_BYTES_PER_SCAN;
     let retainedBytes = 0;
     let materialized = 0;
-    // An unreadable profile manifest must degrade to "default profile only"
-    // instead of taking down extension sync entirely. Profiles missing from
-    // the list are also absent from scannedProfiles, so findDeletions
-    // suppresses their deletions rather than uninstalling them elsewhere.
+    // An unreadable profile manifest must not turn missing profiles into removals.
     if (this.profileSweep === null) {
       let declaredProfiles: ExtensionProfile[] = [];
       this.profileSweepManifestUnreadable = false;
@@ -417,6 +416,50 @@ export class ExtensionsAdapter implements ResourceAdapter {
           profileNeedsRetry = true;
           this.oversized.delete(resourceId);
         }
+        if (
+          (await mtimeOrNull(this.paths.cursorExtensionsManifest)) !== manifestMtimeMs ||
+          (profile.id !== "default" &&
+            (await mtimeOrNull(join(this.paths.profilesRoot, profile.id, "extensions.json"))) !== registryMtimeMs)
+        ) {
+          throw new Error("Extension registry changed during enumeration; retrying before detecting removals.");
+        }
+        const installedIds = new Set(installed.map((entry) => entry.id.toLowerCase()));
+        const prefix = `extension/${encodeURIComponent(profile.id)}/`;
+        for (const resourceId in known) {
+          const projection = known[resourceId]!;
+          if (projection.kind !== "extension" || !resourceId.startsWith(prefix)) {
+            continue;
+          }
+          const id = resourceId.slice(prefix.length);
+          if (
+            !/^[a-z0-9][a-z0-9-]*\.[a-z0-9][a-z0-9-]*$/.test(id) ||
+            id === EXTENSION_ID.toLowerCase() ||
+            this.ignoredExtensions.matches(id) ||
+            installedIds.has(id)
+          ) {
+            continue;
+          }
+          const semanticHash = sha256(`deleted:${resourceId}`);
+          if (projectionMatchesSemantic(projection, semanticHash)) {
+            continue;
+          }
+          deferred.add(resourceId);
+          profileNeedsRetry = true;
+          if (materialized >= maxResources) {
+            continue;
+          }
+          materialized += 1;
+          deletions.push({
+            resourceId,
+            kind: "extension",
+            semanticHash,
+            metadata: {
+              profileId: profile.id,
+              profileName: profile.name,
+              extensionId: id,
+            },
+          });
+        }
       } catch (error) {
         warnings.push(
           `Unable to enumerate extensions for ${profile.name}: ${
@@ -437,8 +480,8 @@ export class ExtensionsAdapter implements ResourceAdapter {
     if (profile !== undefined && !profileFailed && !profileNeedsRetry) {
       this.failedProfileIds.delete(profile.id);
     }
-    if (snapshots.length > 0) {
-      const fingerprint = snapshots
+    if (snapshots.length > 0 || deletions.length > 0) {
+      const fingerprint = [...snapshots, ...deletions]
         .map((snapshot) => `${snapshot.resourceId}:${snapshot.semanticHash}`)
         .join("\0");
       if (fingerprint !== this.lastEmittedPageFingerprint) {
@@ -495,12 +538,11 @@ export class ExtensionsAdapter implements ResourceAdapter {
         left.localeCompare(right),
       ),
       progressToken: this.progressRevision,
+      verifiedDeletionResourceIds: deletions.map((deletion) => deletion.resourceId),
     };
     return {
       snapshots,
-      // A bounded per-profile page does not retain an all-profile installed
-      // set, so absence cannot safely originate an uninstall tombstone.
-      deletions: [],
+      deletions,
       warnings,
     };
   }

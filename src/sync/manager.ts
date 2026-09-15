@@ -8478,8 +8478,7 @@ export async function scanAdapters(
       break;
     }
     cursorAfterAdapterId = adapter.id;
-    // A failing adapter must not abort the whole cycle; deletions come only
-    // from completed scans, so skipping the adapter is safe.
+    // A failing adapter must not abort the whole cycle.
     try {
       if (maxPayloadBytes !== undefined) {
         adapter.setMaxPayloadBytes?.(maxPayloadBytes);
@@ -8503,13 +8502,15 @@ export async function scanAdapters(
         retainedSnapshotBytes += snapshot.content.byteLength;
       }
       const complete = status?.complete ?? true;
+      const verifiedDeletions = new Set(status?.verifiedDeletionResourceIds ?? []);
       const safeDeletions =
-        complete && !managerDeferred ? result.deletions : [];
+        complete && !managerDeferred
+          ? result.deletions
+          : result.deletions.filter((deletion) => verifiedDeletions.has(deletion.resourceId));
       if (!complete || managerDeferred) {
         deferredAdapterIds.add(adapter.id);
-      } else {
-        deletions.push(...safeDeletions);
       }
+      deletions.push(...safeDeletions);
       adapterIndexes.set(adapter.id, {
         snapshots: new Map(
           retainedForAdapter.map((snapshot) => [snapshot.resourceId, snapshot]),

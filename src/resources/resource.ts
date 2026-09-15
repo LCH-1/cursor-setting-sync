@@ -29,6 +29,8 @@ export interface OversizedSnapshotSettlement {
 export interface ResourceScanStatus {
   complete: boolean;
   deferredResourceIds: readonly string[];
+  /** Exact deletions proved by a complete scope within an unfinished scan. */
+  verifiedDeletionResourceIds?: readonly string[];
   /**
    * Monotonic evidence that a resumable discovery/ack cursor advanced. A
    * helper may keep draining while this changes; retrying the same failed
