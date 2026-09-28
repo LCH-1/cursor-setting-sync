@@ -27,7 +27,7 @@ export interface HelperChange {
 export interface HelperRequest {
   version: number;
   requestId: string;
-  mode: "apply-and-restart" | "final-export" | "restore-backup";
+  mode: "apply-and-restart" | "final-export" | "restore-backup" | "verify-live";
   createdAt: string;
   repositoryRoot: string;
   storageRoot: string;

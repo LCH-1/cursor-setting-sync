@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync, backup } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { SyncRepository } from "../src/protocol/repository";
+import { EventReconciler } from "../src/protocol/reconciler";
 import { restoreDatabaseBackup } from "../src/helper/database";
 import { withReadableBackup } from "../src/helper/compressedBackups";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
@@ -90,6 +91,36 @@ afterEach(async () => {
   await Promise.all(
     temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
+});
+
+describe.skipIf(!existsSync(HELPER))("live helper, end to end", () => {
+  it("settles existing blobs with a live host PID without quitting or writing the database", async () => {
+    const f = await createFixture();
+    const snapshot = chatSnapshot();
+    const content = canonicalBytes(snapshot);
+    const event = await f.repository.publish([{
+      resourceId: `chat/${COMPOSER}`, kind: "chat", content, semanticHash: sha256(content),
+      metadata: { chatSnapshotSchemaVersion: 2, syncOrigin: "agent-kv-enrichment", agentKvEnrichmentAppliesCore: false },
+    }], []);
+    new EventReconciler().reconcile(await f.repository.listEvents(), f.repository.state, null);
+    const tip = f.repository.state.tips[`chat/${COMPOSER}`]![0]!;
+    f.request.mode = "verify-live";
+    f.request.extensionHostPid = process.pid;
+    f.request.changes = [{ ...tip, resourceId: `chat/${COMPOSER}` }];
+    f.repository.state.pendingDatabaseChanges = [{ resourceId: `chat/${COMPOSER}`, kind: "chat", eventHash: event.eventHash!, changeIndex: 0 }];
+    await f.repository.saveState();
+    const db = new DatabaseSync(f.databasePath);
+    try {
+      db.prepare("INSERT INTO composerHeaders VALUES (?,NULL,1,2,0,0,0,NULL,?)").run(COMPOSER, snapshot.header.value);
+      db.prepare("INSERT INTO cursorDiskKV VALUES (?,?)").run(snapshot.composerData.key, "{}");
+      const result = await runHelper(f);
+      expect(result).toMatchObject({ success: true, mode: "verify-live", applied: [`chat/${COMPOSER}`], backupPath: null });
+      expect(await pathExists(join(f.request.storageRoot, "backups"))).toBe(false);
+      expect(db.prepare("SELECT value FROM cursorDiskKV WHERE key=?").get(snapshot.composerData.key)?.value).toBe("{}");
+      await f.repository.refreshState();
+      expect(f.repository.state.pendingDatabaseChanges).toEqual([]);
+    } finally { db.close(); }
+  }, 15_000);
 });
 
 describeBuilt("the offline helper, end to end", () => {

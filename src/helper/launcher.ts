@@ -349,6 +349,22 @@ export class HelperLauncher {
     }
   }
 
+  async verifyWhileRunning(
+    repositoryRoot: string,
+    masterKey: Buffer,
+    changes: HelperChange[],
+    syncOptions: HelperSyncOptions,
+  ): Promise<void> {
+    const child = await this.launch(this.createRequest(
+      "verify-live", repositoryRoot, false, changes, {}, syncOptions,
+    ), masterKey);
+    if (child.exitCode !== null) return;
+    await new Promise<void>((resolve, reject) => {
+      child.once("exit", () => resolve());
+      child.once("error", reject);
+    });
+  }
+
   private async waitForFinalizersToExit(
     cancelledAt: number,
   ): Promise<"free" | FinalizerReplaceOutcome> {

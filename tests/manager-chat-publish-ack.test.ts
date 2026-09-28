@@ -6,13 +6,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("vscode", () => ({ extensions: { all: [] }, workspace: { registerTextDocumentContentProvider: () => ({ dispose() {} }) }, window: { showInformationMessage: async () => undefined, showWarningMessage: async () => undefined } }));
 
-import { StateVscdbChatAdapter, portableChatCoreHash, type PortableChatSnapshotV1 } from "../src/chat/stateVscdb";
+import { StateVscdbChatAdapter, parsePortableChatSnapshot, portableChatCoreHash, type PortableChatSnapshotV1 } from "../src/chat/stateVscdb";
 import { __testing as helperMainTesting } from "../src/helper/main";
+import { verifyLiveQueuedChats } from "../src/helper/liveVerification";
 import type { HelperRequest } from "../src/helper/types";
 import type { ExtensionConfiguration } from "../src/config";
 import type { CursorPaths } from "../src/platform/paths";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import { SyncRepository } from "../src/protocol/repository";
+import { EventReconciler } from "../src/protocol/reconciler";
+import { acquireFileLock } from "../src/platform/lock";
 import type { ResourceAdapter } from "../src/resources/resource";
 import { createExtensionIgnoreMatcher, ExtensionsAdapter } from "../src/resources/extensions";
 import { SyncManager } from "../src/sync/manager";
@@ -28,6 +31,116 @@ const resourceId = `chat/${composerId}`;
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 
 describe("manager local chat publication acknowledgement", () => {
+  it.each(["edited", "pruned", "different-remote", "untrusted-baseline"] as const)("preserves local edits beyond an authenticated equivalent queued baseline (%s)", async mode => {
+    const f = await fixture();
+    try {
+      const original = await f.repository.publish([{ ...f.snapshot, parents: [] }], []);
+      const originalVersion = `${original.eventHash!}#0`;
+      f.repository.state.projections[resourceId] = { resourceId, kind: "chat", versionId: originalVersion,
+        semanticHash: f.snapshot.semanticHash, sourceBubbleCount: 1 };
+      const remote = mode === "different-remote" ? canonicalBytes({ ...f.chat, header: { ...f.chat.header, value: "remote edit" } }) : f.snapshot.content;
+      const merged = await f.repository.publish([{ ...f.snapshot, content: remote, semanticHash: sha256(remote),
+        metadata: { ...f.snapshot.metadata, syncOrigin: "auto-merge" }, parents: [originalVersion] }], []);
+      new EventReconciler().reconcile(await f.repository.listEvents(), f.repository.state, null);
+      const tip = f.repository.state.tips[resourceId]![0]!;
+      f.request.changes = [{ ...tip, resourceId }];
+      f.repository.state.pendingDatabaseChanges = [{ resourceId, kind: "chat", eventHash: merged.eventHash!, changeIndex: 0 }];
+      await f.repository.saveState();
+      const db = new DatabaseSync(f.request.paths.globalDatabase);
+      try {
+        if (mode === "pruned") db.prepare("DELETE FROM cursorDiskKV WHERE key=?").run(f.chat.bubbles[0]!.key);
+        else db.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run("new local edit", f.chat.bubbles[0]!.key);
+      } finally { db.close(); }
+      if (mode === "untrusted-baseline") {
+        const read = f.repository.readVersionMetadata.bind(f.repository);
+        vi.spyOn(f.repository, "readVersionMetadata").mockImplementation(version => version === originalVersion ? Promise.reject(new Error("bad baseline")) : read(version));
+      }
+      const settled = await verifyLiveQueuedChats(f.request, f.repository);
+      if (mode === "edited") {
+        expect(settled).toEqual([resourceId]);
+        expect(f.repository.state.pendingDatabaseChanges).toEqual([]);
+        const published = await f.repository.readVersion(f.repository.state.projections[resourceId].versionId!);
+        expect(published.change.parents).toEqual([originalVersion, tip.versionId].sort());
+        expect(parsePortableChatSnapshot(published.content!).bubbles[0]!.valueBase64).toBe(Buffer.from("new local edit").toString("base64"));
+      } else {
+        expect(settled).toEqual([]);
+        expect(await f.repository.countEvents()).toBe(2);
+        expect(f.repository.state.pendingDatabaseChanges).toHaveLength(1);
+      }
+    } finally { await f.manager.shutdown(); }
+  });
+
+  it("runs live verification after releasing the sync lock and refreshes the queue", async () => {
+    const f = await fixture();
+    f.internals.resourceApplyBlockReason = () => null;
+    const blob = Buffer.from("immutable continuation blob");
+    const id = sha256(blob);
+    const content = canonicalBytes({ ...f.chat, schemaVersion: 2, agentKv: {
+      blobs: [{ key: `agentKv:blob:${id}`, valueType: "blob", valueBase64: blob.toString("base64") }], referencedIds: [id], missingIds: [],
+    } });
+    await f.repository.publish([{ ...f.snapshot, content, semanticHash: sha256(content), metadata: {
+      ...f.snapshot.metadata, chatSnapshotSchemaVersion: 2, syncOrigin: "agent-kv-enrichment", agentKvEnrichmentAppliesCore: false,
+      agentKvBlobCount: 1, agentKvReferencedCount: 1, agentKvMissingCount: 0,
+    } }], []);
+    const runtime = f.manager as unknown as {
+      masterKey: Buffer;
+      helperSyncOptions(): HelperRequest["syncOptions"];
+      helper: { verifyWhileRunning: (...args: unknown[]) => Promise<void> };
+    };
+    runtime.masterKey = Buffer.from(f.repository.masterKey);
+    runtime.helperSyncOptions = () => f.request.syncOptions;
+    const verify = vi.spyOn(runtime.helper, "verifyWhileRunning").mockImplementation(async (...args) => {
+      const lock = await acquireFileLock(join(f.request.storageRoot, "sync.lock"));
+      expect(lock).not.toBeNull();
+      try {
+        f.request.changes = args[2] as HelperRequest["changes"];
+        await verifyLiveQueuedChats(f.request, f.repository);
+      } finally { await lock?.release(); }
+    });
+    try {
+      await f.sync();
+      expect(verify).toHaveBeenCalledOnce();
+      expect(f.repository.state.pendingDatabaseChanges).toEqual([]);
+    } finally { await f.manager.shutdown(); }
+  });
+
+  it.each(["v1", "blobs", "missing", "corrupt", "changed", "unauthenticated", "superseded", "core-present", "core-changed"] as const)("verifies the exact queued chat while another connection remains open (%s)", async mode => {
+    const f = await fixture();
+    const db = new DatabaseSync(f.request.paths.globalDatabase);
+    try {
+      const blob = Buffer.from("immutable continuation blob");
+      const id = sha256(blob);
+      const enriched = { ...f.chat, schemaVersion: 2, agentKv: { blobs: [{ key: `agentKv:blob:${id}`, valueType: "blob", valueBase64: blob.toString("base64") }], referencedIds: [id], missingIds: [] } };
+      const content = mode === "v1" ? f.snapshot.content : canonicalBytes(enriched);
+      const metadata = mode === "v1" ? f.snapshot.metadata! : { ...f.snapshot.metadata, chatSnapshotSchemaVersion: 2, syncOrigin: "agent-kv-enrichment", agentKvEnrichmentAppliesCore: mode === "core-present" || mode === "core-changed" };
+      const event = await f.repository.publish([{ ...f.snapshot, content, semanticHash: sha256(content), metadata, parents: [] }], []);
+      const versionId = `${event.eventHash!}#0`;
+      new EventReconciler().reconcile(await f.repository.listEvents(), f.repository.state, null);
+      const tip = f.repository.state.tips[resourceId]![0]!;
+      f.request.changes = [{ ...tip, resourceId }];
+      f.repository.state.pendingDatabaseChanges = [{ resourceId, kind: "chat", eventHash: event.eventHash!, changeIndex: 0, blockedReason: "Incomplete continuation" }];
+      await f.repository.saveState();
+      if (mode === "missing") db.prepare("DELETE FROM cursorDiskKV WHERE key=?").run(`agentKv:blob:${id}`);
+      if (mode === "corrupt") db.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run(Buffer.from("wrong"), `agentKv:blob:${id}`);
+      if (mode === "changed" || mode === "core-changed") db.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run("local edit", f.chat.bubbles[0]!.key);
+      if (mode === "unauthenticated") vi.spyOn(f.repository, "readVersionMetadata").mockRejectedValue(new Error("authentication failed"));
+      if (mode === "superseded") f.repository.state.tips[resourceId] = [{ ...tip, versionId: `${"f".repeat(64)}#0` }];
+      const before = db.prepare("SELECT key, value FROM cursorDiskKV ORDER BY key").all();
+      const verified = await verifyLiveQueuedChats(f.request, f.repository);
+      expect(db.prepare("SELECT key, value FROM cursorDiskKV ORDER BY key").all()).toEqual(before);
+      if (mode === "v1" || mode === "blobs" || mode === "core-present") {
+        expect(verified).toEqual([resourceId]);
+        expect(f.repository.state.pendingDatabaseChanges).toEqual([]);
+        expect(f.repository.state.projections[resourceId]).toMatchObject({ versionId, sourceChatCoreHash: portableChatCoreHash(f.chat) });
+        await f.repository.refreshState();
+        expect(f.repository.state.pendingDatabaseChanges).toEqual([]);
+      } else {
+        expect(verified).toEqual([]);
+        expect(f.repository.state.pendingDatabaseChanges).toHaveLength(1);
+      }
+    } finally { db.close(); await f.manager.shutdown(); }
+  });
+
   it.each(["live", "shutdown", "changed", "unauthenticated"] as const)("settles an equivalent queued v1 merge from fresh bounded observations (%s)", async mode => {
     const f = await fixture();
     const original = await f.repository.publish([{ ...f.snapshot, parents: [] }], []);

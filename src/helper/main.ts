@@ -70,6 +70,7 @@ import { buildChatTipEnrichmentCandidateIndex } from "../chat/enrichment";
 import { migrateOfflineChatTips } from "./chatMigration";
 import { mergeOfflineChatConflicts } from "./chatConflictMerge";
 import { maintainCompressedBackups, resolveBackupSource } from "./compressedBackups";
+import { verifyLiveQueuedChats } from "./liveVerification";
 import { ChatTranscriptsAdapter } from "../chat/transcripts";
 import { StoreDbChatAdapter } from "../chat/storeDb";
 import {
@@ -191,6 +192,22 @@ async function run(): Promise<void> {
       throw new Error("The helper received an invalid repository key.");
     }
     await assertRuntimeVersion(request);
+    if (request.mode === "verify-live") {
+      const lock = await acquireSyncLock(request.storageRoot, 30_000);
+      try {
+        const repository = await SyncRepository.openWithMasterKey(
+          request.repositoryRoot, request.storageRoot,
+          await readRepositoryManifest(request.repositoryRoot), masterKey,
+          request.syncOptions.maxPayloadBytes,
+          { extensionVersion: request.extensionVersion, cursorVersion: request.expectedCursorVersion, vscodeVersion: request.expectedVscodeVersion },
+        );
+        const verified = await verifyLiveQueuedChats(request, repository, () => lock.refresh());
+        await writeResult(request, successResult(request, verified, [], null));
+      } finally {
+        await lock.release();
+      }
+      return;
+    }
     if (request.mode === "final-export") {
       finalizerLock = await acquireFileLock(
         join(request.storageRoot, "shutdown-finalizer.lock"),

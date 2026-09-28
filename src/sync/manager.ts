@@ -233,6 +233,7 @@ import {
   workspaceUriMatchesAny,
 } from "../chat/workspace";
 import { HelperLauncher } from "../helper/launcher";
+import { isLiveVerificationCandidate, MAX_LIVE_VERIFICATION_CHANGES } from "../helper/liveVerification";
 import type {
   FinalizerReplaceOutcome,
   HelperSyncOptions,
@@ -598,6 +599,8 @@ export class SyncManager implements vscode.Disposable {
    * queue is still there and the answer "not now" was about now.
    */
   private queuedApplyDeclined = false;
+  private lastLiveVerificationAt = 0;
+  private liveVerificationOffset = 0;
   private automaticMaintenanceAt = 0;
   /** Round-robin and no-op suppression for the bounded v1 -> v2 chat sweep. */
   private chatTipEnrichmentCursor: ChatTipEnrichmentCursor = {
@@ -5895,10 +5898,45 @@ export class SyncManager implements vscode.Disposable {
       await lock.release();
     }
     if (!failed) {
+      await this.verifyPendingWhileRunning(repository, manual);
       // The offer can enter Restart to Apply, which queues another cycle. Do
       // not await it from the cycle that must return before that request can
       // start, or accepting the launch prompt self-deadlocks the queue.
       void this.maybeOfferQueuedApplyAtLaunch();
+    }
+  }
+
+  private async verifyPendingWhileRunning(repository: SyncRepository, manual: boolean): Promise<void> {
+    if (this.disposed || this.repository !== repository || this.masterKey === null ||
+        !this.configuration.syncChat || (!manual && Date.now() - this.lastLiveVerificationAt < 60_000)) return;
+    const candidates = repository.state.pendingDatabaseChanges.flatMap(pending => {
+      const tips = repository.state.tips[pending.resourceId] ?? [];
+      const tip = tips[0];
+      return tips.length === 1 && tip !== undefined &&
+        tip.versionId === `${pending.eventHash}#${pending.changeIndex}` &&
+        isLiveVerificationCandidate(tip) && this.resourceApplyBlockReason(tip) === null ? [{ ...tip, resourceId: pending.resourceId }] : [];
+    });
+    if (candidates.length === 0) return;
+    const offset = this.liveVerificationOffset % candidates.length;
+    const changes = [...candidates.slice(offset), ...candidates.slice(0, offset)].slice(0, MAX_LIVE_VERIFICATION_CHANGES);
+    this.liveVerificationOffset = (offset + changes.length) % candidates.length;
+    this.lastLiveVerificationAt = Date.now();
+    const key = Buffer.from(this.masterKey);
+    try {
+      await this.helper.verifyWhileRunning(repository.root, key, changes, this.helperSyncOptions());
+      if (this.disposed || this.repository !== repository) return;
+      const lock = await this.takeCommandLock(repository);
+      try {
+        await this.consumeHelperResults({ atStartup: false });
+        await repository.refreshState();
+        this.updateStatus(repository);
+      } finally {
+        await lock.release();
+      }
+    } catch (error) {
+      this.status.log(`Live queue verification was deferred: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      key.fill(0);
     }
   }
 
@@ -7887,6 +7925,15 @@ export class SyncManager implements vscode.Disposable {
           }`,
         );
         await rm(claimedPath, { force: true });
+        continue;
+      }
+      if (result.mode === "verify-live") {
+        this.status.log(result.success
+          ? `Settled ${result.applied.length} queued conversation(s) while Cursor remained open; existing content was verified or local edits were synchronized. No database rows were written.`
+          : `Live queue verification was deferred: ${result.error ?? "helper unavailable"}`);
+        await rm(claimedPath, { force: true });
+        const logPath = helperStderrLogPathForResult(this.paths.extensionStorage, name, result.requestId);
+        if (logPath !== null) await rm(logPath, { force: true }).catch(() => {});
         continue;
       }
       consumed.push(result);
