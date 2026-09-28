@@ -9,6 +9,7 @@ import type {
   ResourceTip,
 } from "../types";
 import type { SyncRepository } from "../protocol/repository";
+import { parentsForLocalChange, type ResourceProjection } from "../protocol/reconciler";
 import { classifyLegacyCheckpointMarker } from "../protocol/checkpointMarker";
 import { MAX_EVENT_CHANGES } from "../constants";
 import { PUBLISH_WARNING_SOURCE } from "./warningLog";
@@ -416,6 +417,38 @@ export async function acknowledgePublishedLocalChats(
   await repository.saveState();
 }
 
+export function chatCoreObservationResourceIds(
+  projections: readonly ResourceProjection[],
+  known: Readonly<Record<string, LocalProjection>>,
+): string[] {
+  return projections.filter(({ changed, resourceId, tip }) =>
+    changed && tip.kind === "chat" && tip.operation === "put" &&
+    tip.metadata?.chatSnapshotSchemaVersion === 1 &&
+    known[resourceId]?.semanticHash === tip.semanticHash &&
+    known[resourceId]?.requiresAgentKvRecapture !== true,
+  ).map(({ resourceId }) => resourceId);
+}
+
+export function extensionDeletionSupersedesKnownTips(
+  deletion: ResourceDeletion,
+  known: LocalProjection | undefined,
+  tips: readonly ResourceTip[],
+): boolean {
+  return deletion.kind === "extension" && known?.kind === "extension" &&
+    tips.length > 0 && tips.every(tip => tip.kind === "extension" &&
+      tip.operation === "put" && tip.semanticHash === known.semanticHash);
+}
+
+export function parentsForLocalDeletion(
+  deletion: ResourceDeletion,
+  known: LocalProjection | undefined,
+  tips: ResourceTip[],
+): string[] {
+  return extensionDeletionSupersedesKnownTips(deletion, known, tips)
+    ? tips.map(tip => tip.versionId).sort()
+    : parentsForLocalChange(known, tips);
+}
+
 export async function acknowledgeObservedLocalChats(
   repository: SyncRepository,
   snapshots: readonly ResourceSnapshot[],
@@ -475,6 +508,13 @@ export async function acknowledgeObservedLocalChats(
     }
     if (!acknowledged && failed) {
       unverifiable.add(snapshot.resourceId);
+    }
+    if (acknowledged) {
+      const versionId = repository.state.projections[snapshot.resourceId]!.versionId;
+      repository.state.pendingDatabaseChanges = repository.state.pendingDatabaseChanges.filter(
+        pending => pending.resourceId !== snapshot.resourceId ||
+          `${pending.eventHash}#${pending.changeIndex}` !== versionId,
+      );
     }
   }
   if (changed) {

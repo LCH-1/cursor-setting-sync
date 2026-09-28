@@ -352,6 +352,7 @@ export interface StateVscdbChatAdapterOptions {
    * published/conflicted before the queued write is considered.
    */
   forceCoreVerificationResourceIds?: readonly string[];
+  observeUnchangedCoreResourceIds?: readonly string[];
 }
 
 export function isPortableChatSnapshotV2(
@@ -641,6 +642,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
   private lastKnownReference: Record<string, LocalProjection> | null = null;
   /** One-shot exact verifications requested by the offline helper. */
   private readonly forcedCoreVerificationResourceIds: Set<string>;
+  private readonly observedCoreResourceIds = new Set<string>();
   /** Bounded newest-first graph preference learned once on a fresh adapter. */
   private initialGraphPriorityResourceIds: Set<string> | null = null;
   private initialGraphPriorityLoaded = false;
@@ -666,6 +668,15 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
     this.forcedCoreVerificationResourceIds = new Set(
       options.forceCoreVerificationResourceIds ?? [],
     );
+    this.observeUnchangedCores(options.observeUnchangedCoreResourceIds ?? []);
+  }
+
+  observeUnchangedCores(resourceIds: readonly string[]): void {
+    this.observedCoreResourceIds.clear();
+    for (const resourceId of resourceIds) {
+      this.observedCoreResourceIds.add(resourceId);
+      this.forcedCoreVerificationResourceIds.add(resourceId);
+    }
   }
 
   setMaxPayloadBytes(maxPayloadBytes: number): void {
@@ -1557,6 +1568,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
             this.options.offline === true
               ? MAX_HELPER_SINGLE_CHAT_BYTES
               : MAX_CHAT_INTERACTIVE_CAPTURE_BYTES,
+            this.observedCoreResourceIds.has(resourceId),
           );
           // Deep verification can materialize several megabytes of SQLite
           // text and canonical JSON for one conversation. Yield between those
@@ -1747,6 +1759,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
         }
         if (
           projection?.kind === "chat" &&
+          !this.observedCoreResourceIds.has(resourceId) &&
           captured.agentKvRecaptureAttempted !== true &&
           (projection.semanticHash === semanticHash ||
             projection.retainedLocalHash === semanticHash)
@@ -2570,6 +2583,7 @@ async function captureChat(
   onCoreValueChunkRead?: () => void,
   onCoreMetadataRow?: () => void,
   captureWorkLimit = MAX_CHAT_INTERACTIVE_CAPTURE_BYTES,
+  observeUnchangedCore = false,
 ): Promise<ChatCapture> {
   database.exec("BEGIN");
   try {
@@ -2747,6 +2761,20 @@ async function captureChat(
       ? (statements.bubbles.iterate(...bubbleRange) as Iterable<RawKvRow>)
       : bubbleRows!;
     const core = analyzeChatCore(header, composerDataRow, coreRows);
+    if (observeUnchangedCore && projection?.semanticHash === core.coreHash &&
+        projection.requiresAgentKvRecapture !== true) {
+      // Authenticate a new v1 version from fresh local bytes without walking
+      // its continuation graph or replacing any live database rows.
+      onSnapshotMaterialize?.(resourceId);
+      bubbleRows ??= statements.bubbles.all(...bubbleRange) as RawKvRow[];
+      const snapshot: PortableChatSnapshotV1 = {
+        schemaVersion: 1, composerId: header.composerId, header,
+        composerData: portableRow(composerDataRow), bubbles: bubbleRows.map(portableRow),
+      };
+      resolveInitialGraphPriority(agentKvBudget, resourceId);
+      database.exec("COMMIT");
+      return { kind: "captured", snapshot, coreHash: core.coreHash };
+    }
     if (
       forceCapture &&
       projection?.kind === "chat" &&

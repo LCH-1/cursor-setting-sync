@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("vscode", () => ({ extensions: { all: [] }, workspace: { registerTextDocumentContentProvider: () => ({ dispose() {} }) }, window: { showInformationMessage: async () => undefined, showWarningMessage: async () => undefined } }));
 
-import { portableChatCoreHash, type PortableChatSnapshotV1 } from "../src/chat/stateVscdb";
+import { StateVscdbChatAdapter, portableChatCoreHash, type PortableChatSnapshotV1 } from "../src/chat/stateVscdb";
 import { __testing as helperMainTesting } from "../src/helper/main";
 import type { HelperRequest } from "../src/helper/types";
 import type { ExtensionConfiguration } from "../src/config";
@@ -14,6 +14,7 @@ import type { CursorPaths } from "../src/platform/paths";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import { SyncRepository } from "../src/protocol/repository";
 import type { ResourceAdapter } from "../src/resources/resource";
+import { createExtensionIgnoreMatcher, ExtensionsAdapter } from "../src/resources/extensions";
 import { SyncManager } from "../src/sync/manager";
 import type { CompatibilityReport, ResourceSnapshot, ResourceTip } from "../src/types";
 import type { ConflictController } from "../src/ui/conflicts";
@@ -27,6 +28,98 @@ const resourceId = `chat/${composerId}`;
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 
 describe("manager local chat publication acknowledgement", () => {
+  it.each(["live", "shutdown", "changed", "unauthenticated"] as const)("settles an equivalent queued v1 merge from fresh bounded observations (%s)", async mode => {
+    const f = await fixture();
+    const original = await f.repository.publish([{ ...f.snapshot, parents: [] }], []);
+    const originalVersion = `${original.eventHash!}#0`;
+    f.repository.state.projections[resourceId] = { resourceId, kind: "chat", versionId: originalVersion,
+      semanticHash: f.snapshot.semanticHash, sourceChatCoreHash: portableChatCoreHash(f.chat), sourceTimestamp: 2, sourceBubbleCount: 1 };
+    const merged = await f.repository.publish([{ ...f.snapshot, parents: [originalVersion],
+      metadata: { ...f.snapshot.metadata, syncOrigin: "auto-merge", mergeStrategy: "latest" } }], []);
+    const mergedVersion = `${merged.eventHash!}#0`;
+    f.repository.state.pendingDatabaseChanges = [{ resourceId, kind: "chat", eventHash: merged.eventHash!, changeIndex: 0, blockedReason: "Incomplete continuation" }];
+    await f.repository.saveState();
+    const onCapture = vi.fn();
+    const adapter = new StateVscdbChatAdapter(f.request.paths, { periodicDeepVerification: false, onChatBodyCapture: onCapture });
+    f.internals.adapters = [adapter];
+    f.internals.resourceApplyBlockReason = () => "Incomplete continuation";
+    if (mode === "changed") {
+      const db = new DatabaseSync(f.request.paths.globalDatabase);
+      db.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run(JSON.stringify({ text: "unpublished local edit" }), `bubbleId:${composerId}:bubble-1`);
+      db.close();
+    }
+    if (mode === "unauthenticated") {
+      const read = f.repository.readVersionMetadata.bind(f.repository);
+      vi.spyOn(f.repository, "readVersionMetadata").mockImplementation(versionId => versionId === mergedVersion
+        ? Promise.reject(new Error("Cannot authenticate merged event")) : read(versionId));
+    }
+    try {
+      if (mode === "shutdown") {
+        await helperMainTesting.exportFinalChanges(f.request, f.repository, () => {}, true);
+      } else {
+        await f.sync();
+      }
+      if (mode === "live" || mode === "shutdown") {
+        expect(f.repository.state.projections[resourceId]?.versionId).toBe(mergedVersion);
+        expect(f.repository.state.pendingDatabaseChanges.filter(item => item.resourceId === resourceId)).toEqual([]);
+        expect(await f.repository.countEvents()).toBe(2);
+        if (mode === "live") {
+          const captures = onCapture.mock.calls.length;
+          expect(captures).toBeGreaterThan(0);
+          await f.sync();
+          expect(onCapture).toHaveBeenCalledTimes(captures);
+          expect(f.repository.state.pendingDatabaseChanges).toEqual([]);
+        }
+      } else {
+        expect(f.repository.state.projections[resourceId]?.versionId).not.toBe(mergedVersion);
+        expect(f.repository.state.pendingDatabaseChanges).toContainEqual(expect.objectContaining({ resourceId, eventHash: merged.eventHash }));
+      }
+      const db = new DatabaseSync(f.request.paths.globalDatabase, { readOnly: true });
+      try {
+        const row = db.prepare("SELECT value FROM cursorDiskKV WHERE key=?").get(`bubbleId:${composerId}:bubble-1`);
+        expect(row?.value).toBe(JSON.stringify({ text: mode === "changed" ? "unpublished local edit" : "local message" }));
+      } finally { db.close(); }
+    } finally { await f.manager.shutdown(); }
+  });
+
+  it.each(["live", "shutdown", "new-remote"] as const)("handles an extension removal against a synthetic install (%s)", async mode => {
+    const f = await fixture();
+    const id = "extension/default/publisher.removed";
+    const content = canonicalBytes({ id: "publisher.removed", version: "1.0.0", installed: true, enabled: true, preRelease: false, pinned: false });
+    const snapshot: ResourceSnapshot = { resourceId: id, kind: "extension", content, semanticHash: sha256(content), metadata: { profileId: "default", profileName: null, extensionId: "publisher.removed" } };
+    const installed = await f.repository.publish([{ ...snapshot, parents: [] }], []);
+    const installedVersion = `${installed.eventHash!}#0`;
+    f.repository.state.projections[id] = { resourceId: id, kind: "extension", semanticHash: snapshot.semanticHash, versionId: installedVersion };
+    const remoteContent = mode === "new-remote" ? canonicalBytes({ id: "publisher.removed", version: "2.0.0", installed: true, enabled: true, preRelease: false, pinned: false }) : content;
+    const merged = await f.repository.publish([{ ...snapshot, content: remoteContent, semanticHash: sha256(remoteContent), parents: [installedVersion], metadata: { ...snapshot.metadata, syncOrigin: "conflict-resolution" } }], []);
+    await f.repository.saveState();
+    const adapter = new ExtensionsAdapter(f.request.paths, createExtensionIgnoreMatcher([]), { scanIntervalMs: 0, listInstalledExtensions: async () => [] });
+    f.internals.adapters = [adapter];
+    try {
+      if (mode === "shutdown") {
+        const scan = adapter.scan.bind(adapter);
+        const status = adapter.scanStatus.bind(adapter);
+        vi.spyOn(ExtensionsAdapter.prototype, "scan").mockImplementation(scan);
+        vi.spyOn(ExtensionsAdapter.prototype, "scanStatus").mockImplementation(status);
+        f.request.syncOptions.syncChat = false;
+        await helperMainTesting.exportFinalChanges(f.request, f.repository, () => {});
+      } else {
+        await f.sync();
+      }
+      expect(f.repository.state.tips[id]).toHaveLength(1);
+      if (mode === "new-remote") {
+        expect(f.repository.state.tips[id]![0]).toMatchObject({ operation: "put", versionId: `${merged.eventHash!}#0` });
+        expect(f.repository.state.pendingDatabaseChanges).toContainEqual(expect.objectContaining({ resourceId: id }));
+        return;
+      }
+      expect(f.repository.state.tips[id]![0]).toMatchObject({ operation: "delete", parents: [`${merged.eventHash!}#0`] });
+      expect(f.repository.state.pendingDatabaseChanges.filter(item => item.resourceId === id)).toEqual([]);
+      const eventCount = await f.repository.countEvents();
+      await f.sync();
+      expect(await f.repository.countEvents()).toBe(eventCount);
+    } finally { await f.manager.shutdown(); }
+  });
+
   it("retains the authenticated v1 publication through same-cycle enrichment and shutdown export", async () => {
     const f = await fixture();
     try {

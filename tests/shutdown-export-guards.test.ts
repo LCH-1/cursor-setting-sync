@@ -70,8 +70,12 @@ describe("shutdown export publish guards", () => {
       expect(durable.projections[observed.resourceId]).toMatchObject({ versionId: sourceVersionId,
         semanticHash: observed.semanticHash, sourceBubbleCount: 0, sourceTimestamp: 2,
         sourceChatCoreHash: portableChatCoreHash(parsePortableChatSnapshot(observed.content)) });
-      expect(durable.pendingDatabaseChanges).toHaveLength(1);
-      expect(`${durable.pendingDatabaseChanges[0]!.eventHash}#0`).toBe(tipVersionId);
+      if (kind === "enriched-source") {
+        expect(durable.pendingDatabaseChanges).toHaveLength(1);
+        expect(`${durable.pendingDatabaseChanges[0]!.eventHash}#0`).toBe(tipVersionId);
+      } else {
+        expect(durable.pendingDatabaseChanges).toEqual([]);
+      }
     });
   });
 

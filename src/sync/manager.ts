@@ -278,6 +278,9 @@ import {
   effectiveTipProducer,
   effectiveVersionProducer,
   acknowledgeObservedLocalChats,
+  chatCoreObservationResourceIds,
+  extensionDeletionSupersedesKnownTips,
+  parentsForLocalDeletion,
   acknowledgePublishedLocalChats,
   filterPublishableChanges,
   formatBytes,
@@ -5503,6 +5506,12 @@ export class SyncManager implements vscode.Disposable {
           .filter((projection) => projection.changed)
           .map((projection) => projection.tip.kind),
       );
+      const coreObservations = chatCoreObservationResourceIds(preResult.projections, repository.state.projections);
+      for (const adapter of this.adapters) {
+        if (adapter instanceof StateVscdbChatAdapter) {
+          adapter.observeUnchangedCores(coreObservations);
+        }
+      }
       const scan = await this.scanLocalResources(
         repository.state.projections,
         manual ? "all" : scope,
@@ -5595,7 +5604,10 @@ export class SyncManager implements vscode.Disposable {
       const deletions = scan.deletions.filter(
         (deletion) =>
           !conflictedResources.has(deletion.resourceId) &&
-          !protectedSyntheticResources.has(deletion.resourceId) &&
+          (!protectedSyntheticResources.has(deletion.resourceId) ||
+            extensionDeletionSupersedesKnownTips(deletion,
+              repository.state.projections[deletion.resourceId],
+              repository.state.tips[deletion.resourceId] ?? [])) &&
           !(repository.state.tips[deletion.resourceId] ?? []).some(
             (tip) =>
               tip.operation === "delete" &&
@@ -5605,7 +5617,8 @@ export class SyncManager implements vscode.Disposable {
           deletion.semanticHash,
       ).map((deletion) => ({
         ...deletion,
-        parents: parentsForLocalChange(
+        parents: parentsForLocalDeletion(
+          deletion,
           repository.state.projections[deletion.resourceId],
           repository.state.tips[deletion.resourceId] ?? [],
         ),

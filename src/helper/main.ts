@@ -45,6 +45,8 @@ import type { ResourceProjection } from "../protocol/reconciler";
 import {
   absorbedCheckpointManifest,
   acknowledgeObservedLocalChats,
+  chatCoreObservationResourceIds,
+  parentsForLocalDeletion,
   effectiveSourceDeviceId,
   effectiveSyncOrigin,
   effectiveTipProducer,
@@ -1111,6 +1113,7 @@ async function exportFinalChanges(
       // monotonic frontier then stabilizes and the 32-pass guard fails closed.
       maxProgressDatabaseGenerationRestarts: 1,
       forceCoreVerificationResourceIds,
+      observeUnchangedCoreResourceIds: chatCoreObservationResourceIds(preResult.projections, repository.state.projections),
     });
     adapters.push(
       stateChatAdapter,
@@ -1143,7 +1146,7 @@ async function exportFinalChanges(
     adapter.setMaxPayloadBytes?.(request.syncOptions.maxPayloadBytes);
     const drainsBounded = typeof adapter.scanStatus === "function";
     let scanKnown = drainsBounded
-      ? localProjectionOverlay(repository.state.projections)
+      ? localProjectionOverlay(repository.state.projections, adapter.kinds.includes("extension"))
       : repository.state.projections;
     const passLimit = drainsBounded ? finalExportPassLimit(adapter) : 1;
     let pass = 0;
@@ -1249,7 +1252,7 @@ async function exportFinalChanges(
       // fail-closed guard forever.
       const nextPageKnown =
         progressAware && pageNeedsAcknowledgement
-          ? localProjectionOverlay(repository.state.projections)
+          ? localProjectionOverlay(repository.state.projections, adapter.kinds.includes("extension"))
           : scanKnown;
       for (const snapshot of result.snapshots) {
         const provisional = provisionalLocalProjection(
@@ -1535,7 +1538,8 @@ function prepareFinalExportScanChanges(
     )
     .map((deletion) => ({
       ...deletion,
-      parents: parentsForLocalChange(
+      parents: parentsForLocalDeletion(
+        deletion,
         repository.state.projections[deletion.resourceId],
         repository.state.tips[deletion.resourceId] ?? [],
       ),
@@ -1566,7 +1570,13 @@ function finalExportSnapshotParents(
 
 function localProjectionOverlay(
   projections: Readonly<Record<string, LocalProjection>>,
+  enumerateKnown = false,
 ): Record<string, LocalProjection> {
+  if (enumerateKnown) {
+    // Extension removals compare a complete profile with known installations.
+    // Inherit those keys without copying the full projection table per page.
+    return Object.create(projections) as Record<string, LocalProjection>;
+  }
   const overlay = Object.create(null) as Record<string, LocalProjection>;
   return new Proxy(overlay, {
     get(target, property, receiver) {
