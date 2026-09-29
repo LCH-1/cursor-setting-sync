@@ -36,6 +36,7 @@ import { EventReconciler } from "../src/protocol/reconciler";
 import { SyncRepository } from "../src/protocol/repository";
 import { applyGlobalDatabaseChanges } from "../src/helper/database";
 import { migrateOfflineChatTips } from "../src/helper/chatMigration";
+import { WorkspaceStorageAdapter, workspaceStorageResourceId } from "../src/resources/workspaceStorage";
 import { mergeOfflineChatConflicts } from "../src/helper/chatConflictMerge";
 import { mergeChatSnapshotBuffers } from "../src/chat/chatMerge";
 import { enrichCurrentChatTipsFromLiveDatabase } from "../src/chat/enrichment";
@@ -60,6 +61,45 @@ afterEach(async () => {
 });
 
 describe("the helper's bounded final chat export", () => {
+  it.each(["exact", "unknown-scope"])("isolates a corrupt workspace database only with exhaustive failures (%s)", async (scope) => {
+    const fixture = await createFixture();
+    fixture.database.close();
+    fixture.request.syncOptions.syncWorkspaceStorage = true;
+    fixture.request.syncOptions.syncChat = false;
+    const directory = join(fixture.request.paths.workspaceStorageRoot, "broken");
+    await mkdir(join(directory, "images"), { recursive: true });
+    await writeFile(join(directory, "workspace.json"), JSON.stringify({ folder: "file:///project" }));
+    const broken = Buffer.from("invalid SQLite database retained for recovery");
+    await writeFile(join(directory, "state.vscdb"), broken);
+    await writeFile(join(directory, "images", "local.png"), "local image");
+    const resourceId = workspaceStorageResourceId("broken/state.vscdb");
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- Called with the original adapter as this below.
+    const originalStatus = WorkspaceStorageAdapter.prototype.scanStatus;
+    const spy = scope === "unknown-scope"
+      ? vi.spyOn(WorkspaceStorageAdapter.prototype, "scanStatus").mockImplementation(function (this: WorkspaceStorageAdapter) {
+          return { ...originalStatus.call(this), deferredResourceIdsExhaustive: false };
+        })
+      : undefined;
+    let outcome;
+    try {
+      outcome = await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository);
+    } finally {
+      spy?.mockRestore();
+    }
+    expect(outcome.protectedLocalResourceIds).toContain(resourceId);
+    expect(helperMainTesting.finalExportApplyBlockReason({ resourceId, kind: "workspace-storage" }, outcome)).not.toBeNull();
+    const sibling = { resourceId: workspaceStorageResourceId("healthy/images/remote.png"), kind: "workspace-storage" as const };
+    if (scope === "exact") {
+      expect(outcome.incompleteKinds).not.toContain("workspace-storage");
+      expect(helperMainTesting.finalExportApplyBlockReason(sibling, outcome)).toBeNull();
+    } else {
+      expect(outcome.incompleteKinds).toContain("workspace-storage");
+      expect(helperMainTesting.finalExportApplyBlockReason(sibling, outcome)).not.toBeNull();
+    }
+    expect(fixture.repository.state.tips[workspaceStorageResourceId("broken/images/local.png")]).toHaveLength(1);
+    expect(await readFile(join(directory, "state.vscdb"))).toEqual(broken);
+  });
+
   it.each(["settled", "protected", "incomplete", "round-limit"] as const)("settles a local edit first discovered after partial remote continuation becomes ready in the same shutdown (%s)", async (mode) => {
     const fixture = await createFixture();
     const id = composerId(706);

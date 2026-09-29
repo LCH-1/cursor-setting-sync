@@ -1324,12 +1324,12 @@ async function exportFinalChanges(
       for (const resourceId of status.deferredResourceIds) {
         protectedLocalResourceIds.add(resourceId);
       }
-      // A bounded enumeration can know that an unvisited directory exists
-      // without knowing the resource IDs it contains.  Exact deferred IDs are
-      // still useful diagnostics, but after the finite helper drain every kind
-      // owned by that adapter must fail closed for this run.
-      for (const kind of adapter.kinds) {
-        incompleteKinds.add(kind);
+      // Unknown scopes still fail closed. A completed enumeration with an
+      // exhaustive failure list can protect those files without blocking peers.
+      if (status.deferredResourceIdsExhaustive !== true) {
+        for (const kind of adapter.kinds) {
+          incompleteKinds.add(kind);
+        }
       }
       warnings.push(
         `The final ${adapter.id} export remained incomplete after ${
@@ -1730,7 +1730,7 @@ function finalExportApplyBlockReason(
   >,
 ): string | null {
   if (outcome.protectedLocalResourceIds.includes(change.resourceId)) {
-    return "the exact final local resource was oversized or remained budget-deferred, so the queued incoming change was left untouched";
+    return "the exact final local resource could not be safely exported (read/integrity failure or work limit), so the queued incoming change was left untouched";
   }
   if (outcome.incompleteKinds.includes(change.kind)) {
     return "the final local scan for this resource kind was incomplete, so the queued incoming change was left untouched";

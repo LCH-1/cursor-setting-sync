@@ -119,6 +119,7 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
     WorkspaceStorageCandidate
   >();
   private failedCandidateOverflow = false;
+  private untrackedScanFailure = false;
   private readonly workspaceWalker = new BoundedFileTreeWalker();
   private enumerationActive = false;
   private nextEnumerationAt = 0;
@@ -309,6 +310,7 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
           this.pendingCandidates.set(resourceId, preferred);
         }
       } catch (error) {
+        this.untrackedScanFailure = true;
         warnings.push(formatScanWarning(path, error));
       }
     }
@@ -554,6 +556,13 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
     this.lastScanStatus = {
       complete:
         metadataDeferred.size === 0 &&
+        !this.untrackedScanFailure &&
+        !this.failedCandidateOverflow &&
+        !this.oversized.overflowed &&
+        enumerationDeferred.length === 0,
+      deferredResourceIdsExhaustive:
+        !this.imagesOnly &&
+        !this.untrackedScanFailure &&
         !this.failedCandidateOverflow &&
         !this.oversized.overflowed &&
         enumerationDeferred.length === 0,
@@ -655,6 +664,7 @@ export class WorkspaceStorageAdapter implements ResourceAdapter {
     if (!this.enumerationActive && now >= this.nextEnumerationAt) {
       this.enumerationActive = true;
       this.failedCandidateOverflow = false;
+      this.untrackedScanFailure = false;
       this.oversized.beginGeneration();
     }
     const warnings: string[] = [];

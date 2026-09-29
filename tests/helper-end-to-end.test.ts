@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync, backup } from "node:sqlite";
@@ -395,6 +395,46 @@ describeBuilt("the offline helper, end to end", () => {
       event.manifest.changes.map((change) => change.resourceId),
     );
     expect(exportedIds.some((id) => id.includes(workspaceId))).toBe(true);
+  }, 120_000);
+
+  it("applies healthy workspace images while retaining a corrupt database and its queue entry", async () => {
+    const fixture = await createFixture();
+    const snapshots = [];
+    const broken = Buffer.from("corrupt database must remain byte-identical");
+    for (const workspaceId of ["broken", "healthy"]) {
+      const directory = join(fixture.request.paths.workspaceStorageRoot, workspaceId);
+      await mkdir(directory, { recursive: true });
+      const workspaceUri = `file:///project-${workspaceId}`;
+      await writeFile(join(directory, "workspace.json"), JSON.stringify({ folder: workspaceUri }));
+      const files = workspaceId === "broken" ? ["state.vscdb", "images/remote.png"] : ["images/remote.png"];
+      for (const file of files) {
+        const relativePath = `${workspaceId}/${file}`;
+        const content = Buffer.from(`incoming ${relativePath}`);
+        snapshots.push({ resourceId: `workspace-storage/${encodeURIComponent(relativePath)}`,
+          kind: "workspace-storage" as const, content, semanticHash: sha256(content),
+          metadata: { relativePath, workspaceId, workspaceUri } });
+      }
+      if (workspaceId === "broken") await writeFile(join(directory, "state.vscdb"), broken);
+    }
+    await fixture.repository.publish(snapshots, []);
+    new EventReconciler().reconcile(await fixture.repository.listEvents(), fixture.repository.state, null);
+    fixture.request.changes = snapshots.map(snapshot => ({ ...fixture.repository.state.tips[snapshot.resourceId]![0]!, resourceId: snapshot.resourceId }));
+    fixture.repository.state.pendingDatabaseChanges = fixture.request.changes.map(change => ({
+      resourceId: change.resourceId, kind: change.kind, eventHash: change.eventHash, changeIndex: change.changeIndex,
+    }));
+    fixture.request.syncOptions.syncWorkspaceStorage = true;
+    fixture.request.syncOptions.syncChat = false;
+    await fixture.repository.saveState();
+    const result = await runHelper(fixture);
+    expect(result.success, result.error ?? "").toBe(true);
+    expect(result.applied).toHaveLength(2);
+    expect(await readFile(join(fixture.request.paths.workspaceStorageRoot, "broken", "state.vscdb"))).toEqual(broken);
+    for (const workspaceId of ["broken", "healthy"]) {
+      expect(await readFile(join(fixture.request.paths.workspaceStorageRoot, workspaceId, "images", "remote.png"), "utf8"))
+        .toBe(`incoming ${workspaceId}/images/remote.png`);
+    }
+    const durable = await fixture.repository.stateStore.loadOrCreate(fixture.repository.repository.repositoryId);
+    expect(durable.pendingDatabaseChanges.map(change => change.resourceId)).toEqual(["workspace-storage/broken%2Fstate.vscdb"]);
   }, 120_000);
 
   it("supersedes a final export when a newer session cancelled it", async () => {

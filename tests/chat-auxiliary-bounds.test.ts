@@ -644,6 +644,47 @@ describeWithSqlite("bounded store.db scans", () => {
 });
 
 describe("bounded workspaceStorage scans", () => {
+  it("does not certify a path that failed before an exact resource ID was tracked", async () => {
+    const paths = await createPaths();
+    await writeWorkspaceIdentity(paths, "invalid workspace");
+    await writeFile(join(paths.workspaceStorageRoot, "invalid workspace", "notepads.json"), "{}");
+    const adapter = new WorkspaceStorageAdapter(paths, {}, 1024);
+    try {
+      await adapter.scan({});
+      expect(adapter.scanStatus().complete).toBe(false);
+      expect(adapter.scanStatus().deferredResourceIdsExhaustive).toBe(false);
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
+  it.each(["exact", "enumeration", "overflow", "live"])("certifies only exhaustively tracked workspace failures (%s)", async (mode) => {
+    const paths = await createPaths();
+    await writeWorkspaceIdentity(paths, "workspace-a");
+    const dir = join(paths.workspaceStorageRoot, "workspace-a", "images");
+    await mkdir(dir, { recursive: true });
+    for (let index = 0; index < 4; index += 1) {
+      await writeFile(join(dir, `${index}.png`), "local image");
+    }
+    const adapter = new WorkspaceStorageAdapter(paths, {}, 1024, undefined, mode === "live", {
+      enumerationIntervalMs: Number.MAX_SAFE_INTEGER,
+      ...(mode === "overflow" ? { maxMetadataChecksPerScan: 2 } : {}),
+      onWorkspaceEnumerate: () => {
+        if (mode === "enumeration") throw new Error("directory unreadable");
+      },
+      onFileRead: () => { throw new Error("file unreadable"); },
+    });
+    try {
+      for (let pass = 0; pass < 20; pass += 1) await adapter.scan({});
+      expect(adapter.scanStatus().complete).toBe(false);
+      expect(adapter.scanStatus().deferredResourceIdsExhaustive).toBe(mode === "exact");
+      if (mode === "exact") expect(adapter.scanStatus().deferredResourceIds).toHaveLength(4);
+      if (mode === "overflow") expect(adapter.scanStatus().deferredResourceIds).toContain("workspace-storage-scope/untracked-read-failures");
+    } finally {
+      await adapter.dispose();
+    }
+  });
+
   it("settles an oversized live image before reading it", async () => {
     const paths = await createPaths();
     await writeWorkspaceIdentity(paths, "workspace-a");
