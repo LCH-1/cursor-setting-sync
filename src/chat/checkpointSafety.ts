@@ -44,6 +44,11 @@ export async function inspectChatCheckpointSafety(
   if (tip.kind !== "chat" || tip.operation !== "put") {
     return { metadata: tip.metadata, preserveHistory: false };
   }
+  // Chunked captures are verified by the receiver. Routine checkpoint work
+  // cannot inflate their entire transfer under its smaller work budget.
+  if (tip.metadata?.chatSnapshotSchemaVersion === 3) {
+    return { metadata: tip.metadata, preserveHistory: true, reason: "work-limit" };
+  }
   const cacheKey = `${resourceId}:${tip.semanticHash}`;
   const payloadKey = `${cacheKey}:${tip.payload?.deviceId}:${tip.payload?.objectId}:${tip.payload?.plainBytes}:${tip.payload?.compressedBytes}`;
   let core = budget.authenticatedPayloads.get(payloadKey);

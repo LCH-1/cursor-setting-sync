@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { readdir, rm, stat } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { parsePortableChatSnapshot, portableChatCoreHash } from "../chat/stateVscdb";
+import { CHAT_CHUNK_BYTES, chunkReferences } from "../chat/chunked";
 import {
   CHAT_CHECKPOINT_MAX_WORK_BYTES,
   createChatCheckpointWorkBudget,
@@ -1144,7 +1145,7 @@ export class SyncRepository {
       throw new Error(`Object compressed size mismatch: ${reference.objectId}`);
     }
     const plain = await gunzipAsync(compressed, {
-      maxOutputLength: readLimit,
+      maxOutputLength: Math.max(1, reference.plainBytes),
     });
     if (plain.byteLength !== reference.plainBytes) {
       throw new Error(`Object plain size mismatch: ${reference.objectId}`);
@@ -2210,6 +2211,7 @@ export class SyncRepository {
     const referenced = new Set<string>();
     for (const event of await this.scanEvents(null, true, true)) {
       for (const change of event.manifest.changes) {
+        for (const ref of chunkReferences(change.metadata)) { referenced.add(`${ref.deviceId}/${ref.objectId}`); }
         if (change.payload !== undefined) {
           referenced.add(`${change.payload.deviceId}/${change.payload.objectId}`);
         }
@@ -2218,6 +2220,7 @@ export class SyncRepository {
     const manifest = await this.loadAbsorbedCheckpointManifest();
     if (manifest !== null) {
       for (const resource of manifest.resources) {
+        for (const ref of chunkReferences(resource.metadata)) { referenced.add(`${ref.deviceId}/${ref.objectId}`); }
         if (resource.payload !== undefined) {
           referenced.add(
             `${resource.payload.deviceId}/${resource.payload.objectId}`,
@@ -2233,6 +2236,7 @@ export class SyncRepository {
         candidate.lamport,
       );
       for (const resource of checkpoint.manifest.resources) {
+        for (const ref of chunkReferences(resource.metadata)) { referenced.add(`${ref.deviceId}/${ref.objectId}`); }
         if (resource.payload !== undefined) {
           referenced.add(
             `${resource.payload.deviceId}/${resource.payload.objectId}`,
@@ -3106,6 +3110,13 @@ export class SyncRepository {
     // and settings sync could not fix it because settings ride the same log.
     validateEventManifest(manifest, MAX_APPLY_BATCH_BYTES);
     return { path, fileName, eventHash: actualHash, stored, manifest };
+  }
+
+  async writeChatChunk(content: Buffer): Promise<ObjectReference> {
+    if (content.byteLength > Math.min(CHAT_CHUNK_BYTES, this.maxPayloadBytes)) {
+      throw new Error("Chat chunk exceeds the bounded payload limit.");
+    }
+    return this.writeObject(content);
   }
 
   private async writeObject(content: Buffer): Promise<ObjectReference> {

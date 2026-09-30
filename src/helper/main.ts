@@ -65,6 +65,7 @@ import {
   portableChatCoreHash,
   type PortableChatSnapshot,
 } from "../chat/stateVscdb";
+import { assertChunkedChatMetadata, parseChunkedChat, stageChunkedChat } from "../chat/chunked";
 import { verifyPortableChatContinuationClosure } from "../chat/continuationClosure";
 import { buildChatTipEnrichmentCandidateIndex } from "../chat/enrichment";
 import { migrateOfflineChatTips } from "./chatMigration";
@@ -756,6 +757,7 @@ async function applyVerifiedPage(
     warnings.push(`Preparing ${resourceId}: ${message}`);
   }
   const prepared = preparation.prepared;
+  try {
 
   // Every kind that lives in the global `state.vscdb`. Missing one here does
   // not fail loudly: the change is prepared, routed to neither applier, and
@@ -865,6 +867,9 @@ async function applyVerifiedPage(
       .map(helperChangeVersionId)
       .filter((versionId) => remainingReadyVersionIds.has(versionId)),
   };
+  } finally {
+    for (const item of prepared) { await item.chunkedChat?.dispose(); }
+  }
 }
 
 function pageMayMutateGlobalDatabase(
@@ -1161,6 +1166,7 @@ async function exportFinalChanges(
       continue;
     }
     adapter.setMaxPayloadBytes?.(request.syncOptions.maxPayloadBytes);
+    adapter.setChatChunkStore?.(repository);
     const drainsBounded = typeof adapter.scanStatus === "function";
     let scanKnown = drainsBounded
       ? localProjectionOverlay(repository.state.projections, adapter.kinds.includes("extension"))
@@ -1847,6 +1853,10 @@ function boundedHelperTargetPage(
       if (totalBytes + declaredBytes > MAX_HELPER_APPLY_WORK_BYTES) {
         continue;
       }
+      if (change.kind === "chat" && change.metadata?.chatSnapshotSchemaVersion === 3) {
+        if (selected.length === 0) { return [change]; }
+        continue;
+      }
       totalBytes += declaredBytes;
     }
     selected.push(change);
@@ -1871,6 +1881,7 @@ export async function prepareChanges(
   const failureByResourceId: Record<string, string> = {};
   let totalBytes = 0;
   let preparedCount = 0;
+  let hasChunkedChat = false;
   const batchLimit = MAX_HELPER_APPLY_WORK_BYTES;
   for (const change of changes) {
     if (change.operation === "put") {
@@ -1901,6 +1912,10 @@ export async function prepareChanges(
         );
         continue;
       }
+      if (hasChunkedChat || (change.kind === "chat" && change.metadata?.chatSnapshotSchemaVersion === 3 && preparedCount > 0)) {
+        skipped.push(`${change.resourceId}: deferred to a later bounded helper apply page; it stays queued`);
+        continue;
+      }
       let content: Buffer;
       try {
         content = await repository.readObject(change.payload);
@@ -1927,6 +1942,23 @@ export async function prepareChanges(
         const message = error instanceof Error ? error.message : String(error);
         skipped.push(`${change.resourceId}: ${message}`);
         failureByResourceId[change.resourceId] = message;
+        continue;
+      }
+      if (change.kind === "chat" && change.metadata?.chatSnapshotSchemaVersion === 3) {
+        try {
+          if (sha256(content) !== change.semanticHash) { throw new Error("Chat manifest hash does not match its event."); }
+          const manifest = parseChunkedChat(content);
+          if (change.resourceId !== `chat/${manifest.composerId}`) { throw new Error("Chat manifest has the wrong composer ID."); }
+          assertChunkedChatMetadata(manifest, change.metadata);
+          const chunkedChat = await stageChunkedChat(repository, manifest);
+          prepared.push({ change, content, chunkedChat });
+          hasChunkedChat = true;
+          preparedCount += 1; totalBytes += declaredBytes;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          skipped.push(`${change.resourceId}: ${message}`);
+          if (!isMissingPathError(error)) { failureByResourceId[change.resourceId] = message; }
+        }
         continue;
       }
       const continuationFailure = await preparedChatContinuationFailure(
@@ -2158,6 +2190,10 @@ function boundedShutdownApplyPage(
   let totalBytes = 0;
   for (const change of candidates) {
     const payloadBytes = change.payload?.plainBytes ?? 0;
+    if (change.kind === "chat" && change.metadata?.chatSnapshotSchemaVersion === 3) {
+      if (changes.length === 0) { return [change]; }
+      continue;
+    }
     if (change.kind === "chat" && payloadBytes > MAX_HELPER_APPLY_WORK_BYTES && payloadBytes <= MAX_HELPER_SINGLE_CHAT_BYTES) {
       if (changes.length === 0) {
         return [change];

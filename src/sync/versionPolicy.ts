@@ -16,6 +16,7 @@ import { PUBLISH_WARNING_SOURCE } from "./warningLog";
 import { assertSafeIdentifier } from "../platform/files";
 import { createHash } from "node:crypto";
 import { parsePortableChatSnapshot, portableChatCoreHash } from "../chat/stateVscdb";
+import { parseChunkedChat, assertChunkedChatMetadata } from "../chat/chunked";
 import { updatePortableComposerHeaderHash } from "../chat/headerCanonical";
 import { sha256 } from "../protocol/canonical";
 
@@ -538,7 +539,9 @@ function authenticatedLocalChatProjection(
     committed.payload.plainBytes !== snapshot.content.byteLength || sha256(snapshot.content) !== snapshot.semanticHash) {
     throw new Error("The acknowledged local chat does not match its authenticated payload.");
   }
-  const core = parsePortableChatSnapshot(snapshot.content);
+  const chunked = committed.metadata?.chatSnapshotSchemaVersion === 3;
+  const core = chunked ? parseChunkedChat(snapshot.content) : parsePortableChatSnapshot(snapshot.content);
+  if (chunked) { assertChunkedChatMetadata(parseChunkedChat(snapshot.content), committed.metadata); }
   if (`chat/${core.composerId}` !== snapshot.resourceId) {
     throw new Error("The acknowledged local chat does not match its authenticated resource.");
   }
@@ -551,8 +554,9 @@ function authenticatedLocalChatProjection(
     versionId,
     payloadObjectId: committed.payload.objectId,
     ...(core.header.lastUpdatedAt === null ? {} : { sourceTimestamp: core.header.lastUpdatedAt }),
-    sourceBubbleCount: core.bubbles.length,
-    sourceChatCoreHash: portableChatCoreHash(core),
+    sourceBubbleCount: "bubbleCount" in core ? core.bubbleCount : core.bubbles.length,
+    sourceChatCoreHash: "chatCoreHash" in core ? core.chatCoreHash : portableChatCoreHash(core),
+    ...("continuationComplete" in core && !core.continuationComplete ? { requiresAgentKvRecapture: true } : {}),
     sourceHeaderFingerprint: headerHash.digest("hex"),
   };
 }

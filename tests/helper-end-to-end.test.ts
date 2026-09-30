@@ -10,7 +10,8 @@ import { EventReconciler } from "../src/protocol/reconciler";
 import { restoreDatabaseBackup } from "../src/helper/database";
 import { withReadableBackup } from "../src/helper/compressedBackups";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
-import { portableChatCoreHash } from "../src/chat/stateVscdb";
+import { portableChatCoreHash, StateVscdbChatAdapter } from "../src/chat/stateVscdb";
+import { captureChunkedChat, chunkedChatMetadata, CHAT_CHUNK_BYTES } from "../src/chat/chunked";
 import { pathExists, readJsonFile, writeJsonAtomic } from "../src/platform/files";
 import type { HelperChange, HelperRequest, HelperResult } from "../src/helper/types";
 import type { CursorPaths } from "../src/platform/paths";
@@ -124,6 +125,81 @@ describe.skipIf(!existsSync(HELPER))("live helper, end to end", () => {
 });
 
 describeBuilt("the offline helper, end to end", () => {
+  it("restores a chunked peer chat beyond both old limits and preserves its backup and workspace mapping", async () => {
+    const f = await createFixture();
+    const sourcePath = join(f.request.storageRoot, "peer.sqlite");
+    const source = new DatabaseSync(sourcePath);
+    source.exec("CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY,value BLOB)");
+    const bubbleCount = 17_000;
+    const blob = Buffer.from("immutable peer continuation");
+    const blobId = sha256(blob);
+    const conversationState = `~${Buffer.concat([Buffer.from([10, 32]), Buffer.from(blobId, "hex")]).toString("base64")}`;
+    const composer = JSON.stringify({ workspaceIdentifier: { id: "peer-workspace" }, conversationState,
+      fullConversationHeadersOnly: Array.from({ length: bubbleCount }, (_, index) => ({ bubbleId: String(index).padStart(8, "0") })) });
+    const insert = source.prepare("INSERT INTO cursorDiskKV VALUES(?,?)");
+    source.exec("BEGIN");
+    insert.run(`composerData:${COMPOSER}`, composer);
+    insert.run(`agentKv:blob:${blobId}`, blob);
+    for (let index = 0; index < bubbleCount; index++) {
+      insert.run(`bubbleId:${COMPOSER}:${String(index).padStart(8, "0")}`, JSON.stringify({ text: "x".repeat(8_192), index }));
+    }
+    source.exec("COMMIT");
+    let manifest;
+    try {
+      source.exec("BEGIN");
+      manifest = await captureChunkedChat(source, { ...chatSnapshot().header, workspaceId: "peer-workspace",
+        value: '{"workspaceIdentifier":{"id":"peer-workspace"},"name":"Large peer chat"}' }, f.repository);
+      source.exec("ROLLBACK");
+    } finally { source.close(); }
+    expect(manifest.bubbleCount).toBe(bubbleCount);
+    expect(manifest.parts.reduce((n, part) => n + part.payload.plainBytes, 0)).toBeGreaterThan(128 * 1024 * 1024);
+    expect(Math.max(...manifest.parts.map(part => part.payload.plainBytes))).toBeLessThanOrEqual(CHAT_CHUNK_BYTES);
+    const content = canonicalBytes(manifest);
+    const siblingId = "3f8f0a52-2f21-4a53-9f6b-1a2b3c4d5e60";
+    const sibling = chatSnapshot(siblingId);
+    const siblingContent = canonicalBytes(sibling);
+    await f.repository.publish([{ resourceId: `chat/${COMPOSER}`, kind: "chat", content,
+      semanticHash: sha256(content), metadata: chunkedChatMetadata(manifest) }, {
+      resourceId: `chat/${siblingId}`, kind: "chat", content: siblingContent, semanticHash: sha256(siblingContent),
+      metadata: { chatSnapshotSchemaVersion: 2, agentKvMissingCount: 0, chatCoreHash: portableChatCoreHash(sibling) },
+    }], []);
+    new EventReconciler().reconcile(await f.repository.listEvents(), f.repository.state, null);
+    f.request.changes = [COMPOSER, siblingId].map(id => ({ ...f.repository.state.tips[`chat/${id}`]![0]!, resourceId: `chat/${id}` }));
+    f.repository.state.pendingDatabaseChanges = f.request.changes.map(change => ({
+      resourceId: change.resourceId, kind: "chat", eventHash: change.eventHash, changeIndex: change.changeIndex,
+    }));
+    f.request.workspaceMappings = { "peer-workspace": "local-workspace" };
+    f.request.extensionVersion = "1.0.16";
+    await mkdir(join(f.request.paths.workspaceStorageRoot, "local-workspace"), { recursive: true });
+    await writeFile(join(f.request.paths.workspaceStorageRoot, "local-workspace", "workspace.json"), '{"folder":"file:///local-project"}');
+    const target = new DatabaseSync(f.databasePath);
+    target.prepare("INSERT INTO cursorDiskKV VALUES(?,?)").run(`agentKv:blob:${blobId}`, blob.toString("utf8"));
+    target.close();
+    await f.repository.saveState();
+    const result = await runHelper(f);
+    expect(result).toMatchObject({ success: true, error: null });
+    expect(result.applied).toEqual(expect.arrayContaining([`chat/${COMPOSER}`, `chat/${siblingId}`]));
+    const received = new DatabaseSync(f.databasePath, { readOnly: true });
+    try {
+      expect(received.prepare("SELECT count(*) AS n FROM cursorDiskKV WHERE key LIKE ?").get(`bubbleId:${COMPOSER}:%`)!.n).toBe(bubbleCount);
+      expect(received.prepare("SELECT workspaceId FROM composerHeaders WHERE composerId=?").get(COMPOSER)!.workspaceId).toBe("local-workspace");
+      const restored = JSON.parse(received.prepare("SELECT value FROM cursorDiskKV WHERE key=?").get(`composerData:${COMPOSER}`)!.value as string) as { workspaceIdentifier: { id: string } };
+      expect(restored.workspaceIdentifier.id).toBe("local-workspace");
+      expect(received.prepare("SELECT typeof(value) AS t FROM cursorDiskKV WHERE key=?").get(`agentKv:blob:${blobId}`)!.t).toBe("text");
+    } finally { received.close(); }
+    await f.repository.refreshState();
+    const adapter = new StateVscdbChatAdapter(f.request.paths, { forceCoreVerificationResourceIds: [`chat/${COMPOSER}`] });
+    adapter.setChatChunkStore(f.repository);
+    const afterApply = await adapter.scan(f.repository.state.projections);
+    expect(afterApply.snapshots.filter(snapshot => snapshot.resourceId === `chat/${COMPOSER}`)).toEqual([]);
+    await withReadableBackup(result.backupPath!, async path => expect(readComposerIds(path)).not.toContain(COMPOSER));
+    await restoreDatabaseBackup(f.databasePath, result.backupPath!, f.request.storageRoot);
+    expect(readComposerIds(f.databasePath)).not.toContain(COMPOSER);
+    const peer = new DatabaseSync(sourcePath, { readOnly: true });
+    try { expect(peer.prepare("SELECT value FROM cursorDiskKV WHERE key=?").get(`composerData:${COMPOSER}`)!.value).toBe(composer); }
+    finally { peer.close(); }
+  }, 120_000);
+
   it("applies a peer's chat, backs the database up first, and restores cleanly", async () => {
     const fixture = await createFixture();
 

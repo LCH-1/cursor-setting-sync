@@ -9,6 +9,22 @@ import {
 import { sha256 } from "../src/protocol/canonical";
 
 describe("agentKv conversation graph", () => {
+  it("streams every authenticated blob once and releases its bytes while following repeated schema routes", async () => {
+    const leaf = Buffer.from("immutable leaf"); const leafId = sha256(leaf);
+    const child = shellTurn({ commandId: leafId }); const childId = sha256(child);
+    const serializedState = state(Buffer.concat([bytesField(8, Buffer.from(childId, "hex")), bytesField(1, Buffer.from(childId, "hex"))]));
+    const rows = new Map<string, AgentKvBlobLookupResult>([
+      [key(childId), { status: "found", key: key(childId), bytes: child, valueType: "blob" }],
+      [key(leafId), { status: "found", key: key(leafId), bytes: leaf, valueType: "text" }],
+    ]);
+    const normal = await walkAgentKvReachability(serializedState, lookupFrom(rows));
+    const sink = vi.fn(async () => {});
+    const streamed = await walkAgentKvReachability(serializedState, lookupFrom(rows), { blobSink: sink });
+    expect(streamed.complete).toBe(normal.complete);
+    expect(streamed.blobs).toEqual([]);
+    expect(streamed.streamedBlobIds).toEqual(normal.blobs.map(blob => blob.id));
+    expect(sink).toHaveBeenCalledTimes(normal.blobs.length);
+  });
   it("walks nested protobuf references and retains opaque leaves", async () => {
     const leaf = Buffer.from("opaque JSON or text leaf", "utf8");
     const leafId = sha256(leaf);

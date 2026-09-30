@@ -34,13 +34,15 @@ import type { CursorPaths } from "../src/platform/paths";
 import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import { EventReconciler } from "../src/protocol/reconciler";
 import { SyncRepository } from "../src/protocol/repository";
-import { applyGlobalDatabaseChanges } from "../src/helper/database";
+import { applyGlobalDatabaseChanges, restoreDatabaseBackup } from "../src/helper/database";
 import { migrateOfflineChatTips } from "../src/helper/chatMigration";
 import { WorkspaceStorageAdapter, workspaceStorageResourceId } from "../src/resources/workspaceStorage";
 import { mergeOfflineChatConflicts } from "../src/helper/chatConflictMerge";
 import { mergeChatSnapshotBuffers } from "../src/chat/chatMerge";
 import { enrichCurrentChatTipsFromLiveDatabase } from "../src/chat/enrichment";
 import { APPLY_FAILURE_BLOCK_PREFIX, MAX_HELPER_APPLY_WORK_BYTES } from "../src/constants";
+import { captureChunkedChat, chunkedChatMetadata, parseChunkedChat, stageChunkedChat } from "../src/chat/chunked";
+import { acknowledgeObservedLocalChats } from "../src/sync/versionPolicy";
 import type {
   PortableChatSnapshot,
   PortableChatSnapshotV2,
@@ -61,6 +63,116 @@ afterEach(async () => {
 });
 
 describe("the helper's bounded final chat export", () => {
+  it.each(["missing", "tampered"])("isolates a %s chunk and keeps a healthy sibling ready", async reason => {
+    const f = await createFixture(); const id = composerId(903);
+    f.database.prepare("INSERT INTO cursorDiskKV VALUES(?,?)").run(`composerData:${id}`, '{"fullConversationHeadersOnly":[]}');
+    const manifest = await captureChunkedChat(f.database, { composerId: id, workspaceId: null, createdAt: 1, lastUpdatedAt: 2,
+      isArchived: 0, isSubagent: 0, recency: 0, checkpointAt: null, value: "{}" }, f.repository);
+    const content = canonicalBytes(manifest); const healthy = Buffer.from("healthy");
+    await f.repository.publish([{ resourceId: `chat/${id}`, kind: "chat", content, semanticHash: sha256(content), metadata: chunkedChatMetadata(manifest) },
+      { resourceId: "ui-state/healthy", kind: "ui-state", content: healthy, semanticHash: sha256(healthy) }], []);
+    new EventReconciler().reconcile(await f.repository.listEvents(), f.repository.state, null);
+    const original = f.repository.readObject.bind(f.repository);
+    vi.spyOn(f.repository, "readObject").mockImplementation(async reference => {
+      if (reference.objectId === manifest.parts[0]!.payload.objectId) {
+        if (reason === "missing") { throw Object.assign(new Error("chunk has not arrived"), { code: "ENOENT" }); }
+        return Buffer.from("corrupt chunk");
+      }
+      return original(reference);
+    });
+    try {
+      const changes = [`chat/${id}`, "ui-state/healthy"].map(resourceId => ({ ...f.repository.state.tips[resourceId]![0]!, resourceId }));
+      const result = await prepareChanges(f.repository, changes);
+      expect(result.prepared.map(item => item.change.resourceId)).toEqual(["ui-state/healthy"]);
+      expect(Object.keys(result.failureByResourceId)).toEqual(reason === "missing" ? [] : [`chat/${id}`]);
+      expect(f.database.prepare("SELECT count(*) AS n FROM composerHeaders").get()!.n).toBe(0);
+    } finally { f.database.close(); }
+  });
+
+  it("applies a staged large chat with a mapped workspace and remembers its exact local core without echoing it", async () => {
+    const f = await createFixture();
+    const id = composerId(902);
+    const header = { composerId: id, workspaceId: "peer", createdAt: 1, lastUpdatedAt: 2,
+      isArchived: 0, isSubagent: 0, recency: 0, checkpointAt: null, value: '{"workspaceIdentifier":{"id":"peer"}}' };
+    const insert = f.database.prepare("INSERT INTO cursorDiskKV VALUES(?,?)");
+    const blob = Buffer.from("immutable continuation"); const blobId = sha256(blob);
+    const conversationState = `~${Buffer.concat([Buffer.from([10, 32]), Buffer.from(blobId, "hex")]).toString("base64")}`;
+    insert.run(`composerData:${id}`, JSON.stringify({ workspaceIdentifier: { id: "peer" }, conversationState,
+      fullConversationHeadersOnly: Array.from({ length: 17_000 }, (_, i) => ({ bubbleId: String(i).padStart(8, "0") })) }));
+    insert.run(`agentKv:blob:${blobId}`, blob);
+    f.database.exec("BEGIN");
+    for (let i = 0; i < 17_000; i++) { insert.run(`bubbleId:${id}:${String(i).padStart(8, "0")}`, JSON.stringify({ text: "x".repeat(8_192), index: i })); }
+    const manifest = await captureChunkedChat(f.database, header, f.repository);
+    expect(manifest.parts.reduce((n, part) => n + part.payload.plainBytes, 0)).toBeGreaterThan(128 * 1024 * 1024);
+    f.database.exec("COMMIT");
+    const content = canonicalBytes(manifest);
+    await f.repository.publish([{ resourceId: `chat/${id}`, kind: "chat", content, semanticHash: sha256(content), metadata: chunkedChatMetadata(manifest) }], []);
+    new EventReconciler().reconcile(await f.repository.listEvents(), f.repository.state, null);
+    const change: HelperChange = { ...f.repository.state.tips[`chat/${id}`]![0]!, resourceId: `chat/${id}` };
+    const preparation = await prepareChanges(f.repository, [change]);
+    expect(preparation.failureByResourceId).toEqual({});
+    f.database.exec("DELETE FROM cursorDiskKV");
+    insert.run(`agentKv:blob:${blobId}`, blob.toString("utf8"));
+    f.database.close();
+    f.request.workspaceMappings = { peer: "local" };
+    await mkdir(join(f.request.paths.workspaceStorageRoot, "local"), { recursive: true });
+    await writeFile(join(f.request.paths.workspaceStorageRoot, "local", "workspace.json"), '{"folder":"file:///local-project"}');
+    try {
+      const heartbeat = vi.fn();
+      const outcome = await applyGlobalDatabaseChanges(f.request, preparation.prepared, heartbeat);
+      expect(outcome.applied).toEqual([`chat/${id}`]);
+      expect(heartbeat.mock.calls.length).toBeGreaterThan(200);
+      const db = new DatabaseSync(f.request.paths.globalDatabase, { readOnly: true });
+      try {
+        const composer = JSON.parse(db.prepare("SELECT value FROM cursorDiskKV WHERE key=?").get(`composerData:${id}`)!.value as string) as { workspaceIdentifier: { id: string } };
+        expect(composer.workspaceIdentifier.id).toBe("local");
+        expect(db.prepare("SELECT typeof(value) AS t FROM cursorDiskKV WHERE key=?").get(`agentKv:blob:${blobId}`)!.t).toBe("text");
+        const mapped = await captureChunkedChat(db, { ...header, workspaceId: "local", value: '{"workspaceIdentifier":{"id":"local"}}' }, f.repository);
+        expect(outcome.localChatCoreHashes[`chat/${id}`]).toBe(mapped.chatCoreHash);
+      } finally { db.close(); }
+      markAppliedProjections(f.repository, [change], outcome.applied, new Set(), {}, outcome.localChatCoreHashes);
+      const adapter = new StateVscdbChatAdapter(f.request.paths, { forceCoreVerificationResourceIds: [`chat/${id}`] });
+      adapter.setChatChunkStore(f.repository);
+      expect((await adapter.scan(f.repository.state.projections)).snapshots).toEqual([]);
+      await restoreDatabaseBackup(f.request.paths.globalDatabase, outcome.backupPath, f.request.storageRoot);
+      const restored = new DatabaseSync(f.request.paths.globalDatabase, { readOnly: true });
+      try { expect(restored.prepare("SELECT count(*) AS n FROM composerHeaders").get()!.n).toBe(0); }
+      finally { restored.close(); }
+    } finally { for (const item of preparation.prepared) { await item.chunkedChat?.dispose(); } }
+  }, 120_000);
+
+  it("publishes and acknowledges a chat with more than 16,384 rows without retaining a whole payload", async () => {
+    const fixture = await createFixture();
+    const id = composerId(901);
+    insertLiveChat(fixture.database, id, "large row history", 2, 8);
+    fixture.database.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run(JSON.stringify({
+      fullConversationHeadersOnly: [{ bubbleId: `bubble-${id}` }, { bubbleId: "large-16999" }],
+    }), `composerData:${id}`);
+    const insert = fixture.database.prepare("INSERT INTO cursorDiskKV VALUES(?,?)");
+    fixture.database.exec("BEGIN");
+    for (let i = 0; i < 17_000; i++) { insert.run(`bubbleId:${id}:large-${i}`, JSON.stringify({ text: `message ${i}` })); }
+    fixture.database.exec("COMMIT"); fixture.database.close();
+    const adapter = new StateVscdbChatAdapter(fixture.request.paths);
+    adapter.setMaxPayloadBytes(MAX_PAYLOAD_BYTES); adapter.setChatChunkStore(fixture.repository);
+    {
+      const scanned = await adapter.scan({});
+      const snapshot = scanned.snapshots.find(row => row.resourceId === `chat/${id}`)!;
+      expect(snapshot).toBeDefined(); expect(snapshot.content.byteLength).toBeLessThan(32_768);
+      const manifest = parseChunkedChat(snapshot.content);
+      expect(manifest.bubbleCount).toBe(17_001);
+      await fixture.repository.publish([snapshot], []);
+      new EventReconciler().reconcile(await fixture.repository.listEvents(), fixture.repository.state, null);
+      expect(await acknowledgeObservedLocalChats(fixture.repository, [snapshot])).toEqual(new Set());
+      expect(fixture.repository.state.projections[`chat/${id}`]!.sourceBubbleCount).toBe(17_001);
+      const stage = await stageChunkedChat(fixture.repository, manifest); await stage.dispose();
+      const unchanged = await adapter.scan(fixture.repository.state.projections);
+      expect(unchanged.snapshots).toEqual([]);
+      expect(unchanged.warnings).toEqual([]);
+      const outcome = await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository, () => {}, true);
+      expect(outcome.protectedLocalResourceIds).toEqual([]);
+      expect(outcome.incompleteKinds).toEqual([]);
+    }
+  }, 30_000);
   it.each(["exact", "unknown-scope"])("isolates a corrupt workspace database only with exhaustive failures (%s)", async (scope) => {
     const fixture = await createFixture();
     fixture.database.close();

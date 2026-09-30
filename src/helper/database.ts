@@ -40,6 +40,7 @@ import {
   type PortableKvRow,
 } from "../chat/stateVscdb";
 import { updatePortableComposerHeaderHash } from "../chat/headerCanonical";
+import { CHAT_CHUNK_BYTES, stagedPortable, stagedRow, type StagedChunkedChat } from "../chat/chunked";
 import {
   DEFAULT_BROKEN_CHAT_INSPECTION_LIMITS,
   auditChatReferences,
@@ -90,6 +91,7 @@ const MAX_STORED_PROFILE_MANIFEST_BYTES = 8 * 1024 * 1024;
 export interface PreparedHelperChange {
   change: HelperChange;
   content?: Buffer;
+  chunkedChat?: StagedChunkedChat;
 }
 
 export interface DatabaseApplyResult {
@@ -1122,6 +1124,7 @@ function applyPreparedChanges(
         marker,
         ignoredUiStateKeys,
         localDeviceId,
+        heartbeat,
       );
       database.exec("RELEASE cursor_sync_change");
     } catch (error) {
@@ -1193,8 +1196,12 @@ function applyPreparedChange(
   marker: MarkerState,
   ignoredUiStateKeys: IgnoreMatcher,
   localDeviceId?: string,
+  heartbeat: () => void = () => {},
 ): ChangeOutcome {
   const { change, content } = item;
+  if (item.chunkedChat !== undefined && change.kind === "chat" && change.operation === "put") {
+    return applyChunkedChat(database, request, item.chunkedChat, localWorkspaces, change.metadata, heartbeat);
+  }
   if (change.kind === "chat") {
     if (change.operation === "delete") {
       return { status: "skipped", reason: "tombstone retained without hard delete" };
@@ -2012,11 +2019,44 @@ function uiStateValue(
   return legacyStorageValue(content);
 }
 
+function applyChunkedChat(
+  database: DatabaseSync, request: HelperRequest, staged: StagedChunkedChat,
+  localWorkspaces: WorkspaceIdentity[], metadata: Record<string, JsonValue> | undefined,
+  heartbeat: () => void,
+): ChangeOutcome {
+  const manifest = staged.manifest;
+  const workspaceId = manifest.header.workspaceId;
+  const target = workspaceId === null ? null : resolveTargetWorkspace(workspaceId,
+    metadataStringOrNull(metadata, "workspaceUri"), localWorkspaces, request.workspaceMappings) ?? workspaceId;
+  const insert = database.prepare("INSERT INTO cursorDiskKV(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value");
+  const coreHash = createHash("sha256"); coreHash.update('{"bubbles":[');
+  let bubbles = 0;
+  let written = 0;
+  for (const row of staged.database.prepare("SELECT key,value,valueType,kind FROM kv WHERE key<>? ORDER BY key").iterate(`composerData:${manifest.composerId}`)) {
+    if (written++ % 64 === 0) { heartbeat(); }
+    const portable = stagedPortable(row);
+    if (row.kind === "agent-kv") {
+      upsertAgentKvBlobs(database, { blobs: [portable], referencedIds: [portable.key.slice("agentKv:blob:".length)], missingIds: [] }, CHAT_CHUNK_BYTES);
+    } else {
+      const write = portableKvWrite(portable);
+      insert.run(portable.key, write.value);
+      if (bubbles++ > 0) { coreHash.update(","); }
+      updatePortableRowHash(coreHash, portable, write.valueType);
+    }
+  }
+  const composerData = stagedRow(staged.database, `composerData:${manifest.composerId}`)!;
+  const localChatCoreHash = upsertChat(database, { schemaVersion: 1, composerId: manifest.composerId, header: manifest.header, composerData, bubbles: [] },
+    target, request.syncOptions.maxPayloadBytes, true, coreHash);
+  return { status: "applied", localChatCoreHash };
+}
+
 function upsertChat(
   database: DatabaseSync,
   snapshot: ReturnType<typeof parsePortableChatSnapshot>,
   workspaceId: string | null,
   maxAgentKvBytes: number,
+  chunked = false,
+  prehashedBubbles?: ReturnType<typeof createHash>,
 ): string {
   const header = snapshot.header;
   let headerValue = header.value;
@@ -2028,7 +2068,7 @@ function upsertChat(
   ) {
     if (headerValue !== null) {
       headerValue = remapChatWorkspaceIdentifier(
-        headerValue, header.workspaceId, workspaceId,
+        headerValue, header.workspaceId, workspaceId, chunked,
       );
     }
     if (composerData.valueType !== "null") {
@@ -2036,7 +2076,7 @@ function upsertChat(
       const text = bytes.toString("utf8");
       if (Buffer.from(text, "utf8").equals(bytes)) {
         const mapped = remapChatWorkspaceIdentifier(
-          text, header.workspaceId, workspaceId,
+          text, header.workspaceId, workspaceId, chunked,
         );
         if (mapped !== text) {
           composerData = {
@@ -2050,8 +2090,8 @@ function upsertChat(
   // Hash the normalized rows while they are written. This mirrors what the
   // next live scanner will observe without re-reading the database or building
   // a second whole-chat canonical buffer.
-  const hash = createHash("sha256");
-  hash.update("{");
+  const hash = prehashedBubbles ?? createHash("sha256");
+  if (prehashedBubbles === undefined) { hash.update("{"); }
   if (isPortableChatSnapshotV2(snapshot)) {
     const agentKvResult = upsertAgentKvBlobs(
       database,
@@ -2072,7 +2112,7 @@ function upsertChat(
      ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
   );
   const orderedBubbles = portableRowsInDatabaseOrder(snapshot.bubbles);
-  hash.update('"bubbles":[');
+  if (prehashedBubbles === undefined) { hash.update('"bubbles":['); }
   for (let index = 0; index < orderedBubbles.length; index += 1) {
     const bubble = orderedBubbles[index]!;
     const write = portableKvWrite(bubble);
@@ -2161,11 +2201,12 @@ function remapChatWorkspaceIdentifier(
   text: string,
   sourceWorkspaceId: string,
   targetWorkspaceId: string,
+  chunked = false,
 ): string {
   // Cursor filters the JSON identifier after its SQL workspace filter and
   // recreates future headers from composerData. Change only the known ID token.
   try {
-    assertBoundedJsoncStructure(text, "Chat workspace identifier");
+    assertBoundedJsoncStructure(text, "Chat workspace identifier", chunked ? 1_048_576 : undefined, chunked ? 256 : undefined);
     const errors: ParseError[] = [];
     const root = parseTree(text, errors, {
       disallowComments: true,

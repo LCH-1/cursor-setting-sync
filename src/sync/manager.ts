@@ -6489,6 +6489,7 @@ export class SyncManager implements vscode.Disposable {
       forceCoreVerificationResourceIds: [...targetIds],
     });
     adapter.setMaxPayloadBytes(repository.maxPayloadBytes);
+    adapter.setChatChunkStore(repository);
     const verified = new Set<string>();
     const block = (resourceId: string, detail: string): void => {
       const pending = repository.state.pendingDatabaseChanges.find(
@@ -7187,6 +7188,9 @@ export class SyncManager implements vscode.Disposable {
           new StoreDbChatAdapter(this.paths),
         );
       }
+    }
+    if (this.repository !== null) {
+      for (const adapter of adapters) { adapter.setChatChunkStore?.(this.repository); }
     }
     return adapters;
   }

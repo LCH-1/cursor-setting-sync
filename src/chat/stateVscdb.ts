@@ -2,6 +2,7 @@ import type { DatabaseSync } from "../platform/sqlite";
 import { openDatabase } from "../platform/sqlite";
 import { createHash } from "node:crypto";
 import { MAX_HELPER_SINGLE_CHAT_BYTES } from "../constants";
+import { captureChunkedChat, chunkedChatMetadata, CHUNKED_CHAT_MAX_ROWS, type ChatChunkStore, type ChunkedChatManifest } from "./chunked";
 import { open } from "node:fs/promises";
 import type {
   LocalProjection,
@@ -244,6 +245,7 @@ interface OversizedSettlementOverflow {
 }
 
 type ChatCapture =
+  | { kind: "chunked"; manifest: ChunkedChatManifest }
   | { kind: "missing" }
   | {
       kind: "unchanged";
@@ -720,6 +722,12 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
     this.remainingHeaderProgressDatabaseGenerationRestarts =
       this.maxHeaderProgressDatabaseGenerationRestarts;
     this.settledScan = null;
+  }
+
+  private chunkStore: ChatChunkStore | undefined;
+
+  setChatChunkStore(store: ChatChunkStore): void {
+    this.chunkStore = store;
   }
 
   settleOversizedSnapshot(
@@ -1569,6 +1577,7 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
               ? MAX_HELPER_SINGLE_CHAT_BYTES
               : MAX_CHAT_INTERACTIVE_CAPTURE_BYTES,
             this.observedCoreResourceIds.has(resourceId),
+            this.chunkStore,
           );
           // Deep verification can materialize several megabytes of SQLite
           // text and canonical JSON for one conversation. Yield between those
@@ -1679,6 +1688,33 @@ export class StateVscdbChatAdapter implements ResourceAdapter {
           if (this.forcedCoreVerificationResourceIds.has(resourceId)) {
             completedForcedVerifications.add(resourceId);
           }
+          lastCompletedBodyCapture = resourceId;
+          continue;
+        }
+        if (captured.kind === "chunked") {
+          const manifest = captured.manifest;
+          const content = canonicalBytes(manifest);
+          const semanticHash = sha256(content);
+          this.pendingSnapshots.set(resourceId, {
+            semanticHash, databaseFingerprint, sourceTimestamp: manifest.header.lastUpdatedAt,
+            sourceBubbleCount: manifest.bubbleCount, sourceChatCoreHash: manifest.chatCoreHash,
+            sourceHeaderFingerprint: headerFingerprint, sourceHeaderMetadataFingerprint: metadata.fingerprint,
+            coreVerifiedAt: now,
+          });
+          this.oversizedSettlements.delete(resourceId);
+          this.pendingBubbleCountMismatches.delete(resourceId);
+          const workspaceUri = manifest.header.workspaceId === null ? null :
+            (await lookupWorkspaceIdentitiesById(this.paths, [manifest.header.workspaceId], { maxLookups: 1 }))
+              .get(manifest.header.workspaceId)?.uri ?? null;
+          snapshots.push({ resourceId, kind: "chat", content, semanticHash, metadata: {
+            ...chunkedChatMetadata(manifest), workspaceUri, headerFingerprint,
+            ...(chatHeaderTitle(manifest.header.value) === null ? {} : { title: chatHeaderTitle(manifest.header.value)! }),
+          } });
+          if (!manifest.continuationComplete) {
+            warnings.push(`${resourceId}: the chunked history was saved but its local continuation graph is incomplete; it cannot yet be applied on another PC.`);
+          }
+          retainedSnapshotBytes += content.byteLength;
+          completedForcedVerifications.add(resourceId);
           lastCompletedBodyCapture = resourceId;
           continue;
         }
@@ -2584,6 +2620,7 @@ async function captureChat(
   onCoreMetadataRow?: () => void,
   captureWorkLimit = MAX_CHAT_INTERACTIVE_CAPTURE_BYTES,
   observeUnchangedCore = false,
+  chunkStore?: ChatChunkStore,
 ): Promise<ChatCapture> {
   database.exec("BEGIN");
   try {
@@ -2625,11 +2662,32 @@ async function captureChat(
       statements.bubbleCount,
       header.composerId,
       onBubbleCountProbe,
+      chunkStore === undefined ? MAX_CHAT_CORE_METADATA_ROWS : CHUNKED_CHAT_MAX_ROWS,
     );
+    const captureChunks = async (): Promise<ChatCapture> => {
+      const manifest = await captureChunkedChat(database, header, chunkStore!);
+      resolveInitialGraphPriority(agentKvBudget, resourceId);
+      database.exec("COMMIT");
+      if (manifest.continuationComplete && projection?.requiresAgentKvRecapture !== true &&
+          (projection?.sourceBubbleCount ?? 0) > MAX_CHAT_CORE_METADATA_ROWS &&
+          projection?.sourceBubbleCount === manifest.bubbleCount && projection.sourceChatCoreHash === manifest.chatCoreHash) {
+        rememberObservedChatSource(projection, header.lastUpdatedAt, manifest.bubbleCount, manifest.chatCoreHash, portableHeaderFingerprint(header));
+        return { kind: "unchanged" };
+      }
+      return { kind: "chunked", manifest };
+    };
+    if (chunkStore !== undefined && !forceCapture && projection?.requiresAgentKvRecapture !== true &&
+        projection?.sourceTimestamp === header.lastUpdatedAt && projection.sourceBubbleCount === boundedBubbleCount &&
+        projection.sourceBubbleCount > MAX_CHAT_CORE_METADATA_ROWS) {
+      resolveInitialGraphPriority(agentKvBudget, resourceId);
+      database.exec("COMMIT");
+      return { kind: "unchanged" };
+    }
     if (
       boundedBubbleCount !== null &&
       boundedBubbleCount > MAX_CHAT_CORE_METADATA_ROWS
     ) {
+      if (chunkStore !== undefined) { return await captureChunks(); }
       const oversized = opaqueOversizedChatCore(
         header,
         composerDataMetadata,
@@ -2685,6 +2743,7 @@ async function captureChat(
         liveBubbleCount ?? 0,
       );
       if (rawCoreLowerBound > captureWorkLimit) {
+        if (chunkStore !== undefined) { return await captureChunks(); }
         const oversized = opaqueOversizedChatCore(
           header,
           composerDataMetadata,
@@ -3428,13 +3487,14 @@ function currentBubbleCount(
   statement: ChatStatement,
   composerId: string,
   onProbe?: () => void,
+  maxRows = MAX_CHAT_CORE_METADATA_ROWS,
 ): number {
   onProbe?.();
   const total = plainNumber(
     (
       statement.get(
         ...bubbleKeyRange(composerId),
-        MAX_CHAT_CORE_METADATA_ROWS + 1,
+        maxRows + 1,
       ) as
         | { total?: SqliteRowValue }
         | undefined

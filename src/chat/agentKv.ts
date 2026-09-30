@@ -23,6 +23,8 @@ export const DEFAULT_AGENT_KV_WALK_LIMITS: Readonly<AgentKvWalkLimits> =
 
 export interface AgentKvWalkOptions {
   limits?: Partial<AgentKvWalkLimits>;
+  /** Discards blob bytes after delivery; repeated schema routes re-read and verify them. */
+  blobSink?: (blob: AgentKvReachableBlob) => Promise<void>;
 }
 
 export type AgentKvValueType = "text" | "blob";
@@ -124,6 +126,7 @@ export interface AgentKvRootExtractionResult {
 export interface AgentKvReachabilityResult {
   roots: string[];
   blobs: AgentKvReachableBlob[];
+  streamedBlobIds?: string[];
   missing: AgentKvMissingBlob[];
   tampered: AgentKvTamperedBlob[];
   unreadable: AgentKvUnreadableIssue[];
@@ -248,6 +251,7 @@ export async function walkAgentKvReachability(
     }
   }
   const resolved = new Map<string, AgentKvReachableBlob | null>();
+  const streamed = new Set<string>();
   let visitedNodes = 0;
   let totalBytes = extracted.seedBytes;
   let examinedBytes = extracted.seedBytes;
@@ -259,6 +263,16 @@ export async function walkAgentKvReachability(
       break;
     }
     let blob = resolved.get(current.id);
+    if (options?.blobSink !== undefined && streamed.has(current.id)) {
+      const again = await lookup(`${AGENT_KV_BLOB_PREFIX}${current.id}`, limits.maxBytes - examinedBytes);
+      if (again.status !== "found" || again.bytes.byteLength > limits.maxBytes - examinedBytes ||
+          sha256(again.bytes) !== current.id || again.key !== `${AGENT_KV_BLOB_PREFIX}${current.id}`) {
+        limitReasons.add("bytes");
+        break;
+      }
+      examinedBytes += again.bytes.byteLength;
+      blob = { id: current.id, key: again.key, depth: current.depth, bytes: Buffer.from(again.bytes) };
+    }
     if (!resolved.has(current.id)) {
       if (visitedNodes >= limits.maxNodes) {
         limitReasons.add("nodes");
@@ -402,9 +416,14 @@ export async function walkAgentKvReachability(
       if (rawResult.valueType !== undefined) {
         blob.valueType = rawResult.valueType;
       }
-      blobs.push(blob);
+      if (options?.blobSink !== undefined) {
+        await options.blobSink(blob);
+        streamed.add(blob.id);
+      } else {
+        blobs.push(blob);
+      }
       totalBytes += bytes.byteLength;
-      resolved.set(current.id, blob);
+      resolved.set(current.id, options?.blobSink === undefined ? blob : null);
     }
 
     if (blob === null || blob === undefined || current.type === "opaque") {
@@ -464,6 +483,7 @@ export async function walkAgentKvReachability(
   return {
     roots: [...extracted.roots],
     blobs,
+    ...(options?.blobSink === undefined ? {} : { streamedBlobIds: [...streamed].sort(compareCodeUnits) }),
     missing,
     tampered,
     unreadable,

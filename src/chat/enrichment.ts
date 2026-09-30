@@ -474,6 +474,7 @@ function tipNeedsAgentKvEnrichment(tip: ResourceTip): boolean {
     return false;
   }
   const schemaVersion = tip.metadata?.chatSnapshotSchemaVersion;
+  if (schemaVersion === 3) { return false; }
   const missing = tip.metadata?.agentKvMissingCount;
   return (
     (isCoreMigrationSourceTip(tip) &&

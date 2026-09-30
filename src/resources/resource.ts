@@ -5,6 +5,7 @@ import type {
   ResourceScanResult,
   ResourceSnapshot,
 } from "../types";
+import type { ChatChunkStore } from "../chat/chunked";
 
 export type ResourceApplyInput = ResourceSnapshot | ResourceDeletion;
 
@@ -49,6 +50,7 @@ export interface ResourceAdapter {
 
   /** Optional policy hook for adapters that settle exact oversized snapshots. */
   setMaxPayloadBytes?(maxPayloadBytes: number): void;
+  setChatChunkStore?(store: ChatChunkStore): void;
   /** Acknowledges that the manager deliberately filtered this exact snapshot. */
   settleOversizedSnapshot?(
     snapshot: ResourceSnapshot,

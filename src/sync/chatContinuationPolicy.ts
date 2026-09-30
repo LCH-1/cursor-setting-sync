@@ -23,7 +23,8 @@ export function chatContinuationApplyBlockReason(
   ) {
     return undefined;
   }
-  return tip.metadata?.chatSnapshotSchemaVersion === 2 &&
+  return (tip.metadata?.chatSnapshotSchemaVersion === 2 ||
+    (tip.metadata?.chatSnapshotSchemaVersion === 3 && tip.metadata.continuationComplete === true)) &&
     tip.metadata.agentKvMissingCount === 0
     ? undefined
     : INCOMPLETE_CHAT_CONTINUATION_BLOCK_REASON;
