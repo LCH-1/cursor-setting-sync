@@ -76,6 +76,8 @@ import { LocalStateStore } from "../src/protocol/localState";
 import { EventReconciler } from "../src/protocol/reconciler";
 import { SyncRepository } from "../src/protocol/repository";
 import type { ResourceAdapter } from "../src/resources/resource";
+import type { HelperRequest } from "../src/helper/types";
+import { DEFAULT_IGNORED_SETTINGS } from "../src/resources/settings";
 import type {
   CompatibilityReport,
   LocalProjection,
@@ -113,6 +115,33 @@ afterEach(async () => {
       }),
     ),
   );
+});
+
+describe("portable SSH automatic-install settings", () => {
+  it("uses the same separate settings policy in the live adapter and helper request", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ssh-manager-policy-"));
+    temporaryRoots.push(root);
+    await writeFile(join(root, "settings.json"), JSON.stringify({
+      "remote.SSH.defaultExtensions": ["ms-python.python"],
+      "remote.SSH.configFile": "local-config",
+    }));
+    const manager = createManager({
+      paths: { userDataRoot: root, profilesRoot: join(root, "profiles"), cursorHome: join(root, ".cursor"), workspaceStorageRoot: join(root, "workspaceStorage"), extensionStorage: join(root, "storage"), helperScript: join(root, "helper.js") } as CursorPaths,
+      configuration: { useDefaultIgnoredSettings: true, ignoredSettings: [], ignoredExtensions: [], ignoredUserFiles: [], ignoredUiStateKeys: [], effectiveIgnoredWorkspaces: [], workspaceMappings: {}, syncChat: false, syncWorkspaceStorage: false, maxPayloadBytes: 1024 * 1024, gitSync: false } as unknown as ExtensionConfiguration,
+    });
+    const internals = manager as unknown as { createAdapters(): ResourceAdapter[]; helperSyncOptions(): HelperRequest["syncOptions"] };
+    const adapters = internals.createAdapters();
+    try {
+      const settings = adapters.find((adapter) => adapter.id === "settings")!;
+      expect((await settings.scan({})).snapshots.map((snapshot) => snapshot.resourceId)).toEqual(["settings/default/remote.SSH.defaultExtensions"]);
+      const options = internals.helperSyncOptions();
+      expect(options.machineScopedSettings).toEqual(DEFAULT_IGNORED_SETTINGS);
+      expect(options.settingsPolicy).toEqual({ machineScopedSettings: [], defaultIgnoredSettings: DEFAULT_IGNORED_SETTINGS });
+    } finally {
+      await Promise.all(adapters.map(async (adapter) => { await adapter.dispose?.(); }));
+      manager.dispose();
+    }
+  });
 });
 
 describe("conflict command graph refresh", () => {

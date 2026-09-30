@@ -81,6 +81,7 @@ import {
 } from "../chat/workspace";
 import {
   SettingsAdapter,
+  createMachineSettingsIgnoreMatcher,
   createSettingsIgnoreMatcher,
 } from "../resources/settings";
 import {
@@ -1080,7 +1081,12 @@ async function exportFinalChanges(
     new SettingsAdapter(
       request.paths,
       createSettingsIgnoreMatcher(request.syncOptions.ignoredSettings),
-      createSettingsIgnoreMatcher(request.syncOptions.machineScopedSettings),
+      request.syncOptions.settingsPolicy === undefined
+        ? createSettingsIgnoreMatcher(request.syncOptions.machineScopedSettings)
+        : createMachineSettingsIgnoreMatcher(
+          request.syncOptions.settingsPolicy.machineScopedSettings,
+          request.syncOptions.settingsPolicy.defaultIgnoredSettings,
+        ),
     ),
     new ProfileFilesAdapter(request.paths, {
       forceVerificationResourceIds: forceTargetVerificationResourceIds,

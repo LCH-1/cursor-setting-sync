@@ -460,6 +460,8 @@ export interface DiagnosticSnapshot {
   effectiveConfiguration: DiagnosticConfiguration;
   /** The built-in machine-specific keys in force, empty when opted out. */
   defaultIgnoredSettings: string[];
+  /** Portable preferences excepted only from the built-in patterns. */
+  defaultIgnoredSettingsExceptions?: string[];
   /** Everything excluded as machine-specific, defaults and extensions merged. */
   machineScopedSettings: string[];
   gitMode: "off" | "enabled" | "degraded";

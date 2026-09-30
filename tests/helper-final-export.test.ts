@@ -49,6 +49,7 @@ import type {
 } from "../src/chat/stateVscdb";
 import type { PortableStoreSnapshot } from "../src/chat/storeDb";
 import type { ResourceSnapshot } from "../src/types";
+import { DEFAULT_IGNORED_SETTINGS } from "../src/resources/settings";
 
 const PASSPHRASE = "a sufficiently long final export passphrase";
 const MAX_PAYLOAD_BYTES = 1024 * 1024;
@@ -60,6 +61,27 @@ afterEach(async () => {
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
+});
+
+describe("the helper's portable SSH settings export", () => {
+  it.each([true, false])("keeps defaultExtensions portable without changing legacy requests (separate policy=%s)", async (separatePolicy) => {
+    const fixture = await createFixture();
+    fixture.database.close();
+    fixture.request.syncOptions.syncChat = false;
+    fixture.request.syncOptions.machineScopedSettings = [...DEFAULT_IGNORED_SETTINGS];
+    if (separatePolicy) {
+      fixture.request.syncOptions.settingsPolicy = { machineScopedSettings: [], defaultIgnoredSettings: [...DEFAULT_IGNORED_SETTINGS] };
+    }
+    await writeFile(join(fixture.request.paths.userDataRoot, "settings.json"), JSON.stringify({
+      "remote.SSH.defaultExtensions": ["ms-python.python"],
+      "remote.SSH.configFile": "local-config",
+    }));
+    const outcome = await helperMainTesting.exportFinalChanges(fixture.request, fixture.repository);
+    expect(outcome.warnings).toEqual([]);
+    const eventChanges = (await fixture.repository.listEvents()).flatMap((event) => event.manifest.changes);
+    expect(eventChanges.some((change) => change.resourceId === "settings/default/remote.SSH.defaultExtensions")).toBe(separatePolicy);
+    expect(eventChanges.some((change) => change.resourceId === "settings/default/remote.SSH.configFile")).toBe(false);
+  });
 });
 
 describe("the helper's bounded final chat export", () => {

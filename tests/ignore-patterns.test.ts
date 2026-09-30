@@ -12,7 +12,7 @@ import { normalizeIgnoredUiStateKeys } from "../src/resources/uiStatePolicy";
 import {
   DEFAULT_IGNORED_SETTINGS,
   SettingsAdapter,
-  createSettingsIgnoreMatcher,
+  createDefaultSettingsIgnoreMatcher,
 } from "../src/resources/settings";
 import { createExtensionIgnoreMatcher } from "../src/resources/extensions";
 import { standingWarningDiagnostics } from "../src/sync/warningLog";
@@ -173,7 +173,7 @@ describe("ignore matchers wired into the adapters", () => {
 });
 
 describe("default machine-specific settings", () => {
-  const matcher = createSettingsIgnoreMatcher([...DEFAULT_IGNORED_SETTINGS]);
+  const matcher = createDefaultSettingsIgnoreMatcher([...DEFAULT_IGNORED_SETTINGS]);
 
   it("excludes the workbench-registered keys extension scanning cannot see", () => {
     for (const key of [
@@ -208,6 +208,7 @@ describe("default machine-specific settings", () => {
       "terminal.integrated.env.linux",
       "files.simpleDialog.enable",
       "python.venvPath",
+      "remote.SSH.defaultExtensions",
     ]) {
       expect(matcher.matches(key)).toBe(false);
     }
@@ -244,8 +245,8 @@ describe("settings keys the built-in defaults took over", () => {
     const adapter = new SettingsAdapter(
       { userDataRoot: root, profilesRoot: join(root, "profiles") } as CursorPaths,
       EMPTY_IGNORE_MATCHER,
-      createSettingsIgnoreMatcher([...DEFAULT_IGNORED_SETTINGS]),
-      createSettingsIgnoreMatcher([...DEFAULT_IGNORED_SETTINGS]),
+      createDefaultSettingsIgnoreMatcher([...DEFAULT_IGNORED_SETTINGS]),
+      createDefaultSettingsIgnoreMatcher([...DEFAULT_IGNORED_SETTINGS]),
     );
     const result = await adapter.scan(known);
     // A key the built-in defaults took over is a deliberate exclusion, not a

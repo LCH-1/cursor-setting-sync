@@ -108,6 +108,35 @@ export const DEFAULT_IGNORED_SETTINGS: readonly string[] = [
   "window.zoomPerWindow",
 ];
 
+export const DEFAULT_IGNORED_SETTINGS_EXCEPTIONS: readonly string[] = [
+  "remote.SSH.defaultExtensions",
+];
+
+export function createDefaultSettingsIgnoreMatcher(
+  entries: readonly string[],
+): IgnoreMatcher {
+  const matcher = createIgnoreMatcher(entries);
+  const exceptions = new Set(DEFAULT_IGNORED_SETTINGS_EXCEPTIONS);
+  return {
+    patterns: matcher.patterns,
+    matches: (value) => !exceptions.has(value) && matcher.matches(value),
+    unmatched: (candidates) =>
+      matcher.unmatched([...candidates].filter((value) => !exceptions.has(value))),
+  };
+}
+
+export function createMachineSettingsIgnoreMatcher(
+  machineScopedSettings: readonly string[],
+  defaultIgnoredSettings: readonly string[],
+): IgnoreMatcher {
+  // Only our defaults yield to portable preferences. User exclusions and
+  // extension-declared machine scope must still protect their values.
+  return combineIgnoreMatchers(
+    createSettingsIgnoreMatcher(machineScopedSettings),
+    createDefaultSettingsIgnoreMatcher(defaultIgnoredSettings),
+  );
+}
+
 /** Ignore-list flavour shared by settings keys and extension identifiers. */
 export function createSettingsIgnoreMatcher(
   entries: readonly string[],

@@ -117,8 +117,11 @@ import {
 } from "../resources/resource";
 import {
   DEFAULT_IGNORED_SETTINGS,
+  DEFAULT_IGNORED_SETTINGS_EXCEPTIONS,
   SettingsAdapter,
   collectMachineScopedSettings,
+  createDefaultSettingsIgnoreMatcher,
+  createMachineSettingsIgnoreMatcher,
   createSettingsIgnoreMatcher,
 } from "../resources/settings";
 import { ProfileFilesAdapter } from "../resources/profileFiles";
@@ -4702,6 +4705,9 @@ export class SyncManager implements vscode.Disposable {
       defaultIgnoredSettings: this.configuration.useDefaultIgnoredSettings
         ? [...DEFAULT_IGNORED_SETTINGS]
         : [],
+      defaultIgnoredSettingsExceptions: this.configuration.useDefaultIgnoredSettings
+        ? [...DEFAULT_IGNORED_SETTINGS_EXCEPTIONS]
+        : [],
       machineScopedSettings: this.machineSpecificSettingPatterns().sort(
         (left, right) => left.localeCompare(right),
       ),
@@ -7125,15 +7131,19 @@ export class SyncManager implements vscode.Disposable {
    * scan can ever see them.
    */
   machineSpecificSettingPatterns(): string[] {
-    const packageJson: unknown[] = vscode.extensions.all.map(
-      (extension): unknown => extension.packageJSON as unknown,
-    );
     return [
       ...(this.configuration.useDefaultIgnoredSettings
         ? DEFAULT_IGNORED_SETTINGS
         : []),
-      ...collectMachineScopedSettings(packageJson),
+      ...this.extensionMachineScopedSettingPatterns(),
     ];
+  }
+
+  private extensionMachineScopedSettingPatterns(): string[] {
+    const packageJson: unknown[] = vscode.extensions.all.map(
+      (extension): unknown => extension.packageJSON as unknown,
+    );
+    return [...collectMachineScopedSettings(packageJson)];
   }
 
   private createAdapters(): ResourceAdapter[] {
@@ -7141,8 +7151,13 @@ export class SyncManager implements vscode.Disposable {
       new SettingsAdapter(
         this.paths,
         createSettingsIgnoreMatcher(this.configuration.ignoredSettings),
-        createSettingsIgnoreMatcher(this.machineSpecificSettingPatterns()),
-        createSettingsIgnoreMatcher(
+        createMachineSettingsIgnoreMatcher(
+          this.extensionMachineScopedSettingPatterns(),
+          this.configuration.useDefaultIgnoredSettings
+            ? DEFAULT_IGNORED_SETTINGS
+            : [],
+        ),
+        createDefaultSettingsIgnoreMatcher(
           this.configuration.useDefaultIgnoredSettings
             ? [...DEFAULT_IGNORED_SETTINGS]
             : [],
@@ -7758,9 +7773,15 @@ export class SyncManager implements vscode.Disposable {
       // path that scans workspaceStorage, so it has to see the built-in
       // local-workspace exclusion too or the two halves disagree.
       ignoredWorkspaces: this.configuration.effectiveIgnoredWorkspaces,
-      // Already includes the built-in defaults, so the helper applies exactly
-      // the same exclusions the extension host does.
+      // Keep the combined list for older helpers; new helpers use the separate
+      // sources below so portable exceptions never weaken machine scope.
       machineScopedSettings: this.machineSpecificSettingPatterns(),
+      settingsPolicy: {
+        machineScopedSettings: this.extensionMachineScopedSettingPatterns(),
+        defaultIgnoredSettings: this.configuration.useDefaultIgnoredSettings
+          ? [...DEFAULT_IGNORED_SETTINGS]
+          : [],
+      },
       syncChat: this.configuration.syncChat,
       syncWorkspaceStorage: this.configuration.syncWorkspaceStorage,
       applyOnShutdown: this.configuration.applyOnShutdown,

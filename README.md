@@ -201,6 +201,8 @@ Keys that VS Code's own Settings Sync propagates between machines are deliberate
 
 Settings that an installed extension declares as `machine` or `machine-overridable` scope are excluded on top of this list.
 
+`remote.SSH.defaultExtensions` is an exception to the built-in `remote.SSH.*` pattern: it is the shared preference for extensions automatically installed on SSH hosts. Removing an ID from this list now synchronizes to other PCs, so their next SSH connection uses the updated list. Explicit entries in `ignoredSettings` or `settingsSync.ignoredSettings` still take precedence. Remote extension uninstall alone does not edit this automatic-install preference or uninstall extensions already present on a server.
+
 If a key on this list had already synchronized from this PC before the list started covering it, the output channel names it, and `Show Diagnostics` keeps the same notice under the standing warnings — so a key that stops travelling after an upgrade is never silent.
 
 ### UI state is not synchronized

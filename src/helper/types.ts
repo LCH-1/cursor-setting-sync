@@ -56,6 +56,11 @@ export interface HelperRequest {
      */
     ignoredWorkspaces?: string[];
     machineScopedSettings: string[];
+    /** Separate sources; the legacy combined list above protects older helpers. */
+    settingsPolicy?: {
+      machineScopedSettings: string[];
+      defaultIgnoredSettings: string[];
+    };
     /**
      * Whether the shutdown finalizer writes the queue as well as exporting it.
      *

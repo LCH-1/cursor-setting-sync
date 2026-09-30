@@ -2,7 +2,7 @@
   "name": "cursor-setting-sync",
   "displayName": "Cursor Setting Sync",
   "description": "Securely synchronize Cursor settings, workspace state, profiles, extensions, user files, and chat data across devices.",
-  "version": "1.0.16",
+  "version": "1.0.17",
   "publisher": "lch",
   "icon": "icon.png",
   "license": "MIT",
@@ -115,7 +115,7 @@
         "cursorSettingSync.useDefaultIgnoredSettings": {
           "type": "boolean",
           "default": true,
-          "description": "Exclude a built-in list of machine-specific settings (window.zoomLevel, terminal.integrated.defaultProfile.*, terminal.integrated.shell*, git.path, http.proxy*, remote.SSH.*, and similar) that describe this computer rather than a preference. Keys VS Code Settings Sync itself propagates, such as terminal.integrated.profiles.*, are not on the list. Turn this off to synchronize them anyway."
+          "description": "Exclude a built-in list of machine-specific settings (window.zoomLevel, terminal.integrated.defaultProfile.*, terminal.integrated.shell*, git.path, http.proxy*, remote.SSH.*, and similar) that describe this computer rather than a preference. remote.SSH.defaultExtensions is a portable exception, so automatic-install list changes travel between PCs. Keys VS Code Settings Sync itself propagates, such as terminal.integrated.profiles.*, are not on the list. Turn this off to synchronize the machine-specific values too."
         },
         "cursorSettingSync.ignoredExtensions": {
           "type": "array",
