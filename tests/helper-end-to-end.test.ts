@@ -161,7 +161,8 @@ describeBuilt("the offline helper, end to end", () => {
     await f.repository.publish([{ resourceId: `chat/${COMPOSER}`, kind: "chat", content,
       semanticHash: sha256(content), metadata: chunkedChatMetadata(manifest) }, {
       resourceId: `chat/${siblingId}`, kind: "chat", content: siblingContent, semanticHash: sha256(siblingContent),
-      metadata: { chatSnapshotSchemaVersion: 2, agentKvMissingCount: 0, chatCoreHash: portableChatCoreHash(sibling) },
+      metadata: { chatSnapshotSchemaVersion: 2, agentKvBlobCount: 0, agentKvReferencedCount: 0,
+        agentKvMissingCount: 0, chatCoreHash: portableChatCoreHash(sibling) },
     }], []);
     new EventReconciler().reconcile(await f.repository.listEvents(), f.repository.state, null);
     f.request.changes = [COMPOSER, siblingId].map(id => ({ ...f.repository.state.tips[`chat/${id}`]![0]!, resourceId: `chat/${id}` }));
