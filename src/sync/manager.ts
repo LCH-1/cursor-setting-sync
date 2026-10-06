@@ -432,13 +432,14 @@ export function backgroundGitPullDue(
 export interface AdapterScanIndex {
   snapshots: Map<string, ResourceSnapshot>;
   deletions: Map<string, ResourceDeletion>;
+  verifiedUnchangedHashes?: ReadonlyMap<string, string>;
   complete: boolean;
   deferredResourceIds: Set<string>;
 }
 
 export type SyntheticApplyDecision =
   | { action: "apply" }
-  | { action: "already-applied"; live: ResourceSnapshot }
+  | { action: "already-applied"; live?: ResourceSnapshot }
   | { action: "drift" };
 
 interface PendingWorkspaceMappingChoice {
@@ -6363,6 +6364,9 @@ export class SyncManager implements vscode.Disposable {
           this.configuration.maxPayloadBytes,
         ) ?? [];
         scanned = {
+          verifiedUnchangedHashes: new Map(
+            (status?.verifiedUnchangedResources ?? []).map((item) => [item.resourceId, item.semanticHash]),
+          ),
           snapshots: new Map(
             result.snapshots.map((snapshot) => [snapshot.resourceId, snapshot]),
           ),
@@ -8597,6 +8601,9 @@ export async function scanAdapters(
       }
       deletions.push(...safeDeletions);
       adapterIndexes.set(adapter.id, {
+        verifiedUnchangedHashes: new Map(
+          (status?.verifiedUnchangedResources ?? []).map((item) => [item.resourceId, item.semanticHash]),
+        ),
         snapshots: new Map(
           retainedForAdapter.map((snapshot) => [snapshot.resourceId, snapshot]),
         ),
@@ -10178,6 +10185,15 @@ export function syntheticApplyDecision(
 ): SyntheticApplyDecision {
   if (scanned === null) {
     return { action: "drift" };
+  }
+  const verifiedHash = scanned.verifiedUnchangedHashes?.get(resourceId);
+  if (verifiedHash !== undefined) {
+    if (verifiedHash === tip.semanticHash) {
+      return { action: "already-applied" };
+    }
+    return verifiedHash === known?.semanticHash
+      ? { action: "apply" }
+      : { action: "drift" };
   }
   const live = scanned.snapshots.get(resourceId);
   if (live !== undefined) {

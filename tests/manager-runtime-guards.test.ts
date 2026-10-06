@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as sqlite from "node:sqlite";
@@ -77,7 +77,9 @@ import { EventReconciler } from "../src/protocol/reconciler";
 import { SyncRepository } from "../src/protocol/repository";
 import type { ResourceAdapter } from "../src/resources/resource";
 import type { HelperRequest } from "../src/helper/types";
-import { DEFAULT_IGNORED_SETTINGS } from "../src/resources/settings";
+import { DEFAULT_IGNORED_SETTINGS, SettingsAdapter } from "../src/resources/settings";
+import { EMPTY_IGNORE_MATCHER } from "../src/resources/ignorePatterns";
+import { serializeCanonical } from "../src/resources/jsonc";
 import type {
   CompatibilityReport,
   LocalProjection,
@@ -1202,6 +1204,60 @@ describe("workspace mapping and chat continuation blocks", () => {
 });
 
 describe("running ordinary apply drift guard", () => {
+  it.each([false, true])("settles an unchanged synthetic setting without overwriting edits (edited: %s)", async (edited) => {
+    const root = await mkdtemp(join(tmpdir(), "cursor-unchanged-setting-"));
+    temporaryRoots.push(root);
+    const settingsPath = join(root, "settings.json");
+    const key = "remote.SSH.defaultExtensions";
+    const value = ["ms-python.python"];
+    await writeFile(settingsPath, JSON.stringify({ [key]: value }));
+    const adapter = new SettingsAdapter(
+      { userDataRoot: root, profilesRoot: join(root, "profiles") } as CursorPaths,
+      EMPTY_IGNORE_MATCHER,
+      EMPTY_IGNORE_MATCHER,
+    );
+    const apply = vi.spyOn(adapter, "apply");
+    const fixture = await createSyncHarness(adapter);
+    const content = serializeCanonical(value);
+    const resourceId = `settings/default/${key}`;
+    await fixture.repository.publish([{
+      resourceId,
+      kind: "settings",
+      content,
+      semanticHash: sha256(content),
+      metadata: { profileId: "default", key, syncOrigin: "conflict-resolution" },
+    }], []);
+    await reconcileAndPersist(fixture.repository);
+    const tip = fixture.repository.state.tips[resourceId]![0]!;
+    fixture.repository.state.projections[resourceId] = {
+      resourceId,
+      kind: "settings",
+      semanticHash: tip.semanticHash,
+      versionId: "previous-version#0",
+    };
+    fixture.repository.state.pendingDatabaseChanges.push({
+      resourceId,
+      kind: "settings",
+      eventHash: tip.eventHash,
+      changeIndex: tip.changeIndex,
+    });
+    if (edited) {
+      await writeFile(settingsPath, JSON.stringify({ [key]: [...value, "ms-python.pylint"] }));
+    }
+    const original = await readFile(settingsPath, "utf8");
+    const internals = fixture.manager as unknown as {
+      applyPendingRunningResources(repository: SyncRepository): Promise<void>;
+    };
+    await internals.applyPendingRunningResources(fixture.repository);
+    expect(apply).not.toHaveBeenCalled();
+    expect(await readFile(settingsPath, "utf8")).toBe(original);
+    expect(fixture.repository.state.pendingDatabaseChanges).toHaveLength(edited ? 1 : 0);
+    expect(fixture.repository.state.projections[resourceId]?.versionId).toBe(
+      edited ? "previous-version#0" : tip.versionId,
+    );
+    fixture.manager.dispose();
+  });
+
   it("preflights oversized live payloads, keeps their block stable, and applies a small sibling", async () => {
     const apply = vi.fn(async () => undefined);
     const adapter: ResourceAdapter = {

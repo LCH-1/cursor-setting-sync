@@ -2378,10 +2378,10 @@ describeWithBackup("offline database helper", () => {
     }
   });
 
-  it("defers blob-only enrichment before reading an over-limit local chat body", async () => {
+  it("adds verified enrichment blobs without reading an over-limit local chat body", async () => {
     const fixture = await createFixture({ maxPayloadBytes: 1024 });
     const composerId = "32323232-3232-4232-8232-323232323232";
-    const recoveredBlob = Buffer.from("must remain unapplied", "utf8");
+    const recoveredBlob = Buffer.from("verified recovered blob", "utf8");
     const recoveredKey = `agentKv:blob:${sha256(recoveredBlob)}`;
     const seed = new DatabaseSync(fixture.databasePath);
     insertTestHeader(seed, composerId, "local-header", 1);
@@ -2401,10 +2401,8 @@ describeWithBackup("offline database helper", () => {
       ),
     ]);
 
-    expect(result.applied).toEqual([]);
-    expect(result.skipped.join("\n")).toContain(
-      "Chat enrichment deferred: the local conversation exceeds the bounded 1024-byte inspection limit",
-    );
+    expect(result.applied).toEqual([`chat/${composerId}`]);
+    expect(result.localChatCoreHashes[`chat/${composerId}`]).toBeNull();
     const database = new DatabaseSync(fixture.databasePath, { readOnly: true });
     try {
       expect(
@@ -2415,7 +2413,8 @@ describeWithBackup("offline database helper", () => {
           )
           .get(`bubbleId:${composerId}:oversized`),
       ).toEqual({ valueType: "blob", valueBytes: 4096 });
-      expect(readKv(database, recoveredKey)).toBeUndefined();
+      expect(readKv(database, recoveredKey)).toBe(recoveredBlob.toString("utf8"));
+      expect(readKv(database, `composerData:${composerId}`)).toBe("{}");
     } finally {
       database.close();
     }

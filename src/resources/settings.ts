@@ -211,6 +211,7 @@ export class SettingsAdapter implements ResourceAdapter {
     let observedKeysComplete = true;
     const silencedByDefaults = new Set<string>();
     const deferred = new Set<string>();
+    const verifiedUnchangedResources: { resourceId: string; semanticHash: string }[] = [];
     const now = (this.options.now ?? Date.now)();
     if (
       !this.profileEnumerationActive &&
@@ -354,6 +355,7 @@ export class SettingsAdapter implements ResourceAdapter {
             )
           ) {
             this.oversized.delete(resourceId);
+            verifiedUnchangedResources.push({ resourceId, semanticHash: valueSemanticHash });
             continue;
           }
           if (materialized >= maxResources) {
@@ -442,6 +444,7 @@ export class SettingsAdapter implements ResourceAdapter {
 
     this.lastScanStatus = {
       complete: deferred.size === 0,
+      ...(verifiedUnchangedResources.length === 0 ? {} : { verifiedUnchangedResources }),
       deferredResourceIds: [...deferred].sort((left, right) =>
         left.localeCompare(right),
       ),

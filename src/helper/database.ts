@@ -1962,6 +1962,11 @@ function readSyntheticApplyLocalChat(
     return result.snapshot;
   }
   if (result.limitReached) {
+    if (recipe === "Chat enrichment") {
+      // Blob-only enrichment preserves every core row; an unobserved core
+      // cannot supply a shortcut hash, but must not block verified blob inserts.
+      return null;
+    }
     throw new Error(
       `${recipe} deferred: the local conversation exceeds the bounded ` +
         `${limit}-byte inspection limit; no database rows were changed.`,

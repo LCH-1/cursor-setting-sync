@@ -30,6 +30,10 @@ export interface OversizedSnapshotSettlement {
 export interface ResourceScanStatus {
   complete: boolean;
   deferredResourceIds: readonly string[];
+  verifiedUnchangedResources?: readonly {
+    resourceId: string;
+    semanticHash: string;
+  }[];
   /** Full enumeration finished; every remaining failure has an exact ID. */
   deferredResourceIdsExhaustive?: boolean;
   /** Exact deletions proved by a complete scope within an unfinished scan. */
