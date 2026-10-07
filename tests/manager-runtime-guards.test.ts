@@ -1204,6 +1204,39 @@ describe("workspace mapping and chat continuation blocks", () => {
 });
 
 describe("running ordinary apply drift guard", () => {
+  it.each([false, true])("rechecks an old version block without clearing an apply failure (failed: %s)", async (failed) => {
+    const apply = vi.fn(async () => undefined);
+    const adapter: ResourceAdapter = {
+      id: "offline-extension",
+      kinds: ["extension"],
+      appliesWhileRunning: false,
+      scan: async () => ({ snapshots: [], deletions: [], warnings: [] }),
+      apply,
+    };
+    const fixture = await createSyncHarness(adapter);
+    const content = Buffer.from("{}");
+    const resourceId = "extension/default/example.test";
+    await fixture.repository.publish([{
+      resourceId, kind: "extension", content, semanticHash: sha256(content),
+    }], []);
+    await reconcileAndPersist(fixture.repository);
+    const tip = fixture.repository.state.tips[resourceId]![0]!;
+    const blockedReason = failed
+      ? `${APPLY_FAILURE_BLOCK_PREFIX}: installation failed`
+      : "Created by newer extension 0.0.63; update the local installation from 0.0.62 before applying it.";
+    fixture.repository.state.pendingDatabaseChanges.push({
+      resourceId, kind: "extension", eventHash: tip.eventHash, changeIndex: tip.changeIndex, blockedReason,
+    });
+    const internals = fixture.manager as unknown as {
+      applyPendingRunningResources(repository: SyncRepository): Promise<void>;
+    };
+    await internals.applyPendingRunningResources(fixture.repository);
+    expect(apply).not.toHaveBeenCalled();
+    expect(fixture.repository.state.pendingDatabaseChanges).toHaveLength(1);
+    expect(fixture.repository.state.pendingDatabaseChanges[0]?.blockedReason).toBe(failed ? blockedReason : undefined);
+    fixture.manager.dispose();
+  });
+
   it.each([false, true])("settles an unchanged synthetic setting without overwriting edits (edited: %s)", async (edited) => {
     const root = await mkdtemp(join(tmpdir(), "cursor-unchanged-setting-"));
     temporaryRoots.push(root);

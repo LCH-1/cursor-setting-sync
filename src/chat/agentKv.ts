@@ -780,6 +780,8 @@ const conversationStateFields: { [fieldNumber: number]: SchemaFieldRule } = {
   36: lengthField(),
   // Cursor 3.18: message_count_at_last_compaction is a uint32, not a blob edge.
   37: varintField(),
+  38: lengthField(undefined, { repeated: true }),
+  39: varintField(),
 };
 
 const selectedContextFields = opaqueLengthFields([
@@ -857,6 +859,8 @@ const AGENT_KV_SCHEMAS: Readonly<Record<AgentKvSchemaName, AgentKvSchema>> = {
       4: lengthField(),
       5: varintField(),
       6: varintField(true),
+      9: lengthField(undefined, { repeated: true }),
+      10: lengthField(),
     },
   },
   "shell-turn": {

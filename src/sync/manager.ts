@@ -6414,6 +6414,9 @@ export class SyncManager implements vscode.Disposable {
         item.blockedReason = blockedReason;
         continue;
       }
+      if (item.blockedReason?.startsWith("Created by newer ")) {
+        queuePending(repository, { resourceId: item.resourceId, tip, changed: true });
+      }
       const adapter = this.adapterFor(tip.kind);
       if (!adapter.appliesWhileRunning) {
         continue;

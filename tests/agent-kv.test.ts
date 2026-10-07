@@ -572,7 +572,53 @@ describe("agentKv conversation graph", () => {
     expect(lookup).toHaveBeenCalledTimes(materialized.length);
   });
 
-  it.each([37, 38])("refuses non-scalar or unknown conversation field %i", (field) => {
+  it("walks Cursor 3.23 turns without treating message IDs or tool names as blob references", async () => {
+    const user = bytesField(1, Buffer.from("retained user message"));
+    const userId = sha256(user);
+    const ignoredId = Buffer.alloc(32, 0x7a);
+    const turn = bytesField(1, Buffer.concat([
+      bytesField(1, Buffer.from(userId, "hex")),
+      bytesField(9, ignoredId),
+      bytesField(9, Buffer.from("read_file")),
+      bytesField(10, ignoredId),
+    ]));
+    const turnId = sha256(turn);
+    const lookup = vi.fn(lookupFrom(new Map([
+      [key(turnId), { status: "found", key: key(turnId), bytes: turn }],
+      [key(userId), { status: "found", key: key(userId), bytes: user }],
+    ])));
+    const result = await walkAgentKvReachability(state(Buffer.concat([
+      bytesField(8, Buffer.from(turnId, "hex")),
+      bytesField(38, ignoredId),
+      bytesField(38, Buffer.from("recent-message")),
+      varint(39n * 8n),
+      varint(2n),
+    ])), lookup);
+
+    expect(result.complete).toBe(true);
+    expect(result.limitReasons).toEqual([]);
+    expect(result.blobs.map(({ id }) => id).sort()).toEqual([turnId, userId].sort());
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([9, 10])("refuses a non-string Cursor 3.23 agent-turn field %i", async (field) => {
+    const turn = bytesField(1, Buffer.concat([varint(BigInt(field) * 8n), varint(1n)]));
+    const turnId = sha256(turn);
+    const result = await walkAgentKvReachability(
+      state(bytesField(8, Buffer.from(turnId, "hex"))),
+      lookupFrom(new Map([[key(turnId), { status: "found", key: key(turnId), bytes: turn }]])),
+    );
+    expect(result.complete).toBe(false);
+    expect(result.limitReasons).toEqual(["schema"]);
+  });
+
+  it("refuses a non-string recent message ID field", () => {
+    const result = extractAgentKvRootIds(state(Buffer.concat([varint(38n * 8n), varint(1n)])));
+    expect(result.complete).toBe(false);
+    expect(result.limitReasons).toEqual(["schema"]);
+  });
+
+  it.each([37, 39, 41])("refuses non-scalar or unknown conversation field %i", (field) => {
     const result = extractAgentKvRootIds(state(bytesField(field, Buffer.alloc(32))));
 
     expect(result.complete).toBe(false);
