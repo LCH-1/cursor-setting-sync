@@ -244,6 +244,38 @@ Shared-folder status only confirms a local file write. Always wait for OneDrive 
 
 See [usage](docs/usage.md), [protocol](docs/protocol.md), [security](docs/security.md), and [compatibility](docs/compatibility.md) for technical details.
 
+## Cursor update monitoring
+
+The `Cursor schema watch` GitHub workflow checks the official `stable` and `latest`
+download feeds every six hours, on relevant pull requests/pushes, and on manual
+dispatch. It extracts only the public application's product metadata and bundled
+protobuf descriptors without launching Cursor or opening user databases. Identical
+releases in the two feeds share a download within one run. These feed names are
+the download API's tracks; `latest` is not a guarantee of a distinct Nightly build.
+
+The inspector compares field numbers, names, scalar types, message/enum targets,
+maps, cardinality, and oneof membership against the checked-in inventory. It also
+checks the continuation parser's actual rules independently of that inventory.
+New/changed/removed fields, unsupported parser fields, or failed extraction fail
+the job. The job summary and `cursor-schema-reports` artifact contain details;
+downloads themselves and user chat data are not uploaded. GitHub Actions failure
+notifications follow the repository/account's notification settings.
+
+Run `node scripts/cursor-schema-watch.mjs` on Linux with `unsquashfs`, or inspect an
+existing installation on any platform:
+
+```powershell
+node scripts/cursor-schema-watch.mjs --app-root "$env:LOCALAPPDATA/Programs/cursor/resources/app"
+```
+
+Reports are written under `tmp/cursor-schema-watch`. To capture an inventory after
+reviewing a new installation, add `--write-baseline`; this explicit operation does
+not approve compatibility or suppress unsupported-field findings. A matching
+inventory is not proof of database integrity or successful backup/restore. Public
+release timing and GitHub schedule delays mean detection cannot guarantee a patch
+before every PC updates. The workflow never changes user settings, relaxes the
+parser, or automatically publishes an extension.
+
 ## License
 
 [MIT](LICENSE)

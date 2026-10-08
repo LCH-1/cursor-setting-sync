@@ -1,0 +1,63 @@
+name: Cursor schema watch
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/cursor-schema-watch.yml"
+      - "scripts/cursor-schema-*"
+      - "src/monitor/**"
+      - "src/chat/agentKv.ts"
+      - "tests/cursor-schema-watch.test.ts"
+  pull_request:
+    paths:
+      - ".github/workflows/cursor-schema-watch.yml"
+      - "scripts/cursor-schema-*"
+      - "src/monitor/**"
+      - "src/chat/agentKv.ts"
+      - "tests/cursor-schema-watch.test.ts"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cursor-schema-watch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  inspect:
+    name: Inspect official stable and latest Cursor
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REQUIRE_SQLITE_BACKUP: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Verify schema inspector regression tests
+        run: |
+          npm run check
+          npx vitest run --dir tests tests/cursor-schema-watch.test.ts tests/agent-kv.test.ts tests/compatibility.test.ts tests/chat-continuation-closure.test.ts
+      - name: Install archive inspection tool
+        run: sudo apt-get update && sudo apt-get install -y squashfs-tools
+      - name: Inspect official releases without running Cursor
+        run: node scripts/cursor-schema-watch.mjs --track stable --track latest
+      - name: Preserve actionable inspection reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cursor-schema-reports
+          path: |
+            tmp/cursor-schema-watch/stable/*.json
+            tmp/cursor-schema-watch/stable/*.md
+            tmp/cursor-schema-watch/latest/*.json
+            tmp/cursor-schema-watch/latest/*.md
+          if-no-files-found: warn
+          retention-days: 30

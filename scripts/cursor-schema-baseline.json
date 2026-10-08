@@ -1,0 +1,1869 @@
+{
+  "formatVersion": 1,
+  "messages": {
+    "agent.v1.ConversationStateStructure": [
+      {
+        "kind": "scalar",
+        "name": "root_prompt_messages_json",
+        "no": 1,
+        "repeated": true,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "todos",
+        "no": 3,
+        "repeated": true,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "pending_tool_calls",
+        "no": 4,
+        "repeated": true,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "token_details",
+        "no": 5,
+        "T": "agent.v1.ConversationTokenDetails"
+      },
+      {
+        "kind": "scalar",
+        "name": "summary",
+        "no": 6,
+        "opt": true,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "plan",
+        "no": 7,
+        "opt": true,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "turns",
+        "no": 8,
+        "repeated": true,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "previous_workspace_uris",
+        "no": 9,
+        "repeated": true,
+        "T": 9
+      },
+      {
+        "kind": "enum",
+        "name": "mode",
+        "no": 10,
+        "opt": true,
+        "T": "agent.v1.AgentMode"
+      },
+      {
+        "kind": "scalar",
+        "name": "summary_archive",
+        "no": 11,
+        "opt": true,
+        "T": 12
+      },
+      {
+        "K": 9,
+        "kind": "map",
+        "name": "file_states",
+        "no": 12,
+        "V": {
+          "kind": "scalar",
+          "T": 12
+        }
+      },
+      {
+        "kind": "scalar",
+        "name": "summary_archives",
+        "no": 13,
+        "repeated": true,
+        "T": 12
+      },
+      {
+        "kind": "message",
+        "name": "turn_timings",
+        "no": 14,
+        "repeated": true,
+        "T": "agent.v1.StepTiming"
+      },
+      {
+        "K": 9,
+        "kind": "map",
+        "name": "file_states_v2",
+        "no": 15,
+        "V": {
+          "kind": "message",
+          "T": "agent.v1.FileStateStructure"
+        }
+      },
+      {
+        "K": 9,
+        "kind": "map",
+        "name": "subagent_states",
+        "no": 16,
+        "V": {
+          "kind": "message",
+          "T": "agent.v1.SubagentPersistedState"
+        }
+      },
+      {
+        "kind": "scalar",
+        "name": "self_summary_count",
+        "no": 17,
+        "T": 13
+      },
+      {
+        "kind": "scalar",
+        "name": "read_paths",
+        "no": 18,
+        "repeated": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "active_branch_name",
+        "no": 19,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "K": 9,
+        "kind": "map",
+        "name": "plans",
+        "no": 20,
+        "V": {
+          "kind": "message",
+          "T": "agent.v1.PlanRegistryEntry"
+        }
+      },
+      {
+        "kind": "message",
+        "name": "tracked_git_repo_branches",
+        "no": 21,
+        "repeated": true,
+        "T": "agent.v1.TrackedGitRepo"
+      },
+      {
+        "kind": "scalar",
+        "name": "agent_type",
+        "no": 22,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "communicate_update_history",
+        "no": 23,
+        "repeated": true,
+        "T": "agent.v1.CommunicateUpdateHistoryEntry"
+      },
+      {
+        "K": 9,
+        "kind": "map",
+        "name": "subagent_threads",
+        "no": 24,
+        "V": {
+          "kind": "scalar",
+          "T": 9
+        }
+      },
+      {
+        "kind": "scalar",
+        "name": "communicate_update_final_summary",
+        "no": 25,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "conversation_started_timestamp_ms",
+        "no": 26,
+        "opt": true,
+        "T": 4
+      },
+      {
+        "kind": "scalar",
+        "name": "conversation_started_time_zone",
+        "no": 27,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "communicate_update_completed_subtitle",
+        "no": 28,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "K": 9,
+        "kind": "map",
+        "name": "communicate_update_states_by_parent_tool_call_id",
+        "no": 29,
+        "V": {
+          "kind": "message",
+          "T": "agent.v1.CommunicateUpdateTurnState"
+        }
+      },
+      {
+        "K": 9,
+        "kind": "map",
+        "name": "subagent_runs_by_parent_tool_call_id",
+        "no": 30,
+        "V": {
+          "kind": "message",
+          "T": "agent.v1.SubagentRunState"
+        }
+      },
+      {
+        "K": 9,
+        "kind": "map",
+        "name": "subagent_state_refs",
+        "no": 31,
+        "V": {
+          "kind": "scalar",
+          "T": 12
+        }
+      },
+      {
+        "kind": "message",
+        "name": "goal_state",
+        "no": 32,
+        "opt": true,
+        "T": "agent.v1.GoalState"
+      },
+      {
+        "kind": "scalar",
+        "name": "is_root_project_conversation",
+        "no": 33,
+        "opt": true,
+        "T": 8
+      },
+      {
+        "kind": "scalar",
+        "name": "completed_ask_question_tool_call_ids",
+        "no": 34,
+        "repeated": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "durable_skill_blocks",
+        "no": 35,
+        "repeated": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "durable_custom_mode_id",
+        "no": 36,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "message_count_at_last_compaction",
+        "no": 37,
+        "opt": true,
+        "T": 13
+      },
+      {
+        "kind": "scalar",
+        "name": "recent_user_message_ids",
+        "no": 38,
+        "repeated": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "recent_user_message_ids_older_turn_count",
+        "no": 39,
+        "opt": true,
+        "T": 13
+      },
+      {
+        "kind": "message",
+        "name": "turn_telemetry",
+        "no": 40,
+        "opt": true,
+        "T": "agent.v1.TurnTelemetryState"
+      }
+    ],
+    "agent.v1.FileStateStructure": [
+      {
+        "kind": "scalar",
+        "name": "content",
+        "no": 1,
+        "opt": true,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "initial_content",
+        "no": 2,
+        "opt": true,
+        "T": 12
+      }
+    ],
+    "agent.v1.SubagentPersistedState": [
+      {
+        "kind": "message",
+        "name": "conversation_state",
+        "no": 1,
+        "T": "agent.v1.ConversationStateStructure"
+      },
+      {
+        "kind": "scalar",
+        "name": "created_timestamp_ms",
+        "no": 2,
+        "T": 4
+      },
+      {
+        "kind": "scalar",
+        "name": "last_used_timestamp_ms",
+        "no": 3,
+        "T": 4
+      },
+      {
+        "kind": "message",
+        "name": "subagent_type",
+        "no": 4,
+        "T": "agent.v1.SubagentType"
+      },
+      {
+        "kind": "scalar",
+        "name": "model_id",
+        "no": 5,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "enum",
+        "name": "environment",
+        "no": 6,
+        "T": "agent.v1.SubagentExecutionEnvironment"
+      },
+      {
+        "kind": "message",
+        "name": "cloud_subagent",
+        "no": 7,
+        "opt": true,
+        "T": "agent.v1.CloudSubagentReference"
+      },
+      {
+        "kind": "scalar",
+        "name": "first_class_bc_id",
+        "no": 8,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "cloud_requested_environment_build_id",
+        "no": 9,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "machine",
+        "no": 10,
+        "opt": true,
+        "T": "agent.v1.TargetMachine"
+      }
+    ],
+    "agent.v1.ConversationTurnStructure": [
+      {
+        "kind": "message",
+        "name": "agent_conversation_turn",
+        "no": 1,
+        "oneof": "turn",
+        "T": "agent.v1.AgentConversationTurnStructure"
+      },
+      {
+        "kind": "message",
+        "name": "shell_conversation_turn",
+        "no": 2,
+        "oneof": "turn",
+        "T": "agent.v1.ShellConversationTurnStructure"
+      }
+    ],
+    "agent.v1.AgentConversationTurnStructure": [
+      {
+        "kind": "scalar",
+        "name": "user_message",
+        "no": 1,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "steps",
+        "no": 2,
+        "repeated": true,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "request_id",
+        "no": 3,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "encrypted_model",
+        "no": 4,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "dynamic_tool_count",
+        "no": 5,
+        "opt": true,
+        "T": 13
+      },
+      {
+        "kind": "scalar",
+        "name": "send_message_step_indices",
+        "no": 6,
+        "repeated": true,
+        "T": 13
+      },
+      {
+        "kind": "scalar",
+        "name": "routed_model_display_name",
+        "no": 7,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "subagent_dispatch_steps",
+        "no": 8,
+        "repeated": true,
+        "T": "agent.v1.SubagentDispatchStep"
+      },
+      {
+        "kind": "scalar",
+        "name": "dynamic_tool_names",
+        "no": 9,
+        "repeated": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "user_message_id",
+        "no": 10,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "long_reasoning_reminder",
+        "no": 11,
+        "opt": true,
+        "T": "agent.v1.LongReasoningReminderState"
+      },
+      {
+        "kind": "scalar",
+        "name": "long_reasoning_reminder_exposure_logged",
+        "no": 12,
+        "T": 8
+      }
+    ],
+    "agent.v1.ShellConversationTurnStructure": [
+      {
+        "kind": "scalar",
+        "name": "shell_command",
+        "no": 1,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "shell_output",
+        "no": 2,
+        "T": 12
+      }
+    ],
+    "agent.v1.UserMessage": [
+      {
+        "kind": "scalar",
+        "name": "text",
+        "no": 1,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "message_id",
+        "no": 2,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "selected_context",
+        "no": 3,
+        "opt": true,
+        "T": "agent.v1.SelectedContext"
+      },
+      {
+        "kind": "enum",
+        "name": "mode",
+        "no": 4,
+        "T": "agent.v1.AgentMode"
+      },
+      {
+        "kind": "scalar",
+        "name": "is_simulated_msg",
+        "no": 5,
+        "opt": true,
+        "T": 8
+      },
+      {
+        "kind": "scalar",
+        "name": "best_of_n_group_id",
+        "no": 6,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "try_use_best_of_n_promotion",
+        "no": 7,
+        "opt": true,
+        "T": 8
+      },
+      {
+        "kind": "scalar",
+        "name": "rich_text",
+        "no": 8,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "enum",
+        "name": "simulated_msg_reason",
+        "no": 9,
+        "opt": true,
+        "T": "agent.v1.SimulatedMsgReason"
+      },
+      {
+        "kind": "scalar",
+        "name": "conversation_state_blob_id",
+        "no": 10,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "subagent_system_reminder",
+        "no": 11,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "triggering_user_info",
+        "no": 13,
+        "opt": true,
+        "T": "agent.v1.TriggeringUserInfo"
+      },
+      {
+        "kind": "message",
+        "name": "execute_plan_info",
+        "no": 14,
+        "opt": true,
+        "T": "agent.v1.ExecutePlanInfo"
+      },
+      {
+        "kind": "message",
+        "name": "simulated_message_metadata",
+        "no": 15,
+        "opt": true,
+        "T": "agent.v1.UserMessage.SimulatedMessageMetadata"
+      },
+      {
+        "kind": "scalar",
+        "name": "prompt_reference_id",
+        "no": 16,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "thread_id",
+        "no": 17,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "text_blob_id",
+        "no": 18,
+        "opt": true,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "rich_text_blob_id",
+        "no": 19,
+        "opt": true,
+        "T": 12
+      },
+      {
+        "kind": "message",
+        "name": "hook_additional_contexts",
+        "no": 21,
+        "repeated": true,
+        "T": "agent.v1.HookAdditionalContext"
+      },
+      {
+        "kind": "message",
+        "name": "custom_mode_intent",
+        "no": 22,
+        "opt": true,
+        "T": "agent.v1.CustomModeIntent"
+      },
+      {
+        "kind": "message",
+        "name": "project_details",
+        "no": 23,
+        "opt": true,
+        "T": "agent.v1.ProjectDetails"
+      },
+      {
+        "kind": "scalar",
+        "name": "turn_steer",
+        "no": 24,
+        "opt": true,
+        "T": 8
+      },
+      {
+        "kind": "scalar",
+        "name": "started_at_ms",
+        "no": 25,
+        "opt": true,
+        "T": 4
+      },
+      {
+        "kind": "scalar",
+        "name": "completed_at_ms",
+        "no": 26,
+        "opt": true,
+        "T": 4
+      },
+      {
+        "kind": "scalar",
+        "name": "sent_by_agent_id",
+        "no": 27,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "sent_by_voice_call",
+        "no": 28,
+        "opt": true,
+        "T": 8
+      }
+    ],
+    "agent.v1.SelectedContext": [
+      {
+        "kind": "message",
+        "name": "selected_images",
+        "no": 1,
+        "repeated": true,
+        "T": "agent.v1.SelectedImage"
+      },
+      {
+        "kind": "message",
+        "name": "invocation_context",
+        "no": 2,
+        "opt": true,
+        "T": "agent.v1.InvocationContext"
+      },
+      {
+        "kind": "scalar",
+        "name": "extra_context",
+        "no": 3,
+        "repeated": true,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "files",
+        "no": 4,
+        "repeated": true,
+        "T": "agent.v1.SelectedFile"
+      },
+      {
+        "kind": "message",
+        "name": "code_selections",
+        "no": 5,
+        "repeated": true,
+        "T": "agent.v1.SelectedCodeSelection"
+      },
+      {
+        "kind": "message",
+        "name": "terminals",
+        "no": 6,
+        "repeated": true,
+        "T": "agent.v1.SelectedTerminal"
+      },
+      {
+        "kind": "message",
+        "name": "terminal_selections",
+        "no": 7,
+        "repeated": true,
+        "T": "agent.v1.SelectedTerminalSelection"
+      },
+      {
+        "kind": "message",
+        "name": "folders",
+        "no": 8,
+        "repeated": true,
+        "T": "agent.v1.SelectedFolder"
+      },
+      {
+        "kind": "message",
+        "name": "external_links",
+        "no": 9,
+        "repeated": true,
+        "T": "agent.v1.SelectedExternalLink"
+      },
+      {
+        "kind": "message",
+        "name": "cursor_rules",
+        "no": 10,
+        "repeated": true,
+        "T": "agent.v1.SelectedCursorRule"
+      },
+      {
+        "kind": "message",
+        "name": "git_diff_from_branch_to_main",
+        "no": 11,
+        "opt": true,
+        "T": "agent.v1.SelectedGitDiffFromBranchToMain"
+      },
+      {
+        "kind": "message",
+        "name": "cursor_commands",
+        "no": 12,
+        "repeated": true,
+        "T": "agent.v1.SelectedCursorCommand"
+      },
+      {
+        "kind": "message",
+        "name": "documentations",
+        "no": 13,
+        "repeated": true,
+        "T": "agent.v1.SelectedDocumentation"
+      },
+      {
+        "kind": "message",
+        "name": "ui_elements",
+        "no": 14,
+        "repeated": true,
+        "T": "agent.v1.SelectedUIElement"
+      },
+      {
+        "kind": "message",
+        "name": "console_logs",
+        "no": 15,
+        "repeated": true,
+        "T": "agent.v1.SelectedConsoleLog"
+      },
+      {
+        "kind": "message",
+        "name": "extra_context_entries",
+        "no": 16,
+        "repeated": true,
+        "T": "agent.v1.ExtraContextEntry"
+      },
+      {
+        "kind": "message",
+        "name": "git_commits",
+        "no": 17,
+        "repeated": true,
+        "T": "agent.v1.SelectedGitCommit"
+      },
+      {
+        "kind": "message",
+        "name": "git_diff",
+        "no": 18,
+        "opt": true,
+        "T": "agent.v1.SelectedGitDiff"
+      },
+      {
+        "kind": "message",
+        "name": "past_chats",
+        "no": 19,
+        "repeated": true,
+        "T": "agent.v1.SelectedPastChat"
+      },
+      {
+        "kind": "message",
+        "name": "git_pr_diff_selections",
+        "no": 20,
+        "repeated": true,
+        "T": "agent.v1.SelectedGitPRDiffSelection"
+      },
+      {
+        "kind": "message",
+        "name": "selected_pull_requests",
+        "no": 21,
+        "repeated": true,
+        "T": "agent.v1.SelectedPullRequest"
+      },
+      {
+        "kind": "message",
+        "name": "selected_subagents",
+        "no": 22,
+        "repeated": true,
+        "T": "agent.v1.SelectedSubagent"
+      },
+      {
+        "kind": "message",
+        "name": "selected_videos",
+        "no": 23,
+        "repeated": true,
+        "T": "agent.v1.SelectedVideo"
+      },
+      {
+        "kind": "message",
+        "name": "selected_browsers",
+        "no": 24,
+        "repeated": true,
+        "T": "agent.v1.SelectedBrowser"
+      },
+      {
+        "kind": "message",
+        "name": "selected_documents",
+        "no": 25,
+        "repeated": true,
+        "T": "agent.v1.SelectedDocument"
+      },
+      {
+        "kind": "message",
+        "name": "selected_skills",
+        "no": 26,
+        "repeated": true,
+        "T": "agent.v1.AgentSkill"
+      },
+      {
+        "kind": "message",
+        "name": "recent_agents_context",
+        "no": 27,
+        "opt": true,
+        "T": "agent.v1.RecentAgentsContext"
+      },
+      {
+        "kind": "message",
+        "name": "selected_agentic_git_action",
+        "no": 34,
+        "opt": true,
+        "T": "agent.v1.SelectedAgenticGitAction"
+      }
+    ],
+    "agent.v1.SelectedImage": [
+      {
+        "kind": "scalar",
+        "name": "blob_id",
+        "no": 1,
+        "oneof": "data_or_blob_id",
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "uuid",
+        "no": 2,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "path",
+        "no": 3,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "dimension",
+        "no": 4,
+        "T": "agent.v1.SelectedImage.Dimension"
+      },
+      {
+        "kind": "scalar",
+        "name": "mime_type",
+        "no": 7,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "data",
+        "no": 8,
+        "oneof": "data_or_blob_id",
+        "T": 12
+      },
+      {
+        "kind": "message",
+        "name": "blob_id_with_data",
+        "no": 9,
+        "oneof": "data_or_blob_id",
+        "T": "agent.v1.SelectedImage.BlobIdWithData"
+      },
+      {
+        "kind": "message",
+        "name": "prompt_upload_ref",
+        "no": 10,
+        "oneof": "data_or_blob_id",
+        "T": "agent.v1.PromptUploadRef"
+      }
+    ],
+    "agent.v1.ExtraContextEntry": [
+      {
+        "kind": "scalar",
+        "name": "data",
+        "no": 1,
+        "oneof": "data_or_blob_id",
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "blob_id",
+        "no": 2,
+        "oneof": "data_or_blob_id",
+        "T": 12
+      }
+    ],
+    "agent.v1.InvocationContext": [
+      {
+        "kind": "message",
+        "name": "slack_thread",
+        "no": 1,
+        "oneof": "data",
+        "T": "agent.v1.InvocationContext.SlackThread"
+      },
+      {
+        "kind": "message",
+        "name": "github_pr",
+        "no": 2,
+        "oneof": "data",
+        "T": "agent.v1.InvocationContext.GithubPR"
+      },
+      {
+        "kind": "message",
+        "name": "ide_state",
+        "no": 3,
+        "oneof": "data",
+        "T": "agent.v1.InvocationContext.IdeState"
+      },
+      {
+        "kind": "message",
+        "name": "microsoft_teams_thread",
+        "no": 4,
+        "oneof": "data",
+        "T": "agent.v1.InvocationContext.MicrosoftTeamsThread"
+      },
+      {
+        "kind": "scalar",
+        "name": "blob_id",
+        "no": 10,
+        "oneof": "data",
+        "T": 12
+      }
+    ],
+    "agent.v1.SelectedPullRequest": [
+      {
+        "kind": "scalar",
+        "name": "number",
+        "no": 1,
+        "T": 5
+      },
+      {
+        "kind": "scalar",
+        "name": "url",
+        "no": 2,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "title",
+        "no": 3,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "folder_path",
+        "no": 4,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "summary_json",
+        "no": 5,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "description",
+        "no": 6,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "blob_id",
+        "no": 7,
+        "opt": true,
+        "T": 12
+      }
+    ],
+    "agent.v1.SelectedGitPRDiffSelection": [
+      {
+        "kind": "scalar",
+        "name": "pr_url",
+        "no": 1,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "file_path",
+        "no": 2,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "start_line",
+        "no": 3,
+        "T": 5
+      },
+      {
+        "kind": "scalar",
+        "name": "end_line",
+        "no": 4,
+        "T": 5
+      },
+      {
+        "kind": "scalar",
+        "name": "diff_content",
+        "no": 5,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "blob_id",
+        "no": 6,
+        "opt": true,
+        "T": 12
+      }
+    ],
+    "agent.v1.ConversationStep": [
+      {
+        "kind": "message",
+        "name": "assistant_message",
+        "no": 1,
+        "oneof": "message",
+        "T": "agent.v1.AssistantMessage"
+      },
+      {
+        "kind": "message",
+        "name": "tool_call",
+        "no": 2,
+        "oneof": "message",
+        "T": "agent.v1.ToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "thinking_message",
+        "no": 3,
+        "oneof": "message",
+        "T": "agent.v1.ThinkingMessage"
+      }
+    ],
+    "agent.v1.ToolCall": [
+      {
+        "kind": "message",
+        "name": "shell_tool_call",
+        "no": 1,
+        "oneof": "tool",
+        "T": "agent.v1.ShellToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "delete_tool_call",
+        "no": 3,
+        "oneof": "tool",
+        "T": "agent.v1.DeleteToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "glob_tool_call",
+        "no": 4,
+        "oneof": "tool",
+        "T": "agent.v1.GlobToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "grep_tool_call",
+        "no": 5,
+        "oneof": "tool",
+        "T": "agent.v1.GrepToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "read_tool_call",
+        "no": 8,
+        "oneof": "tool",
+        "T": "agent.v1.ReadToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "update_todos_tool_call",
+        "no": 9,
+        "oneof": "tool",
+        "T": "agent.v1.UpdateTodosToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "read_todos_tool_call",
+        "no": 10,
+        "oneof": "tool",
+        "T": "agent.v1.ReadTodosToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "edit_tool_call",
+        "no": 12,
+        "oneof": "tool",
+        "T": "agent.v1.EditToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "ls_tool_call",
+        "no": 13,
+        "oneof": "tool",
+        "T": "agent.v1.LsToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "read_lints_tool_call",
+        "no": 14,
+        "oneof": "tool",
+        "T": "agent.v1.ReadLintsToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "mcp_tool_call",
+        "no": 15,
+        "oneof": "tool",
+        "T": "agent.v1.McpToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "sem_search_tool_call",
+        "no": 16,
+        "oneof": "tool",
+        "T": "agent.v1.SemSearchToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "create_plan_tool_call",
+        "no": 17,
+        "oneof": "tool",
+        "T": "agent.v1.CreatePlanToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "web_search_tool_call",
+        "no": 18,
+        "oneof": "tool",
+        "T": "agent.v1.WebSearchToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "task_tool_call",
+        "no": 19,
+        "oneof": "tool",
+        "T": "agent.v1.TaskToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "list_mcp_resources_tool_call",
+        "no": 20,
+        "oneof": "tool",
+        "T": "agent.v1.ListMcpResourcesToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "read_mcp_resource_tool_call",
+        "no": 21,
+        "oneof": "tool",
+        "T": "agent.v1.ReadMcpResourceToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "apply_agent_diff_tool_call",
+        "no": 22,
+        "oneof": "tool",
+        "T": "agent.v1.ApplyAgentDiffToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "ask_question_tool_call",
+        "no": 23,
+        "oneof": "tool",
+        "T": "agent.v1.AskQuestionToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "fetch_tool_call",
+        "no": 24,
+        "oneof": "tool",
+        "T": "agent.v1.FetchToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "switch_mode_tool_call",
+        "no": 25,
+        "oneof": "tool",
+        "T": "agent.v1.SwitchModeToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "generate_image_tool_call",
+        "no": 28,
+        "oneof": "tool",
+        "T": "agent.v1.GenerateImageToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "record_screen_tool_call",
+        "no": 29,
+        "oneof": "tool",
+        "T": "agent.v1.RecordScreenToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "computer_use_tool_call",
+        "no": 30,
+        "oneof": "tool",
+        "T": "agent.v1.ComputerUseToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "write_shell_stdin_tool_call",
+        "no": 31,
+        "oneof": "tool",
+        "T": "agent.v1.WriteShellStdinToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "reflect_tool_call",
+        "no": 32,
+        "oneof": "tool",
+        "T": "agent.v1.ReflectToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "setup_vm_environment_tool_call",
+        "no": 33,
+        "oneof": "tool",
+        "T": "agent.v1.SetupVmEnvironmentToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "truncated_tool_call",
+        "no": 34,
+        "oneof": "tool",
+        "T": "agent.v1.TruncatedToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "start_grind_execution_tool_call",
+        "no": 35,
+        "oneof": "tool",
+        "T": "agent.v1.StartGrindExecutionToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "start_grind_planning_tool_call",
+        "no": 36,
+        "oneof": "tool",
+        "T": "agent.v1.StartGrindPlanningToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "web_fetch_tool_call",
+        "no": 37,
+        "oneof": "tool",
+        "T": "agent.v1.WebFetchToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "report_bugfix_results_tool_call",
+        "no": 38,
+        "oneof": "tool",
+        "T": "agent.v1.ReportBugfixResultsToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "ai_attribution_tool_call",
+        "no": 39,
+        "oneof": "tool",
+        "T": "agent.v1.AiAttributionToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "pr_management_tool_call",
+        "no": 40,
+        "oneof": "tool",
+        "T": "agent.v1.PrManagementToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "mcp_auth_tool_call",
+        "no": 41,
+        "oneof": "tool",
+        "T": "agent.v1.McpAuthToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "await_tool_call",
+        "no": 42,
+        "oneof": "tool",
+        "T": "agent.v1.AwaitToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "blame_by_file_path_tool_call",
+        "no": 43,
+        "oneof": "tool",
+        "T": "agent.v1.BlameByFilePathToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "get_mcp_tools_tool_call",
+        "no": 44,
+        "oneof": "tool",
+        "T": "agent.v1.GetMcpToolsToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "report_bug_tool_call",
+        "no": 45,
+        "oneof": "tool",
+        "T": "agent.v1.ReportBugToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "set_active_branch_tool_call",
+        "no": 46,
+        "oneof": "tool",
+        "T": "agent.v1.SetActiveBranchToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "communicate_update_tool_call",
+        "no": 48,
+        "oneof": "tool",
+        "T": "agent.v1.CommunicateUpdateToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "send_final_summary_tool_call",
+        "no": 49,
+        "oneof": "tool",
+        "T": "agent.v1.SendFinalSummaryToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "update_pr_code_tour_tool_call",
+        "no": 50,
+        "oneof": "tool",
+        "T": "agent.v1.UpdatePrCodeTourToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "replace_env_tool_call",
+        "no": 51,
+        "oneof": "tool",
+        "T": "agent.v1.ReplaceEnvToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "edit_pr_labels_tool_call",
+        "no": 52,
+        "oneof": "tool",
+        "T": "agent.v1.EditPrLabelsToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "record_ci_investigation_findings_tool_call",
+        "no": 53,
+        "oneof": "tool",
+        "T": "agent.v1.RecordCiInvestigationFindingsToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "hook_additional_contexts",
+        "no": 54,
+        "repeated": true,
+        "T": "agent.v1.HookAdditionalContext"
+      },
+      {
+        "kind": "message",
+        "name": "send_message_tool_call",
+        "no": 55,
+        "oneof": "tool",
+        "T": "agent.v1.SendMessageToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "fetch_cloud_agent_data_tool_call",
+        "no": 56,
+        "oneof": "tool",
+        "T": "agent.v1.FetchCloudAgentDataToolCall"
+      },
+      {
+        "kind": "scalar",
+        "name": "tool_call_id",
+        "no": 57,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "send_to_user_tool_call",
+        "no": 58,
+        "oneof": "tool",
+        "T": "agent.v1.SendToUserToolCall"
+      },
+      {
+        "kind": "scalar",
+        "name": "started_at_ms",
+        "no": 59,
+        "opt": true,
+        "T": 4
+      },
+      {
+        "kind": "scalar",
+        "name": "completed_at_ms",
+        "no": 60,
+        "opt": true,
+        "T": 4
+      },
+      {
+        "kind": "message",
+        "name": "pi_read_tool_call",
+        "no": 61,
+        "oneof": "tool",
+        "T": "agent.v1.PiReadToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "pi_bash_tool_call",
+        "no": 62,
+        "oneof": "tool",
+        "T": "agent.v1.PiBashToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "pi_edit_tool_call",
+        "no": 63,
+        "oneof": "tool",
+        "T": "agent.v1.PiEditToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "pi_write_tool_call",
+        "no": 64,
+        "oneof": "tool",
+        "T": "agent.v1.PiWriteToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "pi_grep_tool_call",
+        "no": 65,
+        "oneof": "tool",
+        "T": "agent.v1.PiGrepToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "pi_find_tool_call",
+        "no": 66,
+        "oneof": "tool",
+        "T": "agent.v1.PiFindToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "pi_ls_tool_call",
+        "no": 67,
+        "oneof": "tool",
+        "T": "agent.v1.PiLsToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "connect_scm_tool_call",
+        "no": 68,
+        "oneof": "tool",
+        "T": "agent.v1.ConnectScmToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "search_conversations_tool_call",
+        "no": 69,
+        "oneof": "tool",
+        "T": "agent.v1.SearchConversationsToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "create_goal_tool_call",
+        "no": 70,
+        "oneof": "tool",
+        "T": "agent.v1.CreateGoalToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "update_goal_tool_call",
+        "no": 71,
+        "oneof": "tool",
+        "T": "agent.v1.UpdateGoalToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "adopt_tool_call",
+        "no": 72,
+        "oneof": "tool",
+        "T": "agent.v1.AdoptToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "get_agent_status_tool_call",
+        "no": 73,
+        "oneof": "tool",
+        "T": "agent.v1.GetAgentStatusToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "send_to_agent_tool_call",
+        "no": 74,
+        "oneof": "tool",
+        "T": "agent.v1.SendToAgentToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "read_agent_transcript_tool_call",
+        "no": 75,
+        "oneof": "tool",
+        "T": "agent.v1.ReadAgentTranscriptToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "create_agent_tool_call",
+        "no": 76,
+        "oneof": "tool",
+        "T": "agent.v1.CreateAgentToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "stop_agent_tool_call",
+        "no": 77,
+        "oneof": "tool",
+        "T": "agent.v1.StopAgentToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "get_pr_code_tour_tool_call",
+        "no": 78,
+        "oneof": "tool",
+        "T": "agent.v1.GetPrCodeTourToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "write_canvas_tool_call",
+        "no": 79,
+        "oneof": "tool",
+        "T": "agent.v1.WriteCanvasToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "read_canvas_tool_call",
+        "no": 80,
+        "oneof": "tool",
+        "T": "agent.v1.ReadCanvasToolCall"
+      },
+      {
+        "kind": "message",
+        "name": "generate_video_tool_call",
+        "no": 81,
+        "oneof": "tool",
+        "T": "agent.v1.GenerateVideoToolCall"
+      }
+    ],
+    "agent.v1.ReadToolCall": [
+      {
+        "kind": "message",
+        "name": "args",
+        "no": 1,
+        "T": "agent.v1.ReadToolArgs"
+      },
+      {
+        "kind": "message",
+        "name": "result",
+        "no": 2,
+        "T": "agent.v1.ReadToolResult"
+      }
+    ],
+    "agent.v1.ReadToolResult": [
+      {
+        "kind": "message",
+        "name": "success",
+        "no": 1,
+        "oneof": "result",
+        "T": "agent.v1.ReadToolSuccess"
+      },
+      {
+        "kind": "message",
+        "name": "error",
+        "no": 2,
+        "oneof": "result",
+        "T": "agent.v1.ReadToolError"
+      }
+    ],
+    "agent.v1.ReadToolSuccess": [
+      {
+        "kind": "scalar",
+        "name": "content",
+        "no": 1,
+        "oneof": "output",
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "is_empty",
+        "no": 2,
+        "T": 8
+      },
+      {
+        "kind": "scalar",
+        "name": "exceeded_limit",
+        "no": 3,
+        "T": 8
+      },
+      {
+        "kind": "scalar",
+        "name": "total_lines",
+        "no": 4,
+        "T": 13
+      },
+      {
+        "kind": "scalar",
+        "name": "file_size",
+        "no": 5,
+        "T": 13
+      },
+      {
+        "kind": "scalar",
+        "name": "data",
+        "no": 6,
+        "oneof": "output",
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "path",
+        "no": 7,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "read_range",
+        "no": 8,
+        "opt": true,
+        "T": "agent.v1.ReadRange"
+      },
+      {
+        "kind": "scalar",
+        "name": "data_blob_id",
+        "no": 9,
+        "oneof": "output",
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "content_blob_id",
+        "no": 10,
+        "oneof": "output",
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "include_line_numbers",
+        "no": 11,
+        "opt": true,
+        "T": 8
+      },
+      {
+        "kind": "scalar",
+        "name": "related_cursor_rule_paths",
+        "no": 12,
+        "repeated": true,
+        "T": 9
+      },
+      {
+        "kind": "message",
+        "name": "related_cursor_rules",
+        "no": 13,
+        "repeated": true,
+        "T": "agent.v1.CursorRule"
+      }
+    ],
+    "agent.v1.TaskToolCall": [
+      {
+        "kind": "message",
+        "name": "args",
+        "no": 1,
+        "T": "agent.v1.TaskArgs"
+      },
+      {
+        "kind": "message",
+        "name": "result",
+        "no": 2,
+        "T": "agent.v1.TaskResult"
+      },
+      {
+        "kind": "scalar",
+        "name": "cloud_agent_bc_id",
+        "no": 3,
+        "opt": true,
+        "T": 9
+      }
+    ],
+    "agent.v1.TaskResult": [
+      {
+        "kind": "message",
+        "name": "success",
+        "no": 1,
+        "oneof": "result",
+        "T": "agent.v1.TaskSuccess"
+      },
+      {
+        "kind": "message",
+        "name": "error",
+        "no": 2,
+        "oneof": "result",
+        "T": "agent.v1.TaskError"
+      }
+    ],
+    "agent.v1.TaskSuccess": [
+      {
+        "kind": "message",
+        "name": "conversation_steps",
+        "no": 1,
+        "repeated": true,
+        "T": "agent.v1.ConversationStep"
+      },
+      {
+        "kind": "scalar",
+        "name": "agent_id",
+        "no": 2,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "scalar",
+        "name": "is_background",
+        "no": 3,
+        "T": 8
+      },
+      {
+        "kind": "scalar",
+        "name": "duration_ms",
+        "no": 4,
+        "opt": true,
+        "T": 4
+      },
+      {
+        "kind": "scalar",
+        "name": "result_suffix",
+        "no": 5,
+        "opt": true,
+        "T": 9
+      },
+      {
+        "kind": "enum",
+        "name": "background_reason",
+        "no": 6,
+        "T": "agent.v1.SubagentBackgroundReason"
+      },
+      {
+        "kind": "scalar",
+        "name": "transcript_path",
+        "no": 7,
+        "opt": true,
+        "T": 9
+      }
+    ],
+    "agent.v1.TruncatedToolCall": [
+      {
+        "kind": "scalar",
+        "name": "original_step_blob_id",
+        "no": 1,
+        "T": 12
+      },
+      {
+        "kind": "message",
+        "name": "args",
+        "no": 2,
+        "T": "agent.v1.TruncatedToolCallArgs"
+      },
+      {
+        "kind": "message",
+        "name": "result",
+        "no": 3,
+        "T": "agent.v1.TruncatedToolCallResult"
+      },
+      {
+        "kind": "scalar",
+        "name": "original_step_size_bytes",
+        "no": 4,
+        "T": 13
+      },
+      {
+        "kind": "message",
+        "name": "preview",
+        "no": 5,
+        "T": "agent.v1.ToolCall"
+      }
+    ],
+    "agent.v1.SelectedImage.BlobIdWithData": [
+      {
+        "kind": "scalar",
+        "name": "blob_id",
+        "no": 1,
+        "T": 12
+      },
+      {
+        "kind": "scalar",
+        "name": "data",
+        "no": 2,
+        "T": 12
+      }
+    ]
+  },
+  "cursorVersion": "3.23.23",
+  "vscodeVersion": "1.128.0",
+  "commit": "2dac2428994fe34f12658d9ecad1541b98db2c00",
+  "observedAt": "2026-10-08T03:14:07.430Z"
+}

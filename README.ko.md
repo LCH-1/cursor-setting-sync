@@ -240,6 +240,34 @@ VS Code 자체 Settings Sync가 기기 간에 전파하는 키는 의도적으�
 
 기술적 상세는 [usage](docs/usage.md), [protocol](docs/protocol.md), [security](docs/security.md), [compatibility](docs/compatibility.md)를 참고하세요.
 
+## Cursor 업데이트 사전 감시
+
+`Cursor schema watch` GitHub workflow는 공식 다운로드 API의 `stable`·`latest`를
+6시간마다 확인하며, 관련 코드의 PR·푸시와 수동 실행도 지원합니다. 설치 파일에서
+공개 제품 정보와 채팅 protobuf 구조만 추출합니다. Cursor를 실행하거나 사용자
+DB를 읽지 않으며, 두 채널의 버전·커밋이 같으면 한 번만 다운로드합니다.
+`latest`는 다운로드 API의 이름이며 별도 Nightly 버전이 항상 제공된다는 뜻은 아닙니다.
+
+필드 번호·이름·타입·참조 대상·map·반복 여부·oneof 변경을 기준 목록과 비교하고,
+현재 이어하기 파서의 실제 지원 규칙도 별도로 검사합니다. 구조 변경·미지원 필드·
+추출 실패가 있으면 CI가 실패하고 작업 요약과 `cursor-schema-reports` 아티팩트에
+상세 결과가 남습니다. 설치 파일과 개인 채팅 데이터는 업로드하지 않습니다.
+실패 알림 수신은 GitHub 저장소·계정의 알림 설정에 따릅니다.
+
+Linux에서 `unsquashfs`를 설치한 뒤 `node scripts/cursor-schema-watch.mjs`로
+공식 배포를 검사하거나, Windows의 기존 설치를 다음 명령으로 검사할 수 있습니다.
+
+```powershell
+node scripts/cursor-schema-watch.mjs --app-root "$env:LOCALAPPDATA/Programs/cursor/resources/app"
+```
+
+결과는 `tmp/cursor-schema-watch`에 기록됩니다. 새 설치를 검토한 뒤
+`--write-baseline`을 추가하면 기준 목록을 명시적으로 갱신할 수 있지만,
+미지원 필드 경고를 없애거나 호환성을 승인하는 동작은 아닙니다.
+구조가 같다는 결과만으로 DB 상태나 백업·복원의 성공을 보장하지 않습니다.
+공개 배포 시점과 GitHub 실행 지연 때문에 모든 PC의 업데이트 전에 패치를
+보장할 수는 없습니다. 자동 설정 변경·파서 완화·확장 배포는 수행하지 않습니다.
+
 ## 라이선스
 
 [MIT](LICENSE)

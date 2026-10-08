@@ -160,6 +160,7 @@
     "vscode:prepublish": "npm run verify",
     "build": "node esbuild.mjs && npm run smoke",
     "smoke": "node scripts/smoke-bundle.cjs",
+    "cursor:watch": "node scripts/cursor-schema-watch.mjs",
     "watch": "node esbuild.mjs --watch",
     "check": "tsc --noEmit",
     "lint": "eslint .",

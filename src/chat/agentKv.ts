@@ -823,7 +823,7 @@ toolCallFields[57] = lengthField();
 toolCallFields[59] = varintField();
 toolCallFields[60] = varintField();
 
-const AGENT_KV_SCHEMAS: Readonly<Record<AgentKvSchemaName, AgentKvSchema>> = {
+export const AGENT_KV_SCHEMAS: Readonly<Record<AgentKvSchemaName, AgentKvSchema>> = {
   "conversation-state": { fields: conversationStateFields },
   "file-state": {
     fields: {
