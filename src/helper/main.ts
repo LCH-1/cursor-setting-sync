@@ -19,6 +19,9 @@ import {
   RESTART_TO_APPLY_TITLE,
 } from "../constants";
 import { GLOBAL_DATABASE_KINDS } from "../types";
+import { crossVersionChatBlockReason, chatCompatibilityFieldObserver, requiresCrossVersionInspection, isVersionCompatibilityBlock, chatCompatibilityTargetFingerprint, type ChatCompatibilityTarget } from "../chat/dataCompatibility";
+import { inspectInstalledCursorDataSchema } from "../platform/cursorDataSchema";
+import { effectiveTipProducer as chatDataProducer } from "../sync/versionPolicy";
 import type {
   LocalProjection,
   ResourceDeletion,
@@ -68,7 +71,7 @@ import {
 import { assertChunkedChatMetadata, parseChunkedChat, stageChunkedChat } from "../chat/chunked";
 import { verifyPortableChatContinuationClosure } from "../chat/continuationClosure";
 import { buildChatTipEnrichmentCandidateIndex } from "../chat/enrichment";
-import { migrateOfflineChatTips } from "./chatMigration";
+import { migrateOfflineChatTips, helperAcceptsChatProducer } from "./chatMigration";
 import { mergeOfflineChatConflicts } from "./chatConflictMerge";
 import { maintainCompressedBackups, resolveBackupSource } from "./compressedBackups";
 import { verifyLiveQueuedChats } from "./liveVerification";
@@ -194,6 +197,10 @@ async function run(): Promise<void> {
       throw new Error("The helper received an invalid repository key.");
     }
     await assertRuntimeVersion(request);
+    // Re-read the installed schema in the helper; the request is not proof of the target format.
+    delete request.cursorDataSchema;
+    try { request.cursorDataSchema = await inspectInstalledCursorDataSchema(request.paths.appRoot); }
+    catch (error) { collected.warnings.push(`Cross-version chat inspection unavailable: ${error instanceof Error ? error.message : String(error)}`); }
     if (request.mode === "verify-live") {
       const lock = await acquireSyncLock(request.storageRoot, 30_000);
       try {
@@ -201,7 +208,7 @@ async function run(): Promise<void> {
           request.repositoryRoot, request.storageRoot,
           await readRepositoryManifest(request.repositoryRoot), masterKey,
           request.syncOptions.maxPayloadBytes,
-          { extensionVersion: request.extensionVersion, cursorVersion: request.expectedCursorVersion, vscodeVersion: request.expectedVscodeVersion },
+          { extensionVersion: request.extensionVersion, cursorVersion: request.expectedCursorVersion, vscodeVersion: request.expectedVscodeVersion, ...(request.cursorDataSchema === undefined ? {} : { cursorDataSchema: request.cursorDataSchema }) },
         );
         const verified = await verifyLiveQueuedChats(request, repository, () => lock.refresh());
         await writeResult(request, successResult(request, verified, [], null));
@@ -390,6 +397,7 @@ async function executeRequest(
     masterKey,
     request.syncOptions.maxPayloadBytes,
     {
+      ...(request.cursorDataSchema === undefined ? {} : { cursorDataSchema: request.cursorDataSchema }),
       extensionVersion: request.extensionVersion,
       cursorVersion: request.expectedCursorVersion,
       vscodeVersion: request.expectedVscodeVersion,
@@ -745,7 +753,10 @@ async function applyVerifiedPage(
         ? `${change.resourceId}: superseded or conflicted`
         : `${change.resourceId}: ${exportBlock}`;
     });
-  const preparation = await prepareChanges(repository, eligible);
+  const preparation = await prepareChanges(repository, eligible, {
+    cursorVersion: request.expectedCursorVersion, vscodeVersion: request.expectedVscodeVersion, extensionVersion: request.extensionVersion,
+    ...(request.cursorDataSchema === undefined ? {} : { cursorDataSchema: request.cursorDataSchema }),
+  });
   skipped.push(...preparation.skipped);
   // A payload this computer cannot read is a real failure, not a routine skip:
   // it never heals on its own, so it has to be visible and it has to stop
@@ -853,6 +864,7 @@ async function applyVerifiedPage(
     { ...globalRetainedHashes, ...nonGlobalResult.retainedLocalHashes },
     globalLocalChatCoreHashes,
     failureByResourceId,
+    { cursorVersion: request.expectedCursorVersion, vscodeVersion: request.expectedVscodeVersion, extensionVersion: request.extensionVersion, ...(request.cursorDataSchema === undefined ? {} : { cursorDataSchema: request.cursorDataSchema }) },
   );
   await repository.saveState();
   const remainingReadyVersionIds = new Set(
@@ -1017,6 +1029,7 @@ async function exportFinalChanges(
     checkpoint,
   );
   if (request.syncOptions.syncChat) {
+    refreshShutdownChatCompatibility(repository, request);
     refreshShutdownChatPending(repository, preResult.projections);
   }
   const targetChanges = finalExportTargetPage(
@@ -1877,6 +1890,7 @@ function helperPayloadLimit(kind: ResourceKind): number {
 export async function prepareChanges(
   repository: SyncRepository,
   changes: HelperChange[],
+  local?: ChatCompatibilityTarget,
 ): Promise<{
   prepared: PreparedHelperChange[];
   skipped: string[];
@@ -1950,13 +1964,26 @@ export async function prepareChanges(
         failureByResourceId[change.resourceId] = message;
         continue;
       }
+      if (change.kind === "chat" && local !== undefined) {
+        const tip = repository.state.tips[change.resourceId]?.find(t => t.eventHash === change.eventHash && t.changeIndex === change.changeIndex);
+        const producer = tip === undefined ? undefined : chatDataProducer(tip);
+        let reason: string | null = null;
+        if (producer === undefined) reason = "Cross-version chat has no authenticated source producer";
+        else if (requiresCrossVersionInspection(producer, local) && change.metadata?.chatSnapshotSchemaVersion !== 3) reason = sha256(content) !== change.semanticHash ?
+          "Cross-version chat payload does not match its authenticated hash" : await crossVersionChatBlockReason(content, tip!, producer, local);
+        if (reason !== null) { skipped.push(`${change.resourceId}: ${reason}`); failureByResourceId[change.resourceId] = reason; continue; }
+      }
       if (change.kind === "chat" && change.metadata?.chatSnapshotSchemaVersion === 3) {
         try {
           if (sha256(content) !== change.semanticHash) { throw new Error("Chat manifest hash does not match its event."); }
           const manifest = parseChunkedChat(content);
           if (change.resourceId !== `chat/${manifest.composerId}`) { throw new Error("Chat manifest has the wrong composer ID."); }
           assertChunkedChatMetadata(manifest, change.metadata);
-          const chunkedChat = await stageChunkedChat(repository, manifest);
+          const tip = repository.state.tips[change.resourceId]?.find(t => t.eventHash === change.eventHash && t.changeIndex === change.changeIndex);
+          const producer = tip === undefined ? undefined : chatDataProducer(tip);
+          const observer = local !== undefined && producer !== undefined && requiresCrossVersionInspection(producer, local) ? chatCompatibilityFieldObserver(producer, local) : undefined;
+          const chunkedChat = await stageChunkedChat(repository, manifest, observer?.onField);
+          if (observer?.reason() !== undefined && observer.reason() !== null) { await chunkedChat.dispose(); throw new Error(observer.reason()!); }
           prepared.push({ change, content, chunkedChat });
           hasChunkedChat = true;
           preparedCount += 1; totalBytes += declaredBytes;
@@ -2085,6 +2112,17 @@ function shutdownApplyBatch(
   );
 }
 
+export function refreshShutdownChatCompatibility(repository: SyncRepository, request: HelperRequest): void {
+  const fingerprint = chatCompatibilityTargetFingerprint({ cursorVersion: request.expectedCursorVersion, vscodeVersion: request.expectedVscodeVersion, extensionVersion: request.extensionVersion, ...(request.cursorDataSchema === undefined ? {} : { cursorDataSchema: request.cursorDataSchema }) });
+  for (const pending of repository.state.pendingDatabaseChanges) {
+    if (pending.kind !== "chat" || pending.blockedReason === undefined || !isVersionCompatibilityBlock(pending.blockedReason)) continue;
+    if (pending.compatibilityTargetFingerprint === fingerprint) continue;
+    const tip = repository.state.tips[pending.resourceId]?.find(t => t.eventHash === pending.eventHash && t.changeIndex === pending.changeIndex);
+    // Admission only: prepareChanges proves the exact bytes again before a database write.
+    if (tip !== undefined && helperAcceptsChatProducer(tip, request)) { delete pending.blockedReason; delete pending.compatibilityTargetFingerprint; }
+  }
+}
+
 function shutdownApplyCandidates(
   repository: SyncRepository,
   projections: ResourceProjection[],
@@ -2170,6 +2208,11 @@ function refreshShutdownChatPending(
     }
     const tip = current.get(pending.resourceId)?.tip;
     if (tip?.kind === "chat") {
+      if ((pending.eventHash !== tip.eventHash || pending.changeIndex !== tip.changeIndex) &&
+        pending.blockedReason !== undefined && isVersionCompatibilityBlock(pending.blockedReason)) {
+        delete pending.blockedReason;
+        delete pending.compatibilityTargetFingerprint;
+      }
       // This only rebinds an existing queue entry. The current tip must still
       // pass final local verification and ordinary prepare/apply checks.
       pending.eventHash = tip.eventHash;
@@ -2367,6 +2410,7 @@ export function markAppliedProjections(
   retainedLocalHashes: Readonly<Record<string, string>> = {},
   localChatCoreHashes: Readonly<Record<string, string | null>> = {},
   failureByResourceId: Readonly<Record<string, string>> = {},
+  local?: ChatCompatibilityTarget,
 ): void {
   const applied = new Set(appliedResourceIds);
   for (const change of eligible) {
@@ -2436,6 +2480,7 @@ export function markAppliedProjections(
       continue;
     }
     pending.blockedReason = `${APPLY_FAILURE_BLOCK_PREFIX}: ${failure} Run "${RESTART_TO_APPLY_TITLE}" to try it again.`;
+    if (local !== undefined && isVersionCompatibilityBlock(failure)) pending.compatibilityTargetFingerprint = chatCompatibilityTargetFingerprint(local);
   }
 }
 

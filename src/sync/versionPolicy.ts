@@ -114,6 +114,7 @@ export function effectiveVersionProducer(
     const checkpointed = parseEventProducer(metadata.checkpointedProducer);
     if (checkpointed !== undefined && producer !== undefined) {
       return {
+        ...checkpointed,
         extensionVersion: producer.extensionVersion,
         cursorVersion: checkpointed.cursorVersion,
         vscodeVersion: checkpointed.vscodeVersion,
@@ -142,6 +143,7 @@ export function effectiveVersionProducer(
       return undefined;
     }
     return {
+      ...original,
       // The extension version gates the NEW v2 envelope. Cursor/VS Code gate
       // the unchanged database core copied from the source tip. Taking all
       // three fields from either producer would respectively let an old build
@@ -161,6 +163,7 @@ export function effectiveVersionProducer(
         ? producer === undefined
           ? undefined
           : {
+              ...original,
               extensionVersion: producer.extensionVersion,
               cursorVersion: original.cursorVersion,
               vscodeVersion: original.vscodeVersion,
@@ -247,11 +250,13 @@ export function parseEventProducer(
   ) {
     return undefined;
   }
-  return { extensionVersion, cursorVersion, vscodeVersion };
+  return { extensionVersion, cursorVersion, vscodeVersion,
+    ...(typeof value.cursorDataSchema === "string" ? { cursorDataSchema: value.cursorDataSchema } : {}) };
 }
 
 export function producerAsMetadata(producer: EventProducer): JsonValue {
   return {
+    ...(producer.cursorDataSchema === undefined ? {} : { cursorDataSchema: producer.cursorDataSchema }),
     extensionVersion: producer.extensionVersion,
     cursorVersion: producer.cursorVersion,
     vscodeVersion: producer.vscodeVersion,

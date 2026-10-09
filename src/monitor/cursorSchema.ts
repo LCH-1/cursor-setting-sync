@@ -2,30 +2,8 @@ import ts from "typescript";
 import { createReadStream } from "node:fs";
 import { AGENT_KV_SCHEMAS } from "../chat/agentKv";
 
-export const CURSOR_MESSAGE_NAMES = {
-  "conversation-state": "agent.v1.ConversationStateStructure",
-  "file-state": "agent.v1.FileStateStructure",
-  "subagent-state": "agent.v1.SubagentPersistedState",
-  "conversation-turn": "agent.v1.ConversationTurnStructure",
-  "agent-turn": "agent.v1.AgentConversationTurnStructure",
-  "shell-turn": "agent.v1.ShellConversationTurnStructure",
-  "user-message": "agent.v1.UserMessage",
-  "selected-context": "agent.v1.SelectedContext",
-  "selected-image": "agent.v1.SelectedImage",
-  "extra-context-entry": "agent.v1.ExtraContextEntry",
-  "invocation-context": "agent.v1.InvocationContext",
-  "selected-pull-request": "agent.v1.SelectedPullRequest",
-  "selected-git-pr-diff": "agent.v1.SelectedGitPRDiffSelection",
-  "conversation-step": "agent.v1.ConversationStep",
-  "tool-call": "agent.v1.ToolCall",
-  "read-tool-call": "agent.v1.ReadToolCall",
-  "read-tool-result": "agent.v1.ReadToolResult",
-  "read-tool-success": "agent.v1.ReadToolSuccess",
-  "task-tool-call": "agent.v1.TaskToolCall",
-  "task-result": "agent.v1.TaskResult",
-  "task-success": "agent.v1.TaskSuccess",
-  "truncated-tool-call": "agent.v1.TruncatedToolCall",
-} as const satisfies Record<keyof typeof AGENT_KV_SCHEMAS, string>;
+import { CURSOR_MESSAGE_NAMES } from "../chat/cursorMessageNames";
+export { CURSOR_MESSAGE_NAMES } from "../chat/cursorMessageNames";
 
 export const MONITORED_CURSOR_MESSAGES = [
   ...Object.values(CURSOR_MESSAGE_NAMES),
@@ -42,6 +20,7 @@ export interface CursorField extends DescriptorObject {
 export interface CursorSchemaSnapshot {
   formatVersion: 1;
   messages: Record<string, CursorField[]>;
+  enums?: Record<string, DescriptorObject[]>;
 }
 export interface CursorSchemaChange {
   message: string;
@@ -62,9 +41,10 @@ const FIELD_PROPERTIES = new Set([
   "packed", "localName", "jsonName", "delimited",
 ]);
 
-export function extractCursorSchema(source: string): CursorSchemaSnapshot {
+export function extractCursorSchema(source: string, includeReferenced = false): CursorSchemaSnapshot {
   const symbols = new Map<string, string>();
   const definitions = new Map<string, number>();
+  const enumDefinitions = new Map<string, number>();
   const pattern = /([\w$]+)\s*=\s*[\w$]+\.make(MessageType|Enum)\(\s*["']([^"']+)["']\s*,/g;
   for (const match of source.matchAll(pattern)) {
     const symbol = match[1]!;
@@ -73,13 +53,56 @@ export function extractCursorSchema(source: string): CursorSchemaSnapshot {
       throw new Error(`Ambiguous protobuf symbol ${symbol}`);
     }
     symbols.set(symbol, name);
+    if (match[2] === "Enum") enumDefinitions.set(name, match.index + match[0].length);
     if (match[2] === "MessageType") {
       if (definitions.has(name)) throw new Error(`Duplicate descriptor ${name}`);
       definitions.set(name, match.index + match[0].length);
     }
   }
+  if (includeReferenced) {
+    for (const match of source.matchAll(/([\w$]+)\.typeName=["']([^"']+)["']/g)) {
+      const symbol = match[1]!;
+      const field = new RegExp(`${symbol.replace(/\$/g, "\\$")}\\.fields=[\\w$.]+\\.newFieldList\\(`).exec(source.slice(match.index, match.index + 2_000));
+      if (field !== null) {
+        symbols.set(symbol, match[2]!);
+        definitions.set(match[2]!, match.index + field.index + field[0].length);
+      }
+    }
+    for (const match of source.matchAll(/\.setEnumType\(([\w$]+),["']([^"']+)["'],/g)) {
+      symbols.set(match[1]!, match[2]!);
+      enumDefinitions.set(match[2]!, match.index + match[0].length);
+    }
+    for (const match of source.matchAll(/static typeName=["']([^"']+)["']/g)) {
+      const start = source.lastIndexOf("=class", match.index);
+      if (start < 0 || match.index - start > 10_000) continue;
+      const symbol = /([\w$]+)$/.exec(source.slice(Math.max(0, start - 100), start))?.[1];
+      const field = /static fields=[\w$.]+\.newFieldList\(/.exec(source.slice(match.index, match.index + 2_000));
+      if (symbol !== undefined && field !== null) {
+        symbols.set(symbol, match[1]!);
+        definitions.set(match[1]!, match.index + field.index + field[0].length);
+      }
+    }
+    const aliases = [...source.matchAll(/([\w$]+)=([\w$]+)(?=[,;}])/g)];
+    for (let pass = 0; pass < 8; pass += 1) {
+      let changed = false;
+      for (const alias of aliases) {
+        if (!symbols.has(alias[1]!) && symbols.has(alias[2]!)) { symbols.set(alias[1]!, symbols.get(alias[2]!)!); changed = true; }
+      }
+      if (!changed) break;
+    }
+  }
   const messages: CursorSchemaSnapshot["messages"] = {};
-  for (const name of MONITORED_CURSOR_MESSAGES) {
+  const enums: Record<string, DescriptorObject[]> = {};
+  const pending: string[] = [...MONITORED_CURSOR_MESSAGES];
+  for (const name of pending) {
+    if (messages[name] !== undefined || enums[name] !== undefined) continue;
+    if (includeReferenced && enumDefinitions.has(name)) {
+      enums[name] = readDescriptorArray(source, enumDefinitions.get(name)!, name).elements.map(node => {
+        if (!ts.isObjectLiteralExpression(node)) throw new Error(`Invalid enum ${name}`);
+        return parseObject(node, symbols);
+      });
+      continue;
+    }
     const start = definitions.get(name);
     if (start === undefined) throw new Error(`Missing protobuf descriptor ${name}`);
     const array = readDescriptorArray(source, start, name);
@@ -90,8 +113,16 @@ export function extractCursorSchema(source: string): CursorSchemaSnapshot {
       numbers.add(field.no);
     }
     messages[name] = fields.sort((a, b) => a.no - b.no);
+    if (includeReferenced) {
+      const visit = (value: DescriptorValue): void => {
+        if (typeof value === "string" && (definitions.has(value) || enumDefinitions.has(value))) pending.push(value);
+        else if (typeof value === "object") Object.values(value).forEach(visit);
+      };
+      fields.forEach(field => Object.values(field).forEach(visit));
+      if (pending.length > 100_000) throw new Error("Cursor descriptor graph exceeds inspection limit");
+    }
   }
-  return { formatVersion: 1, messages };
+  return { formatVersion: 1, messages, ...(includeReferenced ? { enums } : {}) };
 }
 
 function readDescriptorArray(source: string, start: number, name: string): ts.ArrayLiteralExpression {

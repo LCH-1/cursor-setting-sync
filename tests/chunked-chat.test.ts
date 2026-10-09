@@ -11,6 +11,11 @@ import { canonicalBytes, sha256 } from "../src/protocol/canonical";
 import { portableChatCoreHash, type PortableComposerHeader, type PortableKvRow } from "../src/chat/stateVscdb";
 import { SyncRepository } from "../src/protocol/repository";
 import { chatContinuationApplyBlockReason } from "../src/sync/chatContinuationPolicy";
+import { prepareChanges } from "../src/helper/main";
+import { EventReconciler } from "../src/protocol/reconciler";
+import { decodeCursorDataSchema, encodeCursorDataSchema } from "../src/platform/cursorDataSchema";
+import legacySchemas from "../src/platform/legacyCursorSchemas.json";
+import { CURSOR_MESSAGE_NAMES } from "../src/chat/cursorMessageNames";
 
 const id = "11111111-2222-4333-8444-555555555555";
 const header: PortableComposerHeader = { composerId: id, workspaceId: null, createdAt: 1, lastUpdatedAt: 2,
@@ -51,6 +56,28 @@ function replacePart(fixture: Awaited<ReturnType<typeof captured>>, edit: (rows:
 }
 
 describe("bounded chunked chat transfer", () => {
+  it.each([false, true])("verifies cross-version fields while staging schema-v3 before preparing a write (changed: %s)", async changed => {
+    const root = await mkdtemp(join(tmpdir(), "cross-version-chunks-")); roots.push(root);
+    const repository = await SyncRepository.create(join(root, "repo"), join(root, "local"), "a long test passphrase", 1024 * 1024,
+      { extensionVersion: "1.0.20", cursorVersion: "3.24.9", vscodeVersion: "1.105.0", cursorDataSchema: legacySchemas["3.24.9"] });
+    const db = databaseFixture(1);
+    try {
+      db.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run(JSON.stringify({ fullConversationHeadersOnly: [{ bubbleId: "00000000" }], conversationState: `~${Buffer.from([0xb2, 0x02, 0x01, 0x61]).toString("base64")}` }), `composerData:${id}`);
+      const manifest = await captureChunkedChat(db, header, repository);
+      const content = canonicalBytes(manifest);
+      await repository.publish([{ resourceId: `chat/${id}`, kind: "chat", content, semanticHash: sha256(content), metadata: chunkedChatMetadata(manifest) }], []);
+      new EventReconciler().reconcile(await repository.listEvents(), repository.state, null);
+      const tip = repository.state.tips[`chat/${id}`]![0]!;
+      const schema = structuredClone(decodeCursorDataSchema(legacySchemas["3.23.23"]));
+      if (changed) schema.messages[CURSOR_MESSAGE_NAMES["conversation-state"]]!.find(f => f.no === 38)!.name = "different";
+      const result = await prepareChanges(repository, [{ ...tip, resourceId: `chat/${id}` }], {
+        extensionVersion: "1.0.19", cursorVersion: "3.23.23", vscodeVersion: "1.105.0", cursorDataSchema: encodeCursorDataSchema(schema),
+      });
+      expect(result.prepared).toHaveLength(changed ? 0 : 1);
+      expect(result.failureByResourceId[`chat/${id}`]).toEqual(changed ? expect.stringContaining("#38") : undefined);
+      for (const row of result.prepared) await row.chunkedChat?.dispose();
+    } finally { db.close(); }
+  });
   it("preserves more than 16,384 rows with bounded parts and a verified staged core", async () => {
     const fixture = await captured(17_000);
     expect(fixture.manifest.bubbleCount).toBe(17_000);

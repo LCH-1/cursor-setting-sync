@@ -12,6 +12,7 @@ import {
   __testing as helperMainTesting,
   markAppliedProjections,
   prepareChanges,
+  refreshShutdownChatCompatibility,
 } from "../src/helper/main";
 import { EventReconciler } from "../src/protocol/reconciler";
 import { SyncRepository } from "../src/protocol/repository";
@@ -31,6 +32,9 @@ import type { PreparedHelperChange } from "../src/helper/database";
 import { CursorReopenedError } from "../src/helper/resourceApply";
 import type { ResourceProjection } from "../src/protocol/reconciler";
 import { MAX_HELPER_APPLY_WORK_BYTES, MAX_HELPER_SINGLE_CHAT_BYTES } from "../src/constants";
+import legacySchemas from "../src/platform/legacyCursorSchemas.json";
+import { chatCompatibilityTargetFingerprint } from "../src/chat/dataCompatibility";
+import { APPLY_FAILURE_BLOCK_PREFIX } from "../src/constants";
 
 const PASSPHRASE = "a sufficiently long test passphrase";
 const PRODUCER: EventProducer = {
@@ -40,6 +44,51 @@ const PRODUCER: EventProducer = {
 };
 
 describe("preparing a helper batch", () => {
+  it.each([false, true])("proves authenticated cross-version chat bytes before admitting a database write (new field: %s)", async newField => {
+    await withRepository(async repository => {
+      const composerId = "00000000-0000-4000-8000-000000000099";
+      const state = newField ? Buffer.from([0xd2, 0x02, 0x01, 0x61]) : Buffer.from([0xb2, 0x02, 0x01, 0x61]);
+      const entry = await publishPortableChat(repository, portableChat(composerId, { conversationState: `~${state.toString("base64")}` }));
+      const sibling = await publish(repository, "compatible", "ordinary file");
+      const result = await prepareChanges(repository, [helperChange(entry), helperChange(sibling)], {
+        extensionVersion: "1.0.19", cursorVersion: "3.23.23", vscodeVersion: "1.105.0", cursorDataSchema: legacySchemas["3.23.23"],
+      });
+      expect(result.prepared.map(row => row.change.resourceId)).toEqual(newField ? [sibling.resourceId] : [entry.resourceId, sibling.resourceId]);
+      expect(result.failureByResourceId[entry.resourceId]).toEqual(newField ? expect.stringContaining("#42") : undefined);
+    }, { extensionVersion: "1.0.20", cursorVersion: "3.24.9", vscodeVersion: "1.105.0", cursorDataSchema: legacySchemas["3.24.9"] });
+  });
+  it("ignores a cached version block at shutdown but preserves unrelated failures and exclusions", async () => {
+    await withRepository(async repository => {
+      const entry = await publishPortableChat(repository, portableChat("00000000-0000-4000-8000-000000000098"));
+      entry.tip.producer = { extensionVersion: "1.0.20", cursorVersion: "3.24.9", vscodeVersion: "1.105.0" };
+      const pending = { resourceId: entry.resourceId, kind: "chat" as const, eventHash: entry.tip.eventHash, changeIndex: entry.tip.changeIndex, blockedReason: "Created by newer Cursor 3.24.9" };
+      repository.state.pendingDatabaseChanges = [pending];
+      const request = { expectedCursorVersion: "3.23.23", expectedVscodeVersion: "1.105.0", extensionVersion: "1.0.19", cursorDataSchema: legacySchemas["3.23.23"] } as HelperRequest;
+      refreshShutdownChatCompatibility(repository, request);
+      expect(pending.blockedReason).toBeUndefined();
+      for (const reason of ["Apply failed: database corrupt", "This workspace is excluded", "mapping required"]) {
+        pending.blockedReason = reason;
+        refreshShutdownChatCompatibility(repository, request);
+        expect(pending.blockedReason).toBe(reason);
+      }
+    });
+  });
+  it("keeps a verified incompatible chat blocked until the installed format or parser changes", async () => {
+    await withRepository(async repository => {
+      const entry = await publishPortableChat(repository, portableChat("00000000-0000-4000-8000-000000000097"));
+      entry.tip.producer = { extensionVersion: "1.0.20", cursorVersion: "3.24.9", vscodeVersion: "1.105.0" };
+      const target = { cursorVersion: "3.23.23", vscodeVersion: "1.105.0", extensionVersion: "1.0.19", cursorDataSchema: legacySchemas["3.23.23"] };
+      const pending = { resourceId: entry.resourceId, kind: "chat" as const, eventHash: entry.tip.eventHash, changeIndex: entry.tip.changeIndex, blockedReason: `${APPLY_FAILURE_BLOCK_PREFIX}: The installed Cursor cannot read field`, compatibilityTargetFingerprint: chatCompatibilityTargetFingerprint(target) };
+      repository.state.pendingDatabaseChanges = [pending];
+      const request = { expectedCursorVersion: target.cursorVersion, expectedVscodeVersion: target.vscodeVersion, extensionVersion: target.extensionVersion, cursorDataSchema: target.cursorDataSchema } as HelperRequest;
+      refreshShutdownChatCompatibility(repository, request);
+      expect(pending.blockedReason).toContain("cannot read");
+      request.extensionVersion = "1.0.20";
+      refreshShutdownChatCompatibility(repository, request);
+      expect(pending.blockedReason).toBeUndefined();
+      expect(pending.compatibilityTargetFingerprint).toBeUndefined();
+    });
+  });
   it("admits one large chat alone without raising the ordinary resource page ceiling", () => {
     const small: HelperChange = {
       resourceId: "chat/11111111-1111-4111-8111-111111111111", kind: "chat", operation: "put",
@@ -1389,6 +1438,7 @@ function objectPath(root: string, published: PublishedTip): string {
 
 async function withRepository(
   run: (repository: SyncRepository, root: string) => Promise<void>,
+  producer: EventProducer = PRODUCER,
 ): Promise<void> {
   const temporaryRoot = await mkdtemp(join(tmpdir(), "cursor-prepare-test-"));
   const root = join(temporaryRoot, "repository");
@@ -1398,7 +1448,7 @@ async function withRepository(
       join(temporaryRoot, "storage"),
       PASSPHRASE,
       1024 * 1024,
-      PRODUCER,
+      producer,
     );
     await run(repository, root);
   } finally {

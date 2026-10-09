@@ -16,7 +16,7 @@ describe("Cursor-only release workflow", () => {
     const files = await vsce.listFiles({ cwd: process.cwd(), dependencies: false });
     const publicFiles = new Set([
       "package.json", "README.md", "README.ko.md", "CHANGELOG.md", "LICENSE",
-      "THIRD_PARTY_NOTICES.md", "icon.png", "dist/extension.js", "dist/helper.js",
+      "THIRD_PARTY_NOTICES.md", "icon.png", "dist/extension.js", "dist/helper.js", "dist/schema-inspector.js", "dist/LICENSE.typescript.txt",
       "docs/usage.md", "docs/security.md", "docs/protocol.md", "docs/compatibility.md",
     ]);
     expect(files.filter((file) => !publicFiles.has(file))).toEqual([]);

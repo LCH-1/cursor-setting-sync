@@ -268,6 +268,7 @@ export class HelperLauncher {
       extensionHostPid: process.pid,
       restart,
       expectedCursorVersion: this.compatibility.cursorVersion,
+      ...(this.compatibility.cursorDataSchema === undefined ? {} : { cursorDataSchema: this.compatibility.cursorDataSchema }),
       expectedVscodeVersion: this.compatibility.vscodeVersion,
       extensionVersion: this.compatibility.extensionVersion,
       paths: this.paths,

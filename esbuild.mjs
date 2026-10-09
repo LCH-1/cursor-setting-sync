@@ -1,11 +1,15 @@
 import * as esbuild from "esbuild";
+import { copyFile, mkdir } from "node:fs/promises";
 
 const watch = process.argv.includes("--watch");
+await mkdir("dist", { recursive: true });
+await copyFile("node_modules/typescript/LICENSE.txt", "dist/LICENSE.typescript.txt");
 
 const context = await esbuild.context({
   entryPoints: {
     extension: "src/extension.ts",
     helper: "src/helper/main.ts",
+    "schema-inspector": "src/platform/schemaInspector.ts",
   },
   bundle: true,
   platform: "node",

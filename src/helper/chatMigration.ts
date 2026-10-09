@@ -8,11 +8,13 @@ import { EventReconciler } from "../protocol/reconciler";
 import type { SyncRepository } from "../protocol/repository";
 import { absorbedCheckpointManifest, effectiveTipProducer } from "../sync/versionPolicy";
 import { chatContinuationApplyBlockReason } from "../sync/chatContinuationPolicy";
+import { canInspectChatCompatibility } from "../chat/dataCompatibility";
 import type { ResourceTip } from "../types";
 import type { HelperRequest } from "./types";
 
 export function helperAcceptsChatProducer(tip: ResourceTip, request: HelperRequest): boolean {
   const producer = effectiveTipProducer(tip);
+  if (canInspectChatCompatibility(producer, { cursorVersion: request.expectedCursorVersion, ...(request.cursorDataSchema === undefined ? {} : { cursorDataSchema: request.cursorDataSchema }) })) return true;
   return producer !== undefined && ([
     [producer.extensionVersion, request.extensionVersion],
     [producer.cursorVersion, request.expectedCursorVersion],

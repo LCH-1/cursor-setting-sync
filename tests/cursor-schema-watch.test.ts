@@ -49,6 +49,14 @@ function changedField(name: string, number: number, changes: Partial<CursorField
 }
 
 describe("Cursor schema preflight", () => {
+  it("extracts aliases, generated class descriptors and complete referenced enums without executing vendor code", () => {
+    const empty = MONITORED_CURSOR_MESSAGES.filter(name => name !== conversation).map((name, i) => `r${i}=p.makeMessageType(${JSON.stringify(name)},()=>[])`).join(";");
+    const source = `${empty};root=p.makeMessageType(${JSON.stringify(conversation)},()=>[{no:5,name:"token_details",kind:"message",T:alias},{no:10,name:"mode",kind:"enum",T:en}]);alias=other;other.typeName="fixture.Opaque";other.fields=p.newFieldList(()=>[{no:1,name:"value",kind:"scalar",T:9}]);en=p.makeEnum("fixture.Mode",[{no:0,name:"DEFAULT"},{no:1,name:"ACTIVE"}]);throw new Error("never execute");`;
+    const result = extractCursorSchema(source, true);
+    expect(result.messages[conversation]![0]!.T).toBe("fixture.Opaque");
+    expect(result.messages["fixture.Opaque"]).toEqual([{ no: 1, name: "value", kind: "scalar", T: 9 }]);
+    expect(result.enums!["fixture.Mode"]).toEqual([{ no: 0, name: "DEFAULT" }, { no: 1, name: "ACTIVE" }]);
+  });
   it("extracts the complete public inventory without evaluating Cursor code", () => {
     const source = `throw new Error('never execute bundled code');${bundleFor(baseline)}`;
     const observed = extractCursorSchema(source);

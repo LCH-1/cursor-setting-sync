@@ -8,6 +8,7 @@ import type {
   ResourceKind,
 } from "../types";
 import { pathExists } from "./files";
+import { inspectInstalledCursorDataSchema } from "./cursorDataSchema";
 import type { CursorPaths } from "./paths";
 import {
   inspectSqliteCapabilities,
@@ -56,6 +57,9 @@ export async function inspectCompatibility(
     );
   }
   const cursorVersion = product.version ?? "unknown";
+  let cursorDataSchema: string | undefined;
+  try { cursorDataSchema = await inspectInstalledCursorDataSchema(paths.appRoot); }
+  catch (error) { warnings.push(`Cross-version chat inspection is unavailable: ${formatError(error)}`); }
   const vscodeVersion = product.vscodeVersion ?? "unknown";
   const sqlite = inspectSqliteCapabilities();
   const runtimeReasons: string[] = [];
@@ -110,6 +114,7 @@ export async function inspectCompatibility(
       );
 
   return {
+    ...(cursorDataSchema === undefined ? {} : { cursorDataSchema }),
     compatible,
     extensionVersion,
     cursorVersion,
@@ -332,6 +337,7 @@ export function databaseApplyBlockReason(
   kind: ResourceKind,
   producer: EventProducer | undefined,
   local: CompatibilityReport,
+  inspectedChat = false,
 ): string | null {
   const localBlock = databaseCapabilityBlockReason(kind, local);
   if (localBlock !== null) {
@@ -349,6 +355,7 @@ export function databaseApplyBlockReason(
     ["extension", producer.extensionVersion, local.extensionVersion],
   ] as const) {
     const comparison = compareVersions(incoming, current);
+    if (kind === "chat" && inspectedChat) continue;
     if (comparison === null) {
       return `Unable to compare the incoming ${label} version (${incoming}) with the local version (${current}).`;
     }

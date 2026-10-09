@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
+import { canInspectChatCompatibility, crossVersionChatBlockReason, requiresCrossVersionInspection, isVersionCompatibilityBlock, chatCompatibilityTargetFingerprint } from "../chat/dataCompatibility";
 import {
   APPLY_FAILURE_BLOCK_PREFIX,
   AUTOMATIC_CHECKPOINT_COOLDOWN_MS,
@@ -536,6 +537,7 @@ export class SyncManager implements vscode.Disposable {
   });
   private readonly helper: HelperLauncher;
   private readonly producer: EventProducer;
+  private readonly chatCompatibilityResults = new Map<string, { fingerprint: string; reason: string | null }>();
   private readonly historyDocuments = new Map<string, string>();
   private readonly historyPreviewRegistration: vscode.Disposable;
   private readonly gitWarningsShown = new Set<GitErrorKind>();
@@ -676,6 +678,7 @@ export class SyncManager implements vscode.Disposable {
       },
     });
     this.producer = {
+      ...(compatibility.cursorDataSchema === undefined ? {} : { cursorDataSchema: compatibility.cursorDataSchema }),
       extensionVersion: compatibility.extensionVersion,
       cursorVersion: compatibility.cursorVersion,
       vscodeVersion: compatibility.vscodeVersion,
@@ -5818,6 +5821,7 @@ export class SyncManager implements vscode.Disposable {
         this.status.log(formatWarningLine(entry));
       }
       const pendingPruned = prunePending(repository, result.projections);
+      const compatibilityChanged = await this.refreshPendingVersionCompatibility(repository);
       for (const projection of result.projections) {
         if (unverifiableLocalChats.has(projection.resourceId)) {
           queuePending(repository, projection, "The matching local chat observation could not be authenticated; synchronize again before applying it.");
@@ -5838,6 +5842,7 @@ export class SyncManager implements vscode.Disposable {
         synthetic.changed ||
         suppressedProjectionChanged ||
         pendingPruned ||
+        compatibilityChanged ||
         appliedProjectionStateChanged ||
         repository.state.pendingDatabaseChanges.length !== pendingCountBefore ||
         repository.state.lastError !== null;
@@ -6162,6 +6167,7 @@ export class SyncManager implements vscode.Disposable {
         stateChanged = true;
         continue;
       }
+      await this.inspectIncomingChatCompatibility(repository, tip);
       const blockedReason = this.resourceApplyBlockReason(tip);
       if (blockedReason !== null) {
         if (queuePending(repository, projection, blockedReason)) {
@@ -6977,11 +6983,55 @@ export class SyncManager implements vscode.Disposable {
     ) {
       return PERMANENT_EXCLUSION_REASONS[2];
     }
+    const cached = this.chatCompatibilityResults.get(tip.versionId);
+    if (cached !== undefined && cached.fingerprint === chatCompatibilityTargetFingerprint(this.compatibility) && cached.reason !== null) return cached.reason;
+    const pending = tip.kind === "chat" ? this.repository?.state.pendingDatabaseChanges.find(p => p.eventHash === tip.eventHash && p.changeIndex === tip.changeIndex) : undefined;
+    if (pending?.blockedReason !== undefined && isVersionCompatibilityBlock(pending.blockedReason) &&
+      pending.compatibilityTargetFingerprint === chatCompatibilityTargetFingerprint(this.compatibility)) return pending.blockedReason;
     return databaseApplyBlockReason(
       tip.kind,
       effectiveTipProducer(tip),
       this.compatibility,
+      tip.kind === "chat" && canInspectChatCompatibility(effectiveTipProducer(tip), this.compatibility),
     );
+  }
+
+  private async inspectIncomingChatCompatibility(repository: SyncRepository, tip: ResourceTip): Promise<void> {
+    const producer = effectiveTipProducer(tip);
+    const fingerprint = chatCompatibilityTargetFingerprint(this.compatibility);
+    if (tip.kind !== "chat" || tip.operation !== "put" || producer === undefined ||
+      !requiresCrossVersionInspection(producer, this.compatibility) ||
+      !canInspectChatCompatibility(producer, this.compatibility) || this.chatCompatibilityResults.get(tip.versionId)?.fingerprint === fingerprint) return;
+    // Larger payloads are verified by the offline helper before it can write.
+    if (tip.payload === undefined || tip.payload.plainBytes > 16 * 1024 * 1024 || tip.metadata?.chatSnapshotSchemaVersion === 3) return;
+    try {
+      const content = await repository.readObject(tip.payload);
+      const reason = sha256(content) !== tip.semanticHash ? "Cross-version chat payload does not match its authenticated hash" :
+        await crossVersionChatBlockReason(content, tip, producer, this.compatibility);
+      if (this.chatCompatibilityResults.size >= 512) this.chatCompatibilityResults.delete(this.chatCompatibilityResults.keys().next().value!);
+      this.chatCompatibilityResults.set(tip.versionId, { fingerprint, reason });
+    } catch (error) {
+      // Cloud hydration is retried; it must not become an immutable compatibility verdict.
+      this.status.log(`Deferred chat compatibility inspection: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async refreshPendingVersionCompatibility(repository: SyncRepository): Promise<boolean> {
+    let changed = false;
+    let inspections = 0;
+    const fingerprint = chatCompatibilityTargetFingerprint(this.compatibility);
+    for (const pending of repository.state.pendingDatabaseChanges) {
+      if (pending.blockedReason === undefined || !isVersionCompatibilityBlock(pending.blockedReason)) continue;
+      if (pending.compatibilityTargetFingerprint === fingerprint) continue;
+      const tip = findTip(repository, pending.resourceId, pending.eventHash, pending.changeIndex);
+      if (tip === undefined) continue;
+      if (tip.kind === "chat" && inspections < 2) { inspections += 1; await this.inspectIncomingChatCompatibility(repository, tip); }
+      const reason = this.resourceApplyBlockReason(tip);
+      if (reason === null) { delete pending.blockedReason; delete pending.compatibilityTargetFingerprint; }
+      else { pending.blockedReason = reason; pending.compatibilityTargetFingerprint = fingerprint; }
+      changed = true;
+    }
+    return changed;
   }
 
   /**

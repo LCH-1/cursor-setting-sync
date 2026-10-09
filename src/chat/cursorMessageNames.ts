@@ -1,0 +1,26 @@
+import type { AGENT_KV_SCHEMAS } from "./agentKv";
+
+export const CURSOR_MESSAGE_NAMES = {
+  "conversation-state": "agent.v1.ConversationStateStructure",
+  "file-state": "agent.v1.FileStateStructure",
+  "subagent-state": "agent.v1.SubagentPersistedState",
+  "conversation-turn": "agent.v1.ConversationTurnStructure",
+  "agent-turn": "agent.v1.AgentConversationTurnStructure",
+  "shell-turn": "agent.v1.ShellConversationTurnStructure",
+  "user-message": "agent.v1.UserMessage",
+  "selected-context": "agent.v1.SelectedContext",
+  "selected-image": "agent.v1.SelectedImage",
+  "extra-context-entry": "agent.v1.ExtraContextEntry",
+  "invocation-context": "agent.v1.InvocationContext",
+  "selected-pull-request": "agent.v1.SelectedPullRequest",
+  "selected-git-pr-diff": "agent.v1.SelectedGitPRDiffSelection",
+  "conversation-step": "agent.v1.ConversationStep",
+  "tool-call": "agent.v1.ToolCall",
+  "read-tool-call": "agent.v1.ReadToolCall",
+  "read-tool-result": "agent.v1.ReadToolResult",
+  "read-tool-success": "agent.v1.ReadToolSuccess",
+  "task-tool-call": "agent.v1.TaskToolCall",
+  "task-result": "agent.v1.TaskResult",
+  "task-success": "agent.v1.TaskSuccess",
+  "truncated-tool-call": "agent.v1.TruncatedToolCall",
+} as const satisfies Record<keyof typeof AGENT_KV_SCHEMAS, string>;

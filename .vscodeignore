@@ -12,6 +12,8 @@
 !icon.png
 !dist/extension.js
 !dist/helper.js
+!dist/schema-inspector.js
+!dist/LICENSE.typescript.txt
 !docs/usage.md
 !docs/security.md
 !docs/protocol.md

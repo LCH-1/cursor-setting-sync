@@ -8,7 +8,7 @@ import { buffersFitJsonStructureBudget } from "../protocol/jsonStructure";
 import type { JsonValue, ObjectReference } from "../types";
 import type { PortableComposerHeader, PortableKvRow } from "./stateVscdb";
 import { updatePortableComposerHeaderHash } from "./headerCanonical";
-import { walkAgentKvReachability, type AgentKvBlobLookupResult } from "./agentKv";
+import { walkAgentKvReachability, type AgentKvBlobLookupResult, type AgentKvWalkOptions } from "./agentKv";
 
 export const CHAT_CHUNK_BYTES = 8 * 1024 * 1024;
 export const CHUNKED_CHAT_MAX_BYTES = 2 * 1024 * 1024 * 1024;
@@ -231,7 +231,7 @@ export interface StagedChunkedChat {
   database: DatabaseSync;
   dispose(): Promise<void>;
 }
-export async function stageChunkedChat(store: ChatChunkStore, m: ChunkedChatManifest): Promise<StagedChunkedChat> {
+export async function stageChunkedChat(store: ChatChunkStore, m: ChunkedChatManifest, onField?: AgentKvWalkOptions["onField"]): Promise<StagedChunkedChat> {
   if (!m.continuationComplete || m.agentKvMissingCount !== 0) { throw new Error("Chat continuation snapshot is incomplete."); }
   const root = await mkdtemp(join(tmpdir(), "cursor-sync-chat-"));
   const database = openDatabase(join(root, "stage.sqlite"));
@@ -277,6 +277,7 @@ export async function stageChunkedChat(store: ChatChunkStore, m: ChunkedChatMani
         finishCoreHash(hash, composer, m.header) !== m.chatCoreHash) { throw new Error("Chat chunk core is incomplete or has an invalid hash."); }
     const graph = await walkAgentKvReachability([...states.values], key => stagedBlobLookup(database, key), {
       limits: { maxNodes: 50_000, maxBytes: CHUNKED_CHAT_MAX_BYTES, maxDepth: 256, maxProtobufDepth: 64 }, blobSink: async () => {},
+      ...(onField === undefined ? {} : { onField }),
     });
     if (!graph.complete) { throw new Error("Chat chunk continuation closure could not be verified."); }
     return { manifest: m, database, dispose };

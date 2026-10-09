@@ -153,6 +153,14 @@ describe("cross-version synchronization policy", () => {
       ),
     ).toContain("newer extension 0.1.0");
   });
+  it("admits an inspectable chat without bypassing database capability or other resource gates", () => {
+    const local = report("1.0.19", "3.23.23", "1.105.0");
+    const incoming = producer("1.0.20", "3.24.9", "1.105.0");
+    expect(databaseApplyBlockReason("chat", incoming, local, true)).toBeNull();
+    expect(databaseApplyBlockReason("profile", incoming, local, true)).toContain("newer Cursor");
+    local.databaseCapabilities["global-chat"] = { available: false, reasons: ["integrity failure"] };
+    expect(databaseApplyBlockReason("chat", incoming, local, true)).toContain("integrity failure");
+  });
 
   it("keeps file resources bidirectional across versions", () => {
     expect(isDatabaseBackedKind("settings")).toBe(false);

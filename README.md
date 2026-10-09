@@ -23,13 +23,16 @@ Cursor versions do not need to match exactly.
 
 - File-based resources synchronize in both directions across supported Cursor versions.
 - Database-backed resources created by an older Cursor or extension version can be applied by a newer version.
-- Database-backed resources created by a newer Cursor, VS Code base, or extension version are deferred on an older PC. Update that PC before applying them.
+- Supported complete chat snapshots can synchronize across different Cursor and extension versions when their actually used continuation fields match the installed receiving Cursor descriptors. Unused new fields do not block synchronization. Unknown fields, changed field meanings, missing data, and unverified source formats stay deferred.
+- Old version-only chat blocks are rechecked automatically during synchronization and shutdown apply. Other database formats retain their existing conservative version gates.
 - Workspace database rows are serialized into a versioned portable payload and merged with SQL only after Cursor exits. Original SQLite files are never transported or installed.
 - A deferred remote version is not replaced by an unchanged older local copy. If both PCs genuinely modify the same resource, both versions are preserved as a conflict instead of silently overwriting either side.
 - Unknown repository protocol versions fail closed before the client publishes local changes.
 - Safe but unknown resource kinds from a newer extension remain in the immutable log; an older extension continues applying kinds it understands and picks up the deferred kind after it is updated.
 
-This policy prioritizes forward migration and data safety. Reverse application to an older Cursor is allowed only when the producing versions are not newer and the local database passes the required schema checks.
+Local database capability checks, authenticated payload hashes, complete continuation verification, and backups still apply. The shutdown helper independently inspects the installed Cursor and verifies incoming bytes before writing.
+
+The descriptor inspection worker bundles TypeScript (Microsoft Corporation), licensed under Apache 2.0. Its license is included as `dist/LICENSE.typescript.txt` in the extension.
 
 ## Requirements
 

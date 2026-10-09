@@ -25,6 +25,7 @@ export interface AgentKvWalkOptions {
   limits?: Partial<AgentKvWalkLimits>;
   /** Discards blob bytes after delivery; repeated schema routes re-read and verify them. */
   blobSink?: (blob: AgentKvReachableBlob) => Promise<void>;
+  onField?: (schema: AgentKvSchemaName | "selected-image-with-data", field: number, wire: number) => void;
 }
 
 export type AgentKvValueType = "text" | "blob";
@@ -195,6 +196,7 @@ export function extractAgentKvRootIds(
   const extracted = extractRootsWithLimits(
     serializedState,
     limits,
+    options?.onField,
   );
   return {
     roots: extracted.roots,
@@ -222,7 +224,7 @@ export async function walkAgentKvReachability(
   options?: AgentKvWalkOptions,
 ): Promise<AgentKvReachabilityResult> {
   const limits = normalizeLimits(options);
-  const extracted = extractRootsWithLimits(serializedState, limits);
+  const extracted = extractRootsWithLimits(serializedState, limits, options?.onField);
   const blobs: AgentKvReachableBlob[] = [];
   const missing: AgentKvMissingBlob[] = [];
   const tampered: AgentKvTamperedBlob[] = [];
@@ -436,6 +438,7 @@ export async function walkAgentKvReachability(
       scheduledIds,
       limits.maxNodes - scheduledIds.size,
       limits.maxNodes,
+      options?.onField,
     );
     if (!parsed.valid) {
       limitReasons.add("schema");
@@ -504,6 +507,7 @@ export async function walkAgentKvReachability(
 function extractRootsWithLimits(
   serializedState: string | readonly string[],
   limits: Readonly<AgentKvWalkLimits>,
+  onField?: AgentKvWalkOptions["onField"],
 ): InternalRootExtractionResult {
   const states =
     typeof serializedState === "string" ? [serializedState] : serializedState;
@@ -563,6 +567,7 @@ function extractRootsWithLimits(
       roots,
       limits.maxNodes - roots.size,
       limits.maxNodes,
+      onField,
     );
     if (!parsed.valid) {
       unreadable.push({
@@ -616,6 +621,7 @@ function parseProtobuf(
   knownCandidates: ReadonlySet<string>,
   maxNewCandidates: number,
   maxMapEntries: number,
+  onField?: AgentKvWalkOptions["onField"],
 ): ParsedProtobuf {
   if (type === "opaque") {
     return {
@@ -638,6 +644,7 @@ function parseProtobuf(
     depthLimited: false,
     candidateLimited: false,
     schemaUnsupported: false,
+    onField,
   };
   walkSchemaMessage(bytes, 0, type, context);
   return {
@@ -693,6 +700,7 @@ interface DeferredSchemaField {
 }
 
 interface SemanticParseContext {
+  onField?: AgentKvWalkOptions["onField"];
   candidates: Map<string, Set<AgentKvMessageType>>;
   newCandidateIds: Set<string>;
   knownCandidates: ReadonlySet<string>;
@@ -1062,6 +1070,7 @@ function walkSchemaMessage(
   >();
 
   scanProtobufMessage(bytes, (fieldNumber, wireType, payload) => {
+    context.onField?.(schemaName, fieldNumber, wireType);
     const rule = schema.fields[fieldNumber];
     if (rule === undefined) {
       context.schemaUnsupported = true;
@@ -1218,6 +1227,7 @@ function parseSelectedImageWithData(
   let blobId: Uint8Array | undefined;
   let data: Uint8Array | undefined;
   scanProtobufMessage(payload, (fieldNumber, wireType, fieldPayload) => {
+    context.onField?.("selected-image-with-data", fieldNumber, wireType);
     if (
       (fieldNumber !== 1 && fieldNumber !== 2) ||
       wireType !== WIRE_LENGTH_DELIMITED ||

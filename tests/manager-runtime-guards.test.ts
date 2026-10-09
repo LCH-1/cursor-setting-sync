@@ -89,6 +89,8 @@ import type {
 import { ConflictController, type ConflictSelection } from "../src/ui/conflicts";
 import type { StatusController } from "../src/ui/status";
 import { shouldPublishSnapshot } from "../src/sync/versionPolicy";
+import { decodeCursorDataSchema, encodeCursorDataSchema } from "../src/platform/cursorDataSchema";
+import legacySchemas from "../src/platform/legacyCursorSchemas.json";
 
 const { DatabaseSync } = sqlite;
 const T0 = Date.parse("2026-08-08T00:00:00.000Z");
@@ -1204,6 +1206,46 @@ describe("workspace mapping and chat continuation blocks", () => {
 });
 
 describe("running ordinary apply drift guard", () => {
+  it.each([false, true])("automatically rechecks an old chat version block from its actual payload (new field: %s)", async newField => {
+    const fixture = await createSyncHarness();
+    const internals = fixture.manager as unknown as {
+      compatibility: CompatibilityReport;
+      configuration: { syncChat: boolean };
+      refreshPendingVersionCompatibility(repository: SyncRepository): Promise<boolean>;
+      resourceApplyBlockReason(tip: ResourceTip): string | null;
+    };
+    Object.assign(internals.compatibility, { cursorVersion: "3.23.23", extensionVersion: "1.0.19", vscodeVersion: "1.105.0", cursorDataSchema: legacySchemas["3.23.23"] });
+    internals.configuration.syncChat = true;
+    const resourceId = "chat/00000000-0000-4000-8000-000000000020";
+    const composerId = resourceId.slice(5);
+    const state = newField ? Buffer.from([0xd2, 0x02, 0x01, 0x61]) : Buffer.from([0xb2, 0x02, 0x01, 0x61]);
+    const content = Buffer.from(JSON.stringify({
+      schemaVersion: 2, composerId,
+      header: { composerId, workspaceId: "workspace", createdAt: 1, lastUpdatedAt: 2, isArchived: 0, isSubagent: 0, recency: 1, checkpointAt: null, value: "{}" },
+      composerData: { key: `composerData:${composerId}`, valueType: "text", valueBase64: Buffer.from(JSON.stringify({ fullConversationHeadersOnly: [], conversationState: `~${state.toString("base64")}` })).toString("base64") },
+      bubbles: [], agentKv: { blobs: [], referencedIds: [], missingIds: [] },
+    }));
+    await fixture.repository.publish([{ resourceId, kind: "chat", content, semanticHash: sha256(content), metadata: { chatSnapshotSchemaVersion: 2 } }], []);
+    await reconcileAndPersist(fixture.repository);
+    const tip = fixture.repository.state.tips[resourceId]![0]!;
+    tip.producer = { cursorVersion: "3.24.9", extensionVersion: "1.0.20", vscodeVersion: "1.105.0" };
+    const pending = { resourceId, kind: "chat" as const, eventHash: tip.eventHash, changeIndex: tip.changeIndex, blockedReason: "Created by newer Cursor 3.24.9" };
+    fixture.repository.state.pendingDatabaseChanges.push(pending);
+    expect(await internals.refreshPendingVersionCompatibility(fixture.repository)).toBe(true);
+    expect(pending.blockedReason).toEqual(newField ? expect.stringContaining("#42") : undefined);
+    expect(await internals.refreshPendingVersionCompatibility(fixture.repository)).toBe(false);
+    if (newField) expect(internals.resourceApplyBlockReason(tip)).toBe(pending.blockedReason);
+    if (newField) {
+      const updated = structuredClone(decodeCursorDataSchema(legacySchemas["3.23.23"]));
+      updated.messages["agent.v1.ConversationStateStructure"]!.push(decodeCursorDataSchema(legacySchemas["3.24.9"]).messages["agent.v1.ConversationStateStructure"]!.find(f => f.no === 42)!);
+      internals.compatibility.cursorDataSchema = encodeCursorDataSchema(updated);
+      expect(await internals.refreshPendingVersionCompatibility(fixture.repository)).toBe(true);
+      // The descriptor mismatch is gone, but the parser still cannot walk this new field.
+      expect(pending.blockedReason).toContain("continuation cannot be verified");
+      expect(await internals.refreshPendingVersionCompatibility(fixture.repository)).toBe(false);
+    }
+    fixture.manager.dispose();
+  });
   it.each([false, true])("rechecks an old version block without clearing an apply failure (failed: %s)", async (failed) => {
     const apply = vi.fn(async () => undefined);
     const adapter: ResourceAdapter = {

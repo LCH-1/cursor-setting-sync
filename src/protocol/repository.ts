@@ -3511,6 +3511,7 @@ function checkpointMarkerMetadata(
       checkpointedProducer === null
         ? null
         : {
+            ...(checkpointedProducer.cursorDataSchema === undefined ? {} : { cursorDataSchema: checkpointedProducer.cursorDataSchema }),
             extensionVersion: checkpointedProducer.extensionVersion,
             cursorVersion: checkpointedProducer.cursorVersion,
             vscodeVersion: checkpointedProducer.vscodeVersion,
@@ -3541,6 +3542,7 @@ function checkpointedEffectiveProducer(active: ResourceTip): EventProducer | nul
         return null;
       }
       return {
+        ...original,
         extensionVersion: active.producer.extensionVersion,
         cursorVersion: original.cursorVersion,
         vscodeVersion: original.vscodeVersion,
@@ -3563,6 +3565,7 @@ function checkpointedEffectiveProducer(active: ResourceTip): EventProducer | nul
         return null;
       }
       return {
+        ...original,
         extensionVersion: active.producer.extensionVersion,
         cursorVersion: original.cursorVersion,
         vscodeVersion: original.vscodeVersion,
@@ -3582,6 +3585,7 @@ function checkpointedEffectiveProducer(active: ResourceTip): EventProducer | nul
       return null;
     }
     return {
+      ...original,
       extensionVersion: active.producer.extensionVersion,
       cursorVersion: original.cursorVersion,
       vscodeVersion: original.vscodeVersion,
@@ -3606,7 +3610,7 @@ function eventProducerMetadata(value: JsonValue | undefined): EventProducer | nu
   return typeof extensionVersion === "string" &&
     typeof cursorVersion === "string" &&
     typeof vscodeVersion === "string"
-    ? { extensionVersion, cursorVersion, vscodeVersion }
+    ? { extensionVersion, cursorVersion, vscodeVersion, ...(typeof value.cursorDataSchema === "string" ? { cursorDataSchema: value.cursorDataSchema } : {}) }
     : null;
 }
 
@@ -3980,7 +3984,8 @@ function validateEventProducer(producer: EventProducer): void {
     typeof producer !== "object" ||
     !isBoundedVersion(producer.extensionVersion) ||
     !isBoundedVersion(producer.cursorVersion) ||
-    !isBoundedVersion(producer.vscodeVersion)
+    !isBoundedVersion(producer.vscodeVersion) ||
+    (producer.cursorDataSchema !== undefined && (typeof producer.cursorDataSchema !== "string" || producer.cursorDataSchema.length > 128 * 1024))
   ) {
     throw new Error("Event producer metadata is invalid.");
   }

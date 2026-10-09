@@ -35,6 +35,7 @@ export interface HelperRequest {
   extensionHostPid: number;
   restart: boolean;
   expectedCursorVersion: string;
+  cursorDataSchema?: string;
   expectedVscodeVersion: string;
   extensionVersion: string;
   paths: CursorPaths;

@@ -60,6 +60,24 @@ if (helper.error !== undefined || LOAD_FAILURE.test(helperOutput)) {
   process.stdout.write("smoke: helper.js loads\n");
 }
 
+const inspector = spawnSync(process.execPath, ["-e", `
+  const {Worker}=require("node:worker_threads");
+  const worker=new Worker(process.argv[1],{workerData:process.argv[2]});
+  const timer=setTimeout(()=>{worker.terminate();process.exitCode=1},10000);
+  worker.once("message",value=>{
+    clearTimeout(timer);
+    if(typeof value.error!=="string"||${LOAD_FAILURE}.test(value.error))process.exitCode=1;
+    worker.terminate();
+  });
+  worker.once("error",error=>{clearTimeout(timer);process.stderr.write(String(error));process.exitCode=1});
+`, join(distRoot, "schema-inspector.js"), join(distRoot, "missing-app-fixture")], {
+  encoding: "utf8", timeout: 15_000,
+});
+if (inspector.error !== undefined || inspector.status !== 0) {
+  failed = true;
+  process.stderr.write(`smoke: schema-inspector.js FAILED to load\n${inspector.error?.stack ?? inspector.stderr}\n`);
+} else process.stdout.write("smoke: schema-inspector.js loads in a worker\n");
+
 if (failed) {
   process.exitCode = 1;
 }

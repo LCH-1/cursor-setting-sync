@@ -127,6 +127,7 @@ export interface EventProducer {
   extensionVersion: string;
   cursorVersion: string;
   vscodeVersion: string;
+  cursorDataSchema?: string;
 }
 
 export interface EventHeader {
@@ -310,6 +311,7 @@ export interface PendingDatabaseChange {
   resourceId: string;
   kind: ResourceKind;
   blockedReason?: string;
+  compatibilityTargetFingerprint?: string;
 }
 
 export interface StreamCursor {
@@ -384,6 +386,7 @@ export interface MergeOutcome {
 }
 
 export interface CompatibilityReport {
+  cursorDataSchema?: string;
   compatible: boolean;
   extensionVersion: string;
   cursorVersion: string;
