@@ -8,7 +8,7 @@ vi.mock("vscode", () => ({ extensions: { all: [] }, workspace: { registerTextDoc
 
 import { StateVscdbChatAdapter, parsePortableChatSnapshot, portableChatCoreHash, type PortableChatSnapshotV1 } from "../src/chat/stateVscdb";
 import { __testing as helperMainTesting } from "../src/helper/main";
-import { verifyLiveQueuedChats } from "../src/helper/liveVerification";
+import { isLiveVerificationCandidate, verifyLiveQueuedChats } from "../src/helper/liveVerification";
 import type { HelperRequest } from "../src/helper/types";
 import type { ExtensionConfiguration } from "../src/config";
 import type { CursorPaths } from "../src/platform/paths";
@@ -31,6 +31,102 @@ const resourceId = `chat/${composerId}`;
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))); });
 
 describe("manager local chat publication acknowledgement", () => {
+  it.each(["partial", "complete", "missing-blob", "corrupt-blob", "changed-core", "untrusted-baseline", "different-baseline", "tampered-payload", "recapture", "superseded"] as const)("settles an equivalent v2 merge only after authenticating and observing its existing rows (%s)", async mode => {
+    const f = await fixture();
+    const db = new DatabaseSync(f.request.paths.globalDatabase);
+    try {
+      const blob = Buffer.from("immutable continuation blob");
+      const id = sha256(blob);
+      const missing = "f".repeat(64);
+      const content = canonicalBytes({ ...f.chat, schemaVersion: 2, agentKv: {
+        blobs: [{ key: `agentKv:blob:${id}`, valueType: "blob", valueBase64: blob.toString("base64") }],
+        referencedIds: mode === "complete" ? [id] : [id, missing].sort(),
+        missingIds: mode === "complete" ? [] : [missing],
+      } });
+      const snapshot = { ...f.snapshot, content, semanticHash: sha256(content), metadata: {
+        ...f.snapshot.metadata, chatSnapshotSchemaVersion: 2, agentKvBlobCount: 1,
+        agentKvReferencedCount: mode === "complete" ? 1 : 2, agentKvMissingCount: mode === "complete" ? 0 : 1,
+      } };
+      const baseline = await f.repository.publish([{ ...snapshot, parents: [] }], []);
+      const baselineId = `${baseline.eventHash!}#0`;
+      const merged = await f.repository.publish([{ ...snapshot, parents: [baselineId], metadata: {
+        ...snapshot.metadata, syncOrigin: "auto-merge",
+      } }], []);
+      new EventReconciler().reconcile(await f.repository.listEvents(), f.repository.state, null);
+      const tip = f.repository.state.tips[resourceId]![0]!;
+      f.repository.state.projections[resourceId] = {
+        resourceId, kind: "chat", versionId: baselineId, semanticHash: snapshot.semanticHash,
+        payloadObjectId: tip.payload!.objectId,
+        ...(mode === "recapture" ? { requiresAgentKvRecapture: true } : {}),
+      };
+      f.request.changes = [{ ...tip, resourceId }];
+      const pending = { resourceId, kind: "chat" as const, eventHash: merged.eventHash!, changeIndex: 0,
+        blockedReason: "Waiting for a complete synchronized continuation snapshot." };
+      f.repository.state.pendingDatabaseChanges = [pending];
+      expect(isLiveVerificationCandidate(tip, f.repository.state.projections[resourceId])).toBe(true);
+      expect(isLiveVerificationCandidate(tip)).toBe(false);
+      if (mode === "missing-blob") db.prepare("DELETE FROM cursorDiskKV WHERE key=?").run(`agentKv:blob:${id}`);
+      if (mode === "corrupt-blob") db.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run(Buffer.from("wrong"), `agentKv:blob:${id}`);
+      if (mode === "changed-core") db.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run("local edit", f.chat.bubbles[0]!.key);
+      if (mode === "untrusted-baseline" || mode === "different-baseline") {
+        const read = f.repository.readVersionMetadata.bind(f.repository);
+        vi.spyOn(f.repository, "readVersionMetadata").mockImplementation(async version => {
+          if (version !== baselineId) return read(version);
+          if (mode === "untrusted-baseline") throw new Error("baseline authentication failed");
+          const original = await read(version);
+          return { ...original, change: { ...original.change, semanticHash: "0".repeat(64) } };
+        });
+      }
+      if (mode === "tampered-payload") {
+        const read = f.repository.readVersion.bind(f.repository);
+        vi.spyOn(f.repository, "readVersion").mockImplementation(async version => ({ ...await read(version), content: Buffer.from("tampered") }));
+      }
+      if (mode === "superseded") f.repository.state.tips[resourceId] = [{ ...tip, versionId: `${"f".repeat(64)}#0` }];
+      const before = db.prepare("SELECT key,value FROM cursorDiskKV ORDER BY key").all();
+      let verified: string[];
+      if (mode === "partial") {
+        f.internals.resourceApplyBlockReason = () => null;
+        const runtime = f.manager as unknown as {
+          masterKey: Buffer;
+          helperSyncOptions(): HelperRequest["syncOptions"];
+          helper: { verifyWhileRunning: (...args: unknown[]) => Promise<void> };
+          verifyPendingWhileRunning(repository: SyncRepository, manual: boolean): Promise<void>;
+        };
+        runtime.masterKey = Buffer.from(f.repository.masterKey);
+        runtime.helperSyncOptions = () => f.request.syncOptions;
+        verified = [];
+        const verify = vi.spyOn(runtime.helper, "verifyWhileRunning").mockImplementation(async (...args) => {
+          f.request.changes = args[2] as HelperRequest["changes"];
+          verified = await verifyLiveQueuedChats(f.request, f.repository);
+        });
+        await runtime.verifyPendingWhileRunning(f.repository, true);
+        expect(verify).toHaveBeenCalledOnce();
+      } else {
+        verified = await verifyLiveQueuedChats(f.request, f.repository);
+      }
+      expect(db.prepare("SELECT key,value FROM cursorDiskKV ORDER BY key").all()).toEqual(before);
+      expect(db.prepare("SELECT value FROM cursorDiskKV WHERE key=?").get(`agentKv:blob:${missing}`)).toBeUndefined();
+      if (mode === "partial" || mode === "complete") {
+        expect(verified).toEqual([resourceId]);
+        expect(f.repository.state.pendingDatabaseChanges).toEqual([]);
+        expect(f.repository.state.projections[resourceId]?.versionId).toBe(tip.versionId);
+        expect((await f.repository.readVersion(baselineId)).content).toEqual(content);
+        expect((await f.repository.readVersion(tip.versionId)).change.metadata?.agentKvMissingCount).toBe(mode === "complete" ? 0 : 1);
+        if (mode === "partial") {
+          f.internals.adapters[0]!.scan = async () => ({ snapshots: [snapshot], deletions: [], warnings: [] });
+          (f.manager as unknown as { lastLiveVerificationAt: number }).lastLiveVerificationAt = 0;
+          await f.sync();
+          (f.manager as unknown as { lastLiveVerificationAt: number }).lastLiveVerificationAt = 0;
+          await f.sync();
+          expect(f.repository.state.pendingDatabaseChanges).toEqual([]);
+        }
+      } else {
+        expect(verified).toEqual([]);
+        expect(f.repository.state.pendingDatabaseChanges).toEqual([pending]);
+      }
+    } finally { db.close(); await f.manager.shutdown(); }
+  });
+
   it.each(["edited", "pruned", "different-remote", "untrusted-baseline"] as const)("preserves local edits beyond an authenticated equivalent queued baseline (%s)", async mode => {
     const f = await fixture();
     try {

@@ -5926,7 +5926,7 @@ export class SyncManager implements vscode.Disposable {
       const tip = tips[0];
       return tips.length === 1 && tip !== undefined &&
         tip.versionId === `${pending.eventHash}#${pending.changeIndex}` &&
-        isLiveVerificationCandidate(tip) && this.resourceApplyBlockReason(tip) === null ? [{ ...tip, resourceId: pending.resourceId }] : [];
+        isLiveVerificationCandidate(tip, repository.state.projections[pending.resourceId]) && this.resourceApplyBlockReason(tip) === null ? [{ ...tip, resourceId: pending.resourceId }] : [];
     });
     if (candidates.length === 0) return;
     const offset = this.liveVerificationOffset % candidates.length;

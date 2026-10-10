@@ -30,6 +30,8 @@ Cursor versions do not need to match exactly.
 - Unknown repository protocol versions fail closed before the client publishes local changes.
 - Safe but unknown resource kinds from a newer extension remain in the immutable log; an older extension continues applying kinds it understands and picks up the deferred kind after it is updated.
 
+An equivalent queued v2 chat is settled without database writes only after authenticating its baseline and verifying its existing conversation core and every supplied continuation blob. Missing continuation data remains missing and is never installed or reported as repaired.
+
 Local database capability checks, authenticated payload hashes, complete continuation verification, and backups still apply. The shutdown helper independently inspects the installed Cursor and verifies incoming bytes before writing.
 
 The descriptor inspection worker bundles TypeScript (Microsoft Corporation), licensed under Apache 2.0. Its license is included as `dist/LICENSE.typescript.txt` in the extension.

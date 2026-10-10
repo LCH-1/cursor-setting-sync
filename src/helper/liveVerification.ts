@@ -6,17 +6,23 @@ import { openDatabase, type DatabaseSync } from "../platform/sqlite";
 import { canonicalBytes, sha256 } from "../protocol/canonical";
 import type { SyncRepository } from "../protocol/repository";
 import { acknowledgePublishedLocalChats, effectiveSyncOrigin } from "../sync/versionPolicy";
-import type { ResourceChange, ResourceSnapshot } from "../types";
+import type { LocalProjection, ResourceChange, ResourceSnapshot } from "../types";
 import type { HelperRequest } from "./types";
 
 const MAX_LIVE_VERIFICATION_BYTES = 128 * 1024 * 1024;
 const MAX_LIVE_CORE_BYTES = 128 * 1024 * 1024;
 export const MAX_LIVE_VERIFICATION_CHANGES = 8;
 
-export function isLiveVerificationCandidate(change: Pick<ResourceChange, "kind" | "operation" | "metadata">): boolean {
+export function isLiveVerificationCandidate(
+  change: Pick<ResourceChange, "kind" | "operation" | "metadata" | "semanticHash" | "payload">,
+  previous?: LocalProjection,
+): boolean {
   return change.kind === "chat" && change.operation === "put" &&
     (change.metadata?.chatSnapshotSchemaVersion === 1 ||
-      effectiveSyncOrigin(change.metadata) === "agent-kv-enrichment");
+      effectiveSyncOrigin(change.metadata) === "agent-kv-enrichment" ||
+      (change.metadata?.chatSnapshotSchemaVersion === 2 && previous?.versionId != null &&
+        previous.semanticHash === change.semanticHash && change.payload !== undefined &&
+        previous.payloadObjectId === change.payload.objectId));
 }
 
 /** The caller owns the synchronization lock. Cursor's database is never written. */
@@ -37,12 +43,12 @@ export async function verifyLiveQueuedChats(
           `${pending.eventHash}#${pending.changeIndex}` === versionId)) continue;
     try {
       const { change } = await repository.readVersionMetadata(versionId);
-      if (change.resourceId !== requested.resourceId || !isLiveVerificationCandidate(change) ||
+      const previous = repository.state.projections[change.resourceId];
+      if (change.resourceId !== requested.resourceId || !isLiveVerificationCandidate(change, previous) ||
           change.payload === undefined || change.payload.plainBytes > request.syncOptions.maxPayloadBytes) continue;
       workBytes += change.payload.plainBytes;
       if (workBytes > MAX_LIVE_VERIFICATION_BYTES) break;
       const enrichment = effectiveSyncOrigin(change.metadata) === "agent-kv-enrichment";
-      const previous = repository.state.projections[change.resourceId];
       if (previous?.requiresAgentKvRecapture === true) continue;
       let authenticatedBaseline = false;
       if (!enrichment && previous?.versionId && previous.semanticHash === change.semanticHash) {
@@ -50,8 +56,10 @@ export async function verifyLiveQueuedChats(
         authenticatedBaseline = baseline.resourceId === change.resourceId && baseline.kind === "chat" &&
           baseline.operation === "put" && baseline.semanticHash === change.semanticHash;
       }
+      const equivalentV2 = !enrichment && change.metadata?.chatSnapshotSchemaVersion === 2;
+      if (equivalentV2 && !authenticatedBaseline) continue;
       let incoming = null;
-      if (enrichment) {
+      if (enrichment || equivalentV2) {
         const version = await repository.readVersion(versionId);
         if (version.content === null || sha256(version.content) !== change.semanticHash) continue;
         incoming = parsePortableChatSnapshot(version.content);
@@ -100,7 +108,7 @@ export async function verifyLiveQueuedChats(
             sourceChatCoreHash: coreHash, sourceBubbleCount: current.snapshot.bubbles.length,
             sourceHeaderFingerprint: headerHash.digest("hex"),
             ...(current.snapshot.header.lastUpdatedAt === null ? {} : { sourceTimestamp: current.snapshot.header.lastUpdatedAt }),
-            ...(enrichment ? { retainedLocalHash: sha256(content) } : {}),
+            ...(incoming !== null ? { retainedLocalHash: sha256(content) } : {}),
           };
         }
       } finally {
