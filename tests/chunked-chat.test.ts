@@ -16,6 +16,10 @@ import { EventReconciler } from "../src/protocol/reconciler";
 import { decodeCursorDataSchema, encodeCursorDataSchema } from "../src/platform/cursorDataSchema";
 import legacySchemas from "../src/platform/legacyCursorSchemas.json";
 import { CURSOR_MESSAGE_NAMES } from "../src/chat/cursorMessageNames";
+import { prepareChatConflictResolution } from "../src/chat/conflictResolution";
+import { mergeOfflineChatConflicts } from "../src/helper/chatConflictMerge";
+import type { HelperRequest } from "../src/helper/types";
+import type { JsonValue } from "../src/types";
 
 const id = "11111111-2222-4333-8444-555555555555";
 const header: PortableComposerHeader = { composerId: id, workspaceId: null, createdAt: 1, lastUpdatedAt: 2,
@@ -54,6 +58,122 @@ function replacePart(fixture: Awaited<ReturnType<typeof captured>>, edit: (rows:
   part.payload = { ...part.payload, objectId: part.hash, plainBytes: bytes.byteLength, compressedBytes: bytes.byteLength };
   fixture.objects.set(part.hash, bytes); return manifest;
 }
+
+async function chunkedConflict(sameCore = false, state?: string, failure?: string) {
+  const root = await mkdtemp(join(tmpdir(), "chunked-conflict-")); roots.push(root);
+  const producer = { extensionVersion: "1.0.20", cursorVersion: "3.24.9", vscodeVersion: "1.105.0",
+    cursorDataSchema: legacySchemas["3.24.9"] };
+  const repository = await SyncRepository.create(join(root, "repo"), join(root, "storage"),
+    "sufficiently long chunk conflict passphrase", 128 * 1024 * 1024, producer);
+  const db = databaseFixture(24);
+  if (state !== undefined) db.prepare("UPDATE cursorDiskKV SET value=? WHERE key=?").run(
+    JSON.stringify({ fullConversationHeadersOnly: [{ bubbleId: "00000000" }], conversationState: state }), `composerData:${id}`);
+  const manifests: ChunkedChatManifest[] = [];
+  let original: Record<string, JsonValue> | undefined;
+  try {
+    for (const size of [2048, 1024]) {
+      const manifest = await captureChunkedChat(db, sameCore || manifests.length === 0 ? header :
+        { ...header, value: '{"name":"Latest long history"}' }, {
+        maxPayloadBytes: size, writeChatChunk: content => repository.writeChatChunk(content),
+        readObject: ref => repository.readObject(ref),
+      });
+      const second = manifests.length > 0;
+      if (second && failure === "incomplete") manifest.continuationComplete = false;
+      const metadata = chunkedChatMetadata(manifest);
+      if (second && failure === "metadata") metadata.bubbleCount = manifest.bubbleCount + 1;
+      if (second && failure === "origin") {
+        metadata.chatResolutionOrigin = original!;
+        metadata.chatResolutionCoreHash = "0".repeat(64);
+      }
+      const content = canonicalBytes(manifest); manifests.push(manifest);
+      const published = await repository.publish([{ resourceId: `chat/${id}`, kind: "chat", content, semanticHash: sha256(content),
+        parents: [], metadata }], []);
+      original ??= { versionId: `${published.eventHash}#0`, eventHash: published.eventHash,
+        deviceId: repository.state.device.deviceId, lamport: repository.state.lamport };
+    }
+  } finally { db.close(); }
+  const reconciled = new EventReconciler().reconcile(await repository.listEvents(), repository.state, null);
+  return { repository, manifests, conflict: reconciled.conflicts.find(c => c.resourceId === `chat/${id}`)!, producer };
+}
+
+describe("chunked chat conflict resolution", () => {
+  it("keeps the authored latest v3 ahead of a later recapture of an older core", async () => {
+    const { repository, manifests, producer } = await chunkedConflict();
+    const authored = repository.state.tips[`chat/${id}`]![0]!;
+    const older = repository.state.tips[`chat/${id}`]![1]!;
+    const content = canonicalBytes(manifests[0]!);
+    await repository.publish([{ resourceId: `chat/${id}`, kind: "chat", content, semanticHash: sha256(content),
+      parents: [older.versionId], metadata: { ...chunkedChatMetadata(manifests[0]!), syncOrigin: "agent-kv-enrichment",
+        enrichedFromVersionId: older.versionId, originalProducer: { ...producer } } }], []);
+    const current = new EventReconciler().reconcile(await repository.listEvents(), repository.state, null).conflicts[0]!;
+    const result = await prepareChatConflictResolution(repository, current, { offline: true, tipsAllowed: () => true });
+    expect(result?.content).toEqual(canonicalBytes(manifests[1]!));
+    expect(result?.metadata?.chatResolutionOrigin).toMatchObject({ versionId: authored.versionId, lamport: authored.lamport });
+  });
+
+  it.each([false, true])("validates the exact latest v3 and acknowledges every original fork (same core: %s)", async sameCore => {
+    const fixture = await chunkedConflict(sameCore);
+    const { repository, conflict, manifests } = fixture;
+    const tips = [...repository.state.tips[`chat/${id}`]!];
+    const beforeChunk = vi.fn(async () => {});
+    const result = await prepareChatConflictResolution(repository, conflict,
+      { offline: true, tipsAllowed: () => true, beforeChunk });
+    expect(result?.content).toEqual(canonicalBytes(manifests[1]!));
+    expect(result?.metadata).toMatchObject({ ...chunkedChatMetadata(manifests[1]!),
+      chatResolutionStrategy: "latest", chatResolutionCoreHash: manifests[1]!.chatCoreHash,
+      chatResolutionOrigin: { versionId: tips[0]!.versionId }, title: sameCore ? "Long history" : "Latest long history" });
+    expect(result?.parents).toEqual(tips.map(t => t.versionId).sort());
+    expect(beforeChunk).toHaveBeenCalledTimes(manifests[1]!.parts.length);
+    if (sameCore) expect(manifests[0]!.chatCoreHash).toBe(manifests[1]!.chatCoreHash);
+    await repository.publish([result!], []);
+    const after = new EventReconciler().reconcile(await repository.listEvents(), repository.state, null);
+    expect(after.conflicts).toHaveLength(0);
+    const history = await repository.listResourceHistory(`chat/${id}`);
+    expect(history.map(e => e.versionId)).toEqual(expect.arrayContaining(tips.map(t => t.versionId)));
+    const stage = await stageChunkedChat(repository, parseChunkedChat(result!.content));
+    await stage.dispose();
+  });
+
+  it("defers v3 validation online without reading any chunk or manifest body", async () => {
+    const { repository, conflict } = await chunkedConflict();
+    const body = vi.spyOn(repository, "tryReadVersion");
+    const chunks = vi.spyOn(repository, "readObject");
+    const onWarning = vi.fn();
+    expect(await prepareChatConflictResolution(repository, conflict,
+      { offline: false, tipsAllowed: () => true, onWarning })).toBeNull();
+    expect(body).not.toHaveBeenCalled(); expect(chunks).not.toHaveBeenCalled();
+    expect(onWarning).toHaveBeenCalledWith(expect.stringContaining("offline chunk validation"));
+  });
+
+  it.each(["missing", "tampered", "metadata", "origin", "incomplete"])("retains both forks when latest v3 validation fails (%s)", async failure => {
+    const { repository, conflict, manifests } = await chunkedConflict(false, undefined, failure);
+    const read = repository.readObject.bind(repository);
+    const latestChunk = manifests[1]!.parts[0]!.payload.objectId;
+    if (failure === "missing" || failure === "tampered") vi.spyOn(repository, "readObject").mockImplementation(async ref => {
+      if (ref.objectId !== latestChunk) return read(ref);
+      if (failure === "missing") throw Object.assign(new Error("missing chunk"), { code: "ENOENT" });
+      return Buffer.from("corrupted chunk");
+    });
+    expect(await prepareChatConflictResolution(repository, conflict, { offline: true, tipsAllowed: () => true })).toBeNull();
+    expect(repository.state.tips[`chat/${id}`]).toHaveLength(2);
+  });
+
+  it.each([false, true])("checks actual Cursor field compatibility before republishing v3 in the helper (changed: %s)", async changed => {
+    const state = `~${Buffer.from([0xb2, 0x02, 0x01, 0x61]).toString("base64")}`;
+    const { repository } = await chunkedConflict(false, state);
+    const target = structuredClone(decodeCursorDataSchema(legacySchemas["3.23.23"]));
+    if (changed) target.messages[CURSOR_MESSAGE_NAMES["conversation-state"]]!.find(f => f.no === 38)!.name = "different";
+    const request = { extensionVersion: "1.0.22", expectedCursorVersion: "3.23.23", expectedVscodeVersion: "1.105.0",
+      cursorDataSchema: encodeCursorDataSchema(target) } as HelperRequest;
+    const exclusive = vi.fn(async () => {}), heartbeat = vi.fn();
+    const result = await mergeOfflineChatConflicts(repository, request, exclusive, heartbeat);
+    expect(result.published).toBe(changed ? 0 : 1);
+    expect(repository.state.tips[`chat/${id}`]).toHaveLength(changed ? 2 : 1);
+    if (changed) expect(result.warnings.join(" ")).toContain("#38");
+    else expect(repository.state.pendingDatabaseChanges).toContainEqual(expect.objectContaining({ resourceId: `chat/${id}`, kind: "chat" }));
+    expect(exclusive).toHaveBeenCalled(); expect(heartbeat).toHaveBeenCalled();
+  });
+});
 
 describe("bounded chunked chat transfer", () => {
   it.each([false, true])("verifies cross-version fields while staging schema-v3 before preparing a write (changed: %s)", async changed => {

@@ -121,6 +121,8 @@ PC B에서는 대화가 정상적으로 이어지고 있고, 새 승계 Agent가
 
 PC A는 완전한 portable v2 continuation graph에서만 채팅 core를 대기열에 넣어 적용하고, 오프라인 헬퍼가 쓰기 직전에 메타데이터와 reachable closure를 다시 검증합니다. Legacy blob-only 이벤트 자체는 blob만 추가할 수 있고 없는 core를 직접 만들지는 않지만, 그 payload의 closure가 완전하면 현재 확장이 검증된 core-applying child로 다시 발행해 기존 저장소에서도 원본 core를 복구할 수 있게 합니다. 실제로 보존된 orphan blob은 유지하고, 현재 core에서 도달할 수 없으며 원본 PC에도 없다고 확인된 missing 선언만 bounded 단계로 정규화합니다. Cursor가 양쪽 사본에 같은 고정 timestamp를 부여했더라도, 더 긴 완전한 사본이 공통 visible sequence의 확실한 strict extension일 때만 자동으로 선택됩니다. 모호하게 갈라진 fork는 자동 덮어쓰기하지 않고 수동 처리를 위해 남깁니다. 새로 발행되거나 변경된 채팅도 bounded 두 개 작업 묶음에 포함된 경우에만 같은 동기화 주기 안에서 continuation enrichment를 받습니다. 다만 오래된 채팅이 매우 많으면 backlog는 점진적으로 처리되므로 한 주기로 모든 legacy 대화가 준비된다고 보장하지 않습니다. 정상 원본이 남은 PC에서 추가 자동 동기화 주기를 허용한 뒤 다른 PC에 적용하세요.
 
+1.0.22부터 종료 도우미가 대용량 v3 채팅 충돌도 기존의 인증된 원본 순서 정책으로 해결합니다. 모든 조각, 본문 해시, 이어하기 데이터의 완전성, 버전 간 사용 필드를 검증한 뒤 정확한 최신 대화를 유지합니다. 원본 분기는 모두 버전 이력에 남습니다. 검증에 실패하면 충돌을 유지하며, Cursor 실행 중에는 대용량 조각 검증을 종료 후로 미룹니다.
+
 ## 하나의 관리 명령
 
 명령 팔레트에는 **Cursor Setting Sync: Manage** 하나만 표시됩니다. 평소에는 명령이 필요 없습니다. 동기화는 폴링과 파일 감시로 자동 실행되고, 안전한 파일 변경은 Cursor 실행 중 적용되며, 대기 중인 DB 변경은 모든 Cursor 창을 정상 종료하면 적용됩니다. 체크포인트·프루닝·orphan 정리도 bounded 안전 조건 뒤에서 자동 실행됩니다.

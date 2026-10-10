@@ -29,6 +29,10 @@ export async function mergeOfflineChatConflicts(
       offline: true,
       tipsAllowed: (tips) => tips.every((tip) => helperAcceptsChatProducer(tip, request)),
       onWarning: (message) => warnings.push(message),
+      target: { cursorVersion: request.expectedCursorVersion, vscodeVersion: request.expectedVscodeVersion,
+        extensionVersion: request.extensionVersion,
+        ...(request.cursorDataSchema === undefined ? {} : { cursorDataSchema: request.cursorDataSchema }) },
+      beforeChunk: async () => { await ensureExclusiveAccess(); heartbeat(); },
     }).catch((error: unknown) => {
       warnings.push(`Offline chat merge for ${conflict.resourceId} was deferred: ${error instanceof Error ? error.message : String(error)}`);
       return null;

@@ -123,6 +123,8 @@ PC A queues and applies a chat core only from a complete portable continuation g
 
 Starting with 1.0.16, conversations exceeding the former 16,384-row or whole-payload work limits are captured automatically as encrypted pieces of at most 8 MiB and a small v3 manifest. Both PCs need 1.0.16 or later to receive this format; existing v1/v2 conversations remain readable. The receiver authenticates every piece and verifies the complete continuation graph in a temporary staging database before the usual backup and shutdown transaction. A missing piece remains queued for a later attempt. Each conversation is bounded to 250,000 message rows and 2 GiB of encoded pieces; an individual row must fit one piece. Ambiguous concurrent edits still require conflict resolution, and capturing a large conversation does not write to a running Cursor database.
 
+Starting with 1.0.22, the shutdown helper also resolves v3 chat conflicts using the existing authenticated original-ordering policy. It validates every chunk, the core hash, continuation closure, and cross-version fields before retaining the exact latest conversation. All original branches remain in version history. Validation failures keep the conflict unresolved; large chunk validation is deferred while Cursor is running.
+
 ## One management command
 
 The Command Palette exposes exactly one entry: **Cursor Setting Sync: Manage**. Normal operation needs no command: synchronization polls and watches automatically, safe file changes apply while Cursor runs, queued database changes apply after a normal full shutdown, and checkpoint/prune/orphan maintenance runs behind bounded safety gates.

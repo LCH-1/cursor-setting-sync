@@ -2,7 +2,7 @@ import { MAX_HELPER_SINGLE_CHAT_BYTES, MAX_PARENTS_PER_CHANGE } from "../constan
 import { compareCodeUnits, sha256 } from "../protocol/canonical";
 import { compareTips } from "../protocol/reconciler";
 import type { ResourceVersionMetadata, ResourceVersionOrdering, SyncRepository } from "../protocol/repository";
-import { effectiveSyncOrigin } from "../sync/versionPolicy";
+import { effectiveSyncOrigin, effectiveVersionProducer } from "../sync/versionPolicy";
 import type { JsonValue, ResourceSnapshot, ResourceTip, SyncConflict } from "../types";
 import {
   CHAT_AUTO_MERGE_MAX_WORK_BYTES,
@@ -15,6 +15,8 @@ import {
 import { verifyPortableChatContinuationClosure } from "./continuationClosure";
 import { parsePortableChatSnapshot, portableChatCoreHash, type PortableChatSnapshot } from "./stateVscdb";
 import { chatHeaderTitle } from "./title";
+import { assertChunkedChatMetadata, chunkedChatMetadata, parseChunkedChat, stageChunkedChat } from "./chunked";
+import { chatCompatibilityFieldObserver, requiresCrossVersionInspection, type ChatCompatibilityTarget } from "./dataCompatibility";
 
 const MAX_RESOLUTION_SOURCES = 16;
 const MAX_ORIGIN_VERSIONS = 64;
@@ -23,6 +25,8 @@ interface ResolutionOptions {
   offline: boolean;
   tipsAllowed(tips: ResourceTip[]): boolean;
   onWarning?(message: string): void;
+  target?: ChatCompatibilityTarget;
+  beforeChunk?(): Promise<void>;
 }
 
 interface Candidate {
@@ -80,6 +84,13 @@ export async function prepareChatConflictResolution(
   const latest = candidates[0];
   if (latest === undefined) {
     return null;
+  }
+  if (latest.data.change.metadata?.chatSnapshotSchemaVersion === 3) {
+    if (!options.offline) {
+      options.onWarning?.(`Chat ${conflict.resourceId} requires offline chunk validation; the shutdown helper will validate its latest version while retaining the original forks.`);
+      return null;
+    }
+    return prepareChunkedResolution(repository, conflict.resourceId, tips, latest, maxInput, options);
   }
   const baseData = conflict.baseVersionId === null ? null : await readMetadata(conflict.baseVersionId);
   const baseUsable = conflict.baseVersionId === null || (baseData !== null &&
@@ -211,8 +222,80 @@ function resolutionSnapshot(
   strategy: "merged" | "latest",
   exact: boolean,
 ): ResourceSnapshot {
+  return exactResolutionSnapshot(resourceId, tips, content, chatMetadataForExactSnapshot(inherited, snapshot),
+    portableChatCoreHash(snapshot), inherited, origin, strategy, exact);
+}
+
+async function prepareChunkedResolution(
+  repository: SyncRepository,
+  resourceId: string,
+  tips: ResourceTip[],
+  latest: Candidate,
+  maxInput: number,
+  options: ResolutionOptions,
+): Promise<ResourceSnapshot | null> {
+  if (!declaredInputsFit([latest.data.change.payload?.plainBytes], maxInput, maxInput)) {
+    return null;
+  }
+  try {
+    const data = await repository.tryReadVersion(latest.tip.versionId);
+    if (data?.content === null || data?.content === undefined || data.content.byteLength > maxInput ||
+      data.content.byteLength !== latest.data.change.payload?.plainBytes || sha256(data.content) !== latest.tip.semanticHash) {
+      throw new Error("Chat manifest does not match its authenticated version.");
+    }
+    const manifest = parseChunkedChat(data.content);
+    if (`chat/${manifest.composerId}` !== resourceId ||
+      (latest.data.change.metadata?.chatResolutionOrigin !== undefined &&
+        latest.data.change.metadata.chatResolutionCoreHash !== manifest.chatCoreHash)) {
+      throw new Error("Chat manifest does not match its composer or original core.");
+    }
+    assertChunkedChatMetadata(manifest, latest.data.change.metadata);
+    const producer = effectiveVersionProducer(latest.data.change.metadata, latest.data.producer);
+    if (options.target !== undefined && producer === undefined) {
+      throw new Error("Chunked chat has no authenticated source producer.");
+    }
+    const observer = options.target !== undefined && requiresCrossVersionInspection(producer, options.target)
+      ? chatCompatibilityFieldObserver(producer!, options.target) : undefined;
+    const staged = await stageChunkedChat({
+      maxPayloadBytes: repository.maxPayloadBytes,
+      writeChatChunk: content => repository.writeChatChunk(content),
+      readObject: async reference => {
+        await options.beforeChunk?.();
+        return repository.readObject(reference);
+      },
+    }, manifest, observer?.onField);
+    try {
+      const reason = observer?.reason();
+      if (reason !== null && reason !== undefined) {
+        throw new Error(reason);
+      }
+    } finally {
+      await staged.dispose();
+    }
+    const metadata = { ...latest.data.change.metadata, ...chunkedChatMetadata(manifest) };
+    delete metadata.title;
+    const title = chatHeaderTitle(manifest.header.value);
+    if (title !== null) metadata.title = title;
+    return exactResolutionSnapshot(resourceId, tips, data.content, metadata, manifest.chatCoreHash,
+      latest.data.change.metadata, latest.origin, "latest", true);
+  } catch (error) {
+    options.onWarning?.(`Chat ${resourceId} could not validate its latest chunked version: ${error instanceof Error ? error.message : String(error)}; the original forks remain available.`);
+    return null;
+  }
+}
+
+function exactResolutionSnapshot(
+  resourceId: string,
+  tips: ResourceTip[],
+  content: Buffer,
+  metadata: Record<string, JsonValue>,
+  coreHash: string,
+  inherited: Record<string, JsonValue> | undefined,
+  origin: ResourceVersionOrdering,
+  strategy: "merged" | "latest",
+  exact: boolean,
+): ResourceSnapshot {
   const preserveRecipe = exact && effectiveSyncOrigin(inherited) === "agent-kv-enrichment";
-  const metadata = chatMetadataForExactSnapshot(inherited, snapshot);
   for (const key of ["checkpointedSyncOrigin", "checkpointedVersionId", "checkpointedProducer", "checkpointedSourceDeviceId"]) {
     delete metadata[key];
   }
@@ -224,7 +307,7 @@ function resolutionSnapshot(
       syncOrigin: preserveRecipe ? "agent-kv-enrichment" : "auto-merge",
       chatResolutionStrategy: strategy,
       chatResolutionOrigin: { ...origin },
-      chatResolutionCoreHash: portableChatCoreHash(snapshot),
+      chatResolutionCoreHash: coreHash,
     },
   };
 }
