@@ -44,6 +44,18 @@ const PRODUCER: EventProducer = {
 };
 
 describe("preparing a helper batch", () => {
+  it.each([false, true])("verifies old nested bytes for installed 3.24.9 before a write (removed field used: %s)", async removedField => {
+    await withRepository(async repository => {
+      const tokens = removedField ? Buffer.from([42, 1, 97]) : Buffer.from([8, 1]);
+      const state = Buffer.concat([Buffer.from([42, tokens.length]), tokens, Buffer.from([80, 1])]);
+      const entry = await publishPortableChat(repository, portableChat("00000000-0000-4000-8000-000000000096", { conversationState: `~${state.toString("base64")}` }));
+      const result = await prepareChanges(repository, [helperChange(entry)], {
+        extensionVersion: "1.0.21", cursorVersion: "3.24.9", vscodeVersion: "1.128.0", cursorDataSchema: legacySchemas["3.24.9"],
+      });
+      expect(result.prepared).toHaveLength(removedField ? 0 : 1);
+      expect(result.failureByResourceId[entry.resourceId]).toEqual(removedField ? expect.stringContaining("ConversationTokenDetails#5") : undefined);
+    }, { extensionVersion: "1.0.19", cursorVersion: "3.23.23", vscodeVersion: "1.105.0", cursorDataSchema: legacySchemas["3.23.23"] });
+  });
   it.each([false, true])("proves authenticated cross-version chat bytes before admitting a database write (new field: %s)", async newField => {
     await withRepository(async repository => {
       const composerId = "00000000-0000-4000-8000-000000000099";

@@ -73,6 +73,63 @@ describe("actual cross-version chat data compatibility", () => {
       expect(observer.reason()).toContain(`nested ${type}`);
     }
   });
+  it("accepts old token details without the removed blob field in installed 3.24.9", async () => {
+    const source = { ...producer, cursorVersion: "3.23.23", cursorDataSchema: legacy["3.23.23"] };
+    const tokens = Buffer.from([8, 12, 16, 24]);
+    expect(await reason(bytesField(5, tokens), { source, targetSchema: legacy["3.24.9"] })).toBeNull();
+    expect(await reason(bytesField(5, Buffer.concat([tokens, bytesField(5, Buffer.alloc(32))])), { source, targetSchema: legacy["3.24.9"] })).toContain("ConversationTokenDetails#5");
+  });
+  it("checks every occurrence of opaque messages instead of caching their first payload", async () => {
+    const source = { ...producer, cursorVersion: "3.23.23", cursorDataSchema: legacy["3.23.23"] };
+    const state = Buffer.concat([bytesField(5, Buffer.from([8, 1])), bytesField(5, bytesField(5, Buffer.alloc(32)))]);
+    expect(await reason(state, { source, targetSchema: legacy["3.24.9"] })).toContain("ConversationTokenDetails#5");
+  });
+  it("accepts unchanged used enum values but rejects the removed PROJECT value", async () => {
+    const source = { ...producer, cursorVersion: "3.23.23", cursorDataSchema: legacy["3.23.23"] };
+    for (const value of [0, 1, 2, 3, 4, 5, 7, 8]) {
+      expect(await reason(Buffer.from([80, value]), { source, targetSchema: legacy["3.24.9"] })).toBeNull();
+    }
+    expect(await reason(Buffer.from([80, 6]), { source, targetSchema: legacy["3.24.9"] })).toContain("AgentMode value 6");
+    expect(await reason(Buffer.from([80, 1, 80, 6]), { source, targetSchema: legacy["3.24.9"] })).toContain("AgentMode value 6");
+  });
+  it("checks changed enum values in packed fields and map entries", async () => {
+    const sourceSchema = structuredClone(decodeCursorDataSchema(legacy["3.23.23"]));
+    const installed = structuredClone(decodeCursorDataSchema(legacy["3.24.9"]));
+    const fields = [
+      { no: 1, name: "modes", kind: "enum", T: "agent.v1.AgentMode", repeated: true },
+      { no: 2, name: "modes_by_name", kind: "map", K: 9, V: { kind: "enum", T: "agent.v1.AgentMode" } },
+    ];
+    sourceSchema.messages["agent.v1.ConversationTokenDetails"] = fields;
+    installed.messages["agent.v1.ConversationTokenDetails"] = fields;
+    const options = { source: { ...producer, cursorVersion: "3.23.23", cursorDataSchema: encodeCursorDataSchema(sourceSchema) }, targetSchema: encodeCursorDataSchema(installed) };
+    expect(await reason(bytesField(5, bytesField(1, Buffer.from([1, 2]))), options)).toBeNull();
+    expect(await reason(bytesField(5, bytesField(1, Buffer.from([1, 6]))), options)).toContain("AgentMode value 6");
+    expect(await reason(bytesField(5, bytesField(1, Buffer.from([128]))), options)).not.toBeNull();
+    expect(await reason(bytesField(5, bytesField(2, Buffer.from([16, 1]))), options)).toBeNull();
+    expect(await reason(bytesField(5, bytesField(2, Buffer.from([16, 6]))), options)).toContain("AgentMode value 6");
+    expect(await reason(bytesField(5, bytesField(2, Buffer.from([24, 1]))), options)).not.toBeNull();
+  });
+  it("bounds recursive opaque data inspection", async () => {
+    const sourceSchema = structuredClone(decodeCursorDataSchema(legacy["3.23.23"]));
+    const installed = structuredClone(sourceSchema);
+    const type = "agent.v1.ConversationTokenDetails";
+    sourceSchema.messages[type] = [{ no: 1, name: "child", kind: "message", T: type }];
+    installed.messages[type] = [...sourceSchema.messages[type], { no: 2, name: "unused", kind: "scalar", T: 13 }];
+    let tokens: Buffer = Buffer.alloc(0);
+    for (let depth = 0; depth < 70; depth++) tokens = bytesField(1, tokens);
+    expect(await reason(bytesField(5, tokens), { source: { ...producer, cursorVersion: "3.23.23", cursorDataSchema: encodeCursorDataSchema(sourceSchema) }, targetSchema: encodeCursorDataSchema(installed) })).toContain("cannot be verified");
+  });
+  it("rejects changed used fields inside opaque messages but allows unused changes", async () => {
+    const changed = structuredClone(decodeCursorDataSchema(legacy["3.24.9"]));
+    changed.messages["agent.v1.ConversationTokenDetails"]!.find(f => f.no === 2)!.name = "different";
+    const targetSchema = encodeCursorDataSchema(changed);
+    expect(await reason(bytesField(5, Buffer.from([8, 1])), { targetSchema })).toBeNull();
+    expect(await reason(bytesField(5, Buffer.from([16, 1])), { targetSchema })).toContain("ConversationTokenDetails#2");
+  });
+  it.each([Buffer.from([8]), bytesField(1, Buffer.from("wrong wire")), Buffer.from([48, 1])])("rejects malformed or unknown opaque message fields %j", async tokens => {
+    const source = { ...producer, cursorVersion: "3.23.23", cursorDataSchema: legacy["3.23.23"] };
+    expect(await reason(bytesField(5, tokens), { source, targetSchema: legacy["3.24.9"] })).not.toBeNull();
+  });
   it("checks an actual new producer schema instead of guessing from the version", async () => {
     expect(await reason(bytesField(38, Buffer.from("id")), { source: { ...producer, cursorVersion: "8.0.0", cursorDataSchema: legacy["3.24.9"] } })).toBeNull();
     expect(await reason(Buffer.alloc(0), { source: { ...producer, cursorVersion: "8.0.0" } })).toContain("unavailable");

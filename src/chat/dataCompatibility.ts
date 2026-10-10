@@ -3,7 +3,7 @@ import type { CursorField, CursorSchemaSnapshot } from "../monitor/cursorSchema"
 import legacySchemas from "../platform/legacyCursorSchemas.json";
 import { decodeCursorDataSchema } from "../platform/cursorDataSchema";
 import { compareVersions } from "../platform/compatibility";
-import { AGENT_KV_SCHEMAS, type AgentKvWalkOptions } from "./agentKv";
+import { AGENT_KV_SCHEMAS, readVarint, scanProtobufMessage, type AgentKvWalkOptions } from "./agentKv";
 import { CURSOR_MESSAGE_NAMES } from "./cursorMessageNames";
 import { parsePortableChatSnapshot } from "./stateVscdb";
 import { verifyPortableChatContinuationClosure } from "./continuationClosure";
@@ -49,6 +49,9 @@ export function chatCompatibilityFieldObserver(producer: EventProducer, local: P
   const [source, target] = schemas(producer, local);
   const checked = new Set<string>();
   let failure: string | null = null;
+  const identicalTypes = new Map<string, boolean>();
+  let inspectedBytes = 0;
+  let inspectedFields = 0;
   const sameOpaqueType = (name: string, visiting = new Set<string>()): boolean => {
     if (visiting.size >= 256) return false;
     if (visiting.has(name)) return true;
@@ -61,20 +64,101 @@ export function chatCompatibilityFieldObserver(producer: EventProducer, local: P
       return true;
     }));
   };
+  const identicalType = (name: string): boolean => {
+    let identical = identicalTypes.get(name);
+    if (identical === undefined) { identical = sameOpaqueType(name); identicalTypes.set(name, identical); }
+    return identical;
+  };
+  const inspectEnum = (name: string, value: bigint): boolean => {
+    const no = Number(BigInt.asIntN(32, value));
+    const a = source.enums?.[name]?.find(f => f.no === no), b = target.enums?.[name]?.find(f => f.no === no);
+    if (a === undefined || b === undefined || canonical(a) !== canonical(b)) {
+      failure = `The installed Cursor cannot read ${name} value ${no} with the source enum definition`;
+      return false;
+    }
+    return true;
+  };
+  const inspectField = (field: CursorField, wire: number, payload: Uint8Array | undefined, depth: number, value?: bigint): boolean => {
+    if (!["message", "map", "enum", "scalar"].includes(field.kind) ||
+      (field.kind === "scalar" && ![1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 15, 16, 17, 18].includes(Number(field.T)))) return false;
+    const expectedWire = field.kind === "message" || field.kind === "map" ? 2 : field.kind === "enum" ? 0 :
+      [1, 6, 16].includes(Number(field.T)) ? 1 : [2, 7, 15].includes(Number(field.T)) ? 5 : [9, 12].includes(Number(field.T)) ? 2 : 0;
+    if (wire !== expectedWire && !(wire === 2 && field.repeated === true && expectedWire !== 2)) return false;
+    if (field.kind === "message") return typeof field.T === "string" && payload !== undefined && inspectMessage(field.T, payload, depth);
+    if (field.kind === "enum") {
+      if (typeof field.T !== "string") return false;
+      if (identicalType(field.T)) return true;
+      if (wire === 0) return value !== undefined && inspectEnum(field.T, value);
+      if (payload === undefined) return false;
+      let offset = 0;
+      while (offset < payload.byteLength) {
+        const entry = readVarint(payload, offset);
+        if (entry === undefined || ++inspectedFields > 1_000_000 || !inspectEnum(field.T, entry.value)) return false;
+        offset = entry.nextOffset;
+      }
+      return true;
+    }
+    if (field.kind !== "map") {
+      if (wire !== 2 || expectedWire === 2) return true;
+      if (payload === undefined) return false;
+      if (expectedWire === 1 || expectedWire === 5) return payload.byteLength % (expectedWire === 1 ? 8 : 4) === 0;
+      let offset = 0;
+      while (offset < payload.byteLength) {
+        const entry = readVarint(payload, offset);
+        if (entry === undefined || ++inspectedFields > 1_000_000) return false;
+        offset = entry.nextOffset;
+      }
+      return true;
+    }
+    if (payload === undefined) return false;
+    const mapValue = field.V;
+    if (typeof mapValue !== "object") return false;
+    return scanProtobufMessage(payload, (no, entryWire, entryPayload, entryValue) => {
+      if (++inspectedFields > 1_000_000) { failure = "Cross-version chat nested inspection exceeds its work limit"; return false; }
+      if (no !== 1 && no !== 2) { failure = "Cross-version chat contains an unknown nested map field"; return false; }
+      const descriptor = no === 1 ? { kind: "scalar", T: field.K } : mapValue;
+      if (!inspectField({ ...descriptor, no, name: no === 1 ? "key" : "value" } as CursorField, entryWire, entryPayload, depth + 1, entryValue)) {
+        failure ??= "Cross-version chat nested map data cannot be verified";
+        return false;
+      }
+      return true;
+    }) && failure === null;
+  };
+  const inspectMessage = (name: string, payload: Uint8Array, depth: number): boolean => {
+    if (depth > 64 || (inspectedBytes += payload.byteLength) > 128 * 1024 * 1024) return false;
+    const a = source.messages[name], b = target.messages[name];
+    if (a === undefined || b === undefined) return false;
+    // Unused descriptor changes cannot make compatible stored bytes unreadable.
+    return scanProtobufMessage(payload, (no, wire, bytes, value) => {
+      if (++inspectedFields > 1_000_000) { failure = "Cross-version chat nested inspection exceeds its work limit"; return false; }
+      const incoming = a.find(f => f.no === no), installed = b.find(f => f.no === no);
+      if (incoming === undefined || installed === undefined || canonical(incoming) !== canonical(installed)) {
+        failure = `The installed Cursor cannot read ${name}#${no} with the source field definition`;
+        return false;
+      }
+      if (!inspectField(incoming, wire, bytes, depth + 1, value)) { failure ??= `Cross-version chat nested ${name}#${no} data cannot be verified`; return false; }
+      return true;
+    }) && failure === null;
+  };
   return {
     reason: () => failure,
-    onField(schema, no) {
+    onField(schema, no, wire, payload, value) {
       const name = schema === "selected-image-with-data" ? "agent.v1.SelectedImage.BlobIdWithData" : CURSOR_MESSAGE_NAMES[schema];
       const key = `${name}#${no}`;
-      if (checked.has(key) || failure !== null) return;
-      checked.add(key);
+      if (failure !== null) return;
       const a: CursorField | undefined = source.messages[name]?.find(f => f.no === no), b = target.messages[name]?.find(f => f.no === no);
-      if (a === undefined || b === undefined || canonical(a) !== canonical(b)) { failure = `The installed Cursor cannot read ${key} with the source field definition`; return; }
+      if (!checked.has(key)) {
+        if (a === undefined || b === undefined || canonical(a) !== canonical(b)) { failure = `The installed Cursor cannot read ${key} with the source field definition`; return; }
+        checked.add(key);
+      }
+      if (a === undefined) return;
       const action = schema === "selected-image-with-data" ? undefined : AGENT_KV_SCHEMAS[schema].fields[no]?.action;
       const traversed = action?.kind === "message" || action?.kind === "map-message" || action?.kind === "selected-image-with-data";
       if (!traversed) {
         const type = typeof a.T === "string" ? a.T : typeof a.V === "object" && typeof a.V.T === "string" ? a.V.T : undefined;
-        if (type !== undefined && !sameOpaqueType(type)) failure = `The installed Cursor cannot read the nested ${type} used by ${key}`;
+        if (type !== undefined && !identicalType(type) && !inspectField(a, wire, payload, 0, value)) {
+          failure ??= `The installed Cursor cannot read the nested ${type} used by ${key}`;
+        }
       }
     },
   };

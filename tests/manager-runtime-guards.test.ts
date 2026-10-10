@@ -90,6 +90,7 @@ import { ConflictController, type ConflictSelection } from "../src/ui/conflicts"
 import type { StatusController } from "../src/ui/status";
 import { shouldPublishSnapshot } from "../src/sync/versionPolicy";
 import { decodeCursorDataSchema, encodeCursorDataSchema } from "../src/platform/cursorDataSchema";
+import { chatCompatibilityTargetFingerprint } from "../src/chat/dataCompatibility";
 import legacySchemas from "../src/platform/legacyCursorSchemas.json";
 
 const { DatabaseSync } = sqlite;
@@ -1206,6 +1207,35 @@ describe("workspace mapping and chat continuation blocks", () => {
 });
 
 describe("running ordinary apply drift guard", () => {
+  it("rechecks the 1.0.20 nested schema verdict after the receiver extension updates", async () => {
+    const fixture = await createSyncHarness();
+    const internals = fixture.manager as unknown as {
+      compatibility: CompatibilityReport;
+      configuration: { syncChat: boolean };
+      refreshPendingVersionCompatibility(repository: SyncRepository): Promise<boolean>;
+    };
+    Object.assign(internals.compatibility, { cursorVersion: "3.24.9", extensionVersion: "1.0.20", vscodeVersion: "1.128.0", cursorDataSchema: legacySchemas["3.24.9"] });
+    internals.configuration.syncChat = true;
+    const resourceId = "chat/00000000-0000-4000-8000-000000000021", composerId = resourceId.slice(5);
+    const content = Buffer.from(JSON.stringify({
+      schemaVersion: 2, composerId,
+      header: { composerId, workspaceId: "workspace", createdAt: 1, lastUpdatedAt: 2, isArchived: 0, isSubagent: 0, recency: 1, checkpointAt: null, value: "{}" },
+      composerData: { key: `composerData:${composerId}`, valueType: "text", valueBase64: Buffer.from(JSON.stringify({ fullConversationHeadersOnly: [], conversationState: `~${Buffer.from([42, 2, 8, 1, 80, 1]).toString("base64")}` })).toString("base64") },
+      bubbles: [], agentKv: { blobs: [], referencedIds: [], missingIds: [] },
+    }));
+    await fixture.repository.publish([{ resourceId, kind: "chat", content, semanticHash: sha256(content), metadata: { chatSnapshotSchemaVersion: 2 } }], []);
+    await reconcileAndPersist(fixture.repository);
+    const tip = fixture.repository.state.tips[resourceId]![0]!;
+    tip.producer = { cursorVersion: "3.23.23", extensionVersion: "1.0.19", vscodeVersion: "1.105.0", cursorDataSchema: legacySchemas["3.23.23"] };
+    const pending = { resourceId, kind: "chat" as const, eventHash: tip.eventHash, changeIndex: tip.changeIndex, blockedReason: "The installed Cursor cannot read the nested agent.v1.ConversationTokenDetails used by agent.v1.ConversationStateStructure#5", compatibilityTargetFingerprint: chatCompatibilityTargetFingerprint(internals.compatibility) };
+    fixture.repository.state.pendingDatabaseChanges.push(pending);
+    expect(await internals.refreshPendingVersionCompatibility(fixture.repository)).toBe(false);
+    internals.compatibility.extensionVersion = "1.0.21";
+    expect(await internals.refreshPendingVersionCompatibility(fixture.repository)).toBe(true);
+    expect(pending.blockedReason).toBeUndefined();
+    expect(pending.compatibilityTargetFingerprint).toBeUndefined();
+    fixture.manager.dispose();
+  });
   it.each([false, true])("automatically rechecks an old chat version block from its actual payload (new field: %s)", async newField => {
     const fixture = await createSyncHarness();
     const internals = fixture.manager as unknown as {

@@ -25,7 +25,7 @@ export interface AgentKvWalkOptions {
   limits?: Partial<AgentKvWalkLimits>;
   /** Discards blob bytes after delivery; repeated schema routes re-read and verify them. */
   blobSink?: (blob: AgentKvReachableBlob) => Promise<void>;
-  onField?: (schema: AgentKvSchemaName | "selected-image-with-data", field: number, wire: number) => void;
+  onField?: (schema: AgentKvSchemaName | "selected-image-with-data", field: number, wire: number, payload?: Uint8Array, value?: bigint) => void;
 }
 
 export type AgentKvValueType = "text" | "blob";
@@ -1069,8 +1069,8 @@ function walkSchemaMessage(
     { action: SchemaFieldAction; values: Map<string, Uint8Array> }
   >();
 
-  scanProtobufMessage(bytes, (fieldNumber, wireType, payload) => {
-    context.onField?.(schemaName, fieldNumber, wireType);
+  scanProtobufMessage(bytes, (fieldNumber, wireType, payload, value) => {
+    context.onField?.(schemaName, fieldNumber, wireType, payload, value);
     const rule = schema.fields[fieldNumber];
     if (rule === undefined) {
       context.schemaUnsupported = true;
@@ -1227,7 +1227,7 @@ function parseSelectedImageWithData(
   let blobId: Uint8Array | undefined;
   let data: Uint8Array | undefined;
   scanProtobufMessage(payload, (fieldNumber, wireType, fieldPayload) => {
-    context.onField?.("selected-image-with-data", fieldNumber, wireType);
+    context.onField?.("selected-image-with-data", fieldNumber, wireType, fieldPayload);
     if (
       (fieldNumber !== 1 && fieldNumber !== 2) ||
       wireType !== WIRE_LENGTH_DELIMITED ||
@@ -1290,12 +1290,13 @@ function acceptsWire(rule: SchemaFieldRule, wireType: number): boolean {
  * callers perform a validation pass first, so returning false from the visitor
  * can stop the second pass without accepting a partially parsed message.
  */
-function scanProtobufMessage(
+export function scanProtobufMessage(
   bytes: Uint8Array,
   visitField?: (
     fieldNumber: number,
     wireType: number,
     payload: Uint8Array | undefined,
+    value?: bigint,
   ) => boolean,
 ): boolean {
   let offset = 0;
@@ -1319,7 +1320,7 @@ function scanProtobufMessage(
       offset = value.nextOffset;
       if (
         visitField !== undefined &&
-        !visitField(Number(fieldNumber), wireType, undefined)
+        !visitField(Number(fieldNumber), wireType, undefined, value.value)
       ) {
         return true;
       }
@@ -1380,7 +1381,7 @@ function scanProtobufMessage(
   return true;
 }
 
-function readVarint(bytes: Uint8Array, offset: number): VarintRead | undefined {
+export function readVarint(bytes: Uint8Array, offset: number): VarintRead | undefined {
   let value = 0n;
   for (let index = 0; index < 10; index += 1) {
     const byte = bytes[offset + index];
