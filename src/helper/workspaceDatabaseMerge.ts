@@ -58,17 +58,19 @@ const TABLE_DESCRIPTORS = [
       "checkpointAt",
       "value",
     ],
+    optionalValueColumns: ["subagentTypeName"],
     required: false,
   },
 ] as const satisfies readonly TableDescriptor[];
 
-type KnownTableName = (typeof TABLE_DESCRIPTORS)[number]["name"];
+type KnownTableName = "ItemTable" | "cursorDiskKV" | "composerHeaders";
 type SqliteValue = null | string | number | bigint | Uint8Array;
 
 interface TableDescriptor {
-  name: string;
+  name: KnownTableName;
   keyColumn: string;
   valueColumns: readonly string[];
+  optionalValueColumns?: readonly string[];
   required: boolean;
 }
 
@@ -76,10 +78,11 @@ interface TableSchema {
   descriptor: TableDescriptor;
   extraColumns: string[];
   requiredExtraColumns: string[];
+  requiredValueColumns: string[];
 }
 
 interface TableReadPreflight {
-  descriptor: (typeof TABLE_DESCRIPTORS)[number];
+  descriptor: TableDescriptor;
   rowCount: number;
   plainBytes: bigint;
   skippedRows: bigint;
@@ -336,6 +339,12 @@ export function mergeWorkspaceDatabaseSnapshots(
     const baseTable = tableByName(canonicalBase, descriptor.name);
     const localTable = tableByName(canonicalLocal, descriptor.name);
     const remoteTable = tableByName(canonicalRemote, descriptor.name);
+    const columns = combinedTableColumns(
+      descriptor,
+      baseTable,
+      localTable,
+      remoteTable,
+    );
     if (localTable === undefined && remoteTable === undefined) {
       continue;
     }
@@ -346,7 +355,7 @@ export function mergeWorkspaceDatabaseSnapshots(
       // would infer: each row equal to base on the present side would take the
       // absent side's "row", dropping the whole table from the merge.
       const present = localTable ?? remoteTable;
-      const presentRows = rowsByKey(present);
+      const presentRows = alignedRowsByKey(present, columns, baseTable);
       const passthrough: WorkspaceDatabaseRow[] = [];
       for (const key of [...presentRows.keys()].sort(compareText)) {
         const row = presentRows.get(key);
@@ -357,14 +366,14 @@ export function mergeWorkspaceDatabaseSnapshots(
       tables.push({
         name: descriptor.name,
         keyColumn: descriptor.keyColumn,
-        columns: [...descriptor.valueColumns],
+        columns,
         rows: passthrough,
       });
       continue;
     }
-    const baseRows = rowsByKey(baseTable);
-    const localRows = rowsByKey(localTable);
-    const remoteRows = rowsByKey(remoteTable);
+    const baseRows = alignedRowsByKey(baseTable, columns);
+    const localRows = alignedRowsByKey(localTable, columns, remoteTable, baseTable);
+    const remoteRows = alignedRowsByKey(remoteTable, columns, localTable, baseTable);
     const mergedRows: WorkspaceDatabaseRow[] = [];
     const keys = new Set([
       ...baseRows.keys(),
@@ -376,6 +385,7 @@ export function mergeWorkspaceDatabaseSnapshots(
       const localRow = localRows.get(key);
       const remoteRow = remoteRows.get(key);
       let merged: WorkspaceDatabaseRow | undefined;
+      const conflictsBefore = conflicts.length;
       if (rowsEqual(localRow, remoteRow)) {
         merged = localRow;
       } else if (rowsEqual(localRow, baseRow)) {
@@ -392,6 +402,23 @@ export function mergeWorkspaceDatabaseSnapshots(
               : "concurrent-update",
         });
       }
+      if (
+        conflicts.length === conflictsBefore &&
+        merged === undefined &&
+        (localRow === undefined || remoteRow === undefined)
+      ) {
+        const deletingTable = localRow === undefined ? localTable : remoteTable;
+        const remainingRow = localRow ?? remoteRow;
+        if (
+          remainingRow !== undefined &&
+          columns.some((column, index) =>
+            !deletingTable.columns.includes(column) &&
+            remainingRow.values[index]?.type !== "null",
+          )
+        ) {
+          conflicts.push(conflict(descriptor, key, "unsafe-schema-delete"));
+        }
+      }
       if (merged !== undefined) {
         mergedRows.push(cloneRow(merged));
       }
@@ -399,7 +426,7 @@ export function mergeWorkspaceDatabaseSnapshots(
     tables.push({
       name: descriptor.name,
       keyColumn: descriptor.keyColumn,
-      columns: [...descriptor.valueColumns],
+      columns,
       rows: mergedRows,
     });
   }
@@ -459,11 +486,12 @@ export function unionWorkspaceDatabaseSnapshots(
   for (const descriptor of TABLE_DESCRIPTORS) {
     const preferredTable = tableByName(canonicalPreferred, descriptor.name);
     const otherTable = tableByName(canonicalOther, descriptor.name);
+    const columns = combinedTableColumns(descriptor, preferredTable, otherTable);
     if (preferredTable === undefined && otherTable === undefined) {
       continue;
     }
-    const merged = rowsByKey(otherTable);
-    for (const [key, row] of rowsByKey(preferredTable)) {
+    const merged = alignedRowsByKey(otherTable, columns, preferredTable);
+    for (const [key, row] of alignedRowsByKey(preferredTable, columns, otherTable)) {
       merged.set(key, row);
     }
     const rows: WorkspaceDatabaseRow[] = [];
@@ -476,7 +504,7 @@ export function unionWorkspaceDatabaseSnapshots(
     tables.push({
       name: descriptor.name,
       keyColumn: descriptor.keyColumn,
-      columns: [...descriptor.valueColumns],
+      columns,
       rows,
     });
   }
@@ -736,7 +764,7 @@ function captureFromOpenDatabase(
     }
     const preflight = preflightTableRows(
       database,
-      descriptor,
+      schema.descriptor,
       snapshotWorkspaceId,
       databaseWorkspaceId,
       limits,
@@ -832,7 +860,9 @@ function assertWorkspaceSnapshotStructuralUpperBound(
     tokens = checkedStructuralAdd(
       tokens,
       workspaceTableStructuralUpperBound(
-        descriptor.valueColumns.length,
+        Array.isArray(table.columns)
+          ? table.columns.length
+          : descriptor.valueColumns.length,
         table.rows.length,
       ),
     );
@@ -872,7 +902,7 @@ function checkedStructuralAdd(left: number, right: number): number {
  */
 function preflightTableRows(
   database: DatabaseSync,
-  descriptor: (typeof TABLE_DESCRIPTORS)[number],
+  descriptor: TableDescriptor,
   snapshotWorkspaceId: string,
   databaseWorkspaceId: string,
   limits: WorkspaceDatabaseLimits,
@@ -1072,10 +1102,15 @@ function inspectTableSchema(
   const knownColumns = new Set([
     descriptor.keyColumn,
     ...descriptor.valueColumns,
+    ...(descriptor.optionalValueColumns ?? []),
   ]);
+  const valueColumns = [
+    ...descriptor.valueColumns,
+    ...(descriptor.optionalValueColumns?.filter((column) => byName.has(column)) ?? []),
+  ];
   const extra = columns.filter((row) => !knownColumns.has(String(row.name)));
   return {
-    descriptor,
+    descriptor: { ...descriptor, valueColumns },
     extraColumns: extra.map((row) => String(row.name)),
     requiredExtraColumns: extra
       .filter(
@@ -1085,6 +1120,12 @@ function inspectTableSchema(
           Number(row.pk) === 0,
       )
       .map((row) => String(row.name)),
+    requiredValueColumns: valueColumns.filter((column) => {
+      const schemaColumn = byName.get(column);
+      return (
+        Number(schemaColumn?.notnull) === 1 && schemaColumn?.dflt_value === null
+      );
+    }),
   };
 }
 
@@ -1274,10 +1315,7 @@ function canonicalSnapshot(
     }
     if (
       !Array.isArray(rawTable.columns) ||
-      rawTable.columns.length !== descriptor.valueColumns.length ||
-      !rawTable.columns.every(
-        (column, index) => column === descriptor.valueColumns[index],
-      )
+      !supportedTableColumns(descriptor, rawTable.columns)
     ) {
       throw new Error(`Workspace database column contract changed for ${descriptor.name}.`);
     }
@@ -1291,7 +1329,7 @@ function canonicalSnapshot(
         !isRecord(rawRow) ||
         typeof rawRow.key !== "string" ||
         !Array.isArray(rawRow.values) ||
-        rawRow.values.length !== descriptor.valueColumns.length
+        rawRow.values.length !== rawTable.columns.length
       ) {
         throw new Error(`Workspace database row is invalid for ${descriptor.name}.`);
       }
@@ -1317,7 +1355,7 @@ function canonicalSnapshot(
     tableMap.set(descriptor.name, {
       name: descriptor.name,
       keyColumn: descriptor.keyColumn,
-      columns: [...descriptor.valueColumns],
+      columns: rawTable.columns.map((column: unknown) => String(column)),
       rows: tableRows.sort((left, right) => compareText(left.key, right.key)),
     });
   }
@@ -1407,20 +1445,42 @@ function planDatabaseMerge(
     if (schema === undefined) {
       throw new Error(`Target workspace database schema was not inspected: ${descriptor.name}.`);
     }
-    const incomingRows = rowsByKey(incomingTable);
-    const targetRows = rowsByKey(targetTable);
-    const baseRows = rowsByKey(tableByName(base, descriptor.name));
+    const unsupportedColumns = incomingTable.columns.filter(
+      (column) => !schema.descriptor.valueColumns.includes(column),
+    );
+    if (
+      unsupportedColumns.some((column) => incomingTable.rows.some((row) =>
+        row.values[incomingTable.columns.indexOf(column)]?.type !== "null",
+      ))
+    ) {
+      throw new Error(
+        `Target workspace database does not support populated column(s) in ${descriptor.name}.`,
+      );
+    }
+    const writeColumns = incomingTable.columns.filter(
+      (column) => schema.descriptor.valueColumns.includes(column),
+    );
+    const writeDescriptor = { ...descriptor, valueColumns: writeColumns };
+    const baseTable = tableByName(base, descriptor.name);
+    const incomingRows = alignedRowsByKey(incomingTable, writeColumns);
+    const actualTargetRows = rowsByKey(targetTable);
+    const targetRows = alignedRowsByKey(targetTable, writeColumns);
+    const baseRows = alignedRowsByKey(baseTable, writeColumns);
 
     for (const [key, incomingRow] of incomingRows) {
       const targetRow = targetRows.get(key);
       if (base === undefined) {
         if (targetRow === undefined) {
-          ensureInsertSupported(schema);
-          operations.push({ kind: "insert", descriptor, key, row: incomingRow });
+          ensureInsertSupported(schema, writeColumns);
+          operations.push({
+            kind: "insert", descriptor: writeDescriptor, key, row: incomingRow,
+          });
         } else if (rowsEqual(targetRow, incomingRow)) {
           unchanged += 1;
         } else {
-          operations.push({ kind: "update", descriptor, key, row: incomingRow });
+          operations.push({
+            kind: "update", descriptor: writeDescriptor, key, row: incomingRow,
+          });
         }
         continue;
       }
@@ -1428,8 +1488,10 @@ function planDatabaseMerge(
       const baseRow = baseRows.get(key);
       if (baseRow === undefined) {
         if (targetRow === undefined) {
-          ensureInsertSupported(schema);
-          operations.push({ kind: "insert", descriptor, key, row: incomingRow });
+          ensureInsertSupported(schema, writeColumns);
+          operations.push({
+            kind: "insert", descriptor: writeDescriptor, key, row: incomingRow,
+          });
         } else if (rowsEqual(targetRow, incomingRow)) {
           unchanged += 1;
         } else {
@@ -1442,7 +1504,9 @@ function planDatabaseMerge(
       } else if (rowsEqual(targetRow, incomingRow)) {
         unchanged += 1;
       } else if (rowsEqual(targetRow, baseRow)) {
-        operations.push({ kind: "update", descriptor, key, row: incomingRow });
+        operations.push({
+          kind: "update", descriptor: writeDescriptor, key, row: incomingRow,
+        });
       } else {
         conflicts.push(conflict(descriptor, key, "concurrent-update"));
       }
@@ -1458,7 +1522,13 @@ function planDatabaseMerge(
           unchanged += 1;
         } else if (!rowsEqual(targetRow, baseRow)) {
           conflicts.push(conflict(descriptor, key, "concurrent-delete"));
-        } else if (schema.extraColumns.length > 0) {
+        } else if (
+          schema.extraColumns.length > 0 ||
+          targetTable.columns.some((column, index) =>
+            !incomingTable.columns.includes(column) &&
+            actualTargetRows.get(key)?.values[index]?.type !== "null",
+          )
+        ) {
           conflicts.push(conflict(descriptor, key, "unsafe-schema-delete"));
         } else {
           operations.push({ kind: "delete", descriptor, key });
@@ -1476,7 +1546,7 @@ function executeOperations(
 ): void {
   for (const operation of operations) {
     const descriptor = operation.descriptor;
-    const schema = schemas.get(descriptor.name as KnownTableName);
+    const schema = schemas.get(descriptor.name);
     if (schema === undefined) {
       throw new Error(`Missing target schema for ${descriptor.name}.`);
     }
@@ -1496,7 +1566,7 @@ function executeOperations(
     }
     const boundValues = operation.row.values.map(fromPortableValue);
     if (operation.kind === "insert") {
-      ensureInsertSupported(schema);
+      ensureInsertSupported(schema, descriptor.valueColumns);
       const columns = [descriptor.keyColumn, ...descriptor.valueColumns];
       database
         .prepare(
@@ -1561,6 +1631,80 @@ function rowsByKey(
   table: WorkspaceDatabaseTable | undefined,
 ): Map<string, WorkspaceDatabaseRow> {
   return new Map(table?.rows.map((row) => [row.key, row]) ?? []);
+}
+
+function supportedTableColumns(
+  descriptor: TableDescriptor,
+  columns: unknown[],
+): boolean {
+  const supported = [
+    ...descriptor.valueColumns,
+    ...(descriptor.optionalValueColumns ?? []).filter((column) =>
+      columns.includes(column),
+    ),
+  ];
+  return (
+    columns.length === supported.length &&
+    columns.every((column, index) => column === supported[index])
+  );
+}
+
+function combinedTableColumns(
+  descriptor: TableDescriptor,
+  ...tables: Array<WorkspaceDatabaseTable | undefined>
+): string[] {
+  return [
+    ...descriptor.valueColumns,
+    ...(descriptor.optionalValueColumns ?? []).filter((column) =>
+      tables.some((table) => table?.columns.includes(column)),
+    ),
+  ];
+}
+
+function projectRow(
+  row: WorkspaceDatabaseRow,
+  sourceColumns: readonly string[],
+  columns: readonly string[],
+  fallbacks: Array<{
+    row: WorkspaceDatabaseRow | undefined;
+    columns: readonly string[];
+  }> = [],
+): WorkspaceDatabaseRow {
+  return {
+    key: row.key,
+    values: columns.map((column) => {
+      const index = sourceColumns.indexOf(column);
+      if (index >= 0) {
+        return { ...row.values[index]! };
+      }
+      for (const fallback of fallbacks) {
+        const fallbackIndex = fallback.columns.indexOf(column);
+        if (fallbackIndex >= 0 && fallback.row !== undefined) {
+          return { ...fallback.row.values[fallbackIndex]! };
+        }
+      }
+      return { type: "null" };
+    }),
+  };
+}
+
+function alignedRowsByKey(
+  table: WorkspaceDatabaseTable | undefined,
+  columns: readonly string[],
+  ...fallbacks: Array<WorkspaceDatabaseTable | undefined>
+): Map<string, WorkspaceDatabaseRow> {
+  const fallbackRows = fallbacks.map((fallback) => ({
+    rows: rowsByKey(fallback),
+    columns: fallback?.columns ?? [],
+  }));
+  return new Map(table?.rows.map((row) => [row.key, projectRow(
+    row,
+    table.columns,
+    columns,
+    fallbackRows.map((fallback) => ({
+      row: fallback.rows.get(row.key), columns: fallback.columns,
+    })),
+  )]) ?? []);
 }
 
 function rowsEqual(
@@ -1642,10 +1786,18 @@ function portableValueBytes(value: PortableSqliteValue): number {
   return Buffer.byteLength(value.value, "utf8");
 }
 
-function ensureInsertSupported(schema: TableSchema): void {
+function ensureInsertSupported(
+  schema: TableSchema,
+  columns: readonly string[],
+): void {
   if (schema.requiredExtraColumns.length > 0) {
     throw new Error(
       `Cannot insert into ${schema.descriptor.name}; unknown required columns are present.`,
+    );
+  }
+  if (schema.requiredValueColumns.some((column) => !columns.includes(column))) {
+    throw new Error(
+      `Cannot insert into ${schema.descriptor.name}; unsupported required columns are present.`,
     );
   }
 }
@@ -1656,7 +1808,7 @@ function conflict(
   reason: WorkspaceDatabaseConflictReason,
 ): WorkspaceDatabaseConflict {
   return {
-    table: descriptor.name as KnownTableName,
+    table: descriptor.name,
     keyDigest: keyDigest(descriptor.name, key),
     reason,
   };

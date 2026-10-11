@@ -15,6 +15,7 @@ import {
 } from "../sync/versionPolicy";
 import {
   isPortableChatSnapshotV2,
+  isSyncableComposerId,
   parsePortableChatSnapshot,
   portableChatCoreHash,
   scanPortableChatConversationStates,
@@ -320,7 +321,11 @@ export function buildChatTipEnrichmentCandidateIndex(
       continue;
     }
     const tip = tips[0];
-    if (tip === undefined || !tipNeedsAgentKvEnrichment(tip)) {
+    if (
+      tip === undefined ||
+      !isSyncableChatTipResource(resourceId, tip) ||
+      !tipNeedsAgentKvEnrichment(tip)
+    ) {
       continue;
     }
     candidates.push({
@@ -378,7 +383,10 @@ function selectIndexedChatTipEnrichmentCandidates(
       continue;
     }
     lastInspected = candidate;
-    if (include(candidate)) {
+    if (
+      isSyncableChatTipResource(candidate.resourceId, candidate.tip) &&
+      include(candidate)
+    ) {
       candidates.push(candidate);
     }
   }
@@ -461,6 +469,16 @@ function compareChatTipEnrichmentPriority(
 function validTipLastUpdatedAt(tip: ResourceTip): number | null {
   const value = tip.metadata?.lastUpdatedAt;
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function isSyncableChatTipResource(
+  resourceId: string,
+  tip: Pick<ResourceTip, "kind">,
+): boolean {
+  if (tip.kind !== "chat" || !resourceId.startsWith("chat/")) {
+    return false;
+  }
+  return isSyncableComposerId(resourceId.slice("chat/".length));
 }
 
 function tipNeedsAgentKvEnrichment(tip: ResourceTip): boolean {

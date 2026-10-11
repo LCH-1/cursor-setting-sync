@@ -32,6 +32,8 @@ Cursor versions do not need to match exactly.
 
 An equivalent queued v2 chat is settled without database writes only after authenticating its baseline and verifying its existing conversation core and every supplied continuation blob. Missing continuation data remains missing and is never installed or reported as repaired.
 
+Workspace header snapshots preserve known optional fields, including explicit null values, while old payloads and Cursor schemas remain supported. Unsupported populated fields stay blocked before any database write. Cursor's permanent non-chat draft placeholders are excluded from continuation enrichment, including old repository entries. A clean shutdown export clears prior helper warnings at the next startup; online verification alone does not conceal them.
+
 Local database capability checks, authenticated payload hashes, complete continuation verification, and backups still apply. The shutdown helper independently inspects the installed Cursor and verifies incoming bytes before writing.
 
 The descriptor inspection worker bundles TypeScript (Microsoft Corporation), licensed under Apache 2.0. Its license is included as `dist/LICENSE.typescript.txt` in the extension.

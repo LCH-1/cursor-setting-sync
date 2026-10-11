@@ -1,11 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("vscode", () => ({
   window: {},
   extensions: { all: [] },
 }));
 
-import { helperWarningObservation, settledStatus } from "../src/sync/manager";
+import { helperWarningObservation, settledStatus, SyncManager } from "../src/sync/manager";
 import {
   HELPER_WARNING_SOURCE,
   StandingWarningRegistry,
@@ -15,10 +18,16 @@ import { filterPublishableChanges } from "../src/sync/versionPolicy";
 import { sha256 } from "../src/protocol/canonical";
 import type { HelperResult } from "../src/helper/types";
 import type { ResourceSnapshot } from "../src/types";
+import type { SyncRepository } from "../src/protocol/repository";
 
 const HOUR = 60 * 60 * 1000;
 const T0 = Date.parse("2026-07-25T00:00:00.000Z");
 const WORKSPACE_DATABASE = "workspace-storage/workspace-a%2Fstate.vscdb";
+const roots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+});
 
 /**
  * The exact wording the shutdown export produces when it drops a resource, so
@@ -55,6 +64,65 @@ function helperResult(overrides: Partial<HelperResult> = {}): HelperResult {
 }
 
 describe("helper-reported warnings reach the user", () => {
+  it("consumes actual shutdown results and checks status as well as the empty queue", async () => {
+    const extensionStorage = await mkdtemp(join(tmpdir(), "cursor-sync-helper-status-"));
+    roots.push(extensionStorage);
+    const registry = new StandingWarningRegistry(HOUR);
+    const status = { log: vi.fn(), setStatus: vi.fn() };
+    const repository = { state: { conflicts: [], pendingDatabaseChanges: [] } } as unknown as SyncRepository;
+    const manager = Object.assign(Object.create(SyncManager.prototype) as object, {
+      paths: { extensionStorage },
+      warnings: registry,
+      status,
+      repository,
+      compatibility: { compatible: true },
+      configuration: { enabled: true },
+      disposed: false,
+      helperFailure: null,
+      recordHelperBackups: vi.fn().mockResolvedValue(undefined),
+      reportAbandonedHelpers: vi.fn().mockResolvedValue(undefined),
+    }) as unknown as {
+      consumeHelperResults(options?: { atStartup: boolean }): Promise<void>;
+      updateStatus(repository: SyncRepository): void;
+    };
+    const observations = [
+      "workspace-a/state.vscdb: Ignored 1 unknown column(s) in composerHeaders.",
+      "Skipped agent blob enrichment for chat/empty-state-draft: Chat snapshot composer ID is invalid..",
+    ];
+    let sequence = 0;
+    const consume = async (overrides: Partial<HelperResult>, atStartup: boolean) => {
+      const requestId = `11111111-1111-4111-8111-${String(++sequence).padStart(12, "0")}`;
+      const result = helperResult({ requestId, mode: "final-export", ...overrides });
+      await writeFile(join(extensionStorage, `helper-result-${requestId}.json`), JSON.stringify(result));
+      await manager.consumeHelperResults({ atStartup });
+      manager.updateStatus(repository);
+      expect(await readdir(extensionStorage)).toEqual([]);
+      expect(repository.state.pendingDatabaseChanges).toEqual([]);
+    };
+
+    await consume({ warnings: observations, skipped: observations }, true);
+    expect(registry.standingFor(HELPER_WARNING_SOURCE)).toHaveLength(2);
+    expect(status.setStatus).toHaveBeenLastCalledWith("partial", expect.stringContaining("2 warning(s)"));
+
+    for (let poll = 0; poll < 5; poll += 1) manager.updateStatus(repository);
+    await consume({ mode: "verify-live", warnings: [], applied: ["chat/already-present"] }, false);
+    await consume({ warnings: [] }, false);
+    await consume({}, true);
+    expect(registry.standingFor(HELPER_WARNING_SOURCE)).toHaveLength(2);
+    expect(status.setStatus).toHaveBeenLastCalledWith("partial", expect.any(String));
+
+    await consume({ warnings: [] }, true);
+    expect(registry.standingFor(HELPER_WARNING_SOURCE)).toEqual([]);
+    expect(status.setStatus).toHaveBeenLastCalledWith("up-to-date", undefined);
+    for (let poll = 0; poll < 5; poll += 1) manager.updateStatus(repository);
+    await consume({ warnings: [] }, true);
+    expect(status.setStatus).toHaveBeenLastCalledWith("up-to-date", undefined);
+
+    await consume({ warnings: [DROPPED_BACKUP], skipped: [DROPPED_BACKUP] }, true);
+    expect(registry.standingFor(HELPER_WARNING_SOURCE)).toHaveLength(1);
+    expect(status.setStatus).toHaveBeenLastCalledWith("partial", expect.stringContaining("1 warning(s)"));
+  });
+
   it("turns a skipped-resource warning into a standing warning and a non-green status", () => {
     // The shutdown export is the ONLY path that backs up workspaceStorage. The
     // defect-4 fix turned an oversized payload there from a hard failure into a

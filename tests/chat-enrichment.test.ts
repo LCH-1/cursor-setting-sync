@@ -71,6 +71,175 @@ afterEach(async () => {
 });
 
 describe("manager repository-tip chat enrichment", () => {
+  it.each([
+    { offline: false, indexed: false },
+    { offline: false, indexed: true },
+    { offline: true, indexed: false },
+    { offline: true, indexed: true },
+  ])(
+    "leaves historical placeholders untouched without decrypting them (offline=$offline, indexed=$indexed)",
+    async ({ offline, indexed }) => {
+      const repository = await createRepository();
+      const placeholders = ["empty-state-draft", "new-chat", `${composer(400)}/draft`];
+      const originalTips: ResourceTip[] = [];
+      for (const id of placeholders) {
+        originalTips.push(await publishChat(repository, legacyChat(id, 0)));
+      }
+      const valid = await publishChat(repository, legacyChat(composer(401), 1));
+      const originalEvents = await repository.listEvents();
+      const readVersion = vi.spyOn(repository, "tryReadVersion");
+      const collectAgentKv = vi.fn(async () => null);
+      const result = await enrichCurrentChatTips(repository, {
+        cursor: initialCursor(),
+        maxPayloadBytes: repository.maxPayloadBytes,
+        offline,
+        collectAgentKv,
+        ...(indexed
+          ? {
+              candidateIndex: buildChatTipEnrichmentCandidateIndex(repository.state.tips),
+              candidateGeneration: 1,
+            }
+          : {}),
+      });
+
+      expect(result).toMatchObject({ attempted: 1, published: 0, warnings: [] });
+      expect(readVersion.mock.calls).toEqual([[valid.versionId]]);
+      expect(collectAgentKv).toHaveBeenCalledTimes(1);
+      for (const [index, id] of placeholders.entries()) {
+        expect(onlyTip(repository, `chat/${id}`)).toEqual(originalTips[index]);
+      }
+      expect(await repository.listEvents()).toEqual(originalEvents);
+    },
+  );
+
+  it("rejects unscannable resource identities in both the built and supplied candidate indexes", async () => {
+    const repository = await createRepository();
+    const placeholder = await publishChat(repository, legacyChat("empty-state-draft", 0));
+    const valid = await publishChat(repository, legacyChat(composer(405), 1));
+    const index = buildChatTipEnrichmentCandidateIndex(repository.state.tips);
+    expect(index.map((candidate) => candidate.resourceId)).toEqual([`chat/${composer(405)}`]);
+
+    const candidateIndex = [
+      { resourceId: "chat/empty-state-draft", tip: placeholder },
+      { resourceId: `workspace/${composer(405)}`, tip: valid },
+    ].map((candidate) => ({ ...candidate, expectedTipIds: [candidate.tip.versionId] }));
+    const readVersion = vi.spyOn(repository, "tryReadVersion");
+    const collectAgentKv = vi.fn(async () => null);
+    const result = await enrichCurrentChatTips(repository, {
+      cursor: initialCursor(),
+      candidateIndex,
+      candidateGeneration: 1,
+      forceRetry: true,
+      maxPayloadBytes: repository.maxPayloadBytes,
+      collectAgentKv,
+    });
+    expect(result).toMatchObject({ attempted: 0, published: 0, warnings: [] });
+    expect(readVersion).not.toHaveBeenCalled();
+    expect(collectAgentKv).not.toHaveBeenCalled();
+  });
+
+  it("verifies UUID source payloads despite stale or malformed composer metadata", async () => {
+    const repository = await createRepository();
+    const originalTips: ResourceTip[] = [];
+    const identities: JsonValue[] = [composer(403), 404, "empty-state-draft"];
+    for (const [index, metadataComposerId] of identities.entries()) {
+      originalTips.push(await publishChat(repository, legacyChat(composer(430 + index), 1), {
+        composerId: metadataComposerId,
+      }));
+    }
+    const candidateIndex = buildChatTipEnrichmentCandidateIndex(repository.state.tips);
+    expect(candidateIndex.map((candidate) => candidate.resourceId)).toEqual(
+      [430, 431, 432].map((index) => `chat/${composer(index)}`),
+    );
+    const readVersion = vi.spyOn(repository, "tryReadVersion");
+    const inspected: string[] = [];
+    const collectAgentKv = vi.fn(async (source: PortableChatSnapshot) => {
+      inspected.push(source.composerId);
+      return null;
+    });
+    let cursor = initialCursor();
+    for (let index = 0; index < identities.length; index += 1) {
+      const result = await enrichCurrentChatTips(repository, {
+        cursor,
+        candidateIndex,
+        candidateGeneration: 1,
+        batchSize: 1,
+        maxPayloadBytes: repository.maxPayloadBytes,
+        collectAgentKv,
+      });
+      expect(result).toMatchObject({ attempted: 1, published: 0, warnings: [] });
+      cursor = result.cursor;
+    }
+    expect(readVersion.mock.calls).toEqual(originalTips.map((tip) => [tip.versionId]));
+    expect(inspected).toEqual(
+      [430, 431, 432].map(composer),
+    );
+  });
+
+  it("keeps valid legacy, missing v2 and unknown schemas eligible while retaining complete v2 and v3 policy", async () => {
+    const repository = await createRepository();
+    const cases: Record<string, JsonValue>[] = [
+      {},
+      { chatSnapshotSchemaVersion: 1 },
+      { chatSnapshotSchemaVersion: 2, agentKvMissingCount: 1 },
+      { chatSnapshotSchemaVersion: 2, agentKvMissingCount: 0 },
+      { chatSnapshotSchemaVersion: 3 },
+      { chatSnapshotSchemaVersion: 99 },
+    ];
+    for (const [index, metadata] of cases.entries()) {
+      const tip = await publishChat(repository, legacyChat(composer(410 + index), 1), metadata);
+      delete tip.metadata?.composerId;
+    }
+    expect(
+      buildChatTipEnrichmentCandidateIndex(repository.state.tips).map((candidate) => candidate.resourceId),
+    ).toEqual([410, 411, 412, 415].map((index) => `chat/${composer(index)}`));
+  });
+
+  it.each(["authentication", "hash", "malformed", "composer-mismatch"] as const)(
+    "retains a real UUID source and reports its %s failure",
+    async (failure) => {
+      const repository = await createRepository();
+      const id = composer(420);
+      const source = legacyChat(id, 1);
+      const malformedContent = Buffer.from("{");
+      const resource = snapshot(failure === "composer-mismatch" ? legacyChat(composer(421), 1) : source, []);
+      const content = failure === "malformed" ? malformedContent : resource.content;
+      await repository.publish([{
+        ...resource,
+        resourceId: `chat/${id}`,
+        content,
+        semanticHash: sha256(content),
+        metadata: { composerId: id },
+      }], []);
+      await reconcile(repository);
+      const original = onlyTip(repository, `chat/${id}`);
+      const collectAgentKv = vi.fn(async () => null);
+      if (failure === "authentication") {
+        vi.spyOn(repository, "tryReadVersion").mockRejectedValue(new Error("authenticated source failed"));
+      } else if (failure === "hash") {
+        const data = await repository.readVersion(original.versionId);
+        vi.spyOn(repository, "tryReadVersion").mockResolvedValue({
+          ...data,
+          content: Buffer.from("changed source bytes"),
+        });
+      }
+      const result = await enrichCurrentChatTips(repository, {
+        cursor: initialCursor(),
+        maxPayloadBytes: repository.maxPayloadBytes,
+        collectAgentKv,
+      });
+      expect(result).toMatchObject({ attempted: 1, published: 0 });
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain(`Skipped agent blob enrichment for chat/${id}:`);
+      if (failure === "composer-mismatch") {
+        expect(result.warnings[0]).toContain("tip composer ID does not match its resource ID");
+      }
+      expect(collectAgentKv).not.toHaveBeenCalled();
+      expect(onlyTip(repository, `chat/${id}`)).toEqual(original);
+      expect(await repository.listEvents()).toHaveLength(1);
+    },
+  );
+
   it("never upgrades a missing0 snapshot with missing visible rows into a core-applying enrichment", async () => {
     const repository = await createRepository();
     const source = {
@@ -2198,14 +2367,14 @@ describe("manager repository-tip chat enrichment", () => {
           : { lastUpdatedAt: index },
       });
       for (let index = 0; index < 100_000; index += 1) {
-        tips[`chat/complete-${index}`] = [tip(index, true)];
+        tips[`chat/${composer(index)}`] = [tip(index, true)];
       }
       // Only actual migration candidates are retained. A mature 100k-chat
       // repository therefore adds no second full-resource structure.
       expect(buildChatTipEnrichmentCandidateIndex(tips)).toEqual([]);
 
       const candidates = Array.from({ length: 10_000 }, (_, index) => ({
-        resourceId: `chat/legacy-${index}`,
+        resourceId: `chat/${composer(100_000 + index)}`,
         tip: tip(index, false),
         expectedTipIds: [`version-${index}`],
       }));

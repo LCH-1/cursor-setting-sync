@@ -10,6 +10,7 @@ import {
   mergeWorkspaceDatabaseSnapshots,
   parseWorkspaceDatabaseSnapshot,
   serializeWorkspaceDatabaseSnapshot,
+  unionWorkspaceDatabaseSnapshots,
   type PortableSqliteValue,
   type WorkspaceDatabaseRow,
   type WorkspaceDatabaseSnapshot,
@@ -108,6 +109,53 @@ describe("portable workspace database snapshots", () => {
     expect(
       snapshotValue(result.snapshot, "composerHeaders", "composer-1", 0),
     ).toEqual({ type: "text", value: "canonical-a" });
+  });
+
+  it.each(["legacy", "empty", "null", "used"] as const)(
+    "captures %s subagent header data without a false unknown-column warning",
+    async (mode) => {
+      const root = await temporaryRoot();
+      const path = join(root, "state.vscdb");
+      const database = await createDatabase(path, {
+        composerHeaders: true,
+        subagentTypeName: mode !== "legacy",
+      });
+      if (mode !== "empty") {
+        insertHeader(database, "composer-1", "header");
+        if (mode === "used") {
+          database.prepare("UPDATE composerHeaders SET subagentTypeName = ?").run("explorer");
+        }
+      }
+      database.close();
+
+      const captured = captureWorkspaceDatabaseSnapshot(path, {
+        workspaceId: "workspace-a", includeComposerHeaders: true,
+      });
+      const headers = captured.snapshot.tables.find((table) => table.name === "composerHeaders");
+      expect(captured.warnings).toEqual([]);
+      expect(headers?.columns).toHaveLength(mode === "legacy" ? 8 : 9);
+      expect(parseWorkspaceDatabaseSnapshot(serializeWorkspaceDatabaseSnapshot(captured.snapshot))).toEqual(captured.snapshot);
+      if (mode === "used") {
+        expect(snapshotValue(captured.snapshot, "composerHeaders", "composer-1", 8)).toEqual(text("explorer"));
+      }
+    },
+  );
+
+  it("keeps the warning and value preservation boundary for unrelated future columns", async () => {
+    const root = await temporaryRoot();
+    const path = join(root, "state.vscdb");
+    const database = await createDatabase(path, { composerHeaders: true, subagentTypeName: true });
+    database.exec("ALTER TABLE composerHeaders ADD COLUMN futureState TEXT");
+    insertHeader(database, "composer-1", "header");
+    database.prepare("UPDATE composerHeaders SET subagentTypeName = ?, futureState = ?").run("explorer", "private-future-data");
+    database.close();
+
+    const captured = captureWorkspaceDatabaseSnapshot(path, {
+      workspaceId: "workspace-a", includeComposerHeaders: true,
+    });
+    expect(captured.warnings).toEqual(["Ignored 1 unknown column(s) in composerHeaders."]);
+    expect(snapshotValue(captured.snapshot, "composerHeaders", "composer-1", 8)).toEqual(text("explorer"));
+    expect(serializeWorkspaceDatabaseSnapshot(captured.snapshot).toString()).not.toContain("private-future-data");
   });
 
   it("rejects malformed values, duplicate keys, and payload limit violations", () => {
@@ -418,7 +466,257 @@ describe("workspace database path distinctness", () => {
   });
 });
 
+describe("optional workspace header merge columns", () => {
+  it("retains new metadata through a legacy row update and a legacy preferred union", async () => {
+    const root = await temporaryRoot();
+    const path = join(root, "state.vscdb");
+    const database = await createDatabase(path, { composerHeaders: true, subagentTypeName: true });
+    insertHeader(database, "composer-1", "base");
+    database.prepare("UPDATE composerHeaders SET subagentTypeName = ?").run("explorer");
+    database.close();
+    const base = captureHeaders(path);
+    const legacy = structuredClone(base);
+    const headers = legacy.tables.find((table) => table.name === "composerHeaders")!;
+    headers.columns.pop();
+    headers.rows[0]!.values.pop();
+    headers.rows[0]!.values[7] = text("legacy-change");
+
+    const merged = mergeWorkspaceDatabaseSnapshots(base, legacy, base);
+    expect(merged.status).toBe("merged");
+    expect(snapshotValue(merged.snapshot, "composerHeaders", "composer-1", 7)).toEqual(text("legacy-change"));
+    expect(snapshotValue(merged.snapshot, "composerHeaders", "composer-1", 8)).toEqual(text("explorer"));
+    const union = unionWorkspaceDatabaseSnapshots(legacy, base);
+    expect(snapshotValue(union, "composerHeaders", "composer-1", 7)).toEqual(text("legacy-change"));
+    expect(snapshotValue(union, "composerHeaders", "composer-1", 8)).toEqual(text("explorer"));
+    expect(parseWorkspaceDatabaseSnapshot(serializeWorkspaceDatabaseSnapshot(union))).toEqual(union);
+
+    const noTable = makeSnapshot("workspace-a", {});
+    const passthrough = mergeWorkspaceDatabaseSnapshots(base, legacy, noTable);
+    expect(snapshotValue(passthrough.snapshot, "composerHeaders", "composer-1", 8)).toEqual(text("explorer"));
+
+    const legacyDeletion = structuredClone(legacy);
+    legacyDeletion.tables.find((table) => table.name === "composerHeaders")!.rows = [];
+    const deletion = mergeWorkspaceDatabaseSnapshots(base, legacyDeletion, base);
+    expect(deletion.status).toBe("conflict");
+    expect(deletion.conflicts).toEqual([expect.objectContaining({ reason: "unsafe-schema-delete" })]);
+  });
+
+  it("merges a newly populated optional column and protects concurrent optional edits", async () => {
+    const root = await temporaryRoot();
+    const path = join(root, "state.vscdb");
+    const database = await createDatabase(path, { composerHeaders: true, subagentTypeName: true });
+    insertHeader(database, "composer-1", "base");
+    database.close();
+    const legacy = captureHeaders(path);
+    const legacyHeaders = legacy.tables.find((table) => table.name === "composerHeaders")!;
+    legacyHeaders.columns.pop();
+    legacyHeaders.rows[0]!.values.pop();
+    const current = structuredClone(legacy);
+    const headers = current.tables.find((table) => table.name === "composerHeaders")!;
+    headers.columns.push("subagentTypeName");
+    headers.rows[0]!.values.push(text("explorer"));
+    const merged = mergeWorkspaceDatabaseSnapshots(legacy, legacy, current);
+    expect(merged.status).toBe("merged");
+    expect(snapshotValue(merged.snapshot, "composerHeaders", "composer-1", 8)).toEqual(text("explorer"));
+
+    const local = structuredClone(current);
+    local.tables.find((table) => table.name === "composerHeaders")!.rows[0]!.values[8] = text("local-edit");
+    const remote = structuredClone(current);
+    remote.tables.find((table) => table.name === "composerHeaders")!.rows[0]!.values[8] = text("remote-edit");
+    const conflict = mergeWorkspaceDatabaseSnapshots(current, local, remote);
+    expect(conflict.status).toBe("conflict");
+    expect(conflict.conflicts).toEqual([expect.objectContaining({ reason: "concurrent-update" })]);
+    expect(conflict.snapshot).toBeUndefined();
+  });
+
+  it("rejects unrecognized or reordered snapshot columns", async () => {
+    const root = await temporaryRoot();
+    const path = join(root, "state.vscdb");
+    const database = await createDatabase(path, { composerHeaders: true });
+    database.close();
+    const snapshot = captureHeaders(path);
+    const headers = snapshot.tables.find((table) => table.name === "composerHeaders")!;
+    headers.columns.push("futureColumn");
+    expect(() => serializeWorkspaceDatabaseSnapshot(snapshot)).toThrow("column contract changed");
+    headers.columns[8] = "subagentTypeName";
+    [headers.columns[0], headers.columns[8]] = [headers.columns[8], headers.columns[0]!];
+    expect(() => serializeWorkspaceDatabaseSnapshot(snapshot)).toThrow("column contract changed");
+  });
+});
+
 describeWithBackup("workspace database query apply", () => {
+  it.each(["clear", "delete"] as const)("preserves the explicit last subagent %s after a current snapshot", async (mode) => {
+    const fixture = await applyFixture({ composerHeaders: true, subagentTypeName: true });
+    insertHeader(fixture.database, "composer-1", "header");
+    fixture.database.prepare("UPDATE composerHeaders SET workspaceId = ?, subagentTypeName = ?").run("workspace-b", "explorer");
+    fixture.database.close();
+    const sourcePath = join(fixture.root, "source.vscdb");
+    const source = await createDatabase(sourcePath, { composerHeaders: true, subagentTypeName: true });
+    insertHeader(source, "composer-1", "header");
+    source.prepare("UPDATE composerHeaders SET subagentTypeName = ?").run("explorer");
+    const base = captureHeaders(sourcePath);
+    source.exec(mode === "clear" ? "UPDATE composerHeaders SET subagentTypeName = NULL" : "DELETE FROM composerHeaders");
+    source.close();
+    const incoming = captureHeaders(sourcePath);
+    expect(incoming.tables.find((table) => table.name === "composerHeaders")?.columns).toHaveLength(9);
+
+    const result = await applyWorkspaceDatabaseSnapshot({
+      targetPath: fixture.targetPath, backupPath: fixture.backupPath,
+      targetWorkspaceId: "workspace-b", base, incoming,
+    });
+    expect(result).toMatchObject(mode === "clear"
+      ? { updated: 1, deleted: 0, warnings: [] }
+      : { updated: 0, deleted: 1, warnings: [] });
+    expect(readHeader(fixture.backupPath, "composer-1")).toMatchObject({ subagentTypeName: "explorer" });
+    if (mode === "clear") {
+      expect(readHeader(fixture.targetPath, "composer-1")).toMatchObject({ subagentTypeName: null });
+    } else {
+      expect(readHeader(fixture.targetPath, "composer-1")).toBeUndefined();
+    }
+  });
+
+  it("imports used and explicit null subagent types with a verified backup and repeatable apply", async () => {
+    const fixture = await applyFixture({ composerHeaders: true, subagentTypeName: true });
+    insertHeader(fixture.database, "null-type", "before");
+    fixture.database.prepare("UPDATE composerHeaders SET subagentTypeName = ?").run("old-type");
+    fixture.database.close();
+    const sourcePath = join(fixture.root, "source.vscdb");
+    const source = await createDatabase(sourcePath, { composerHeaders: true, subagentTypeName: true });
+    insertHeader(source, "used-type", "new");
+    insertHeader(source, "null-type", "new");
+    source.prepare("UPDATE composerHeaders SET subagentTypeName = ? WHERE composerId = ?").run("explorer", "used-type");
+    source.close();
+    const incoming = captureHeaders(sourcePath);
+
+    const applied = await applyWorkspaceDatabaseSnapshot({
+      targetPath: fixture.targetPath, backupPath: fixture.backupPath,
+      targetWorkspaceId: "workspace-b", incoming,
+    });
+    expect(applied).toMatchObject({ inserted: 1, updated: 1, warnings: [] });
+    expect(readHeader(fixture.targetPath, "used-type")).toMatchObject({ workspaceId: "workspace-b", subagentTypeName: "explorer" });
+    expect(readHeader(fixture.targetPath, "null-type")).toMatchObject({ subagentTypeName: null });
+    expect(readHeader(fixture.backupPath, "null-type")).toMatchObject({ subagentTypeName: "old-type", value: "before" });
+    const repeated = await applyWorkspaceDatabaseSnapshot({
+      targetPath: fixture.targetPath, backupPath: join(fixture.root, "repeat-backup.vscdb"),
+      targetWorkspaceId: "workspace-b", incoming,
+    });
+    expect(repeated).toMatchObject({ inserted: 0, updated: 0, deleted: 0, unchanged: 2, warnings: [] });
+  });
+
+  it.each(["nullable", "default"] as const)(
+    "preserves target-only subagent types and %s insertion semantics for an old source",
+    async (mode) => {
+      const fixture = await applyFixture({ composerHeaders: true });
+      fixture.database.exec(mode === "default"
+        ? "ALTER TABLE composerHeaders ADD COLUMN subagentTypeName TEXT DEFAULT 'default-type'"
+        : "ALTER TABLE composerHeaders ADD COLUMN subagentTypeName TEXT");
+      insertHeader(fixture.database, "existing", "before");
+      fixture.database.prepare("UPDATE composerHeaders SET subagentTypeName = ?").run("target-only-type");
+      fixture.database.close();
+      const sourcePath = join(fixture.root, "source.vscdb");
+      const source = await createDatabase(sourcePath, { composerHeaders: true });
+      insertHeader(source, "existing", "after");
+      insertHeader(source, "inserted", "new");
+      source.close();
+
+      const result = await applyWorkspaceDatabaseSnapshot({
+        targetPath: fixture.targetPath, backupPath: fixture.backupPath,
+        targetWorkspaceId: "workspace-b", incoming: captureHeaders(sourcePath),
+      });
+      expect(result).toMatchObject({ inserted: 1, updated: 1, warnings: [] });
+      expect(readHeader(fixture.targetPath, "existing")).toMatchObject({ value: "after", subagentTypeName: "target-only-type" });
+      expect(readHeader(fixture.targetPath, "inserted")).toMatchObject({ subagentTypeName: mode === "default" ? "default-type" : null });
+    },
+  );
+
+  it("accepts unused optional values on an old target without changing its schema", async () => {
+    const fixture = await applyFixture({ composerHeaders: true });
+    fixture.database.close();
+    const sourcePath = join(fixture.root, "source.vscdb");
+    const source = await createDatabase(sourcePath, { composerHeaders: true, subagentTypeName: true });
+    insertHeader(source, "composer-1", "new");
+    source.close();
+    const incoming = captureHeaders(sourcePath);
+    expect(incoming.tables.find((table) => table.name === "composerHeaders")?.columns).toHaveLength(9);
+
+    const result = await applyWorkspaceDatabaseSnapshot({
+      targetPath: fixture.targetPath, backupPath: fixture.backupPath,
+      targetWorkspaceId: "workspace-b", incoming,
+    });
+    expect(result).toMatchObject({ inserted: 1, warnings: [] });
+    expect(readHeader(fixture.targetPath, "composer-1")).toMatchObject({ value: "new" });
+    expect(readHeader(fixture.targetPath, "composer-1")).not.toHaveProperty("subagentTypeName");
+  });
+
+  it("rejects a used optional value on an old target before backup or any write", async () => {
+    const fixture = await applyFixture({ composerHeaders: true });
+    insertHeader(fixture.database, "composer-1", "preserved");
+    insertText(fixture.database, "sentinel", "preserved");
+    fixture.database.close();
+    const sourcePath = join(fixture.root, "source.vscdb");
+    const source = await createDatabase(sourcePath, { composerHeaders: true, subagentTypeName: true });
+    insertHeader(source, "composer-1", "remote");
+    source.prepare("UPDATE composerHeaders SET subagentTypeName = ?").run("explorer");
+    insertText(source, "sentinel", "must-not-write");
+    source.close();
+
+    await expect(applyWorkspaceDatabaseSnapshot({
+      targetPath: fixture.targetPath, backupPath: fixture.backupPath,
+      targetWorkspaceId: "workspace-b", incoming: captureHeaders(sourcePath),
+    })).rejects.toThrow("does not support populated column(s)");
+    expect(readHeader(fixture.targetPath, "composer-1")).toMatchObject({ value: "preserved" });
+    expect(readValue(fixture.targetPath, "sentinel")?.value).toBe("preserved");
+    await expect(stat(fixture.backupPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["legacy", "current"] as const)("protects target-only optional data from an old source deletion after a %s base", async (baseMode) => {
+    const fixture = await applyFixture({ composerHeaders: true, subagentTypeName: true });
+    insertHeader(fixture.database, "composer-1", "base");
+    fixture.database.prepare("UPDATE composerHeaders SET workspaceId = ?, subagentTypeName = ?").run("workspace-b", "target-only-type");
+    fixture.database.close();
+    const sourcePath = join(fixture.root, "source.vscdb");
+    const source = await createDatabase(sourcePath, { composerHeaders: true, subagentTypeName: baseMode === "current" });
+    insertHeader(source, "composer-1", "base");
+    if (baseMode === "current") {
+      source.prepare("UPDATE composerHeaders SET subagentTypeName = ?").run("target-only-type");
+    }
+    source.close();
+    const base = captureHeaders(sourcePath);
+    const incoming = structuredClone(base);
+    const incomingHeaders = incoming.tables.find((table) => table.name === "composerHeaders")!;
+    incomingHeaders.rows = [];
+    if (baseMode === "current") {
+      incomingHeaders.columns.pop();
+    }
+
+    await expect(applyWorkspaceDatabaseSnapshot({
+      targetPath: fixture.targetPath, backupPath: fixture.backupPath,
+      targetWorkspaceId: "workspace-b", base, incoming,
+    })).rejects.toMatchObject({ conflicts: [expect.objectContaining({ reason: "unsafe-schema-delete" })] });
+    expect(readHeader(fixture.targetPath, "composer-1")).toMatchObject({ subagentTypeName: "target-only-type" });
+    await expect(stat(fixture.backupPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("retains unrelated unknown target values during known subagent updates", async () => {
+    const fixture = await applyFixture({ composerHeaders: true, subagentTypeName: true });
+    fixture.database.exec("ALTER TABLE composerHeaders ADD COLUMN futureState TEXT");
+    insertHeader(fixture.database, "composer-1", "before");
+    fixture.database.prepare("UPDATE composerHeaders SET futureState = ?").run("local-only");
+    fixture.database.close();
+    const sourcePath = join(fixture.root, "source.vscdb");
+    const source = await createDatabase(sourcePath, { composerHeaders: true, subagentTypeName: true });
+    insertHeader(source, "composer-1", "after");
+    source.prepare("UPDATE composerHeaders SET subagentTypeName = ?").run("explorer");
+    source.close();
+
+    const result = await applyWorkspaceDatabaseSnapshot({
+      targetPath: fixture.targetPath, backupPath: fixture.backupPath,
+      targetWorkspaceId: "workspace-b", incoming: captureHeaders(sourcePath),
+    });
+    expect(result.warnings).toEqual(["Ignored 1 unknown column(s) in composerHeaders."]);
+    expect(readHeader(fixture.targetPath, "composer-1")).toMatchObject({ value: "after", subagentTypeName: "explorer", futureState: "local-only" });
+  });
+
   it("uses an upsert-only overlay without a base and preserves unrelated state", async () => {
     const fixture = await applyFixture({ extraNullableColumn: true });
     fixture.database
@@ -675,6 +973,7 @@ async function createDatabase(
   options: {
     composerHeaders?: boolean;
     extraNullableColumn?: boolean;
+    subagentTypeName?: boolean;
   } = {},
 ): Promise<sqlite.DatabaseSync> {
   await mkdir(join(path, ".."), { recursive: true });
@@ -695,6 +994,9 @@ async function createDatabase(
         recency INTEGER, checkpointAt INTEGER, value TEXT
       )`,
     );
+    if (options.subagentTypeName === true) {
+      database.exec("ALTER TABLE composerHeaders ADD COLUMN subagentTypeName TEXT");
+    }
   }
   return database;
 }
@@ -718,6 +1020,28 @@ function insertText(database: sqlite.DatabaseSync, key: string, value: string): 
   database
     .prepare("INSERT INTO ItemTable(key, value) VALUES (?, ?)")
     .run(key, value);
+}
+
+function insertHeader(database: sqlite.DatabaseSync, id: string, value: string): void {
+  database.prepare(`INSERT INTO composerHeaders(
+    composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+    isSubagent, recency, checkpointAt, value
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, "workspace-a", 1n, 2n, 0n, 1n, 3n, 4n, value);
+}
+
+function captureHeaders(path: string): WorkspaceDatabaseSnapshot {
+  return captureWorkspaceDatabaseSnapshot(path, {
+    workspaceId: "workspace-a", includeComposerHeaders: true,
+  }).snapshot;
+}
+
+function readHeader(path: string, id: string): Record<string, unknown> | undefined {
+  const database = new sqlite.DatabaseSync(path, { readOnly: true });
+  try {
+    return database.prepare("SELECT * FROM composerHeaders WHERE composerId = ?").get(id);
+  } finally {
+    database.close();
+  }
 }
 
 function makeSnapshot(
